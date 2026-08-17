@@ -1,0 +1,18 @@
+# pi-lens project root for pdkb — keep the repo to real code/docs only.
+
+# Raw markdown corpus (4582 docs, ~106M) + any graphify* extraction-output dirs
+graphify*/
+
+# uat / smoke test scratch dirs (test corpus + their graphify-out output)
+uat*/
+smoke*/
+
+# Watchdog runtime output (snapshot.md rewritten every 10s, hourly logs)
+snapshot/
+
+# pi-internal state (subagents, sessions)
+.pi/
+
+# Python bytecode / caches
+__pycache__/
+*.pyc
