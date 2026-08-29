@@ -1,12 +1,15 @@
 
 repo root
 
-## .gitignore 
-inbox/  raw knowledge materials before standardized 
+## .gitignore
+
+inbox/  raw knowledge materials before standardized
 graphify_ready/ standardized ones
 graphify_output/ compiled llm graphic wiki
 skylark_books/ skylark URLs and its sync records
+
 ## gitkeep
+
 scripts/
 
 ## mdocr — Markdown image prepare/OCR CLI

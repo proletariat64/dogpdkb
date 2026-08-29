@@ -22,3 +22,12 @@ __pycache__/
 
 # Virtualenv
 .venv/
+
+# Pre-existing scripts/ tooling, kept out of version control
+scripts/audit_luna_ocr.py
+scripts/graphify-watchdog-uat.py
+scripts/luna_ocr_monitor.py
+scripts/ocr_qa_checkpoint.py
+scripts/paddleocr_convert.py
+scripts/queue_next_luna_batch.py
+scripts/test_paddleocr_convert.py
