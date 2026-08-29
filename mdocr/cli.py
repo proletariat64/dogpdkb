@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import NoReturn
 
 import requests
 
@@ -20,6 +21,15 @@ from .prepare import prepare_or_report
 
 class CliError(Exception):
     """Fatal invocation error; reported before any processing starts."""
+
+
+class _HelpfulParser(argparse.ArgumentParser):
+    """Print the full help of the failing command on argument errors, so a
+    misuse teaches the user how to use mdocr instead of a bare usage line."""
+
+    def error(self, message: str) -> NoReturn:
+        self.print_help(sys.stderr)
+        self.exit(2, f"\n{self.prog}: error: {message}\n")
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -61,12 +71,12 @@ def prepare_transform(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _HelpfulParser(
         prog="mdocr",
         description="Prepare images referenced by Markdown and optionally OCR them.",
     )
     parser.add_argument("--version", action="version", version=f"mdocr {__version__}")
-    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=False)
 
     for name, help_text in (
         ("prepare", "copy Markdown with images normalized to local JPEG assets"),

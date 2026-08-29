@@ -39,6 +39,26 @@ def test_help_flag_exits_zero():
     assert exc.value.code == 0
 
 
+def test_invalid_command_teaches_help(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["orc", "-h"])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid choice" in err
+    assert "prepare" in err  # full help lists the available commands
+    assert "ocr" in err
+
+
+def test_subcommand_missing_args_teaches_help(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["ocr"])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "usage: mdocr ocr" in err
+    assert "the following arguments are required" in err
+    assert "--output-dir" in err  # subcommand help shows the missing flags
+
+
 def test_missing_input_file(tmp_path, capsys):
     code = cli.main(
         ["prepare", "-f", str(tmp_path / "nope.md"), "-o", str(tmp_path / "out")]
