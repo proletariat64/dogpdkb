@@ -16,3 +16,9 @@ snapshot/
 # Python bytecode / caches
 __pycache__/
 *.pyc
+
+# Package build artifacts
+*.egg-info/
+
+# Virtualenv
+.venv/
