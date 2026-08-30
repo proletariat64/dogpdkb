@@ -7,14 +7,14 @@ import io
 import re
 from collections.abc import Collection
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
 import requests
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from ._http import HttpClient
-from .markdown import ImageRef
+from .markdown import DocumentResult, ImageRef, render_image, transform_images
 
 JPEG_QUALITY = 90
 DOWNLOAD_TIMEOUT = 30
@@ -35,9 +35,10 @@ class ImageError(Exception):
 
 @dataclass(frozen=True)
 class PreparedImage:
-    ref: ImageRef
-    asset_rel: str  # POSIX path relative to the output directory
-    digest: str
+    """A validated local JPEG and its source path in output Markdown."""
+
+    path: Path
+    source: str
 
 
 def _safe_stem(name: str) -> str:
@@ -81,6 +82,40 @@ def validate_image_format(data: bytes, expected_format: str) -> None:
         raise ImageError(f"not a readable image: {exc}") from exc
 
 
+def open_prepared(source: str, output_dir: Path) -> PreparedImage:
+    """Safely reopen a canonical prepared JPEG from the output tree."""
+    source_path = PurePosixPath(source)
+    if source_path.is_absolute() or ".." in source_path.parts:
+        raise ImageError("source outside output tree")
+    if (
+        source != source_path.as_posix()
+        or not source_path.parts
+        or source_path.parts[0] != "assets"
+        or source_path.suffix != ".jpg"
+    ):
+        raise ImageError("source must be a canonical .jpg path under assets")
+
+    try:
+        output_root = output_dir.resolve()
+        assets_root = (output_root / "assets").resolve()
+        asset = output_root.joinpath(*source_path.parts).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ImageError(f"could not resolve source: {exc}") from exc
+    if not asset.is_relative_to(output_root):
+        raise ImageError("source outside output tree")
+    if not asset.is_relative_to(assets_root):
+        raise ImageError("source must be a canonical .jpg path under assets")
+    if not asset.is_file():
+        raise ImageError("prepared JPEG asset not found")
+    try:
+        validate_image_format(asset.read_bytes(), "JPEG")
+    except OSError as exc:
+        raise ImageError(f"prepared JPEG asset unreadable: {exc}") from exc
+    except ImageError as exc:
+        raise ImageError(f"prepared JPEG asset invalid: {exc}") from exc
+    return PreparedImage(path=asset, source=source)
+
+
 def normalize_image(data: bytes, expected_format: str | None = None) -> bytes:
     """Decode with Pillow, honor EXIF orientation, take the first frame, and
     return JPEG bytes. Any decode failure raises ImageError."""
@@ -112,37 +147,42 @@ def _fetch_remote(url: str, session: HttpClient) -> bytes:
     return response.content
 
 
-def prepare_or_report(
-    ref: ImageRef,
+def prepare_document(
+    markdown: str,
     md_file: Path,
     output_dir: Path,
     *,
     download: bool,
-    session: HttpClient | None,
-    warnings: list[str],
-    errors: list[str],
     enabled_extensions: Collection[str] = DEFAULT_ENABLED_EXTENSIONS,
-) -> PreparedImage | None:
-    """prepare_one with skips mapped to warnings and failures to errors.
+    session: HttpClient | None = None,
+) -> DocumentResult:
+    """Prepare every eligible image in one Markdown document."""
+    warnings: list[str] = []
+    errors: list[str] = []
 
-    Returns None when the image was skipped or failed; the caller keeps the
-    original embed unchanged in that case.
-    """
-    try:
-        return prepare_one(
-            ref,
-            md_file,
-            output_dir,
-            download=download,
-            session=session,
-            enabled_extensions=enabled_extensions,
-        )
-    except ImageSkip as exc:
-        warnings.append(f"{ref.target}: {exc}")
-        return None
-    except ImageError as exc:
-        errors.append(f"{ref.target}: {exc}")
-        return None
+    def transform(ref: ImageRef) -> str | None:
+        try:
+            prepared = prepare_one(
+                ref,
+                md_file,
+                output_dir,
+                download=download,
+                session=session,
+                enabled_extensions=enabled_extensions,
+            )
+        except (ImageSkip, ImageError) as exc:
+            messages = warnings if isinstance(exc, ImageSkip) else errors
+            messages.append(f"{ref.target}: {exc}")
+            return None
+        return render_image(ref.alt, prepared.source, ref.title)
+
+    transformed, warnings, errors = transform_images(
+        markdown,
+        transform,
+        errors=errors,
+        warnings=warnings,
+    )
+    return DocumentResult(transformed, tuple(warnings), tuple(errors))
 
 
 def prepare_one(
@@ -200,5 +240,6 @@ def prepare_one(
     except OSError as exc:
         raise ImageError(f"write failed: {exc}") from exc
     return PreparedImage(
-        ref=ref, asset_rel=asset.relative_to(output_dir).as_posix(), digest=digest
+        path=asset,
+        source=asset.relative_to(output_dir).as_posix(),
     )

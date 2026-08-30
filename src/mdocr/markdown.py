@@ -1,4 +1,4 @@
-"""Inline Markdown image parsing and mdocr block markers."""
+"""Inline Markdown image parsing and rewriting."""
 
 from __future__ import annotations
 
@@ -15,18 +15,16 @@ IMAGE_RE = re.compile(r"!\[([^\]]*)\]\((?:<([^>]+)>|([^\s)]+))(?:\s+(['\"])(.*?)
 HTML_IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 REF_IMAGE_RE = re.compile(r"!\[[^\]]*\]\[[^\]]*\]")
 
-OCR_BEGIN = '<!-- mdocr:ocr-begin source="{source}" -->'
-OCR_END = "<!-- mdocr:ocr-end -->"
-
-# A complete OCR result block, capturing its recorded source path.
-OCR_BLOCK_RE = re.compile(
-    r"<!--\s*mdocr:ocr-begin\s+source=\"([^\"]+)\"\s*-->"
-    r".*?"
-    r"<!--\s*mdocr:ocr-end\s*-->",
-    re.DOTALL,
-)
-
 SUPPORTED_SCHEMES = {"http", "https"}
+
+
+@dataclass(frozen=True)
+class DocumentResult:
+    """Observable result of processing one Markdown document."""
+
+    markdown: str
+    warnings: tuple[str, ...]
+    errors: tuple[str, ...]
 
 
 @dataclass(frozen=True)

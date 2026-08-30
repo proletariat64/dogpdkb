@@ -2,12 +2,7 @@
 
 from __future__ import annotations
 
-from mdocr.markdown import (
-    OCR_BLOCK_RE,
-    iter_image_matches,
-    render_image,
-    transform_images,
-)
+from mdocr.markdown import iter_image_matches, render_image, transform_images
 
 from .conftest import ref_of
 
@@ -70,7 +65,7 @@ def test_transform_images_isolates_callback_failure():
             raise RuntimeError("boom")
         return "OK"
 
-    new, warnings, errors = transform_images(text, transform)
+    new, _warnings, errors = transform_images(text, transform)
     assert "![a](one.png)" in new  # failed embed kept
     assert "OK" in new  # later images still processed
     assert len(errors) == 1
@@ -95,18 +90,6 @@ def test_transform_images_replaces_and_reports_html_ref_forms():
     assert any("HTML <img>" in w for w in warnings)
     assert any("reference-style" in w for w in warnings)
     assert errors == []
-
-
-def test_ocr_block_regex_matches_full_block():
-    block = (
-        '<!-- mdocr:ocr-begin source="assets/in/pic.jpg" -->\n\n'
-        "OCR text\n\n"
-        "> Original image: [assets/in/pic.jpg](assets/in/pic.jpg)\n\n"
-        "<!-- mdocr:ocr-end -->"
-    )
-    match = OCR_BLOCK_RE.search(block)
-    assert match is not None
-    assert match.group(1) == "assets/in/pic.jpg"
 
 
 def test_iter_image_matches_multiple():

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from mdocr.ocr import build_ocr_block, ocr_transform
+from mdocr.ocr import build_ocr_block, ocr_document
 
 from .conftest import StubClient, make_image
 
@@ -19,19 +19,21 @@ def test_build_ocr_block_exact_structure():
     )
 
 
-def test_ocr_transform_replaces_embed_with_block(tmp_path):
+def test_ocr_document_replaces_embed_with_block(tmp_path):
     md_file = tmp_path / "doc.md"
     (tmp_path / "pic.png").write_bytes(make_image("PNG"))
     md_file.write_text("before ![a](pic.png) after")
     client = StubClient("test-token")
     output = tmp_path / "out"
 
-    new_text, warnings, errors = ocr_transform(
+    result = ocr_document(
         md_file.read_text(), md_file, output, client, download=False, force=False
     )
 
-    assert errors == []
-    assert warnings == []
+    new_text, warnings, errors = result.markdown, result.warnings, result.errors
+
+    assert not errors
+    assert not warnings
     assert new_text.startswith("before ")
     assert new_text.endswith(" after")
     block_start = new_text.index("<!-- mdocr:ocr-begin")
@@ -45,12 +47,12 @@ def test_ocr_transform_replaces_embed_with_block(tmp_path):
     assert str(client.calls[0]).endswith(".jpg")
 
 
-def test_ocr_transform_skips_remote_without_download(tmp_path):
+def test_ocr_document_skips_remote_without_download(tmp_path):
     md_file = tmp_path / "doc.md"
     md_file.write_text("![a](https://example.com/a.png)")
     client = StubClient("test-token")
 
-    new_text, warnings, errors = ocr_transform(
+    result = ocr_document(
         md_file.read_text(),
         md_file,
         tmp_path / "out",
@@ -59,20 +61,22 @@ def test_ocr_transform_skips_remote_without_download(tmp_path):
         force=False,
     )
 
-    assert errors == []
+    new_text, warnings, errors = result.markdown, result.warnings, result.errors
+
+    assert not errors
     assert len(warnings) == 1
     assert "remote image" in warnings[0]
     assert new_text == "![a](https://example.com/a.png)"
     assert client.calls == []
 
 
-def test_ocr_transform_failed_image_keeps_embed(tmp_path):
+def test_ocr_document_failed_image_keeps_embed(tmp_path):
     md_file = tmp_path / "doc.md"
     (tmp_path / "pic.png").write_bytes(make_image("PNG"))
     md_file.write_text("![a](pic.png)")
     client = StubClient("test-token", fail={"pic-": "x"})
 
-    new_text, _warnings, errors = ocr_transform(
+    result = ocr_document(
         md_file.read_text(),
         md_file,
         tmp_path / "out",
@@ -80,18 +84,20 @@ def test_ocr_transform_failed_image_keeps_embed(tmp_path):
         download=False,
         force=False,
     )
+
+    new_text, _warnings, errors = result.markdown, result.warnings, result.errors
 
     assert new_text == "![a](pic.png)"  # embed preserved
     assert len(errors) == 1
     assert "OCR failed" in errors[0]
 
 
-def test_ocr_transform_missing_image_reports_error(tmp_path):
+def test_ocr_document_missing_image_reports_error(tmp_path):
     md_file = tmp_path / "doc.md"
     md_file.write_text("![a](nope.png)")
     client = StubClient("test-token")
 
-    new_text, _warnings, errors = ocr_transform(
+    result = ocr_document(
         md_file.read_text(),
         md_file,
         tmp_path / "out",
@@ -100,12 +106,14 @@ def test_ocr_transform_missing_image_reports_error(tmp_path):
         force=False,
     )
 
+    new_text, _warnings, errors = result.markdown, result.warnings, result.errors
+
     assert new_text == "![a](nope.png)"
     assert len(errors) == 1
     assert "image file not found" in errors[0]
 
 
-def test_ocr_transform_idempotent_on_existing_blocks(tmp_path):
+def test_ocr_document_idempotent_on_existing_blocks(tmp_path):
     block = build_ocr_block("assets/doc/pic-aaaaaaaa.jpg", "OLD OCR")
     md_file = tmp_path / "doc.md"
     md_file.write_text(f"text\n\n{block}\n")
@@ -114,16 +122,18 @@ def test_ocr_transform_idempotent_on_existing_blocks(tmp_path):
     (output / "assets/doc").mkdir(parents=True)
     (output / "assets/doc/pic-aaaaaaaa.jpg").write_bytes(b"x")
 
-    new_text, _warnings, errors = ocr_transform(
+    result = ocr_document(
         md_file.read_text(), md_file, output, client, download=False, force=False
     )
 
+    new_text, _warnings, errors = result.markdown, result.warnings, result.errors
+
     assert new_text == f"text\n\n{block}\n"  # untouched
-    assert errors == []
+    assert not errors
     assert client.calls == []  # no re-OCR
 
 
-def test_ocr_transform_force_reocrs_existing_blocks(tmp_path):
+def test_ocr_document_force_reocrs_existing_blocks(tmp_path):
     block = build_ocr_block("assets/doc/pic-aaaaaaaa.jpg", "OLD OCR")
     md_file = tmp_path / "doc.md"
     md_file.write_text(f"text\n\n{block}\n")
@@ -132,18 +142,20 @@ def test_ocr_transform_force_reocrs_existing_blocks(tmp_path):
     (output / "assets/doc").mkdir(parents=True)
     (output / "assets/doc/pic-aaaaaaaa.jpg").write_bytes(make_image("JPEG"))
 
-    new_text, _warnings, errors = ocr_transform(
+    result = ocr_document(
         md_file.read_text(), md_file, output, client, download=False, force=True
     )
 
-    assert errors == []
+    new_text, _warnings, errors = result.markdown, result.warnings, result.errors
+
+    assert not errors
     assert "OLD OCR" not in new_text
     assert "OCR of pic-aaaaaaaa.jpg" in new_text
     assert len(client.calls) == 1
     assert str(client.calls[0]).endswith("assets/doc/pic-aaaaaaaa.jpg")
 
 
-def test_ocr_transform_force_keeps_block_on_reocr_failure(tmp_path):
+def test_ocr_document_force_keeps_block_on_reocr_failure(tmp_path):
     block = build_ocr_block("assets/doc/pic-aaaaaaaa.jpg", "OLD OCR")
     md_file = tmp_path / "doc.md"
     md_file.write_text(block)
@@ -152,9 +164,11 @@ def test_ocr_transform_force_keeps_block_on_reocr_failure(tmp_path):
     (output / "assets/doc").mkdir(parents=True)
     (output / "assets/doc/pic-aaaaaaaa.jpg").write_bytes(make_image("JPEG"))
 
-    new_text, _warnings, errors = ocr_transform(
+    result = ocr_document(
         md_file.read_text(), md_file, output, client, download=False, force=True
     )
+
+    new_text, _warnings, errors = result.markdown, result.warnings, result.errors
 
     assert block in new_text  # preserved on failure
     assert len(errors) == 1
@@ -164,7 +178,7 @@ def test_ocr_transform_force_keeps_block_on_reocr_failure(tmp_path):
     ("source", "image_format"),
     [("elsewhere/pic.jpg", "JPEG"), ("assets/doc/pic.png", "PNG")],
 )
-def test_ocr_transform_force_rejects_non_prepared_asset_paths(
+def test_ocr_document_force_rejects_non_prepared_asset_paths(
     tmp_path, source, image_format
 ):
     block = build_ocr_block(source, "OLD OCR")
@@ -176,9 +190,11 @@ def test_ocr_transform_force_rejects_non_prepared_asset_paths(
     asset.parent.mkdir(parents=True)
     asset.write_bytes(make_image(image_format))
 
-    new_text, _warnings, errors = ocr_transform(
+    result = ocr_document(
         md_file.read_text(), md_file, output, client, download=False, force=True
     )
+
+    new_text, _warnings, errors = result.markdown, result.warnings, result.errors
 
     assert new_text == block
     assert len(errors) == 1
@@ -186,7 +202,7 @@ def test_ocr_transform_force_rejects_non_prepared_asset_paths(
     assert client.calls == []
 
 
-def test_ocr_transform_force_rejects_invalid_prepared_jpeg(tmp_path):
+def test_ocr_document_force_rejects_invalid_prepared_jpeg(tmp_path):
     block = build_ocr_block("assets/doc/pic.jpg", "OLD OCR")
     md_file = tmp_path / "doc.md"
     md_file.write_text(block)
@@ -196,9 +212,11 @@ def test_ocr_transform_force_rejects_invalid_prepared_jpeg(tmp_path):
     asset.parent.mkdir(parents=True)
     asset.write_bytes(b"not a JPEG")
 
-    new_text, _, errors = ocr_transform(
+    result = ocr_document(
         md_file.read_text(), md_file, output, client, download=False, force=True
     )
+
+    new_text, _, errors = result.markdown, result.warnings, result.errors
 
     assert new_text == block
     assert len(errors) == 1
@@ -206,7 +224,7 @@ def test_ocr_transform_force_rejects_invalid_prepared_jpeg(tmp_path):
     assert client.calls == []
 
 
-def test_ocr_transform_force_rejects_asset_symlink_outside_assets(tmp_path):
+def test_ocr_document_force_rejects_asset_symlink_outside_assets(tmp_path):
     block = build_ocr_block("assets/doc/pic.jpg", "OLD OCR")
     md_file = tmp_path / "doc.md"
     md_file.write_text(block)
@@ -219,9 +237,11 @@ def test_ocr_transform_force_rejects_asset_symlink_outside_assets(tmp_path):
     asset.parent.mkdir(parents=True)
     asset.symlink_to(outside_asset)
 
-    new_text, _, errors = ocr_transform(
+    result = ocr_document(
         md_file.read_text(), md_file, output, client, download=False, force=True
     )
+
+    new_text, _, errors = result.markdown, result.warnings, result.errors
 
     assert new_text == block
     assert len(errors) == 1
@@ -229,7 +249,7 @@ def test_ocr_transform_force_rejects_asset_symlink_outside_assets(tmp_path):
     assert client.calls == []
 
 
-def test_ocr_transform_ignores_images_inside_existing_blocks(tmp_path):
+def test_ocr_document_ignores_images_inside_existing_blocks(tmp_path):
     block = build_ocr_block("assets/doc/pic-aaaaaaaa.jpg", "![x](inside.png) OLD OCR")
     md_file = tmp_path / "doc.md"
     md_file.write_text(f"text\n\n{block}\n")
@@ -238,16 +258,18 @@ def test_ocr_transform_ignores_images_inside_existing_blocks(tmp_path):
     (output / "assets/doc").mkdir(parents=True)
     (output / "assets/doc/pic-aaaaaaaa.jpg").write_bytes(b"x")
 
-    new_text, _warnings, errors = ocr_transform(
+    result = ocr_document(
         md_file.read_text(), md_file, output, client, download=False, force=False
     )
 
+    new_text, _warnings, errors = result.markdown, result.warnings, result.errors
+
     assert new_text == f"text\n\n{block}\n"  # block (incl. inner image) untouched
-    assert errors == []
+    assert not errors
     assert client.calls == []
 
 
-def test_ocr_transform_force_rejects_source_outside_output(tmp_path):
+def test_ocr_document_force_rejects_source_outside_output(tmp_path):
     block = build_ocr_block("../outside.jpg", "OLD OCR")
     md_file = tmp_path / "doc.md"
     md_file.write_text(block)
@@ -255,9 +277,11 @@ def test_ocr_transform_force_rejects_source_outside_output(tmp_path):
     output = tmp_path / "out"
     output.mkdir()
 
-    new_text, _warnings, errors = ocr_transform(
+    result = ocr_document(
         md_file.read_text(), md_file, output, client, download=False, force=True
     )
+
+    new_text, _warnings, errors = result.markdown, result.warnings, result.errors
 
     assert block in new_text  # rejected source preserved
     assert len(errors) == 1
@@ -265,7 +289,7 @@ def test_ocr_transform_force_rejects_source_outside_output(tmp_path):
     assert client.calls == []
 
 
-def test_ocr_transform_force_rejects_absolute_source(tmp_path):
+def test_ocr_document_force_rejects_absolute_source(tmp_path):
     block = build_ocr_block(str(tmp_path / "abs.jpg"), "OLD OCR")
     md_file = tmp_path / "doc.md"
     md_file.write_text(block)
@@ -273,9 +297,11 @@ def test_ocr_transform_force_rejects_absolute_source(tmp_path):
     output = tmp_path / "out"
     output.mkdir()
 
-    new_text, _warnings, errors = ocr_transform(
+    result = ocr_document(
         md_file.read_text(), md_file, output, client, download=False, force=True
     )
+
+    new_text, _warnings, errors = result.markdown, result.warnings, result.errors
 
     assert block in new_text
     assert len(errors) == 1

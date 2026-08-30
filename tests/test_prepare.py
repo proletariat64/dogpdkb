@@ -7,7 +7,14 @@ import io
 import pytest
 from PIL import Image
 
-from mdocr.prepare import ImageError, ImageSkip, normalize_image, prepare_one
+from mdocr.prepare import (
+    ImageError,
+    ImageSkip,
+    normalize_image,
+    open_prepared,
+    prepare_document,
+    prepare_one,
+)
 
 from .conftest import FakeSession, make_image, ref_of
 
@@ -43,6 +50,25 @@ def test_normalize_rejects_garbage():
         normalize_image(b"this is not an image")
 
 
+def test_prepare_document_owns_partial_success_and_diagnostics(tmp_path):
+    md_file = tmp_path / "doc.md"
+    (tmp_path / "good.png").write_bytes(make_image("PNG"))
+    markdown = "![good](good.png)\n![missing](missing.png)"
+
+    result = prepare_document(
+        markdown,
+        md_file,
+        tmp_path / "out",
+        download=False,
+    )
+
+    assert result.markdown.startswith("![good](assets/doc/good-")
+    assert result.markdown.endswith("![missing](missing.png)")
+    assert not result.warnings
+    assert len(result.errors) == 1
+    assert "image file not found" in result.errors[0]
+
+
 def test_prepare_one_local_writes_deterministic_asset(tmp_path):
     md_file = tmp_path / "doc.md"
     img = tmp_path / "pic.png"
@@ -53,15 +79,13 @@ def test_prepare_one_local_writes_deterministic_asset(tmp_path):
     first = prepare_one(ref_of("![a](pic.png)"), md_file, output, download=False)
     second = prepare_one(ref_of("![a](pic.png)"), md_file, output, download=False)
 
-    assert first.asset_rel == second.asset_rel  # deterministic, collision-safe
-    assert first.asset_rel.startswith("assets/doc/pic-")
-    assert first.asset_rel.endswith(".jpg")
-    asset = output / first.asset_rel
-    assert asset.is_file()
-    with Image.open(asset) as image:
+    assert first.source == second.source  # deterministic, collision-safe
+    assert first.source.startswith("assets/doc/pic-")
+    assert first.source.endswith(".jpg")
+    assert first.path.is_file()
+    with Image.open(first.path) as image:
         assert image.format == "JPEG"
-    # The reference points at the JPEG under the output tree.
-    assert first.asset_rel == asset.relative_to(output).as_posix()
+    assert first.source == first.path.relative_to(output).as_posix()
 
 
 def test_prepare_one_default_tiff_extension_is_case_insensitive(tmp_path):
@@ -73,7 +97,7 @@ def test_prepare_one_default_tiff_extension_is_case_insensitive(tmp_path):
         ref_of("![a](scan.TIFF)"), md_file, tmp_path / "out", download=False
     )
 
-    with Image.open(tmp_path / "out" / prepared.asset_rel) as image:
+    with Image.open(prepared.path) as image:
         assert image.format == "JPEG"
 
 
@@ -87,7 +111,7 @@ def test_prepare_one_jpeg_copies_original_bytes(tmp_path):
         ref_of("![a](photo.jpeg)"), md_file, tmp_path / "out", download=False
     )
 
-    assert (tmp_path / "out" / prepared.asset_rel).read_bytes() == source
+    assert prepared.path.read_bytes() == source
 
 
 def test_prepare_one_rejects_content_not_matching_enabled_extension(tmp_path):
@@ -96,7 +120,9 @@ def test_prepare_one_rejects_content_not_matching_enabled_extension(tmp_path):
     md_file.write_text("x")
 
     with pytest.raises(ImageError, match="not PNG"):
-        prepare_one(ref_of("![a](wrong.png)"), md_file, tmp_path / "out", download=False)
+        prepare_one(
+            ref_of("![a](wrong.png)"), md_file, tmp_path / "out", download=False
+        )
 
 
 def test_prepare_one_remote_without_download_skips(tmp_path):
@@ -130,7 +156,7 @@ def test_prepare_one_remote_with_download(tmp_path):
         download=True,
         session=session,
     )
-    assert (tmp_path / "out" / prepared.asset_rel).is_file()
+    assert prepared.path.is_file()
 
 
 def test_prepare_one_missing_local_file_raises(tmp_path):
@@ -164,4 +190,39 @@ def test_asset_name_uses_source_stem_and_digest(tmp_path):
     prepared = prepare_one(
         ref_of("![a](architecture.png)"), md_file, tmp_path / "out", download=False
     )
-    assert prepared.asset_rel == "assets/doc/architecture-c8f540e9.jpg"
+    assert prepared.source == "assets/doc/architecture-c8f540e9.jpg"
+
+
+def test_open_prepared_reopens_valid_jpeg(tmp_path):
+    output = tmp_path / "out"
+    asset = output / "assets" / "doc" / "pic.jpg"
+    asset.parent.mkdir(parents=True)
+    asset.write_bytes(make_image("JPEG"))
+
+    prepared = open_prepared("assets/doc/pic.jpg", output)
+
+    assert prepared.path == asset.resolve()
+    assert prepared.source == "assets/doc/pic.jpg"
+
+
+@pytest.mark.parametrize(
+    "source, message",
+    [
+        ("../pic.jpg", "outside output tree"),
+        ("pic.jpg", "canonical .jpg path under assets"),
+        ("assets/doc/pic.png", "canonical .jpg path under assets"),
+    ],
+)
+def test_open_prepared_rejects_noncanonical_source(tmp_path, source, message):
+    with pytest.raises(ImageError, match=message):
+        open_prepared(source, tmp_path / "out")
+
+
+def test_open_prepared_rejects_invalid_jpeg(tmp_path):
+    output = tmp_path / "out"
+    asset = output / "assets" / "doc" / "pic.jpg"
+    asset.parent.mkdir(parents=True)
+    asset.write_text("not jpeg")
+
+    with pytest.raises(ImageError, match="prepared JPEG asset invalid"):
+        open_prepared("assets/doc/pic.jpg", output)
