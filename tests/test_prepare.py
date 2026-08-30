@@ -64,6 +64,41 @@ def test_prepare_one_local_writes_deterministic_asset(tmp_path):
     assert first.asset_rel == asset.relative_to(output).as_posix()
 
 
+def test_prepare_one_default_tiff_extension_is_case_insensitive(tmp_path):
+    md_file = tmp_path / "doc.md"
+    (tmp_path / "scan.TIFF").write_bytes(make_image("TIFF"))
+    md_file.write_text("x")
+
+    prepared = prepare_one(
+        ref_of("![a](scan.TIFF)"), md_file, tmp_path / "out", download=False
+    )
+
+    with Image.open(tmp_path / "out" / prepared.asset_rel) as image:
+        assert image.format == "JPEG"
+
+
+def test_prepare_one_jpeg_copies_original_bytes(tmp_path):
+    md_file = tmp_path / "doc.md"
+    source = make_image("JPEG")
+    (tmp_path / "photo.jpeg").write_bytes(source)
+    md_file.write_text("x")
+
+    prepared = prepare_one(
+        ref_of("![a](photo.jpeg)"), md_file, tmp_path / "out", download=False
+    )
+
+    assert (tmp_path / "out" / prepared.asset_rel).read_bytes() == source
+
+
+def test_prepare_one_rejects_content_not_matching_enabled_extension(tmp_path):
+    md_file = tmp_path / "doc.md"
+    (tmp_path / "wrong.png").write_bytes(make_image("JPEG"))
+    md_file.write_text("x")
+
+    with pytest.raises(ImageError, match="not PNG"):
+        prepare_one(ref_of("![a](wrong.png)"), md_file, tmp_path / "out", download=False)
+
+
 def test_prepare_one_remote_without_download_skips(tmp_path):
     md_file = tmp_path / "doc.md"
     md_file.write_text("x")

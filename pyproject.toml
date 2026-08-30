@@ -16,6 +16,7 @@ dependencies = [
 mdocr = "mdocr.cli:main"
 
 [tool.setuptools.packages.find]
+where = ["src"]
 include = ["mdocr*"]
 
 [tool.pytest.ini_options]

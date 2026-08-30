@@ -109,6 +109,24 @@ def test_output_collision_requires_force(tmp_path):
     assert "![a](assets/in/pic-" in (out / "in.md").read_text()
 
 
+@pytest.mark.parametrize("force_args", [[], ["--force"]])
+def test_output_directory_collision_rejected_before_ocr(
+    tmp_path, patch_client, ocr_env, force_args
+):
+    stub = patch_client()
+    write_doc(tmp_path, "![a](pic.png)", images={"pic.png": make_image("PNG")})
+    out = tmp_path / "out"
+    (out / "in.md").mkdir(parents=True)
+
+    assert (
+        cli.main(
+            ["ocr", "-f", str(tmp_path / "in.md"), "-o", str(out), *force_args]
+        )
+        == 2
+    )
+    assert stub.calls == []
+
+
 def test_prepare_end_to_end(tmp_path, capsys):
     write_doc(
         tmp_path,
@@ -125,6 +143,73 @@ def test_prepare_end_to_end(tmp_path, capsys):
     assert (out / "assets/in").is_dir()
     err = capsys.readouterr().err
     assert "remote image" in err  # warning, not failure
+
+
+def test_prepare_skips_disabled_local_extension(tmp_path, capsys):
+    write_doc(tmp_path, "![a](diagram.svg)", images={"diagram.svg": b"<svg/>"})
+    out = tmp_path / "out"
+
+    assert cli.main(["prepare", "-f", str(tmp_path / "in.md"), "-o", str(out)]) == 0
+    assert (out / "in.md").read_text() == "![a](diagram.svg)"
+    assert "extension .svg is not enabled" in capsys.readouterr().err
+
+
+def test_prepare_skips_disabled_remote_before_request(tmp_path, monkeypatch, capsys):
+    write_doc(tmp_path, "![a](https://x.example/diagram.svg?version=1#part)")
+    out = tmp_path / "out"
+    requests = pytest.importorskip("requests")
+
+    class UnexpectedSession:
+        def get(self, url, timeout):
+            raise AssertionError(f"disabled remote image was requested: {url}")
+
+    monkeypatch.setattr(requests, "Session", UnexpectedSession)
+
+    assert (
+        cli.main(
+            ["prepare", "-f", str(tmp_path / "in.md"), "-o", str(out), "--download"]
+        )
+        == 0
+    )
+    assert "diagram.svg" in (out / "in.md").read_text()
+    assert "extension .svg is not enabled" in capsys.readouterr().err
+
+
+def test_prepare_format_accepts_repeated_comma_separated_extensions(tmp_path):
+    write_doc(tmp_path, "![a](image.TGA)", images={"image.TGA": make_image("TGA")})
+    out = tmp_path / "out"
+
+    assert (
+        cli.main(
+            [
+                "prepare",
+                "-f",
+                str(tmp_path / "in.md"),
+                "-o",
+                str(out),
+                "--format",
+                "tga,.tga",
+                "--format",
+                ".TGA",
+            ]
+        )
+        == 0
+    )
+    assert "![a](assets/in/image-" in (out / "in.md").read_text()
+
+
+def test_prepare_rejects_unreadable_requested_format_before_processing(tmp_path, capsys):
+    write_doc(tmp_path, "![a](pic.png)", images={"pic.png": make_image("PNG")})
+    out = tmp_path / "out"
+
+    assert (
+        cli.main(
+            ["prepare", "-f", str(tmp_path / "in.md"), "-o", str(out), "--format", "svg"]
+        )
+        == 2
+    )
+    assert not out.exists()
+    assert "not readable by Pillow: .svg" in capsys.readouterr().err
 
 
 def test_prepare_download_flag(tmp_path, monkeypatch):
@@ -170,6 +255,17 @@ def test_ocr_end_to_end(tmp_path, patch_client, ocr_env):
     assert "> Original image: [assets/in/pic-" in result
     assert result.endswith("outro")
     assert len(stub.calls) == 1
+
+
+def test_ocr_skips_disabled_images_without_submitting(tmp_path, patch_client, ocr_env, capsys):
+    stub = patch_client()
+    write_doc(tmp_path, "![a](diagram.svg)", images={"diagram.svg": b"<svg/>"})
+    out = tmp_path / "out"
+
+    assert cli.main(["ocr", "-f", str(tmp_path / "in.md"), "-o", str(out)]) == 0
+    assert (out / "in.md").read_text() == "![a](diagram.svg)"
+    assert stub.calls == []
+    assert "extension .svg is not enabled" in capsys.readouterr().err
 
 
 def test_ocr_rerun_without_force_is_rejected(tmp_path, patch_client, ocr_env):

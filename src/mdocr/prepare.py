@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import re
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -17,6 +18,9 @@ from .markdown import ImageRef
 
 JPEG_QUALITY = 90
 DOWNLOAD_TIMEOUT = 30
+DEFAULT_ENABLED_EXTENSIONS = frozenset(
+    {".png", ".webp", ".gif", ".jpg", ".jpeg", ".tif", ".tiff"}
+)
 
 _SAFE = re.compile(r"[^A-Za-z0-9_-]+")
 
@@ -46,17 +50,55 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def normalize_image(data: bytes) -> bytes:
+def readable_extensions() -> frozenset[str]:
+    """Return filename extensions the installed Pillow can decode."""
+    Image.init()
+    return frozenset(
+        extension.lower()
+        for extension, image_format in Image.registered_extensions().items()
+        if image_format in Image.OPEN
+    )
+
+
+def _format_for_extension(extension: str) -> str | None:
+    Image.init()
+    return Image.registered_extensions().get(extension.lower())
+
+
+def validate_image_format(data: bytes, expected_format: str) -> None:
+    """Ensure image bytes load fully and match its expected Pillow format."""
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if image.format != expected_format:
+                raise ImageError(
+                    f"image content is {image.format or 'unknown'}, "
+                    f"not {expected_format}"
+                )
+            image.load()
+    except ImageError:
+        raise
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ImageError(f"not a readable image: {exc}") from exc
+
+
+def normalize_image(data: bytes, expected_format: str | None = None) -> bytes:
     """Decode with Pillow, honor EXIF orientation, take the first frame, and
     return JPEG bytes. Any decode failure raises ImageError."""
     try:
-        image = Image.open(io.BytesIO(data))
-        image = ImageOps.exif_transpose(image)
-        # convert() collapses multi-frame sources (e.g. GIF) to their first frame.
-        image = image.convert("RGB")
-        out = io.BytesIO()
-        image.save(out, format="JPEG", quality=JPEG_QUALITY)
-        return out.getvalue()
+        with Image.open(io.BytesIO(data)) as image:
+            if expected_format is not None and image.format != expected_format:
+                raise ImageError(
+                    f"image content is {image.format or 'unknown'}, "
+                    f"not {expected_format}"
+                )
+            image = ImageOps.exif_transpose(image)
+            # convert() collapses multi-frame sources (e.g. GIF) to their first frame.
+            image = image.convert("RGB")
+            out = io.BytesIO()
+            image.save(out, format="JPEG", quality=JPEG_QUALITY)
+            return out.getvalue()
+    except ImageError:
+        raise
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise ImageError(f"not a readable image: {exc}") from exc
 
@@ -79,6 +121,7 @@ def prepare_or_report(
     session: HttpClient | None,
     warnings: list[str],
     errors: list[str],
+    enabled_extensions: Collection[str] = DEFAULT_ENABLED_EXTENSIONS,
 ) -> PreparedImage | None:
     """prepare_one with skips mapped to warnings and failures to errors.
 
@@ -86,7 +129,14 @@ def prepare_or_report(
     original embed unchanged in that case.
     """
     try:
-        return prepare_one(ref, md_file, output_dir, download=download, session=session)
+        return prepare_one(
+            ref,
+            md_file,
+            output_dir,
+            download=download,
+            session=session,
+            enabled_extensions=enabled_extensions,
+        )
     except ImageSkip as exc:
         warnings.append(f"{ref.target}: {exc}")
         return None
@@ -102,16 +152,30 @@ def prepare_one(
     *,
     download: bool,
     session: HttpClient | None = None,
+    enabled_extensions: Collection[str] = DEFAULT_ENABLED_EXTENSIONS,
 ) -> PreparedImage:
-    """Normalize one image into a JPEG asset under the output directory."""
+    """Normalize one eligible image into a JPEG asset under the output directory."""
     if ref.unsupported:
         raise ImageSkip("unsupported image target form")
-    session = session or requests.Session()
+
+    source_path = urlparse(ref.target).path if ref.is_remote else ref.target
+    extension = Path(source_path).suffix.lower()
+    enabled = {item.lower() for item in enabled_extensions}
+    if not extension:
+        raise ImageSkip("image has no filename extension")
+    if extension not in enabled:
+        raise ImageSkip(f"image extension {extension} is not enabled")
+
+    expected_format = _format_for_extension(extension)
+    if expected_format is None or extension not in readable_extensions():
+        raise ImageError(f"image extension {extension} is not readable by Pillow")
+
     if ref.is_remote:
         if not download:
             raise ImageSkip("remote image; pass --download to fetch")
+        session = session or requests.Session()
         data = _fetch_remote(ref.target, session)
-        source_name = Path(urlparse(ref.target).path).name or "remote"
+        source_name = Path(source_path).name or "remote"
     else:
         path = (md_file.parent / ref.target).resolve()
         if not path.is_file():
@@ -123,7 +187,11 @@ def prepare_one(
         source_name = path.name
 
     digest = _digest(data)
-    jpeg = normalize_image(data)
+    if extension in {".jpg", ".jpeg"}:
+        validate_image_format(data, "JPEG")
+        jpeg = data
+    else:
+        jpeg = normalize_image(data, expected_format=expected_format)
     asset_dir = output_dir / "assets" / _safe_stem(md_file.name)
     asset = asset_dir / f"{_safe_stem(source_name)}-{digest[:8]}.jpg"
     try:

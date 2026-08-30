@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from mdocr.ocr import build_ocr_block, ocr_transform
 
 from .conftest import StubClient, make_image
@@ -70,7 +72,7 @@ def test_ocr_transform_failed_image_keeps_embed(tmp_path):
     md_file.write_text("![a](pic.png)")
     client = StubClient("test-token", fail={"pic-": "x"})
 
-    new_text, warnings, errors = ocr_transform(
+    new_text, _warnings, errors = ocr_transform(
         md_file.read_text(),
         md_file,
         tmp_path / "out",
@@ -89,7 +91,7 @@ def test_ocr_transform_missing_image_reports_error(tmp_path):
     md_file.write_text("![a](nope.png)")
     client = StubClient("test-token")
 
-    new_text, warnings, errors = ocr_transform(
+    new_text, _warnings, errors = ocr_transform(
         md_file.read_text(),
         md_file,
         tmp_path / "out",
@@ -112,7 +114,7 @@ def test_ocr_transform_idempotent_on_existing_blocks(tmp_path):
     (output / "assets/doc").mkdir(parents=True)
     (output / "assets/doc/pic-aaaaaaaa.jpg").write_bytes(b"x")
 
-    new_text, warnings, errors = ocr_transform(
+    new_text, _warnings, errors = ocr_transform(
         md_file.read_text(), md_file, output, client, download=False, force=False
     )
 
@@ -128,9 +130,9 @@ def test_ocr_transform_force_reocrs_existing_blocks(tmp_path):
     client = StubClient("test-token")
     output = tmp_path / "out"
     (output / "assets/doc").mkdir(parents=True)
-    (output / "assets/doc/pic-aaaaaaaa.jpg").write_bytes(b"x")
+    (output / "assets/doc/pic-aaaaaaaa.jpg").write_bytes(make_image("JPEG"))
 
-    new_text, warnings, errors = ocr_transform(
+    new_text, _warnings, errors = ocr_transform(
         md_file.read_text(), md_file, output, client, download=False, force=True
     )
 
@@ -148,14 +150,83 @@ def test_ocr_transform_force_keeps_block_on_reocr_failure(tmp_path):
     client = StubClient("test-token", fail={"pic-aaaaaaaa.jpg"})
     output = tmp_path / "out"
     (output / "assets/doc").mkdir(parents=True)
-    (output / "assets/doc/pic-aaaaaaaa.jpg").write_bytes(b"x")
+    (output / "assets/doc/pic-aaaaaaaa.jpg").write_bytes(make_image("JPEG"))
 
-    new_text, warnings, errors = ocr_transform(
+    new_text, _warnings, errors = ocr_transform(
         md_file.read_text(), md_file, output, client, download=False, force=True
     )
 
     assert block in new_text  # preserved on failure
     assert len(errors) == 1
+
+
+@pytest.mark.parametrize(
+    ("source", "image_format"),
+    [("elsewhere/pic.jpg", "JPEG"), ("assets/doc/pic.png", "PNG")],
+)
+def test_ocr_transform_force_rejects_non_prepared_asset_paths(
+    tmp_path, source, image_format
+):
+    block = build_ocr_block(source, "OLD OCR")
+    md_file = tmp_path / "doc.md"
+    md_file.write_text(block)
+    client = StubClient("test-token")
+    output = tmp_path / "out"
+    asset = output / source
+    asset.parent.mkdir(parents=True)
+    asset.write_bytes(make_image(image_format))
+
+    new_text, _warnings, errors = ocr_transform(
+        md_file.read_text(), md_file, output, client, download=False, force=True
+    )
+
+    assert new_text == block
+    assert len(errors) == 1
+    assert "canonical .jpg path under assets" in errors[0]
+    assert client.calls == []
+
+
+def test_ocr_transform_force_rejects_invalid_prepared_jpeg(tmp_path):
+    block = build_ocr_block("assets/doc/pic.jpg", "OLD OCR")
+    md_file = tmp_path / "doc.md"
+    md_file.write_text(block)
+    client = StubClient("test-token")
+    output = tmp_path / "out"
+    asset = output / "assets/doc/pic.jpg"
+    asset.parent.mkdir(parents=True)
+    asset.write_bytes(b"not a JPEG")
+
+    new_text, _, errors = ocr_transform(
+        md_file.read_text(), md_file, output, client, download=False, force=True
+    )
+
+    assert new_text == block
+    assert len(errors) == 1
+    assert "prepared JPEG asset invalid" in errors[0]
+    assert client.calls == []
+
+
+def test_ocr_transform_force_rejects_asset_symlink_outside_assets(tmp_path):
+    block = build_ocr_block("assets/doc/pic.jpg", "OLD OCR")
+    md_file = tmp_path / "doc.md"
+    md_file.write_text(block)
+    client = StubClient("test-token")
+    output = tmp_path / "out"
+    outside_asset = output / "elsewhere.jpg"
+    outside_asset.parent.mkdir(parents=True)
+    outside_asset.write_bytes(make_image("JPEG"))
+    asset = output / "assets/doc/pic.jpg"
+    asset.parent.mkdir(parents=True)
+    asset.symlink_to(outside_asset)
+
+    new_text, _, errors = ocr_transform(
+        md_file.read_text(), md_file, output, client, download=False, force=True
+    )
+
+    assert new_text == block
+    assert len(errors) == 1
+    assert "canonical .jpg path under assets" in errors[0]
+    assert client.calls == []
 
 
 def test_ocr_transform_ignores_images_inside_existing_blocks(tmp_path):
@@ -167,7 +238,7 @@ def test_ocr_transform_ignores_images_inside_existing_blocks(tmp_path):
     (output / "assets/doc").mkdir(parents=True)
     (output / "assets/doc/pic-aaaaaaaa.jpg").write_bytes(b"x")
 
-    new_text, warnings, errors = ocr_transform(
+    new_text, _warnings, errors = ocr_transform(
         md_file.read_text(), md_file, output, client, download=False, force=False
     )
 
@@ -184,7 +255,7 @@ def test_ocr_transform_force_rejects_source_outside_output(tmp_path):
     output = tmp_path / "out"
     output.mkdir()
 
-    new_text, warnings, errors = ocr_transform(
+    new_text, _warnings, errors = ocr_transform(
         md_file.read_text(), md_file, output, client, download=False, force=True
     )
 
@@ -202,7 +273,7 @@ def test_ocr_transform_force_rejects_absolute_source(tmp_path):
     output = tmp_path / "out"
     output.mkdir()
 
-    new_text, warnings, errors = ocr_transform(
+    new_text, _warnings, errors = ocr_transform(
         md_file.read_text(), md_file, output, client, download=False, force=True
     )
 

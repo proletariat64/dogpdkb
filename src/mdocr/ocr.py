@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from collections.abc import Collection
+from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 import requests
 
 from .markdown import OCR_BLOCK_RE, transform_images
-from .prepare import prepare_or_report
+from .prepare import (
+    DEFAULT_ENABLED_EXTENSIONS,
+    ImageError,
+    prepare_or_report,
+    validate_image_format,
+)
 
 
 class OcrClient(Protocol):
@@ -31,23 +37,54 @@ def build_ocr_block(source_rel: str, ocr_markdown: str) -> str:
 def _reocr_existing_blocks(
     text: str, output_dir: Path, client: OcrClient, errors: list[str]
 ) -> str:
-    """Under --force, re-OCR the local JPEG recorded in each existing block.
-
-    Sources that resolve outside the output tree are rejected: the spec
-    requires the recorded source to be the prepared local JPEG.
-    """
+    """Under --force, re-OCR valid prepared JPEGs named by existing blocks."""
     output_root = output_dir.resolve()
+    assets_root = (output_root / "assets").resolve()
 
     def replace(match: re.Match[str]) -> str:
         source = match.group(1)
-        # Reject absolute and traversal sources: only generated relative JPEG
-        # paths under the output tree may be re-OCRed.
-        if Path(source).is_absolute() or not (
-            output_dir / source
-        ).resolve().is_relative_to(output_root):
+        source_path = PurePosixPath(source)
+        if source_path.is_absolute() or ".." in source_path.parts:
             errors.append(f"{source}: re-OCR skipped: source outside output tree")
             return match.group(0)
-        asset = (output_dir / source).resolve()
+        if (
+            source != source_path.as_posix()
+            or not source_path.parts
+            or source_path.parts[0] != "assets"
+            or source_path.suffix != ".jpg"
+        ):
+            errors.append(
+                f"{source}: re-OCR skipped: source must be a canonical .jpg path "
+                "under assets"
+            )
+            return match.group(0)
+
+        try:
+            asset = (output_root.joinpath(*source_path.parts)).resolve()
+        except (OSError, RuntimeError) as exc:
+            errors.append(f"{source}: re-OCR skipped: could not resolve source: {exc}")
+            return match.group(0)
+        if not asset.is_relative_to(output_root):
+            errors.append(f"{source}: re-OCR skipped: source outside output tree")
+            return match.group(0)
+        if not asset.is_relative_to(assets_root):
+            errors.append(
+                f"{source}: re-OCR skipped: source must be a canonical .jpg path "
+                "under assets"
+            )
+            return match.group(0)
+        if not asset.is_file():
+            errors.append(f"{source}: re-OCR skipped: prepared JPEG asset not found")
+            return match.group(0)
+        try:
+            validate_image_format(asset.read_bytes(), "JPEG")
+        except OSError as exc:
+            errors.append(f"{source}: re-OCR skipped: prepared JPEG asset unreadable: {exc}")
+            return match.group(0)
+        except ImageError as exc:
+            errors.append(f"{source}: re-OCR skipped: prepared JPEG asset invalid: {exc}")
+            return match.group(0)
+
         try:
             result = client.convert(asset)
         except Exception as exc:  # noqa: BLE001 - per-image failure is recorded
@@ -89,6 +126,7 @@ def ocr_transform(
     *,
     download: bool,
     force: bool,
+    enabled_extensions: Collection[str] = DEFAULT_ENABLED_EXTENSIONS,
     session: requests.Session | None = None,
 ) -> tuple[str, list[str], list[str]]:
     """Return ``(new_markdown, warnings, errors)`` for one Markdown document."""
@@ -110,6 +148,7 @@ def ocr_transform(
             session=session,
             warnings=warnings,
             errors=errors,
+            enabled_extensions=enabled_extensions,
         )
         if prepared is None:
             return None

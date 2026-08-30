@@ -22,11 +22,11 @@ Running `mdocr` without arguments displays the same top-level help as `mdocr -h`
 ## Commands
 
 ```text
-mdocr prepare -f FILE [FILE ...] --output-dir DIR [--download] [--force]
-mdocr ocr     -f FILE [FILE ...] --output-dir DIR [--download] [--force]
+mdocr prepare -f FILE [FILE ...] --output-dir DIR [--download] [--format EXT[,EXT...]]... [--force]
+mdocr ocr     -f FILE [FILE ...] --output-dir DIR [--download] [--format EXT[,EXT...]]... [--force]
 ```
 
-`-f` and `--file` are equivalent. `-o` may be provided as the short form of `--output-dir`.
+`-f` and `--file` are equivalent. `-o` may be provided as the short form of `--output-dir`. `--format` is long-only because `-f` is already the file option.
 
 Both commands:
 
@@ -69,18 +69,53 @@ Local relative paths and `http://` or `https://` URLs are recognized. Relative l
 
 Reference-style images, HTML `<img>` elements, data URIs, and other URI schemes remain unchanged and produce a warning.
 
+## Supported image formats
+
+By default, mdocr processes only these common filename extensions:
+
+```text
+.png .webp .gif .jpg .jpeg .tif .tiff
+```
+
+Extension matching is case-insensitive. For local images, mdocr checks the local filename. For remote images, it checks the URL path after ignoring its query string and fragment. An image with no extension or an extension that is not enabled remains unchanged and produces a warning. For remote images, this check occurs before any network request.
+
+`--format` adds one or more non-default extensions for the current invocation; it does not replace the default set. The option may be repeated, and each value may contain a comma-separated list. Leading dots are optional, duplicate values are ignored, and values are normalized to lowercase. For example:
+
+```bash
+mdocr prepare -f doc.md -o out/ --format .sgi,.tga
+mdocr ocr -f doc.md -o out/ --format sgi --format tga
+```
+
+An extension supplied through `--format` must be reported as readable by the installed Pillow build. Unsupported requested extensions are argument errors detected before image processing. The target Pillow-readable extension set is:
+
+```text
+.apng .avif .avifs .blp .bmp .bufr .bw .cur .dcx .dds .dib
+.emf .eps .fit .fits .flc .fli .ftc .ftu .gbr .gif .grib
+.h5 .hdf .icb .icns .ico .iim .im .j2c .j2k .jfif .jp2
+.jpc .jpe .jpeg .jpf .jpg .jpx .mpeg .mpg .msp .pbm .pcd
+.pcx .pfm .pgm .png .pnm .ppm .ps .psd .pxr .qoi .ras
+.rgb .rgba .sgi .tga .tif .tiff .vda .vst .webp .wmf .xbm .xpm
+```
+
+Actual availability may vary by Pillow version, platform, installed decoder dependencies, and build options. mdocr must derive validation from Pillow at runtime rather than assume every extension in the target list is available. Formats not reported as readable by Pillow, including SVG, cannot be enabled through `--format`.
+
 ## Image preparation
 
-Every successfully processed image is decoded with Pillow and written as a real JPEG under the output asset directory. Preparation must use Pillow rather than implement image codecs. It applies EXIF orientation, uses the first frame of a multi-frame image, and converts pixels to a JPEG-compatible RGB representation.
+Every successfully processed image is written as a real JPEG under the output asset directory. Preparation must use Pillow rather than implement image codecs.
 
-Existing JPEG sources are also normalized into the output asset directory. Asset names must be deterministic and collision-safe; using a readable source stem plus a SHA-256 prefix is acceptable.
+For `.jpg` and `.jpeg` sources, mdocr validates that Pillow identifies the content as a readable JPEG, then copies the original bytes without pixel conversion, re-encoding, quality loss, or metadata changes. The generated asset still uses the canonical `.jpg` extension.
+
+For every other enabled format, mdocr decodes the image with Pillow, applies EXIF orientation, uses the first frame of a multi-frame image, converts pixels to a JPEG-compatible RGB representation, and encodes the result as JPEG.
+
+A filename extension controls eligibility, but does not replace content validation. A file whose bytes do not decode as its claimed enabled format is an image failure. Asset names must be deterministic and collision-safe; using a readable source stem plus a SHA-256 prefix of the original source bytes is acceptable.
 
 ### Remote images
 
 Remote downloads are disabled by default.
 
 - Without `--download`, remote image embeds remain unchanged, are not OCRed, and produce a warning. This is an intentional skip and does not make the command fail.
-- With `--download`, remote images are downloaded, converted to JPEG, stored under the output asset directory, and treated like local images.
+- With `--download`, remote images with an enabled extension are downloaded, validated, prepared as described above, stored under the output asset directory, and treated like local images.
+- Remote images with a disabled or missing extension remain unchanged and produce a warning even when `--download` is present. mdocr must not request their URLs.
 
 ## `prepare`
 
@@ -104,7 +139,7 @@ Unsupported, skipped, or failed images remain unchanged.
 
 ## `ocr`
 
-`mdocr ocr` accepts raw Markdown directly. Users do not have to run `prepare` first. The command performs the same image download and JPEG normalization internally before submitting each eligible image to PaddleOCR.
+`mdocr ocr` accepts raw Markdown directly. Users do not have to run `prepare` first. The command applies the same format eligibility, download, validation, and preparation behavior internally before submitting each eligible image to PaddleOCR.
 
 The PaddleOCR job submission, polling, result download, and result extraction behavior should be adapted from `scripts/paddleocr_convert.py`. Version 1 uses the existing PaddleOCR job API and the `PaddleOCR-VL-1.6` model. PaddleOCR-produced nested image embeds are converted to textual placeholders, as in the existing converter.
 
@@ -147,23 +182,26 @@ For each failed image:
 - emit a diagnostic identifying the input file and image; and
 - continue processing later images and files.
 
-The command still writes partial output containing all successful transformations. It exits nonzero if any non-skipped image or file failed. Intentionally skipped remote or unsupported image forms produce warnings but do not cause a nonzero exit.
+The command still writes partial output containing all successful transformations. It exits nonzero if any non-skipped image or file failed. Intentionally skipped remote images, disabled or missing image extensions, and unsupported image forms produce warnings but do not cause a nonzero exit.
 
 Argument errors, duplicate output basenames, missing input files, output collisions without `--force`, and a missing `PADDLEOCR_TOKEN` for an OCR run fail before any PaddleOCR jobs are submitted.
 
 ## Acceptance criteria
 
 1. `mdocr`, `mdocr -h`, and `mdocr --help` display top-level help; no-argument use succeeds.
-2. `prepare` converts PNG, WebP, GIF, and JPEG inputs into valid local JPEG files and rewrites their inline Markdown links.
-3. Remote images remain untouched by default and are downloaded and rewritten only with `--download`.
-4. `ocr` works directly from raw Markdown and does not require prior preparation.
-5. Successful OCR replaces each image at its original position with the exact marked structure described above.
-6. The quoted source link in each OCR block resolves to a generated local JPEG.
-7. Existing OCR blocks are idempotently preserved unless `--force` is supplied.
-8. One image failure leaves that embed unchanged, permits later work to complete, writes partial output, and causes a nonzero exit.
-9. Multiple inputs are supported; duplicate basenames are rejected before processing.
-10. Existing outputs are preserved unless `--force` is supplied, and output Markdown writes are atomic.
-11. PaddleOCR HTTP behavior is covered by mocked tests; the automated test suite does not require network access or a real API token.
+2. By default, `prepare` processes PNG, WebP, GIF, JPEG, and TIFF inputs, writes valid local JPEG assets, and rewrites their inline Markdown links.
+3. Valid `.jpg` and `.jpeg` sources are copied byte-for-byte into canonical `.jpg` assets without re-encoding.
+4. Images with disabled or missing extensions remain unchanged with a warning; disabled remote URLs are not requested.
+5. `--format` accepts repeated and comma-separated Pillow-readable extensions, adds them to the defaults, and rejects extensions unavailable in the installed Pillow build before processing.
+6. Remote images remain untouched by default and eligible remote images are downloaded and rewritten only with `--download`.
+7. `ocr` works directly from raw Markdown and does not require prior preparation.
+8. Successful OCR replaces each image at its original position with the exact marked structure described above.
+9. The quoted source link in each OCR block resolves to a generated local JPEG.
+10. Existing OCR blocks are idempotently preserved unless `--force` is supplied.
+11. One image failure leaves that embed unchanged, permits later work to complete, writes partial output, and causes a nonzero exit.
+12. Multiple inputs are supported; duplicate basenames are rejected before processing.
+13. Existing outputs are preserved unless `--force` is supplied, and output Markdown writes are atomic.
+14. PaddleOCR HTTP behavior is covered by mocked tests; the automated test suite does not require network access or a real API token.
 
 ## Non-goals for version 1
 

@@ -16,7 +16,11 @@ from . import __version__
 from .markdown import render_image, transform_images
 from .ocr import ocr_transform
 from .paddle import PaddleClient
-from .prepare import prepare_or_report
+from .prepare import (
+    DEFAULT_ENABLED_EXTENSIONS,
+    prepare_or_report,
+    readable_extensions,
+)
 
 
 class CliError(Exception):
@@ -47,6 +51,7 @@ def prepare_transform(
     output_dir: Path,
     *,
     download: bool,
+    enabled_extensions: frozenset[str] = DEFAULT_ENABLED_EXTENSIONS,
     session: requests.Session | None = None,
 ) -> tuple[str, list[str], list[str]]:
     """Return ``(new_markdown, warnings, errors)`` for one Markdown document."""
@@ -62,6 +67,7 @@ def prepare_transform(
             session=session,
             warnings=warnings,
             errors=errors,
+            enabled_extensions=enabled_extensions,
         )
         if prepared is None:
             return None
@@ -105,6 +111,13 @@ def build_parser() -> argparse.ArgumentParser:
             help="download remote images instead of skipping them",
         )
         command.add_argument(
+            "--format",
+            action="append",
+            default=[],
+            metavar="EXT[,EXT...]",
+            help="add Pillow-readable image extension(s)",
+        )
+        command.add_argument(
             "--force",
             action="store_true",
             help="overwrite existing outputs and re-OCR existing mdocr blocks",
@@ -128,20 +141,52 @@ def _validate(args: argparse.Namespace) -> list[Path]:
     return files
 
 
+def _enabled_extensions(values: list[str]) -> frozenset[str]:
+    """Normalize and validate user-requested Pillow image extensions."""
+    requested: set[str] = set()
+    for value in values:
+        for item in value.split(","):
+            normalized = item.strip().lower().lstrip(".")
+            if not normalized:
+                raise CliError(f"invalid image format extension: {item!r}")
+            requested.add(f".{normalized}")
+
+    unavailable = sorted(requested - readable_extensions())
+    if unavailable:
+        raise CliError(
+            "image format extension not readable by Pillow: " + ", ".join(unavailable)
+        )
+    return DEFAULT_ENABLED_EXTENSIONS | frozenset(requested)
+
+
+def _output_path_is_overwritable(path: Path, *, force: bool) -> bool:
+    """Return whether mdocr may write ``path`` without replacing non-files."""
+    if not path.exists() and not path.is_symlink():
+        return True
+    return force and path.is_file() and not path.is_symlink()
+
+
 def _check_output_collisions(files: list[Path], args: argparse.Namespace) -> None:
     collisions = [
-        str(args.output_dir / f.name)
-        for f in files
-        if (args.output_dir / f.name).is_file()
-    ]
-    if collisions and not args.force:
-        raise CliError(
-            "output file exists (use --force to overwrite): " + ", ".join(collisions)
+        str(args.output_dir / file.name)
+        for file in files
+        if not _output_path_is_overwritable(
+            args.output_dir / file.name, force=args.force
         )
+    ]
+    if not collisions:
+        return
+    if args.force:
+        raise CliError(
+            "output path is not a regular file and cannot be overwritten: "
+            + ", ".join(collisions)
+        )
+    raise CliError("output file exists (use --force to overwrite): " + ", ".join(collisions))
 
 
 def run_command(args: argparse.Namespace) -> int:
     files = _validate(args)
+    enabled_extensions = _enabled_extensions(args.format)
     _check_output_collisions(files, args)
     session = requests.Session()
     client = (
@@ -168,6 +213,7 @@ def run_command(args: argparse.Namespace) -> int:
                     client,
                     download=args.download,
                     force=args.force,
+                    enabled_extensions=enabled_extensions,
                     session=session,
                 )
             else:
@@ -176,6 +222,7 @@ def run_command(args: argparse.Namespace) -> int:
                     md_file,
                     args.output_dir,
                     download=args.download,
+                    enabled_extensions=enabled_extensions,
                     session=session,
                 )
             output = args.output_dir / md_file.name

@@ -1,10 +1,11 @@
 {
   "venvPath": ".",
   "venv": ".venv",
-  "include": ["mdocr", "tests", "scripts"],
+  "include": ["src/mdocr", "tests", "scripts"],
   "executionEnvironments": [
     {
-      "root": "mdocr"
+      "root": ".",
+      "extraPaths": ["src"]
     }
   ]
 }
