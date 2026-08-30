@@ -13,12 +13,11 @@ from typing import NoReturn
 import requests
 
 from . import __version__
-from .markdown import render_image, transform_images
-from .ocr import ocr_transform
+from .ocr import ocr_document
 from .paddle import PaddleClient
 from .prepare import (
     DEFAULT_ENABLED_EXTENSIONS,
-    prepare_or_report,
+    prepare_document,
     readable_extensions,
 )
 
@@ -43,37 +42,6 @@ def atomic_write(path: Path, text: str) -> None:
     )
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
-
-
-def prepare_transform(
-    text: str,
-    md_file: Path,
-    output_dir: Path,
-    *,
-    download: bool,
-    enabled_extensions: frozenset[str] = DEFAULT_ENABLED_EXTENSIONS,
-    session: requests.Session | None = None,
-) -> tuple[str, list[str], list[str]]:
-    """Return ``(new_markdown, warnings, errors)`` for one Markdown document."""
-    errors: list[str] = []
-    warnings: list[str] = []
-
-    def transform(ref):
-        prepared = prepare_or_report(
-            ref,
-            md_file,
-            output_dir,
-            download=download,
-            session=session,
-            warnings=warnings,
-            errors=errors,
-            enabled_extensions=enabled_extensions,
-        )
-        if prepared is None:
-            return None
-        return render_image(ref.alt, prepared.asset_rel, ref.title)
-
-    return transform_images(text, transform, errors=errors, warnings=warnings)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -181,7 +149,9 @@ def _check_output_collisions(files: list[Path], args: argparse.Namespace) -> Non
             "output path is not a regular file and cannot be overwritten: "
             + ", ".join(collisions)
         )
-    raise CliError("output file exists (use --force to overwrite): " + ", ".join(collisions))
+    raise CliError(
+        "output file exists (use --force to overwrite): " + ", ".join(collisions)
+    )
 
 
 def run_command(args: argparse.Namespace) -> int:
@@ -205,8 +175,9 @@ def run_command(args: argparse.Namespace) -> int:
             continue
         try:
             if args.command == "ocr":
-                assert client is not None  # PADDLEOCR_TOKEN validated in _validate
-                new_text, warnings, errors = ocr_transform(
+                if client is None:  # PADDLEOCR_TOKEN validated in _validate
+                    raise CliError("missing PADDLEOCR_TOKEN environment variable")
+                result = ocr_document(
                     text,
                     md_file,
                     args.output_dir,
@@ -217,7 +188,7 @@ def run_command(args: argparse.Namespace) -> int:
                     session=session,
                 )
             else:
-                new_text, warnings, errors = prepare_transform(
+                result = prepare_document(
                     text,
                     md_file,
                     args.output_dir,
@@ -232,7 +203,7 @@ def run_command(args: argparse.Namespace) -> int:
                 raise CliError(
                     f"output file exists (use --force to overwrite): {output}"
                 )
-            atomic_write(output, new_text)
+            atomic_write(output, result.markdown)
         except CliError as exc:
             print(f"mdocr: error: {md_file}: {exc}", file=sys.stderr)
             failed = True
@@ -241,11 +212,11 @@ def run_command(args: argparse.Namespace) -> int:
             print(f"mdocr: error: {md_file}: {exc}", file=sys.stderr)
             failed = True
             continue
-        for warning in warnings:
+        for warning in result.warnings:
             print(f"mdocr: warning: {md_file.name}: {warning}", file=sys.stderr)
-        for error in errors:
+        for error in result.errors:
             print(f"mdocr: error: {md_file.name}: {error}", file=sys.stderr)
-        if errors:
+        if result.errors:
             failed = True
     return 1 if failed else 0
 

@@ -119,9 +119,7 @@ def test_output_directory_collision_rejected_before_ocr(
     (out / "in.md").mkdir(parents=True)
 
     assert (
-        cli.main(
-            ["ocr", "-f", str(tmp_path / "in.md"), "-o", str(out), *force_args]
-        )
+        cli.main(["ocr", "-f", str(tmp_path / "in.md"), "-o", str(out), *force_args])
         == 2
     )
     assert stub.calls == []
@@ -198,13 +196,23 @@ def test_prepare_format_accepts_repeated_comma_separated_extensions(tmp_path):
     assert "![a](assets/in/image-" in (out / "in.md").read_text()
 
 
-def test_prepare_rejects_unreadable_requested_format_before_processing(tmp_path, capsys):
+def test_prepare_rejects_unreadable_requested_format_before_processing(
+    tmp_path, capsys
+):
     write_doc(tmp_path, "![a](pic.png)", images={"pic.png": make_image("PNG")})
     out = tmp_path / "out"
 
     assert (
         cli.main(
-            ["prepare", "-f", str(tmp_path / "in.md"), "-o", str(out), "--format", "svg"]
+            [
+                "prepare",
+                "-f",
+                str(tmp_path / "in.md"),
+                "-o",
+                str(out),
+                "--format",
+                "svg",
+            ]
         )
         == 2
     )
@@ -257,7 +265,9 @@ def test_ocr_end_to_end(tmp_path, patch_client, ocr_env):
     assert len(stub.calls) == 1
 
 
-def test_ocr_skips_disabled_images_without_submitting(tmp_path, patch_client, ocr_env, capsys):
+def test_ocr_skips_disabled_images_without_submitting(
+    tmp_path, patch_client, ocr_env, capsys
+):
     stub = patch_client()
     write_doc(tmp_path, "![a](diagram.svg)", images={"diagram.svg": b"<svg/>"})
     out = tmp_path / "out"

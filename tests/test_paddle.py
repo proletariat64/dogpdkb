@@ -1,4 +1,4 @@
-"""Unit tests for mdocr.paddle PaddleOCR API client."""
+"""Tests for the PaddleOCR conversion seam."""
 
 from __future__ import annotations
 
@@ -6,21 +6,26 @@ import json
 
 import pytest
 
-from mdocr.paddle import PaddleClient, parse_result_jsonl, text_only
+from mdocr.paddle import PaddleClient
 
 from .conftest import FakeResponse, FakeSession, paddle_handler
 
 
-def make_client(handler, token):
+def make_client(handler):
     session = FakeSession(handler)
-    return PaddleClient(token, session=session), session
+    return PaddleClient("test-token", session=session), session
+
+
+def make_image(tmp_path):
+    image = tmp_path / "pic.jpg"
+    image.write_bytes(b"jpeg-bytes")
+    return image
 
 
 def test_convert_happy_path(tmp_path):
-    image = tmp_path / "pic.jpg"
-    image.write_bytes(b"jpeg-bytes")
+    image = make_image(tmp_path)
     handler = paddle_handler(result_markdown="Line one\n\nLine two")
-    client, session = make_client(handler, "test-token")
+    client, session = make_client(handler)
 
     result = client.convert(image)
 
@@ -33,20 +38,23 @@ def test_convert_happy_path(tmp_path):
     assert calls[2][0] == "GET"
 
 
-def test_submit_never_retries_post(tmp_path):
-    image = tmp_path / "pic.jpg"
-    image.write_bytes(b"jpeg-bytes")
-    client, session = make_client(paddle_handler(), "test-token")
+def test_convert_never_retries_submission(tmp_path):
+    image = make_image(tmp_path)
 
-    client.submit(image)
+    def handler(method, url, **kwargs):
+        assert method == "POST"
+        return FakeResponse(status_code=503, text="busy")
 
-    posts = [c for c in session.calls if c[0] == "POST"]
-    assert len(posts) == 1
+    client, session = make_client(handler)
+
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        client.convert(image)
+
+    assert [call[0] for call in session.calls] == ["POST"]
 
 
-def test_poll_failed_state_raises(tmp_path):
-    image = tmp_path / "pic.jpg"
-    image.write_bytes(b"jpeg-bytes")
+def test_convert_failed_job_raises(tmp_path):
+    image = make_image(tmp_path)
 
     def handler(method, url, **kwargs):
         if method == "POST" and url.endswith("/jobs"):
@@ -57,37 +65,89 @@ def test_poll_failed_state_raises(tmp_path):
             )
         raise AssertionError(f"unexpected request: {method} {url}")
 
-    client = PaddleClient("t", session=FakeSession(handler))
+    client, _session = make_client(handler)
+
     with pytest.raises(RuntimeError, match="boom"):
-        client.poll("bad-job")
+        client.convert(image)
 
 
-def test_poll_unknown_state_raises():
+def test_convert_unknown_job_state_raises(tmp_path):
+    image = make_image(tmp_path)
+
     def handler(method, url, **kwargs):
+        if method == "POST":
+            return FakeResponse(json_data={"data": {"jobId": "job-1"}})
         return FakeResponse(json_data={"data": {"state": "mystery"}})
 
-    client = PaddleClient("t", session=FakeSession(handler))
+    client, _session = make_client(handler)
+
     with pytest.raises(RuntimeError, match="mystery"):
-        client.poll("j")
+        client.convert(image)
 
 
-def test_text_only_strips_nested_images():
-    text = 'hello ![x](https://example.com/a.png) and <img src="b.png"> end'
-    assert text_only(text) == (
+def test_convert_replaces_nested_images_with_text(tmp_path):
+    image = make_image(tmp_path)
+    markdown = 'hello ![x](https://example.com/a.png) and <img src="b.png"> end'
+    client, _session = make_client(paddle_handler(result_markdown=markdown))
+
+    result = client.convert(image)
+
+    assert result == (
         "hello [PaddleOCR image region: x] and "
         "[PaddleOCR image region: untranscribed] end"
     )
 
 
-def test_parse_result_jsonl_multiline():
+def test_convert_joins_multiline_result_jsonl(tmp_path):
+    image = make_image(tmp_path)
+    result_url = "https://example.com/result.jsonl"
     lines = [
         {"result": {"layoutParsingResults": [{"markdown": {"text": "a"}}]}},
         {"result": {"layoutParsingResults": [{"markdown": {"text": "b"}}]}},
     ]
-    out = parse_result_jsonl("\n".join(json.dumps(line) for line in lines))
-    assert out == "a\n\nb"
+
+    def handler(method, url, **kwargs):
+        if method == "POST":
+            return FakeResponse(json_data={"data": {"jobId": "job-1"}})
+        if url.endswith("/jobs/job-1"):
+            return FakeResponse(
+                json_data={
+                    "data": {
+                        "state": "done",
+                        "resultUrl": {"jsonUrl": result_url},
+                    }
+                }
+            )
+        if url == result_url:
+            return FakeResponse(text="\n".join(json.dumps(line) for line in lines))
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    client, _session = make_client(handler)
+
+    assert client.convert(image) == "a\n\nb"
 
 
-def test_parse_result_jsonl_empty_raises():
+def test_convert_rejects_empty_result_jsonl(tmp_path):
+    image = make_image(tmp_path)
+    result_url = "https://example.com/result.jsonl"
+
+    def handler(method, url, **kwargs):
+        if method == "POST":
+            return FakeResponse(json_data={"data": {"jobId": "job-1"}})
+        if url.endswith("/jobs/job-1"):
+            return FakeResponse(
+                json_data={
+                    "data": {
+                        "state": "done",
+                        "resultUrl": {"jsonUrl": result_url},
+                    }
+                }
+            )
+        if url == result_url:
+            return FakeResponse(text="")
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    client, _session = make_client(handler)
+
     with pytest.raises(ValueError, match="empty"):
-        parse_result_jsonl("")
+        client.convert(image)
