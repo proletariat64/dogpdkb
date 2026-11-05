@@ -116,8 +116,13 @@ def _call_once(tool: str, args: dict[str, Any]) -> Any:
     responses: dict[int, dict[str, Any]] = {}
 
     def send(payload: dict[str, Any]) -> None:
-        stdin.write(json.dumps(payload) + "\n")
-        stdin.flush()
+        try:
+            stdin.write(json.dumps(payload) + "\n")
+            stdin.flush()
+        except OSError as error:
+            raise SkylarkError(
+                f"utoo-proxy exited during {tool}: {error}", retryable=True
+            ) from error
 
     def wait_for(request_id: int) -> None:
         while request_id not in responses:

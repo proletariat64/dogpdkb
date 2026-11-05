@@ -137,8 +137,15 @@ def merge_graph_records(
         own_key = (item["source_file"], original_id)
         if own_key in collision_remap:
             namespaced = collision_remap[own_key]
+        elif (
+            original_id in fresh_nodes_by_id
+            and fresh_nodes_by_id[original_id]["source_file"] == item["source_file"]
+        ):
+            namespaced = original_id
         else:
-            targets = collision_targets.get(original_id, set())
+            targets = set(collision_targets.get(original_id, set()))
+            if original_id in fresh_nodes_by_id:
+                targets.add(original_id)
             if len(targets) > 1:
                 raise ValueError(f"ambiguous cross-document reference: {original_id}")
             namespaced = next(iter(targets)) if targets else original_id

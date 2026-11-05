@@ -669,3 +669,30 @@ def test_ocr_resume_retries_only_incomplete_documents(tmp_path: Path, monkeypatc
     apply_sync.run_ocr_with_resume(files, output, tmp_path / "state")
 
     assert attempts == ["b.md"]
+
+
+def test_broken_proxy_stdin_is_retried(tmp_path, monkeypatch):
+    import sys
+    from unittest.mock import Mock
+
+    proxy = tmp_path / "proxy"
+    proxy.write_text(
+        f"#!{sys.executable}\n"
+        "import os,sys,json,time\n"
+        "sys.stdin.readline()\n"
+        "os.close(0)\n"
+        "print(json.dumps({'jsonrpc':'2.0','id':1,'result':{}}),flush=True)\n"
+        "time.sleep(10)\n"
+    )
+    proxy.chmod(0o755)
+    monkeypatch.setattr(get_sync, "proxy_bin", lambda: str(proxy))
+    with pytest.raises(get_sync.SkylarkError, match="proxy exited") as error:
+        get_sync._call_once("skylark_doc_list", {})
+    assert error.value.retryable
+
+    request = Mock(side_effect=[error.value, {"documents": []}])
+    monkeypatch.setattr(get_sync, "_call_once", request)
+    monkeypatch.setattr(get_sync, "max_retries", lambda: 1)
+    monkeypatch.setattr(get_sync.time, "sleep", lambda delay: None)
+    assert get_sync.call_tool("skylark_doc_list", {}) == {"documents": []}
+    assert request.call_count == 2

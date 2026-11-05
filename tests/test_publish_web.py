@@ -45,3 +45,38 @@ def test_web_snapshots_follow_current_corpus_and_graph(tmp_path: Path):
     saved = json.loads((tmp_path / "web" / "catalog.json").read_text())
     assert saved["stats"] == catalog["stats"]
     assert (tmp_path / "web" / "catalog.json").stat().st_mode & 0o777 == 0o644
+
+
+def test_missing_corpus_preserves_existing_web_snapshots(tmp_path, monkeypatch):
+    import sys
+
+    import pytest
+
+    graph = tmp_path / "graph.json"
+    graph.write_text('{"nodes": [], "links": []}')
+    output = tmp_path / "web"
+    (output / "map").mkdir(parents=True)
+    catalog = output / "catalog.json"
+    layered = output / "map/map-data.json"
+    catalog.write_text('{"documents": ["keep"]}')
+    layered.write_text('{"nodes": ["keep"]}')
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "publish_web",
+            "--input",
+            str(tmp_path / "missing"),
+            "--graph",
+            str(graph),
+            "--output",
+            str(output),
+            "--book-url",
+            "https://example.invalid/book",
+        ],
+    )
+    with pytest.raises(SystemExit) as error:
+        publish_web.main()
+    assert error.value.code == 2
+    assert json.loads(catalog.read_text()) == {"documents": ["keep"]}
+    assert json.loads(layered.read_text()) == {"nodes": ["keep"]}

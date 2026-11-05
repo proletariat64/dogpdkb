@@ -259,6 +259,8 @@ def main() -> None:
     config = configure(parser, args.config)
     source = configured_book(parser, config, args, args.book_url)
     args.input = args.input or source.corpus
+    if not args.input.is_dir():
+        parser.error(f"input dir not found: {args.input}")
     args.output = args.output or config.web / source.key
     graph_path = (
         args.graph or (config.graph_dir or args.input / "graphify-out") / "graph.json"

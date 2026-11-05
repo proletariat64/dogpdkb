@@ -177,3 +177,36 @@ def test_retained_reference_uses_current_source_and_member_aliases():
     assert candidate["hyperedges"] == [
         {"members": ["outside", "stable"], "source_file": "outside-[9].md"}
     ]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_shared_ids_keep_each_documents_edges_and_hyperedges_local(reverse):
+    names = ["a-[1].md", "b-[2].md"]
+    nodes = [{"id": "shared", "label": name, "source_file": name} for name in names]
+    if reverse:
+        nodes.reverse()
+    candidate, _, _ = graph_sync.merge_graph_records(
+        {"nodes": [], "links": [], "hyperedges": []},
+        {
+            "nodes": nodes,
+            "edges": [
+                {"source": "shared", "target": "shared", "source_file": name}
+                for name in names
+            ],
+            "hyperedges": [
+                {"members": ["shared"], "source_file": name} for name in names
+            ],
+        },
+        current_files=names,
+        old_files=[],
+        deleted_files=[],
+        source_urls={},
+        captured_at="2026-11-05",
+        labels={},
+    )
+    sources = {node["id"]: node["source_file"] for node in candidate["nodes"]}
+    assert len(candidate["links"]) == 2
+    for edge in candidate["links"]:
+        assert sources[edge["source"]] == sources[edge["target"]] == edge["source_file"]
+    for edge in candidate["hyperedges"]:
+        assert [sources[item] for item in edge["members"]] == [edge["source_file"]]

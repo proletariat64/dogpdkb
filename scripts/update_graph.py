@@ -257,9 +257,15 @@ def build_candidate(
 
 
 def publish_candidate(candidate: Path, graph_dir: Path, staging: Path) -> None:
+    files = [path for path in candidate.iterdir() if path.is_file()]
+    if files and all(
+        (graph_dir / source.name).is_file()
+        and (graph_dir / source.name).read_bytes() == source.read_bytes()
+        for source in files
+    ):
+        return
     backup = staging / "graph-backup"
     backup.mkdir(parents=True, exist_ok=True)
-    files = [path for path in candidate.iterdir() if path.is_file()]
     for source in files:
         live = graph_dir / source.name
         archived = backup / source.name
@@ -327,15 +333,55 @@ def main() -> None:
         return
     if not (graph_dir / "graph.json").is_file():
         raise SystemExit(f"existing graph not found: {graph_dir / 'graph.json'}")
-    candidate, audit = build_candidate(
-        corpus,
-        graph_dir,
-        staging,
-        current_files,
-        old_files,
-        deleted_files,
-        source_urls,
-    )
+    # Freeze validated artifacts before publication, so a crash after publishing
+    # does not rebuild them with different timestamps or extraction token counts.
+    inputs = {
+        "corpus": str(corpus),
+        "graph_dir": str(graph_dir),
+        "manifest": manifest,
+        "scope": [current_files, old_files, deleted_files, source_urls],
+        "config": config.snapshot(),
+        "sources": {
+            name: {
+                "size": (corpus / name).stat().st_size,
+                "mtime_ns": (corpus / name).stat().st_mtime_ns,
+            }
+            for name in current_files
+        },
+    }
+    ready_path = staging / "candidate-ready.json"
+    candidate = staging / "candidate"
+    if ready_path.exists():
+        ready = load_json(ready_path)
+        if ready["inputs"] != inputs:
+            raise RuntimeError("candidate inputs changed; use a new staging directory")
+        if not ready["files"] or any(
+            not (candidate / name).is_file() for name in ready["files"]
+        ):
+            raise RuntimeError(
+                "validated candidate files missing; use a new staging directory"
+            )
+        audit = ready["audit"]
+    else:
+        candidate, audit = build_candidate(
+            corpus,
+            graph_dir,
+            staging,
+            current_files,
+            old_files,
+            deleted_files,
+            source_urls,
+        )
+        write_json(
+            ready_path,
+            {
+                "inputs": inputs,
+                "audit": audit,
+                "files": sorted(
+                    path.name for path in candidate.iterdir() if path.is_file()
+                ),
+            },
+        )
     publish_candidate(candidate, graph_dir, staging)
     result = {
         **audit,
