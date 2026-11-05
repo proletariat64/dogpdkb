@@ -12,6 +12,12 @@ dependencies = [
     "Pillow>=9",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
 [project.scripts]
 mdocr = "mdocr.cli:main"
 

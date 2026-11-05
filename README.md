@@ -14,11 +14,33 @@ repo root
 ## mdocr — Markdown image prepare/OCR CLI
 
 `mdocr` prepares images referenced by Markdown and can replace them with OCR
-markdown from the PaddleOCR API. Install once, then run from anywhere:
+markdown from the PaddleOCR API. Bootstrap once with Python 3.12 and `uv`, then
+activate the worktree-local environment:
 
 ```bash
-pip install -e .            # exposes the `mdocr` command
+make bootstrap
+source .venv/bin/activate  # exposes the `mdocr` command
 ```
+
+Run `make test` for the test suite and `make lint` for Ruff checks.
+
+### Yuque Knowledge Base Sync
+
+```bash
+source ~/.bashrc
+
+# Preview only; do not modify any data
+.venv/bin/python scripts/sync_knowledge_base.py --dry-run
+
+# Sync the corpus, Graphify graph, and Web pages
+.venv/bin/python scripts/sync_knowledge_base.py
+
+# Resume after a failure
+.venv/bin/python scripts/sync_knowledge_base.py \
+  --resume --staging <previous-run-directory>
+```
+
+Supports Doc, Sheet, Table, and image OCR. Incremental updates only; no full graph rebuild.
 
 Usage:
 

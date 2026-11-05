@@ -23,6 +23,11 @@ __pycache__/
 # Virtualenv
 .venv/
 
+# docs
+wash/
+tmp/
+graphify_flatten_ready/
+
 # Pre-existing scripts/ tooling, kept out of version control
 scripts/audit_luna_ocr.py
 scripts/graphify-watchdog-uat.py
