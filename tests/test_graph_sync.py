@@ -210,3 +210,48 @@ def test_shared_ids_keep_each_documents_edges_and_hyperedges_local(reverse):
         assert sources[edge["source"]] == sources[edge["target"]] == edge["source_file"]
     for edge in candidate["hyperedges"]:
         assert [sources[item] for item in edge["members"]] == [edge["source_file"]]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_old_node_ids_cannot_be_stolen_by_other_updated_documents(reverse):
+    old = {
+        "directed": True,
+        "nodes": [
+            {"id": "x", "label": "A", "source_file": "a-old-[1].md"},
+            {"id": "c", "label": "C", "source_file": "c-[3].md"},
+        ],
+        "links": [{"source": "c", "target": "x", "source_file": "c-[3].md"}],
+        "hyperedges": [{"members": ["c", "x"], "source_file": "c-[3].md"}],
+    }
+    nodes = [
+        {"id": "x", "label": "B", "source_file": "b-[2].md"},
+        {"id": "x", "label": "A", "source_file": "a-new-[1].md"},
+    ]
+    if reverse:
+        nodes.reverse()
+    candidate, _, _ = graph_sync.merge_graph_records(
+        old,
+        {
+            "nodes": nodes,
+            "edges": [
+                {"source": "x", "target": "x", "source_file": "b-[2].md"},
+                {"source": "x", "target": "x", "source_file": "a-new-[1].md"},
+            ],
+        },
+        current_files=["a-new-[1].md", "b-[2].md"],
+        old_files=["a-old-[1].md"],
+        deleted_files=[],
+        source_urls={},
+        captured_at="2026-11-05",
+        labels={},
+    )
+    result = {node["id"]: node for node in candidate["nodes"]}
+    assert result["x"]["label"] == "A"
+    assert result["x"]["source_file"] == "a-new-[1].md"
+    assert {"source": "c", "target": "x", "source_file": "c-[3].md"} in candidate[
+        "links"
+    ]
+    assert candidate["hyperedges"][0]["members"] == ["c", "x"]
+    for edge in candidate["links"]:
+        if edge["source_file"] != "c-[3].md":
+            assert result[edge["source"]]["source_file"] == edge["source_file"]

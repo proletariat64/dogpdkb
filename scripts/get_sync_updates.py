@@ -29,6 +29,7 @@ Env overrides (same as the skylark pi extension):
 
 import argparse
 import json
+import os
 import random
 import re
 import selectors
@@ -111,9 +112,11 @@ def _call_once(tool: str, args: dict[str, Any]) -> Any:
     if stdin is None or stdout is None:  # pragma: no cover - pipes requested
         raise SkylarkError("failed to open utoo-proxy pipes")
     sel = selectors.DefaultSelector()
+    os.set_blocking(stdout.fileno(), False)
     sel.register(stdout, selectors.EVENT_READ)
     deadline = time.monotonic() + timeout_s()
     responses: dict[int, dict[str, Any]] = {}
+    pending = bytearray()
 
     def send(payload: dict[str, Any]) -> None:
         try:
@@ -131,20 +134,29 @@ def _call_once(tool: str, args: dict[str, Any]) -> Any:
                 raise SkylarkError(
                     f"{tool} timed out after {timeout_s():.0f}s", retryable=True
                 )
-            ready = sel.select(timeout=remaining)
-            if not ready:
+            if b"\n" not in pending:
+                if not sel.select(timeout=remaining):
+                    continue
+                try:
+                    chunk = os.read(stdout.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    raise SkylarkError(
+                        f"utoo-proxy exited early during {tool}", retryable=True
+                    )
+                pending.extend(chunk)
                 continue
-            line = stdout.readline()
-            if line == "":
-                raise SkylarkError(
-                    f"utoo-proxy exited early during {tool}", retryable=True
-                )
+            line, _, rest = pending.partition(b"\n")
+            pending[:] = rest
             text = line.strip()
             if not text:
                 continue
             try:
                 message = json.loads(text)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(message, dict):
                 continue
             mid = message.get("id")
             if isinstance(mid, int):
@@ -184,6 +196,12 @@ def _call_once(tool: str, args: dict[str, Any]) -> Any:
             proc.kill()
         except OSError:
             pass
+        proc.wait()
+        try:
+            stdin.close()
+        except OSError:
+            pass
+        stdout.close()
 
     content = ((responses[2].get("result") or {}).get("content")) or []
     text = (content[0].get("text") if content else "") or ""

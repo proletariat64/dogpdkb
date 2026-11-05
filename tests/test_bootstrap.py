@@ -96,3 +96,62 @@ def test_seed_skips_incompatible_python(environments, monkeypatch):
     )
     bootstrap.seed_from_main(target, lock)
     assert not (target / "lib").exists()
+
+
+@pytest.mark.parametrize("source_shim", [False, True])
+def test_seeded_launchers_execute_in_paths_with_spaces(
+    environments, monkeypatch, source_shim
+):
+    import shlex
+    import subprocess
+
+    source, original_target, lock = environments
+    target = original_target.parent.parent / "work tree's env/.venv"
+    (target / "bin").mkdir(parents=True)
+    (target / "bin/python").symlink_to(sys.executable)
+    command = source / "bin/example"
+    body = "import sys;print(sys.executable)\n"
+    header = (
+        "#!/bin/sh\n"
+        + "'''exec' "
+        + shlex.quote(str(source / "bin/python"))
+        + ' "$0" "$@"\n'
+        + "' '''\n"
+        if source_shim
+        else f"#!{source}/bin/python\n"
+    )
+    command.write_text(header + body)
+    command.chmod(0o755)
+    monkeypatch.setattr(
+        bootstrap.importlib.metadata,
+        "distributions",
+        lambda: [
+            distribution("example", "1.0", {"script": command}),
+        ],
+    )
+    bootstrap.seed_from_main(target, lock)
+    completed = subprocess.run(
+        [str(target / "bin/example")], capture_output=True, text=True, check=True
+    )
+    assert completed.stdout.strip() == str(target / "bin/python")
+    assert not command.samefile(target / "bin/example")
+
+
+def test_seed_skips_whole_distribution_with_unknown_launcher(environments, monkeypatch):
+    source, target, lock = environments
+    metadata = source / "lib/example-1.0.dist-info/METADATA"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text("Name: example\nVersion: 1.0\n")
+    command = source / "bin/example"
+    command.write_text('#!/bin/sh\nexec /some/main/python "$@"\n')
+    command.chmod(0o755)
+    monkeypatch.setattr(
+        bootstrap.importlib.metadata,
+        "distributions",
+        lambda: [
+            distribution("example", "1.0", {"metadata": metadata, "script": command}),
+        ],
+    )
+    bootstrap.seed_from_main(target, lock)
+    assert not (target / "lib/example-1.0.dist-info").exists()
+    assert not (target / "bin/example").exists()

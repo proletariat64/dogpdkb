@@ -2,10 +2,27 @@
 
 import importlib.metadata
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+
+def _rebind_launcher(data: bytes, interpreter: Path) -> bytes | None:
+    shebang, _, body = data.partition(b"\n")
+    if b"python" not in shebang:
+        if shebang.strip() != b"#!/bin/sh":
+            return None
+        execution, _, rest = body.partition(b"\n")
+        closing, _, body = rest.partition(b"\n")
+        if not execution.startswith(b"'''exec' ") or closing.strip() != b"' '''":
+            return None
+    path = str(interpreter)
+    if not any(char.isspace() for char in path) and len(os.fsencode(path)) < 120:
+        return f"#!{path}\n".encode() + body
+    header = f"#!/bin/sh\n'''exec' {shlex.quote(path)} \"$0\" \"$@\"\n' '''\n"
+    return header.encode() + body
 
 
 def seed_from_main(destination: Path, lockfile: Path) -> None:
@@ -32,6 +49,7 @@ def seed_from_main(destination: Path, lockfile: Path) -> None:
         name = distribution.metadata["Name"].lower().replace("_", "-")
         if (name, distribution.version) not in locked:
             continue
+        records = []
         for record in distribution.files or ():
             source = Path(distribution.locate_file(record)).resolve()
             if not source.is_file() or "__pycache__" in source.parts:
@@ -39,20 +57,28 @@ def seed_from_main(destination: Path, lockfile: Path) -> None:
             if not source.is_relative_to(source_prefix):
                 continue
             target = destination / source.relative_to(source_prefix)
-            if target.exists():
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
+            launcher = None
             if target.parent == destination / "bin":
-                with source.open("rb") as stream:
-                    shebang = stream.readline()
-                    if shebang.startswith(b"#!") and b"python" in shebang:
-                        target.write_bytes(
-                            f"#!{target_python}\n".encode() + stream.read()
+                data = source.read_bytes()
+                if data.startswith(b"#!"):
+                    launcher = _rebind_launcher(data, target_python)
+                    if launcher is None:
+                        print(
+                            f"Unrecognized launcher in {name}; using uv cache instead."
                         )
-                        target.chmod(source.stat().st_mode & 0o777)
-                        continue
-            os.link(source, target)
-        print(f"Reused {name}=={distribution.version} from main environment")
+                        break
+            records.append((source, target, launcher))
+        else:
+            for source, target, launcher in records:
+                if target.exists():
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if launcher is not None:
+                    target.write_bytes(launcher)
+                    target.chmod(source.stat().st_mode & 0o777)
+                else:
+                    os.link(source, target)
+            print(f"Reused {name}=={distribution.version} from main environment")
 
 
 def main() -> None:

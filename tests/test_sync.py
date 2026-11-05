@@ -696,3 +696,43 @@ def test_broken_proxy_stdin_is_retried(tmp_path, monkeypatch):
     monkeypatch.setattr(get_sync.time, "sleep", lambda delay: None)
     assert get_sync.call_tool("skylark_doc_list", {}) == {"documents": []}
     assert request.call_count == 2
+
+
+def test_proxy_partial_line_obeys_deadline(tmp_path, monkeypatch):
+    import sys
+    import time
+
+    proxy = tmp_path / "partial-proxy"
+    proxy.write_text(
+        f"#!{sys.executable}\n"
+        "import sys,time\nsys.stdin.readline()\n"
+        "sys.stdout.write('{');sys.stdout.flush()\ntime.sleep(2)\n"
+    )
+    proxy.chmod(0o755)
+    monkeypatch.setattr(get_sync, "proxy_bin", lambda: str(proxy))
+    monkeypatch.setattr(get_sync, "timeout_s", lambda: 0.2)
+    start = time.monotonic()
+    with pytest.raises(get_sync.SkylarkError, match="timed out") as error:
+        get_sync._call_once("skylark_doc_list", {})
+    assert error.value.retryable
+    assert time.monotonic() - start < 1
+
+
+def test_proxy_consumes_buffered_notifications_and_responses(tmp_path, monkeypatch):
+    import sys
+
+    proxy = tmp_path / "batch-proxy"
+    proxy.write_text(
+        f"#!{sys.executable}\n"
+        "import sys,json,time\n"
+        "sys.stdin.readline()\n"
+        "sys.stdout.write(json.dumps({'method':'notice'})+'\\n'+json.dumps({'id':1,'result':{}})+'\\n');sys.stdout.flush()\n"
+        "sys.stdin.readline();sys.stdin.readline()\n"
+        "result={'id':2,'result':{'content':[{'text':json.dumps({'ok':True,'data':{'value':'中文'}})}]}}\n"
+        "sys.stdout.write(json.dumps({'method':'notice'})+'\\n'+json.dumps(result)+'\\n');sys.stdout.flush()\n"
+        "time.sleep(2)\n"
+    )
+    proxy.chmod(0o755)
+    monkeypatch.setattr(get_sync, "proxy_bin", lambda: str(proxy))
+    monkeypatch.setattr(get_sync, "timeout_s", lambda: 0.5)
+    assert get_sync._call_once("skylark_doc_list", {}) == {"value": "中文"}

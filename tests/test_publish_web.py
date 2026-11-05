@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts import publish_web
 
 
@@ -80,3 +82,59 @@ def test_missing_corpus_preserves_existing_web_snapshots(tmp_path, monkeypatch):
     assert error.value.code == 2
     assert json.loads(catalog.read_text()) == {"documents": ["keep"]}
     assert json.loads(layered.read_text()) == {"nodes": ["keep"]}
+
+
+@pytest.mark.parametrize("failed_name", ["catalog.json", "map-data.json"])
+def test_pair_generation_failure_preserves_both_snapshots(
+    tmp_path, monkeypatch, failed_name
+):
+    output = tmp_path / "web"
+    (output / "map").mkdir(parents=True)
+    old_catalog = output / "catalog.json"
+    old_map = output / "map/map-data.json"
+    old_catalog.write_text('{"generation":"old"}')
+    old_map.write_text('{"generation":"old"}')
+    write = publish_web.write_snapshot
+
+    def fail(path, payload):
+        if path.name == failed_name:
+            raise OSError("injected snapshot write failure")
+        write(path, payload)
+
+    monkeypatch.setattr(publish_web, "write_snapshot", fail)
+    with pytest.raises(OSError, match="snapshot write failure"):
+        publish_web.publish_snapshots(
+            output, {"generation": "new"}, {"generation": "new"}
+        )
+    assert json.loads(old_catalog.read_text()) == {"generation": "old"}
+    assert json.loads(old_map.read_text()) == {"generation": "old"}
+
+
+def test_pair_switch_is_atomic_and_recovers_after_interruption(tmp_path, monkeypatch):
+    output = tmp_path / "web"
+    (output / "map").mkdir(parents=True)
+    catalog = output / "catalog.json"
+    layered = output / "map/map-data.json"
+    catalog.write_text('{"generation":"old"}')
+    layered.write_text('{"generation":"old"}')
+    replace = Path.replace
+
+    def interrupt_switch(path, target):
+        if Path(target).name == "current":
+            raise KeyboardInterrupt("injected before pointer switch")
+        return replace(path, target)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "replace", interrupt_switch)
+        with pytest.raises(KeyboardInterrupt):
+            publish_web.publish_snapshots(
+                output, {"generation": "new"}, {"generation": "new"}
+            )
+    assert json.loads(catalog.read_text())["generation"] == "old"
+    assert json.loads(layered.read_text())["generation"] == "old"
+    publish_web.publish_snapshots(output, {"generation": "new"}, {"generation": "new"})
+    assert catalog.is_symlink() and layered.is_symlink()
+    assert catalog.resolve().parent == layered.resolve().parent
+    assert json.loads(catalog.read_text())["generation"] == "new"
+    assert json.loads(layered.read_text())["generation"] == "new"
+    assert catalog.stat().st_mode & 0o777 == 0o644

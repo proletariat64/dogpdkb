@@ -83,7 +83,9 @@ def merge_graph_records(
     protected = {
         node["id"] for node in old.get("nodes", []) if source_name(node) not in affected
     }
-    claimed = set(protected)
+    # Historical references must retain their owner even when that owner's
+    # document is in this delta. Stable identities reclaim these IDs below.
+    claimed = set(old_nodes)
     collision_remap: dict[tuple[str, str], str] = {}
     collision_nodes = []
     for node in new["nodes"]:

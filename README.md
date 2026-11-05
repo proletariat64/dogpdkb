@@ -132,6 +132,12 @@ template. Set `[paths].web` explicitly for a deployed Web server; the portable
 default writes to local `web-output/<book-key>/`. Set `graphify_python` when
 Graphify lives in another environment; otherwise the current interpreter is used.
 
+Web publication writes both JSON files into a generation under `.snapshots/`,
+then atomically switches a shared `current` symlink. The public `catalog.json`
+and `map/map-data.json` paths remain unchanged and become relative symlinks;
+the static server must follow symlinks. Existing ordinary files are preserved
+in an initial generation, and older generations are retained for recovery.
+
 The source list is `skylark_books/roots.json`, referenced by
 `[source].books_file`. It is an input registry, not an automatically discovered
 list of all accessible Yuque books. Example entry:
@@ -167,6 +173,9 @@ An ad-hoc `--skylark-url` uses the `adhoc` key: provide separate `--input`,
 The pipeline forwards `--config` to every child entry point and records effective
 non-secret settings in its checkpoint. Resume rejects changed configuration;
 older checkpoints without configuration metadata require a new staging run.
+Graph updates also pin the original graph artifacts before extraction, build
+from that backup, and compare bytes before publication. A staging directory from
+before this baseline checkpoint was introduced must be replaced by a new run.
 
 | Environment override | TOML key |
 | --- | --- |

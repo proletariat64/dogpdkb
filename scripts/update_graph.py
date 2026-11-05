@@ -10,7 +10,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from graph_sync import doc_id, merge_graph_records
+if __package__:
+    from .graph_sync import doc_id, merge_graph_records
+else:
+    from graph_sync import doc_id, merge_graph_records
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -203,9 +206,11 @@ def build_candidate(
     old_files: list[str],
     deleted_files: list[str],
     source_urls: dict[str, str],
+    *,
+    base_dir: Path,
 ) -> tuple[Path, dict[str, Any]]:
-    old = load_json(graph_dir / "graph.json")
-    labels_path = graph_dir / ".graphify_labels.json"
+    old = load_json(base_dir / "graph.json")
+    labels_path = base_dir / ".graphify_labels.json"
     labels = load_json(labels_path) if labels_path.exists() else {}
     if current_files:
         fresh, tokens = extract_semantic(corpus, graph_dir, staging, current_files)
@@ -230,8 +235,8 @@ def build_candidate(
     from graphify.detect import save_manifest
 
     manifest_path = candidate_dir / "manifest.json"
-    if (graph_dir / "manifest.json").exists():
-        shutil.copy2(graph_dir / "manifest.json", manifest_path)
+    if (base_dir / "manifest.json").exists():
+        shutil.copy2(base_dir / "manifest.json", manifest_path)
     else:
         write_json(manifest_path, {})
     save_manifest(
@@ -256,6 +261,39 @@ def build_candidate(
     return candidate_dir, audit
 
 
+def prepare_base(graph_dir: Path, staging: Path) -> Path:
+    """Capture the build input once; compare bytes instead of adding hashes."""
+    backup = staging / "graph-backup"
+    marker = staging / "base-state.json"
+    if marker.exists():
+        state = load_json(marker)
+        if state["graph_dir"] != str(graph_dir) or any(
+            not (backup / name).is_file() for name in state["files"]
+        ):
+            raise RuntimeError("invalid graph baseline; use a new staging directory")
+        return backup
+    if backup.exists() or (staging / "candidate-ready.json").exists():
+        raise RuntimeError(
+            "staging has no pinned graph baseline; use a new staging directory"
+        )
+    backup.mkdir()
+    files = sorted(path.name for path in graph_dir.iterdir() if path.is_file())
+    for name in files:
+        atomic_copy(graph_dir / name, backup / name)
+    if files != sorted(
+        path.name for path in graph_dir.iterdir() if path.is_file()
+    ) or any(
+        not (graph_dir / name).is_file()
+        or (graph_dir / name).read_bytes() != (backup / name).read_bytes()
+        for name in files
+    ):
+        raise RuntimeError(
+            "graph artifact changed concurrently while capturing baseline"
+        )
+    write_json(marker, {"graph_dir": str(graph_dir), "files": files})
+    return backup
+
+
 def publish_candidate(candidate: Path, graph_dir: Path, staging: Path) -> None:
     files = [path for path in candidate.iterdir() if path.is_file()]
     if files and all(
@@ -265,12 +303,7 @@ def publish_candidate(candidate: Path, graph_dir: Path, staging: Path) -> None:
     ):
         return
     backup = staging / "graph-backup"
-    backup.mkdir(parents=True, exist_ok=True)
-    for source in files:
-        live = graph_dir / source.name
-        archived = backup / source.name
-        if not archived.exists() and live.exists():
-            shutil.copy2(live, archived)
+    base_files = set(load_json(staging / "base-state.json")["files"])
     for source in files:
         live = graph_dir / source.name
         archived = backup / source.name
@@ -282,7 +315,7 @@ def publish_candidate(candidate: Path, graph_dir: Path, staging: Path) -> None:
             and live.read_bytes() == archived.read_bytes()
         ):
             continue
-        if not live.exists() and not archived.exists():
+        if not live.exists() and source.name not in base_files:
             continue
         raise RuntimeError(f"graph artifact changed concurrently: {live}")
     written = []
@@ -333,6 +366,7 @@ def main() -> None:
         return
     if not (graph_dir / "graph.json").is_file():
         raise SystemExit(f"existing graph not found: {graph_dir / 'graph.json'}")
+    base_dir = prepare_base(graph_dir, staging)
     # Freeze validated artifacts before publication, so a crash after publishing
     # does not rebuild them with different timestamps or extraction token counts.
     inputs = {
@@ -371,6 +405,7 @@ def main() -> None:
             old_files,
             deleted_files,
             source_urls,
+            base_dir=base_dir,
         )
         write_json(
             ready_path,

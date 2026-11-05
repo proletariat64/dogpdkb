@@ -5,6 +5,9 @@ import collections
 import json
 import os
 import re
+import shutil
+import tempfile
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -247,6 +250,69 @@ def write_snapshot(path: Path, payload: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _replace_link(path: Path, target: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink() and os.readlink(path) == target:
+        return
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.symlink_to(target)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def publish_snapshots(output: Path, catalog: dict, layered: dict) -> None:
+    """Publish the pair through one atomic pointer, retaining older generations.
+
+    Existing ordinary files are first copied into an initial generation. During
+    migration both public paths still read the old contents until the pointer
+    switches; an interruption before that switch leaves the old pair intact.
+    """
+    snapshots = output / ".snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    current = snapshots / "current"
+    generation = Path(tempfile.mkdtemp(prefix="generation-", dir=snapshots))
+    paths = [
+        (output / "catalog.json", "catalog.json"),
+        (output / "map" / "map-data.json", "map-data.json"),
+    ]
+    try:
+        write_snapshot(generation / "catalog.json", catalog)
+        write_snapshot(generation / "map-data.json", layered)
+        generation.chmod(0o755)
+        for public, _ in paths:
+            if public.exists() and not public.is_file():
+                raise ValueError(f"snapshot path is not a file: {public}")
+        if not current.is_symlink():
+            if current.exists():
+                raise ValueError(f"snapshot pointer is not a symlink: {current}")
+            initial = Path(tempfile.mkdtemp(prefix="initial-", dir=snapshots))
+            for public, name in paths:
+                if public.is_file():
+                    shutil.copy2(public, initial / name)
+            initial.chmod(0o755)
+            try:
+                current.symlink_to(initial.name)
+            except FileExistsError:
+                if not current.is_symlink():
+                    raise
+        if (
+            not current.resolve().is_relative_to(snapshots.resolve())
+            or not current.is_dir()
+        ):
+            raise ValueError(f"invalid snapshot pointer: {current}")
+        _replace_link(output / "catalog.json", ".snapshots/current/catalog.json")
+        _replace_link(
+            output / "map/map-data.json", "../.snapshots/current/map-data.json"
+        )
+        _replace_link(current, generation.name)
+    except BaseException:
+        if current.resolve() != generation.resolve():
+            shutil.rmtree(generation)
+        raise
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     config_arguments(parser, book=True)
@@ -273,8 +339,7 @@ def main() -> None:
         config,
     )
     layered = build_map(graph, catalog, community_limit=config.community_limit)
-    write_snapshot(args.output / "catalog.json", catalog)
-    write_snapshot(args.output / "map" / "map-data.json", layered)
+    publish_snapshots(args.output, catalog, layered)
     result = {
         "status": "completed",
         "documents": catalog["stats"]["documents"],
