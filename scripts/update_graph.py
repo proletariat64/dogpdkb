@@ -1,11 +1,13 @@
 """Incrementally update graphify artifacts for one published sync manifest."""
 
 import argparse
+import fcntl
 import json
 import os
 import shutil
 import sys
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -212,17 +214,25 @@ def build_candidate(
     old = load_json(base_dir / "graph.json")
     labels_path = base_dir / ".graphify_labels.json"
     labels = load_json(labels_path) if labels_path.exists() else {}
-    if current_files:
-        fresh, tokens = extract_semantic(corpus, graph_dir, staging, current_files)
+    # Empty tracked documents have no concepts to extract. Treat their former
+    # graph records as removed, while retaining the empty file in the manifest.
+    empty_files = {
+        name
+        for name in current_files
+        if not (corpus / name).read_text(encoding="utf-8").strip()
+    }
+    semantic_files = [name for name in current_files if name not in empty_files]
+    if semantic_files:
+        fresh, tokens = extract_semantic(corpus, graph_dir, staging, semantic_files)
     else:
         fresh = {"nodes": [], "edges": [], "hyperedges": []}
         tokens = {"input_tokens": 0, "output_tokens": 0}
     candidate, labels, audit = merge_graph_records(
         old,
         fresh,
-        current_files=current_files,
+        current_files=semantic_files,
         old_files=old_files,
-        deleted_files=deleted_files,
+        deleted_files=[*deleted_files, *sorted(empty_files)],
         source_urls=source_urls,
         captured_at=datetime.now(timezone.utc).isoformat(),
         labels=labels,
@@ -261,7 +271,23 @@ def build_candidate(
     return candidate_dir, audit
 
 
+@contextmanager
+def publication_lock(graph_dir: Path):
+    """Serialize publishers and baseline capture without creating graph artifacts."""
+    descriptor = os.open(graph_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
 def prepare_base(graph_dir: Path, staging: Path) -> Path:
+    with publication_lock(graph_dir):
+        return _prepare_base(graph_dir, staging)
+
+
+def _prepare_base(graph_dir: Path, staging: Path) -> Path:
     """Capture the build input once; compare bytes instead of adding hashes."""
     backup = staging / "graph-backup"
     marker = staging / "base-state.json"
@@ -295,6 +321,11 @@ def prepare_base(graph_dir: Path, staging: Path) -> Path:
 
 
 def publish_candidate(candidate: Path, graph_dir: Path, staging: Path) -> None:
+    with publication_lock(graph_dir):
+        _publish_candidate(candidate, graph_dir, staging)
+
+
+def _publish_candidate(candidate: Path, graph_dir: Path, staging: Path) -> None:
     files = [path for path in candidate.iterdir() if path.is_file()]
     if files and all(
         (graph_dir / source.name).is_file()
@@ -317,7 +348,11 @@ def publish_candidate(candidate: Path, graph_dir: Path, staging: Path) -> None:
             continue
         if not live.exists() and source.name not in base_files:
             continue
-        raise RuntimeError(f"graph artifact changed concurrently: {live}")
+        raise RuntimeError(
+            f"graph artifact changed concurrently: {live}; "
+            "retry the retained staging directory with --rebase "
+            "(pipeline: --resume --rebase-graph)"
+        )
     written = []
     try:
         for source in files:
@@ -343,6 +378,11 @@ def main() -> None:
     parser.add_argument("--manifest", type=cli_path, required=True)
     parser.add_argument("--staging", type=cli_path, required=True)
     parser.add_argument("--graph-dir", type=cli_path)
+    parser.add_argument(
+        "--rebase",
+        action="store_true",
+        help="rebuild the staged candidate against the current graph baseline",
+    )
     args = parser.parse_args()
     config = configure(parser, args.config)
     source = (
@@ -366,7 +406,21 @@ def main() -> None:
         return
     if not (graph_dir / "graph.json").is_file():
         raise SystemExit(f"existing graph not found: {graph_dir / 'graph.json'}")
-    base_dir = prepare_base(graph_dir, staging)
+    if args.rebase:
+        with publication_lock(graph_dir):
+            for name in ("graph-backup", "candidate"):
+                if (staging / name).exists():
+                    shutil.rmtree(staging / name)
+            for name in (
+                "base-state.json",
+                "candidate-ready.json",
+                "candidate-validation.json",
+                "result.json",
+            ):
+                (staging / name).unlink(missing_ok=True)
+            base_dir = _prepare_base(graph_dir, staging)
+    else:
+        base_dir = prepare_base(graph_dir, staging)
     # Freeze validated artifacts before publication, so a crash after publishing
     # does not rebuild them with different timestamps or extraction token counts.
     inputs = {

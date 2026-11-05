@@ -262,3 +262,43 @@ def test_invalid_cli_config_fails_before_writing_or_network(tmp_path):
     assert result.returncode == 2
     assert "cannot load config" in result.stderr
     assert not staging.exists()
+
+
+@pytest.mark.parametrize("selection", ["file", "environment", "cli"])
+def test_graphify_interpreter_retains_virtual_environment(
+    config_file, tmp_path, monkeypatch, selection
+):
+    environment = tmp_path / "graphify-env"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(environment)],
+        check=True,
+    )
+    interpreter = environment / "bin/python"
+    assert interpreter.is_symlink()
+    command = ["sync", "--config", str(config_file), "--book", "one", "--dry-run"]
+    if selection == "file":
+        config_file.write_text(
+            config_file.read_text().replace(
+                "[paths]\n", f'[paths]\ngraphify_python = "{interpreter}"\n'
+            )
+        )
+    elif selection == "environment":
+        monkeypatch.setenv("GRAPHIFY_PYTHON", str(interpreter))
+    else:
+        command.extend(["--graphify-python", str(interpreter)])
+    captured = []
+    monkeypatch.setattr(pipeline, "run_pipeline", captured.append)
+    monkeypatch.setattr(sys, "argv", command)
+
+    pipeline.main()
+
+    options = captured[0]
+    assert options.graphify_python == interpreter
+    assert pipeline._config(options)["graphify_python"] == str(interpreter)
+    result = subprocess.run(
+        [str(options.graphify_python), "-c", "import sys; print(sys.prefix)"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert Path(result.stdout.strip()) == environment

@@ -116,7 +116,7 @@ def load_config(path: Path | str | None = None) -> SyncConfig:
             raise ConfigError(f"{section}.{key}: expected a nonempty string")
         return result
 
-    def file_path(section, key, default=None, env=None):
+    def file_path(section, key, default=None, env=None, *, preserve_symlinks=False):
         result = value(section, key, default, env)
         if result is None:
             return None
@@ -124,7 +124,8 @@ def load_config(path: Path | str | None = None) -> SyncConfig:
             raise ConfigError(f"{section}.{key}: expected a nonempty path")
         resolved = Path(result).expanduser()
         base = Path.cwd() if env and env in os.environ else selected.parent
-        return (base / resolved).resolve()
+        path = base / resolved
+        return path.absolute() if preserve_symlinks else path.resolve()
 
     def number(section, key, default, env=None, integer=False, minimum=0):
         raw = value(section, key, default, env)
@@ -190,7 +191,11 @@ def load_config(path: Path | str | None = None) -> SyncConfig:
         web=file_path("paths", "web", "web-output", "DOGPDKB_WEB"),
         graph_dir=file_path("paths", "graph_dir", env="DOGPDKB_GRAPH_DIR"),
         graphify_python=file_path(
-            "paths", "graphify_python", sys.executable, "GRAPHIFY_PYTHON"
+            "paths",
+            "graphify_python",
+            sys.executable,
+            "GRAPHIFY_PYTHON",
+            preserve_symlinks=True,
         ),
         mcp_url=_url(
             string("skylark", "mcp_url", env="SKYLARK_MCP_URL"), "skylark.mcp_url"
@@ -285,7 +290,7 @@ def current_config() -> SyncConfig:
 
 def cli_path(value: str) -> Path:
     """CLI paths are relative to the caller and support quoted home paths."""
-    return Path(value).expanduser().resolve()
+    return Path(value).expanduser().absolute()
 
 
 def config_arguments(parser: argparse.ArgumentParser, *, book=False) -> None:

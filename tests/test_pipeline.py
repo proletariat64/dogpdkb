@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts import sync_knowledge_base as pipeline
 
 
@@ -110,3 +112,49 @@ def test_pipeline_dry_run_stops_after_plan(tmp_path: Path):
     assert calls == ["get_sync_updates.py"]
     assert result["status"] == "dry_run"
     assert not (config.web_dir / "catalog.json").exists()
+
+
+def test_rebase_reuses_published_manifest_after_baseline_conflict(tmp_path: Path):
+    config = options(tmp_path)
+    config.input_dir.mkdir()
+    (config.input_dir / "doc-2026-01-01-[1].md").write_text("old")
+    calls = []
+    original = fake_runner(config.staging, calls)
+    retained = {
+        "exported": [{"id": 1, "file": "new-2026-11-05-[1].md"}],
+        "deleted": [],
+        "skipped": [],
+    }
+
+    def conflict(command):
+        original(command) if Path(command[1]).name != "update_graph.py" else None
+        if Path(command[1]).name == "apply_sync_updates.py":
+            (config.staging / "manifest.json").write_text(json.dumps(retained))
+            (config.input_dir / "new-2026-11-05-[1].md").write_text("new")
+        if Path(command[1]).name == "update_graph.py":
+            raise RuntimeError("graph artifact changed concurrently")
+
+    with pytest.raises(RuntimeError, match="changed concurrently"):
+        pipeline.run_pipeline(config, runner=conflict)
+    config.resume = True
+    config.rebase_graph = True
+    calls.clear()
+
+    def recover(command):
+        if Path(command[1]).name == "update_graph.py":
+            assert "--rebase" in command
+            manifest = Path(command[command.index("--manifest") + 1])
+            assert json.loads(manifest.read_text()) == retained
+        original(command)
+
+    result = pipeline.run_pipeline(config, runner=recover)
+    assert calls == ["update_graph.py", "publish_web.py"]
+    assert result["status"] == "completed"
+
+
+def test_rebase_requires_existing_resume(tmp_path: Path):
+    config = options(tmp_path)
+    config.input_dir.mkdir()
+    config.rebase_graph = True
+    with pytest.raises(ValueError, match="requires --resume"):
+        pipeline.run_pipeline(config, runner=lambda command: pytest.fail(str(command)))

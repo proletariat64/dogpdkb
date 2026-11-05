@@ -2,6 +2,7 @@
 
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -162,3 +163,144 @@ def test_rejects_base_changes_before_first_publication(
     assert (
         update_graph.load_json(staging / "graph-backup/.graphify_labels.json") == labels
     )
+
+
+def test_concurrent_publishers_cannot_overwrite_success(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+    from threading import Event
+
+    graph = tmp_path / "graph"
+    graph.mkdir()
+    update_graph.write_json(graph / "graph.json", {"version": "base"})
+    jobs = []
+    for name in ("first", "second"):
+        stage = tmp_path / name
+        stage.mkdir()
+        update_graph.prepare_base(graph, stage)
+        candidate = stage / "candidate"
+        candidate.mkdir()
+        update_graph.write_json(candidate / "graph.json", {"version": name})
+        jobs.append((candidate, stage))
+    entered = Event()
+    release = Event()
+    second_started = Event()
+    copy = update_graph.atomic_copy
+
+    def pause_first(source, destination):
+        if source == jobs[0][0] / "graph.json":
+            entered.set()
+            assert release.wait(5)
+        copy(source, destination)
+
+    monkeypatch.setattr(update_graph, "atomic_copy", pause_first)
+
+    def publish_second():
+        second_started.set()
+        update_graph.publish_candidate(jobs[1][0], graph, jobs[1][1])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            update_graph.publish_candidate, jobs[0][0], graph, jobs[0][1]
+        )
+        assert entered.wait(5)
+        second = pool.submit(publish_second)
+        try:
+            assert second_started.wait(5)
+            with pytest.raises(TimeoutError):
+                second.result(timeout=0.1)
+        finally:
+            release.set()
+        first.result(timeout=5)
+        with pytest.raises(RuntimeError, match="changed concurrently"):
+            second.result(timeout=5)
+    assert update_graph.load_json(graph / "graph.json") == {"version": "first"}
+    assert sorted(path.name for path in graph.iterdir()) == ["graph.json"]
+
+
+def test_explicit_rebase_keeps_corpus_manifest_and_rebuilds_candidate(
+    graph_job, monkeypatch
+):
+    corpus, graph, staging, builds, _original = graph_job
+    manifest = staging.parent / "manifest.json"
+    manifest_bytes = manifest.read_bytes()
+    update_graph.write_json(
+        graph / "graph.json", {"nodes": [], "links": [], "captured_at": "external"}
+    )
+    monkeypatch.setattr(sys, "argv", [*sys.argv, "--rebase"])
+    update_graph.main()
+    assert len(builds) == 2
+    assert (
+        update_graph.load_json(staging / "graph-backup/graph.json")["captured_at"]
+        == "external"
+    )
+    assert update_graph.load_json(graph / "graph.json")["captured_at"] == "attempt-2"
+    assert manifest.read_bytes() == manifest_bytes
+    assert (corpus / "a-[1].md").read_text() == "source"
+
+
+@pytest.mark.parametrize("body", ["", " \n\t"])
+def test_blank_document_removes_old_semantics_without_extraction(
+    tmp_path, monkeypatch, body
+):
+    from types import ModuleType
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    filename = "blank-[1].md"
+    (corpus / filename).write_text(body)
+    graph_dir = corpus / "graphify-out"
+    graph_dir.mkdir()
+    untouched = {"id": "outside", "label": "Keep", "source_file": "outside-[2].md"}
+    old = {
+        "directed": True,
+        "graph": {},
+        "nodes": [
+            {"id": "stale", "label": "Removed text", "source_file": "old-[1].md"},
+            untouched,
+        ],
+        "links": [
+            {"source": "outside", "target": "stale", "source_file": "outside-[2].md"}
+        ],
+        "hyperedges": [],
+    }
+    update_graph.write_json(graph_dir / "graph.json", old)
+    update_graph.write_json(
+        graph_dir / "manifest.json",
+        {"old-[1].md": {}, "outside-[2].md": {"keep": True}},
+    )
+    staging = tmp_path / "stage"
+    staging.mkdir()
+    base_dir = update_graph.prepare_base(graph_dir, staging)
+
+    def unexpected_extract(*args):
+        pytest.fail("blank sources must not invoke semantic extraction")
+
+    monkeypatch.setattr(update_graph, "extract_semantic", unexpected_extract)
+    monkeypatch.setattr(update_graph, "analysis_artifacts", lambda *args: {})
+    detect = ModuleType("graphify.detect")
+
+    def save_manifest(files, *, manifest_path, kind, root):
+        assert files == {"document": [str(corpus / filename)]}
+        manifest = update_graph.load_json(Path(manifest_path))
+        manifest[filename] = {"kind": kind}
+        update_graph.write_json(Path(manifest_path), manifest)
+
+    detect.save_manifest = save_manifest
+    monkeypatch.setitem(sys.modules, "graphify.detect", detect)
+    candidate, _audit = update_graph.build_candidate(
+        corpus,
+        graph_dir,
+        staging,
+        [filename],
+        ["old-[1].md"],
+        [],
+        {},
+        base_dir=base_dir,
+    )
+    result = update_graph.load_json(candidate / "graph.json")
+    assert result["nodes"] == [untouched]
+    assert result["links"] == []
+    manifest = update_graph.load_json(candidate / "manifest.json")
+    assert filename in manifest
+    assert "old-[1].md" not in manifest
+    assert manifest["outside-[2].md"] == {"keep": True}

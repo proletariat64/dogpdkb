@@ -623,7 +623,7 @@ def test_get_main_writes_structure_changes_and_complete_snapshot(
     assert payload["updated"][0]["format"] == "lake"
 
 
-def test_fetch_doc_list_resumes_from_page_cache(tmp_path: Path, monkeypatch):
+def test_fetch_doc_list_refreshes_page_cache(tmp_path: Path, monkeypatch):
     calls = []
 
     def fake_call(tool, args):
@@ -634,7 +634,7 @@ def test_fetch_doc_list_resumes_from_page_cache(tmp_path: Path, monkeypatch):
 
     assert len(get_sync.fetch_doc_list(123, 2, tmp_path / "pages")) == 2
     assert len(get_sync.fetch_doc_list(123, 2, tmp_path / "pages")) == 2
-    assert calls == [0]
+    assert calls == [0, 0]
 
 
 def test_ocr_resume_retries_only_incomplete_documents(tmp_path: Path, monkeypatch):

@@ -39,6 +39,7 @@ class PipelineOptions:
     skip_web: bool
     settings: SyncConfig | None = None
     book_name: str = ""
+    rebase_graph: bool = False
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -62,7 +63,7 @@ def _config(options: PipelineOptions) -> dict:
         "cutoff": options.cutoff,
         "graph_dir": str(options.graph_dir.resolve()),
         "web_dir": str(options.web_dir.resolve()),
-        "graphify_python": str(options.graphify_python.resolve()),
+        "graphify_python": str(options.graphify_python.expanduser().absolute()),
         "settings": options.settings.snapshot() if options.settings else None,
         "book_name": options.book_name,
     }
@@ -77,6 +78,15 @@ def run_pipeline(
         raise ValueError(f"input dir not found: {input_dir}")
     staging.mkdir(parents=True, exist_ok=True)
     state_path = staging / "pipeline-state.json"
+    if options.rebase_graph and (
+        not options.resume
+        or options.skip_graph
+        or options.dry_run
+        or not state_path.is_file()
+    ):
+        raise ValueError(
+            "--rebase-graph requires --resume of an existing run with graph enabled"
+        )
     config = _config(options)
     if state_path.exists():
         if not options.resume:
@@ -95,6 +105,14 @@ def run_pipeline(
             "outputs": {},
             "status": "running",
         }
+        write_json(state_path, state)
+
+    if options.rebase_graph:
+        if state["stages"].get("corpus") != "completed":
+            raise ValueError("--rebase-graph requires a completed corpus stage")
+        for stage in ("graph", "web"):
+            state["stages"].pop(stage, None)
+            state["outputs"].pop(stage, None)
         write_json(state_path, state)
 
     def with_config(command: list[str]) -> list[str]:
@@ -230,6 +248,7 @@ def run_pipeline(
                 str(staging / "graph-update"),
                 "--graph-dir",
                 str(options.graph_dir),
+                *(["--rebase"] if options.rebase_graph else []),
             ],
             graph_result_path,
         )
@@ -298,12 +317,17 @@ def main() -> None:
     parser.add_argument("--web-dir", type=cli_path)
     parser.add_argument("--skip-graph", action="store_true")
     parser.add_argument("--skip-web", action="store_true")
+    parser.add_argument(
+        "--rebase-graph",
+        action="store_true",
+        help="with --resume, rebuild the retained corpus delta against the current graph",
+    )
     args = parser.parse_args()
     config = configure(parser, args.config)
     source = configured_book(parser, config, args, args.skylark_url)
     input_dir = args.input or source.corpus
     graphify_python = (
-        (args.graphify_python or config.graphify_python).expanduser().resolve()
+        (args.graphify_python or config.graphify_python).expanduser().absolute()
     )
     if not args.skip_graph and not graphify_python.is_file():
         parser.error(f"Graphify Python not found: {graphify_python}")
@@ -319,11 +343,12 @@ def main() -> None:
         resume=args.resume,
         graph_dir=args.graph_dir or config.graph_dir or input_dir / "graphify-out",
         web_dir=args.web_dir or config.web / source.key,
-        graphify_python=graphify_python.resolve(),
+        graphify_python=graphify_python,
         skip_graph=args.skip_graph,
         skip_web=args.skip_web,
         settings=config,
         book_name=source.name,
+        rebase_graph=args.rebase_graph,
     )
     if args.resume:
         print(f"Resuming completed stages in {options.staging}", flush=True)

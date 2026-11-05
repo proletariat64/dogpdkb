@@ -176,6 +176,11 @@ older checkpoints without configuration metadata require a new staging run.
 Graph updates also pin the original graph artifacts before extraction, build
 from that backup, and compare bytes before publication. A staging directory from
 before this baseline checkpoint was introduced must be replaced by a new run.
+If publication fails because another publisher changed the graph baseline, keep
+the staging directory and retry with `--resume --rebase-graph --staging <run>`.
+This reuses the completed corpus manifest and rebuilds only its graph delta
+against the current graph, then republishes the Web snapshot. Starting fresh
+discovery instead can miss changes whose corpus timestamps already advanced.
 
 | Environment override | TOML key |
 | --- | --- |

@@ -425,7 +425,7 @@ def main() -> None:
                 f"  [{i}/{len(delta)}] reuse {doc_id} {prior['title']}", file=sys.stderr
             )
             continue
-        if prior.get("status") == "skipped_empty":
+        if prior.get("status") == "skipped_empty" and doc["kind"] == "new":
             skipped.append((doc_id, "empty document body"))
             continue
         try:
@@ -439,7 +439,7 @@ def main() -> None:
                 file=sys.stderr,
             )
             continue
-        if not body.strip():
+        if not body.strip() and doc["kind"] == "new":
             skipped.append((doc_id, "empty document body"))
             completed[str(doc_id)] = {"status": "skipped_empty"}
             save_progress(errors)

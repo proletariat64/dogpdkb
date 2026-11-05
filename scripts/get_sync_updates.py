@@ -252,6 +252,12 @@ def resolve_book(url: str) -> dict[str, Any]:
 def fetch_doc_list(
     book_id: int, items_count: int, cache_dir: Path | None = None
 ) -> list[dict[str, Any]]:
+    """Fetch a fresh listing; persisted pages are diagnostic checkpoints only.
+
+    The remote API has no snapshot token. Reusing a page from an earlier attempt
+    alongside live pages can silently omit a live document even when the total
+    and unique-ID checks pass, so every attempt refreshes every page.
+    """
     offsets = list(range(0, items_count or PAGE_SIZE, PAGE_SIZE))
     pages: list[list[dict[str, Any]] | None] = [None] * len(offsets)
     if cache_dir is not None:
@@ -263,18 +269,6 @@ def fetch_doc_list(
             if cache_dir is not None
             else None
         )
-        if cache is not None and cache.exists():
-            try:
-                payload = json.loads(cache.read_text(encoding="utf-8"))
-            except json.JSONDecodeError as exc:
-                raise SkylarkError(f"invalid page cache {cache}") from exc
-            if (
-                payload.get("book_id") != book_id
-                or payload.get("offset") != offset
-                or not isinstance(payload.get("items"), list)
-            ):
-                raise SkylarkError(f"invalid page cache {cache}")
-            return payload["items"]
         data = call_tool(
             "skylark_doc_list",
             {"book_id": book_id, "limit": PAGE_SIZE, "offset": offset},
