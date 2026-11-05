@@ -9,18 +9,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from get_sync_updates import SkylarkError, call_tool
 
-SSO_IMAGE_REWRITE = (
-    (
-        "https://intranetproxy.alipay.com/skylark/lark/",
-        "https://yuque.antfin.com/images/lark/",
-    ),
-)
+from mdocr.config import current_config
+
 TABLE_FORMATS = {"laketable", "table"}
 TABLE_PAGE_SIZE = 200
 
 
 def rewrite_image_urls(body: str) -> str:
-    for old, new in SSO_IMAGE_REWRITE:
+    for old, new in current_config().image_url_rewrites:
         body = body.replace(old, new)
     return body
 

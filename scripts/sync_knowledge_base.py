@@ -15,6 +15,14 @@ sys.path.insert(0, str(SCRIPTS))
 
 from apply_sync_updates import corpus_max_date
 
+from mdocr.config import (
+    SyncConfig,
+    cli_path,
+    config_arguments,
+    configure,
+    configured_book,
+)
+
 
 @dataclass
 class PipelineOptions:
@@ -29,6 +37,8 @@ class PipelineOptions:
     graphify_python: Path
     skip_graph: bool
     skip_web: bool
+    settings: SyncConfig | None = None
+    book_name: str = ""
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -53,6 +63,8 @@ def _config(options: PipelineOptions) -> dict:
         "graph_dir": str(options.graph_dir.resolve()),
         "web_dir": str(options.web_dir.resolve()),
         "graphify_python": str(options.graphify_python.resolve()),
+        "settings": options.settings.snapshot() if options.settings else None,
+        "book_name": options.book_name,
     }
 
 
@@ -85,6 +97,11 @@ def run_pipeline(
         }
         write_json(state_path, state)
 
+    def with_config(command: list[str]) -> list[str]:
+        if options.settings:
+            command.extend(["--config", str(options.settings.file)])
+        return command
+
     def execute(name: str, command: list[str], output: Path) -> None:
         if state["stages"].get(name) == "completed":
             if not output.is_file():
@@ -95,7 +112,7 @@ def run_pipeline(
         state["status"] = "running"
         write_json(state_path, state)
         try:
-            runner(command)
+            runner(with_config(command))
             if not output.is_file():
                 raise RuntimeError(f"{name} did not produce {output}")
         except BaseException as error:
@@ -127,7 +144,7 @@ def run_pipeline(
         state["current_stage"] = "plan"
         write_json(state_path, state)
         try:
-            runner(plan_command)
+            runner(with_config(plan_command))
             plans = sorted(plan_dir.glob("sync-updates-*.json"))
             if not plans:
                 raise RuntimeError("plan did not produce a sync JSON")
@@ -222,7 +239,11 @@ def run_pipeline(
         state["stages"]["web"] = "skipped"
         write_json(state_path, state)
     else:
-        book_name = (sync.get("book") or {}).get("name") or "全球资金平台产品"
+        book_name = (
+            (sync.get("book") or {}).get("name")
+            or options.book_name
+            or options.source_url
+        )
         execute(
             "web",
             [
@@ -261,19 +282,10 @@ def run_pipeline(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "-i", "--input", type=Path, default=Path("graphify_flatten_ready")
-    )
-    parser.add_argument(
-        "-s",
-        "--skylark-url",
-        default="https://yuque.antfin.com/global-fund-platform/gom7xx",
-    )
-    parser.add_argument(
-        "--staging",
-        type=Path,
-        default=Path(f"wash/sync-{datetime.now():%Y%m%d-%H%M%S}"),
-    )
+    config_arguments(parser, book=True)
+    parser.add_argument("-i", "--input", type=cli_path)
+    parser.add_argument("-s", "--skylark-url")
+    parser.add_argument("--staging", type=cli_path)
     parser.add_argument("--cutoff")
     parser.add_argument(
         "--dry-run", action="store_true", help="stop after the sync plan"
@@ -281,36 +293,37 @@ def main() -> None:
     parser.add_argument(
         "--resume", action="store_true", help="reuse completed steps in --staging"
     )
-    parser.add_argument("--graph-dir", type=Path)
-    parser.add_argument("--graphify-python", type=Path)
-    parser.add_argument(
-        "--web-dir", type=Path, default=Path("/home/admin/webserver/site/kb")
-    )
+    parser.add_argument("--graph-dir", type=cli_path)
+    parser.add_argument("--graphify-python", type=cli_path)
+    parser.add_argument("--web-dir", type=cli_path)
     parser.add_argument("--skip-graph", action="store_true")
     parser.add_argument("--skip-web", action="store_true")
     args = parser.parse_args()
-    configured_python = args.graphify_python or (
-        Path(os.environ["GRAPHIFY_PYTHON"])
-        if os.environ.get("GRAPHIFY_PYTHON")
-        else None
+    config = configure(parser, args.config)
+    source = configured_book(parser, config, args, args.skylark_url)
+    input_dir = args.input or source.corpus
+    graphify_python = (
+        (args.graphify_python or config.graphify_python).expanduser().resolve()
     )
-    if configured_python is not None and not configured_python.is_file():
-        raise SystemExit(f"Graphify Python not found: {configured_python}")
-    graphify_python = configured_python or Path("/usr/local/python3/bin/python3.12")
-    if not graphify_python.is_file():
-        graphify_python = Path(sys.executable)
+    if not args.skip_graph and not graphify_python.is_file():
+        parser.error(f"Graphify Python not found: {graphify_python}")
     options = PipelineOptions(
-        input_dir=args.input,
-        source_url=args.skylark_url,
-        staging=args.staging,
+        input_dir=input_dir,
+        source_url=source.url,
+        staging=args.staging
+        or config.staging
+        / source.key
+        / f"sync-{datetime.now().astimezone():%Y%m%d-%H%M%S}",
         cutoff=args.cutoff,
         dry_run=args.dry_run,
         resume=args.resume,
-        graph_dir=args.graph_dir or args.input / "graphify-out",
-        web_dir=args.web_dir,
+        graph_dir=args.graph_dir or config.graph_dir or input_dir / "graphify-out",
+        web_dir=args.web_dir or config.web / source.key,
         graphify_python=graphify_python.resolve(),
         skip_graph=args.skip_graph,
         skip_web=args.skip_web,
+        settings=config,
+        book_name=source.name,
     )
     if args.resume:
         print(f"Resuming completed stages in {options.staging}", flush=True)

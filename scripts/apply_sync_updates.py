@@ -45,14 +45,10 @@ from get_sync_updates import (
     save_sync_state,
     toc_paths,
 )
-from sync_formats import export_table
+from sync_formats import export_table, rewrite_image_urls
 
-SSO_IMAGE_REWRITE = (
-    (
-        "https://intranetproxy.alipay.com/skylark/lark/",
-        "https://yuque.antfin.com/images/lark/",
-    ),
-)
+from mdocr.config import cli_path, config_arguments, configure, configured_book
+
 LOCAL_NAME_RE = re.compile(r"-(\d{4}-\d{2}-\d{2})-\[(\d+)\]\.md$")
 
 
@@ -270,10 +266,7 @@ def export_doc(
     data = call_tool("skylark_doc_detail", {"doc_id": doc_id, "format": "md"})
     if not isinstance(data, dict) or not isinstance(data.get("body"), str):
         raise SkylarkError(f"doc {doc_id}: invalid detail payload")
-    body = data["body"]
-    for old, new in SSO_IMAGE_REWRITE:
-        body = body.replace(old, new)
-    return body, data
+    return rewrite_image_urls(data["body"]), data
 
 
 def run_mdocr(files: list[Path], out_dir: Path) -> int:
@@ -326,18 +319,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(__doc__ or "apply sync-updates delta").split("\n")[0]
     )
-    parser.add_argument("-i", "--input", required=True, help="local md corpus dir")
-    parser.add_argument("-s", "--skylark-url", required=True, help="Yuque book url")
+    config_arguments(parser, book=True)
+    parser.add_argument("-i", "--input", help="local md corpus dir")
+    parser.add_argument("-s", "--skylark-url", help="Yuque book url")
     parser.add_argument(
         "--sync-json",
-        type=Path,
-        help="sync-updates JSON (default: newest in -o of get_sync_updates, guessed as tmp/)",
+        type=cli_path,
+        help="sync-updates JSON (default: newest in configured state/<book>/)",
     )
     parser.add_argument(
         "--staging",
-        type=Path,
+        type=cli_path,
         default=None,
-        help="staging dir (default wash/sync-<today>)",
+        help="staging dir (default: configured staging/<book>/sync-<today>)",
     )
     parser.add_argument(
         "--cutoff", help="YYYY-MM-DD delta cutoff (default: newest date in corpus)"
@@ -349,13 +343,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    input_dir = Path(args.input)
+    config = configure(parser, args.config)
+    source = configured_book(parser, config, args, args.skylark_url)
+    args.skylark_url = source.url
+    input_dir = cli_path(args.input) if args.input else source.corpus
     if not input_dir.is_dir():
         raise SystemExit(f"input dir not found: {input_dir}")
 
     book = resolve_book(args.skylark_url)
     book_slug = book["slug"] or str(book["book_id"])
-    sync_path = args.sync_json or latest_sync_json(Path("tmp"), book_slug)
+    sync_path = args.sync_json or latest_sync_json(config.state / source.key, book_slug)
     try:
         sync = json.loads(sync_path.read_text(encoding="utf-8"))
         validate_sync_book(sync, book)
@@ -369,7 +366,9 @@ def main() -> None:
         raise SystemExit(f"cannot plan deletions: {exc}") from exc
     print(f"sync json: {sync_path}")
     print(f"cutoff: {cutoff} · delta docs: {len(delta)} · deletions: {len(deletions)}")
-    staging = args.staging or Path(f"wash/sync-{date.today():%Y%m%d}")
+    staging = (
+        args.staging or config.staging / source.key / f"sync-{date.today():%Y%m%d}"
+    )
     raw_dir = staging / "raw"
     ocr_dir = staging / "md"
     raw_dir.mkdir(parents=True, exist_ok=True)

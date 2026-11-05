@@ -10,45 +10,33 @@ from pathlib import Path
 from typing import Any
 
 NAME_RE = re.compile(r"-(\d{4}-\d{2}-\d{2})-\[(\d+)\]\.md$")
-TOPIC_SPECS = [
-    (
-        1397,
-        "Whale 专项",
-        "项目规划",
-        "全球资金网络升级的项目规划、战役拆解与实施脉络。",
-    ),
-    (0, "USD 美元", "跨境清算", "美元收单站、清算账户与跨境资金结算相关知识。"),
-    (13, "One Portal", "平台产品", "平台户入驻、交易支持与汇率运营产品能力。"),
-    (22, "内部户", "账户体系", "内部账户、账龄管理与账户监控产品体系。"),
-    (3, "SWIFT (跨境)", "清算网络", "SWIFT 跨境清算网络、报文与银行账户规则。"),
-    (19, "核算分录验证", "核算账务", "核算方案、分录验证与虚拟资金流。"),
-    (20, "外汇兑换协议", "外汇产品", "收单站流入、清算与来账兑换协议。"),
-    (1516, "流动性定价引擎", "流动性", "FTP 评价、监测、定价与流动性管理。"),
-    (99, "外部清偿", "资金清算", "主体间协议、集中清算与外部清偿。"),
-]
+from mdocr.config import (
+    SyncConfig,
+    cli_path,
+    config_arguments,
+    configure,
+    configured_book,
+    current_config,
+)
 
 
-def group_for(category: str) -> str:
-    if category == "收付款产品":
-        return "收付款"
-    if category == "Accounting":
-        return "核算"
-    if category == "资金方案中心管控":
-        return "资金方案"
-    if category.startswith("外汇"):
-        return "外汇"
-    if category == "Liquidity":
-        return "流动性"
-    if category == "Whale":
-        return "Whale"
-    if category == "Planning-and-progress-of-key-projects":
-        return "项目规划"
+def group_for(category: str, config: SyncConfig | None = None) -> str:
+    config = config or current_config()
+    if category in config.groups:
+        return config.groups[category]
+    for prefix, group in config.group_prefixes.items():
+        if category.startswith(prefix):
+            return group
     return "其他"
 
 
 def build_catalog(
-    corpus: Path, graph: dict[str, Any], book: dict[str, str]
+    corpus: Path,
+    graph: dict[str, Any],
+    book: dict[str, str],
+    config: SyncConfig | None = None,
 ) -> dict[str, Any]:
+    config = config or current_config()
     concepts = collections.defaultdict(list)
     community_nodes = collections.defaultdict(list)
     for node in graph["nodes"]:
@@ -72,14 +60,18 @@ def build_catalog(
                 "title": parts[-1],
                 "file": path.name,
                 "category": category,
-                "group": group_for(category),
+                "group": group_for(category, config),
                 "date": match.group(1) if match else "",
                 "concepts": concepts.get(path.name, [])[:6],
             }
         )
     documents.sort(key=lambda doc: (doc["date"], doc["title"]), reverse=True)
     topics = []
-    for community_id, name, domain, description in TOPIC_SPECS:
+    for topic in config.topics:
+        community_id = topic["id"]
+        name, domain, description = (
+            topic[key] for key in ("name", "domain", "description")
+        )
         nodes = community_nodes.get(community_id, [])
         labels = []
         for node in nodes:
@@ -257,20 +249,28 @@ def write_snapshot(path: Path, payload: dict[str, Any]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-i", "--input", type=Path, required=True)
-    parser.add_argument("--graph", type=Path)
-    parser.add_argument("-o", "--output", type=Path, required=True)
-    parser.add_argument("--book-name", default="全球资金平台产品")
-    parser.add_argument(
-        "--book-url", default="https://yuque.antfin.com/global-fund-platform/gom7xx"
-    )
+    config_arguments(parser, book=True)
+    parser.add_argument("-i", "--input", type=cli_path)
+    parser.add_argument("--graph", type=cli_path)
+    parser.add_argument("-o", "--output", type=cli_path)
+    parser.add_argument("--book-name")
+    parser.add_argument("--book-url")
     args = parser.parse_args()
-    graph_path = args.graph or args.input / "graphify-out" / "graph.json"
+    config = configure(parser, args.config)
+    source = configured_book(parser, config, args, args.book_url)
+    args.input = args.input or source.corpus
+    args.output = args.output or config.web / source.key
+    graph_path = (
+        args.graph or (config.graph_dir or args.input / "graphify-out") / "graph.json"
+    )
     graph = json.loads(graph_path.read_text(encoding="utf-8"))
     catalog = build_catalog(
-        args.input, graph, {"name": args.book_name, "url": args.book_url}
+        args.input,
+        graph,
+        {"name": args.book_name or source.name or source.url, "url": source.url},
+        config,
     )
-    layered = build_map(graph, catalog)
+    layered = build_map(graph, catalog, community_limit=config.community_limit)
     write_snapshot(args.output / "catalog.json", catalog)
     write_snapshot(args.output / "map" / "map-data.json", layered)
     result = {

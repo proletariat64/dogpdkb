@@ -4,12 +4,17 @@ import argparse
 import json
 import os
 import shutil
+import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from graph_sync import doc_id, merge_graph_records
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from mdocr.config import cli_path, config_arguments, configure, configured_book
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -294,13 +299,22 @@ def publish_candidate(candidate: Path, graph_dir: Path, staging: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-i", "--input", type=Path, required=True)
-    parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--staging", type=Path, required=True)
-    parser.add_argument("--graph-dir", type=Path)
+    config_arguments(parser, book=True)
+    parser.add_argument("-i", "--input", type=cli_path)
+    parser.add_argument("--manifest", type=cli_path, required=True)
+    parser.add_argument("--staging", type=cli_path, required=True)
+    parser.add_argument("--graph-dir", type=cli_path)
     args = parser.parse_args()
-    corpus = args.input.resolve()
-    graph_dir = (args.graph_dir or corpus / "graphify-out").resolve()
+    config = configure(parser, args.config)
+    source = (
+        configured_book(parser, config, args)
+        if args.input is None or args.book
+        else None
+    )
+    corpus = (args.input or source.corpus).resolve()
+    graph_dir = (
+        args.graph_dir or config.graph_dir or corpus / "graphify-out"
+    ).resolve()
     staging = args.staging.resolve()
     staging.mkdir(parents=True, exist_ok=True)
     manifest = load_json(args.manifest)

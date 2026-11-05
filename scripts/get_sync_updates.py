@@ -22,14 +22,13 @@ takes a few minutes.
 
 Env overrides (same as the skylark pi extension):
     UTOO_PROXY_BIN      utoo-proxy binary path (default ~/.utoo-proxy/utoo-proxy)
-    SKYLARK_MCP_URL     gateway URL (default prod skylark gateway)
+    SKYLARK_MCP_URL     gateway URL (default from default.toml)
     SKYLARK_TIMEOUT_MS  per-call timeout (default 60000)
     SKYLARK_MAX_RETRIES retries for retryable envelopes (default 5)
 """
 
 import argparse
 import json
-import os
 import random
 import re
 import selectors
@@ -41,34 +40,35 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
-DEFAULT_SERVER_URL = (
-    "https://mcpgwoffice-prod.alipay.com/mcpgw/v1/shttpproxy/message/"
-    "MAIN_CHAIR_mcp.ant.faas.skylarkmcpserver.skylarkmcpserver"
+from mdocr.config import (
+    cli_path,
+    config_arguments,
+    configure,
+    configured_book,
+    current_config,
 )
+
 PROTOCOL_VERSION = "2024-11-05"
 PAGE_SIZE = 50
-CONCURRENCY = 2
 MAX_RETRY_DELAY_S = 30.0
 
 LOCAL_NAME_RE = re.compile(r"-(\d{4}-\d{2}-\d{2})-\[(\d+)\]\.md$")
 
 
 def proxy_bin() -> str:
-    return os.environ.get(
-        "UTOO_PROXY_BIN", os.path.expanduser("~/.utoo-proxy/utoo-proxy")
-    )
+    return current_config().proxy_bin
 
 
 def server_url() -> str:
-    return os.environ.get("SKYLARK_MCP_URL", DEFAULT_SERVER_URL)
+    return current_config().mcp_url
 
 
 def timeout_s() -> float:
-    return max(float(os.environ.get("SKYLARK_TIMEOUT_MS", "60000")) / 1000.0, 1.0)
+    return current_config().timeout_seconds
 
 
 def max_retries() -> int:
-    return max(int(os.environ.get("SKYLARK_MAX_RETRIES", "5")), 0)
+    return current_config().max_retries
 
 
 def _parse_ts(value: Any) -> datetime | None:
@@ -279,7 +279,7 @@ def fetch_doc_list(
             file=sys.stderr,
         )
 
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+    with ThreadPoolExecutor(max_workers=current_config().concurrency) as pool:
         list(pool.map(fetch, range(len(offsets))))
 
     docs: dict[int, dict[str, Any]] = {}
@@ -502,19 +502,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="List Yuque book additions, updates, moves and deletions."
     )
-    parser.add_argument("-i", "--input", required=True, help="local md sync dir")
-    parser.add_argument("-s", "--skylark-url", required=True, help="Yuque book url")
-    parser.add_argument("-o", "--output", required=True, help="output dir")
+    config_arguments(parser, book=True)
+    parser.add_argument("-i", "--input", help="local md sync dir")
+    parser.add_argument("-s", "--skylark-url", help="Yuque book url")
+    parser.add_argument("-o", "--output", help="output dir")
     parser.add_argument("--json", action="store_true", help="also write a .json copy")
     parser.add_argument(
         "--page-cache",
-        type=Path,
+        type=cli_path,
         help="resume an interrupted listing from this directory",
     )
     args = parser.parse_args()
 
-    input_dir = Path(args.input)
-    output_dir = Path(args.output)
+    config = configure(parser, args.config)
+    source = configured_book(parser, config, args, args.skylark_url)
+    args.skylark_url = source.url
+    input_dir = cli_path(args.input) if args.input else source.corpus
+    output_dir = cli_path(args.output) if args.output else config.state / source.key
     if not input_dir.is_dir():
         raise SystemExit(f"input dir not found: {input_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
