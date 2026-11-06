@@ -1,6 +1,6 @@
 # Sync 长任务故障恢复
 
-Status: ready-for-agent
+Status: resolved
 
 ## Problem Statement
 

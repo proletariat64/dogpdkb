@@ -13,3 +13,7 @@ Use TDD, approved seams in spec Testing Decisions. No live calls. Integration br
 ## Answer
 
 Implemented in 536d4de (integrated via e9605ae). Read-only MCP retries classify envelope, JSON-RPC and transport errors with permanent-error precedence, bounded sanitized diagnostics and per-attempt cleanup. Implementer verified 58 focused tests plus Ruff/format/diff checks; integration adapter/sync/listing checks passed 55 tests. No live calls.
+
+## Comments
+
+Review follow-ups in 1f2c06f and 499b81f stop threaded listing workers and active proxies on cancellation, reject malformed MCP content containers safely, and remove an unused classifier wrapper. Actual SIGINT and wire-response regressions pass in the final 516-test suite.

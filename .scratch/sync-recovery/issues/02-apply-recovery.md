@@ -13,3 +13,7 @@ Use TDD, approved seams in spec Testing Decisions. No live calls. Integration br
 ## Answer
 
 Implemented in 59ed843. Required export/OCR failures now stop before publication/deletions/state updates, including direct and no-merge apply. Checkpoints retain successful work; missing artifacts and incompatible configuration are handled safely, with legacy compatibility. Diagnostic manifests and direct retry commands retained. Implementer verified 68 focused tests plus Ruff/format/diff checks. No live calls.
+
+## Comments
+
+Review follow-up 1410008 reads formal sync state before publication, records its nonzero SystemExit failure, and preserves failure/retry diagnostics when the failed manifest cannot be persisted. Invalid-state and diagnostic-storage regressions pass in the final 516-test suite.
