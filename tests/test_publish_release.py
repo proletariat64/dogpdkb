@@ -521,3 +521,128 @@ def test_invalid_release_response_fails_closed(setup, monkeypatch, output):
     monkeypatch.setattr(publisher.subprocess, "run", run_fake)
     assert run() == 1
     assert fake.mutations == []
+
+
+class FakeGitHub(FakeCLI):
+    def __call__(self, args, **kwargs):
+        if args[0] == "git":
+            return super().__call__(args, **kwargs)
+        self.calls.append(args)
+        assert args[0] == "gh"
+        output, status, error = "", 0, ""
+        if args[1] == "api":
+            assert args[2] == f"repos/proletariat64/dogpdkb/releases/tags/{TAG}"
+            if self.release is None:
+                status, error = (
+                    1,
+                    f"gh: error (HTTP {self.show_status}) secret-provider-body",
+                )
+            else:
+                output = json.dumps(
+                    dict(
+                        self.release,
+                        assets=[
+                            {"name": name, "size": len(body)}
+                            for name, body in self.files.items()
+                        ],
+                    )
+                )
+        else:
+            assert args[1] == "release"
+            assert args[args.index("--repo") + 1] == "proletariat64/dogpdkb"
+            operation = args[2]
+            if operation == "create":
+                assert "--draft" in args and "--verify-tag" in args
+                assert args[args.index("--target") + 1] == HEAD
+                self.release = {
+                    "id": 12,
+                    "tag_name": TAG,
+                    "target_commitish": HEAD,
+                    "draft": True,
+                    "body": args[args.index("--notes") + 1],
+                }
+            elif operation == "upload":
+                assert "--clobber" not in args
+                path = Path(args[4])
+                assert path.name not in self.files
+                if path.name == self.fail_upload:
+                    status, error = 1, "secret-provider-body"
+                else:
+                    self.files[path.name] = path.read_bytes()
+            elif operation == "download":
+                name = args[args.index("--pattern") + 1]
+                Path(args[args.index("--output") + 1]).write_bytes(self.files[name])
+            elif operation == "edit":
+                assert "--draft=false" in args
+                self.release["draft"] = False
+            else:
+                pytest.fail(f"Unexpected gh operation: {operation}")
+        return subprocess.CompletedProcess(args, status, stdout=output, stderr=error)
+
+
+@pytest.fixture
+def github(setup, monkeypatch):
+    fake = FakeGitHub()
+    monkeypatch.setattr(publisher.subprocess, "run", fake)
+    return fake, setup[1]
+
+
+def run_github():
+    return publisher.main(["--tag", TAG, "--target", "github"])
+
+
+def test_github_publish_retry_and_installer(github):
+    fake, dist = github
+    fake.fail_upload = SDIST
+    assert run_github() == 1
+    assert fake.release["draft"] is True
+    wheel = fake.files[WHEEL]
+    (dist / WHEEL).write_bytes(b"rebuilt wheel")
+    fake.fail_upload = None
+    assert run_github() == 0
+    assert fake.release["draft"] is False
+    assert fake.files[WHEEL] == wheel
+    assert (
+        f"https://github.com/proletariat64/dogpdkb/releases/download/{TAG}".encode()
+        in fake.files["install.sh"]
+    )
+    for name in [WHEEL, SDIST, "install.sh"]:
+        assert (
+            f"{hashlib.sha256(fake.files[name]).hexdigest()}  {name}\n".encode()
+            in fake.files["SHA256SUMS"]
+        )
+    fake.calls.clear()
+    assert run_github() == 0
+    assert all(args[0] == "git" or args[1] == "api" for args in fake.calls)
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+def test_github_lookup_errors_do_not_create(github, status, capsys):
+    fake, _ = github
+    fake.show_status = status
+    assert run_github() == 1
+    assert fake.release is None
+    assert "secret-provider-body" not in str(capsys.readouterr())
+
+
+@pytest.mark.parametrize(
+    "field,value", [("body", "unrelated"), ("target_commitish", "b" * 40)]
+)
+def test_github_identity_mismatch_blocks_retry(github, field, value):
+    fake, _ = github
+    assert run_github() == 0
+    fake.release["draft"] = True
+    fake.release[field] = value
+    fake.calls.clear()
+    assert run_github() == 1
+    assert all(args[0] == "git" or args[1] == "api" for args in fake.calls)
+
+
+def test_github_metadata_is_never_replaced(github):
+    fake, _ = github
+    assert run_github() == 0
+    fake.release["draft"] = True
+    fake.files["install.sh"] = b"conflicting installer"
+    assert run_github() == 1
+    assert fake.release["draft"] is True
+    assert fake.files["install.sh"] == b"conflicting installer"

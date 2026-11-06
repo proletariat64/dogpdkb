@@ -1,4 +1,4 @@
-"""Publish a merged GitHub version locally to the AntCode artifact host."""
+"""Publish a merged GitHub version locally to the selected artifact host."""
 
 from __future__ import annotations
 
@@ -75,7 +75,10 @@ def release(
     target: str | None = None,
     dry_run: bool = False,
     retry: bool = False,
+    provider: str = "antcode",
 ) -> str:
+    if provider not in {"antcode", "github"}:
+        raise ValueError("target must be antcode or github")
     version = package_version(root)
     version_tuple(version)
     if target is not None and target != version:
@@ -92,7 +95,7 @@ def release(
             "release requires attached master after the GitHub PR is merged"
         )
     dirty = bool(run(["git", "status", "--porcelain"], root))
-    print(f"Release {tag}: GitHub source, AntCode {PROJECT} artifacts")
+    print(f"Release {tag}: GitHub source, {provider} artifacts")
     if dry_run:
         print("Dry run: no checks, edits, commits, tags or network writes.")
         print(
@@ -100,7 +103,8 @@ def release(
         )
         print(
             f"Current merged version: {version}. Plan: fetch origin/master; verify HEAD; "
-            "make check; make smoke; create/push GitHub tag only; publish locally; update homepage."
+            "make check; make smoke; create/push GitHub tag only; publish locally"
+            + ("; update homepage." if provider == "antcode" else ".")
         )
         return tag
     if dirty:
@@ -142,19 +146,22 @@ def release(
             run([*GIT, "push", REMOTE, f"refs/tags/{tag}"], root)
         except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
             raise RuntimeError(
-                f"{tag} remains local; fix push access, then run make release RETRY=1"
+                f"{tag} remains local; fix push access, then run make release RETRY=1 TARGET={provider}"
             ) from error
     try:
-        run(["make", "publish-release", f"TAG={tag}"], root)
+        run(["make", "publish-release", f"TAG={tag}", f"TARGET={provider}"], root)
     except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
         raise RuntimeError(
-            f"{tag} is pushed but publication failed; run make release RETRY=1"
+            f"{tag} is pushed but publication failed; run make release RETRY=1 TARGET={provider}"
         ) from error
+    if provider == "github":
+        print(f"Published {tag} to GitHub.")
+        return tag
     try:
         run(["make", "publish-site-release", f"TAG={tag}"], root)
     except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
         raise RuntimeError(
-            f"{tag} Release exists but homepage update failed; run make release RETRY=1"
+            f"{tag} Release exists but homepage update failed; run make release RETRY=1 TARGET={provider}"
         ) from error
     print(f"Published {tag} to AntCode and updated the homepage.")
     return tag
@@ -178,9 +185,15 @@ def main() -> int:
         default=os.environ.get("RETRY") == "1",
         help="retry the current version's local build, tag push and publication",
     )
+    parser.add_argument("--target", choices=["antcode", "github"], default="antcode")
     args = parser.parse_args()
     try:
-        release(target=args.version, dry_run=args.dry_run, retry=args.retry)
+        release(
+            target=args.version,
+            dry_run=args.dry_run,
+            retry=args.retry,
+            provider=args.target,
+        )
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
         print(f"release: FAIL: {error}")
         return 1
