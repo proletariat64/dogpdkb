@@ -44,8 +44,13 @@ try:
         fcntl.flock(lock, fcntl.LOCK_EX)
         previous = destination.read_bytes() if destination.exists() else None
         previous_mode = destination.stat().st_mode & 0o7777 if previous is not None else 0o644
+        current = None
         if previous is not None:
-            current = json.loads(previous)
+            try:
+                current = json.loads(previous)
+            except (ValueError, UnicodeError):
+                pass  # Preserve raw bytes for rollback, but allow metadata repair.
+        if isinstance(current, dict):
             version = current.get("version", "")
             if (current.get("schema_version") == 1
                     and current.get("channel") == "stable"

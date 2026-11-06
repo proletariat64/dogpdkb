@@ -110,6 +110,7 @@ function filteredDocuments() {
 }
 
 function renderDocuments() {
+  if (!state.data) return;
   const docs = filteredDocuments();
   const shown = docs.slice(0, state.visible);
   const grid = $('document-grid');

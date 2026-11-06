@@ -12,9 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.mark.skipif(
     shutil.which("node") is None, reason="Node.js required for site tests"
 )
-def test_release_component():
+@pytest.mark.parametrize("component", ["release", "catalog"])
+def test_site_component(component):
     subprocess.run(
-        ["node", "--test", str(ROOT / "tests/site_release.test.cjs")],
+        ["node", "--test", str(ROOT / f"tests/site_{component}.test.cjs")],
         check=True,
         capture_output=True,
         text=True,

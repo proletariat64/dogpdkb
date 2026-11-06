@@ -324,3 +324,28 @@ def test_unsafe_release_never_writes_remote(release, installer, monkeypatch):
     with pytest.raises(tool.SitePublishError):
         tool.publish("v1.2.3")
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "previous", [b"", b"{broken", b"\xff", b"null", b"[]", b'"text"', b"42", b"false"]
+)
+@pytest.mark.parametrize("verification_fails", [False, True])
+def test_remote_repairs_invalid_metadata_with_rollback(
+    tmp_path, monkeypatch, release, installer, previous, verification_fails
+):
+    data = tool.metadata("v1.2.3", release, installer)
+    destination, stage = run_remote(tmp_path, monkeypatch, data)
+    destination.write_bytes(previous)
+    destination.chmod(0o640)
+    if verification_fails:
+        monkeypatch.setattr(request, "urlopen", lambda *a, **kw: Response(b"{}"))
+        with pytest.raises(ValueError, match="HTTP verification failed"):
+            execute_remote(tmp_path)
+        assert destination.read_bytes() == previous
+        assert destination.stat().st_mode & 0o777 == 0o640
+    else:
+        execute_remote(tmp_path)
+        assert json.loads(destination.read_bytes()) == data
+        assert destination.stat().st_mode & 0o777 == 0o644
+    assert not stage.exists()
+    assert not list(destination.parent.glob(".release-*"))
