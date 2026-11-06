@@ -19,9 +19,12 @@ __pycache__/
 
 # Package build artifacts
 *.egg-info/
+/build/
+/dist/
 
-# Virtualenv
+# Virtualenv and worktree-local CI dependency cache
 .venv/
+/.uv-cache/
 
 # docs
 wash/

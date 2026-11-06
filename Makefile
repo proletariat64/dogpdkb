@@ -1,10 +1,15 @@
 PYTHON ?= python3.12
-DEV_PYTHON = .venv/bin/python
+export DEV_PYTHON=.venv/bin/python
 
-.PHONY: bootstrap test lint
+.PHONY: bootstrap doc-guard test lint check
 
 bootstrap:
 	$(PYTHON) -B scripts/bootstrap.py
+
+doc-guard:
+	$(DEV_PYTHON) scripts/doc_guard.py
+
+check: doc-guard lint test
 
 test:
 	$(DEV_PYTHON) -m pytest -q --durations=20

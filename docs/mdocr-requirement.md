@@ -1,3 +1,5 @@
+# mdocr original requirements
+
 i have scripts/paddleocr_convert.py use paddle ocr api to convert pictures inside a markdown.
 
 now i want to upgrade it into a cli 'mdocr'
