@@ -15,7 +15,7 @@ doc-guard:
 check: doc-guard lint test
 
 build:
-	$(UV) build --python "$(DEV_PYTHON)" --out-dir "$(DIST_DIR)"
+	UV_OFFLINE="$${UV_OFFLINE:-1}" $(UV) build --python "$(DEV_PYTHON)" --out-dir "$(DIST_DIR)"
 
 smoke: build
 	$(DEV_PYTHON) scripts/smoke_install.py --dist "$(DIST_DIR)"
