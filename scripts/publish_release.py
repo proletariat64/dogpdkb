@@ -113,11 +113,36 @@ def publish(tag, dist, project, require_token=False, target="antcode"):
             "gh",
             "api",
             f"repos/{project}/releases/tags/{tag}",
-            absent_ok=absent_ok,
+            absent_ok=True,
         )
         if response is None:
-            return None
-        value = decode(response)
+            # GitHub's by-tag endpoint excludes drafts. Check all authenticated
+            # release pages before deciding that a new release may be created.
+            listing = command(
+                "gh", "api", f"repos/{project}/releases", "--paginate", "--slurp"
+            )
+            try:
+                pages = json.loads(listing)
+            except (ValueError, TypeError):
+                raise PublishError("Invalid GitHub release listing") from None
+            if not isinstance(pages, list) or any(
+                not isinstance(page, list)
+                or any(not isinstance(row, dict) for row in page)
+                for page in pages
+            ):
+                raise PublishError("Invalid GitHub release listing")
+            matches = [
+                row for page in pages for row in page if row.get("tag_name") == tag
+            ]
+            if len(matches) > 1:
+                raise PublishError("Duplicate GitHub release tags")
+            if not matches:
+                if absent_ok:
+                    return None
+                raise PublishError("GitHub release missing after creation")
+            value = matches[0]
+        else:
+            value = decode(response)
         if (
             not {"id", "tag_name", "target_commitish", "draft", "body", "assets"}
             <= value.keys()
