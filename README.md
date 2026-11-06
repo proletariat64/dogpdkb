@@ -1,15 +1,38 @@
+# dogpdkb
 
-repo root
+The deliverable is the complete **dogpdkb knowledge synchronization platform**:
+Yuque discovery/export, image preparation/OCR, incremental graph updates, and Web
+data publication. The `mdocr` command is an included component, not a separate
+release unit. See [platform installation and preflight](docs/platform.md).
 
-## data dir structure .gitignore
+## Server installation
 
-+- inbox/   raw knowledge materials before standardized
-+- wiki/ llm wiki
- +- graphify_flatten_ready/  pre-processed knowledge markdowns
- +- graphify_output/  compiled llm graphic wiki
-+- skylark_books/ skylark URLs and its sync records
+The [product homepage](http://poolab-iys595a7znqgza1e.inc.alipay.net/kb/#install)
+shows a copyable Linux installation command and links to AntCode Releases. It
+explicitly distinguishes preview packages from stable versions.
 
-## src
+Published Releases include a version-bound installer. On Linux, replace `v0.1.1`
+with an existing Release tag:
+
+```bash
+curl -fsSL https://code.alipay.com/pd.pt/dogpdkb/releases/download/v0.1.1/install.sh | bash
+```
+
+No AntCode CLI or login is required on the server. Run a new version's command
+to upgrade while preserving configuration and data. See
+[installation, paths and prerequisites](docs/installing.md).
+
+## Repository layout
+
+- `src/dogpdkb/`: installed platform CLI, doctor, configuration templates and workflows.
+- `src/mdocr/`: included Markdown image preparation and OCR component.
+- `scripts/`: development helpers and backwards-compatible workflow entry points.
+- `tests/`: offline automated tests.
+- `web/kb/`: product homepage and independent installation/release panel.
+- `docs/`: engineering documentation.
+- `skylark_books/`: source registry and legacy source reference.
+- `inbox/`: incoming knowledge materials.
+- `graphify_flatten_ready/`: local corpus and graph artifacts, ignored by Git.
 
 ## mdocr — Markdown image prepare/OCR CLI
 
@@ -19,25 +42,45 @@ activate the worktree-local environment:
 
 ```bash
 make bootstrap
-source .venv/bin/activate  # exposes the `mdocr` command
+source .venv/bin/activate  # exposes both `dogpdkb` and `mdocr`
 ```
 
-Run `make test` for the test suite and `make lint` for Ruff checks.
+Run `make check` before pushing: it runs `make doc-guard`, `make lint`, and
+`make test`. Each command can also be run independently. See
+[the document and CI rules](docs/doc-guard.md) for scope and conventions.
+
+Use `make build` for the platform wheel/source distribution, `make smoke` for
+an isolated installation test, and `make doctor` for offline operational preflight
+(or `make doctor DOCTOR_ARGS=--package` for package-only checks).
+
+GitHub is the source repository: development and version changes go through a PR
+and merge into `master`. From the clean, synchronized `master` checkout, run
+`make release` to publish the already-reviewed package version. It pushes only the
+source tag to GitHub; AntCode hosts installation attachments, not a copy of the
+source branch. Preview with `make release DRY_RUN=1`. See
+[local release and retry](docs/releasing.md). Publication uses the local AntCode
+login and finishes by updating the homepage through `poolab`; see
+[homepage delivery](docs/homepage.md).
+
+GitHub Actions runs `make check` and `make smoke` on every push and pull request,
+after bootstrapping Python 3.12 with the committed `uv.lock`. The checks do not
+require Yuque/PaddleOCR credentials or local corpus/graph artifacts. To block
+merges, configure the repository's branch rules to require the `check` status;
+adding a workflow alone does not enforce branch protection.
 
 ### Yuque Knowledge Base Sync
 
 ```bash
 source ~/.bashrc
 
-# Preview only; do not modify any data
-.venv/bin/python scripts/sync_knowledge_base.py --dry-run
+# Discover a plan only: does not publish corpus/graph/Web, but writes staging files
+dogpdkb sync --dry-run
 
-# Sync the corpus, Graphify graph, and Web pages
-.venv/bin/python scripts/sync_knowledge_base.py
+# Sync the corpus, Graphify graph, and Web data
+dogpdkb sync
 
 # Resume after a failure
-.venv/bin/python scripts/sync_knowledge_base.py \
-  --resume --staging <previous-run-directory>
+dogpdkb sync --resume --staging <previous-run-directory>
 ```
 
 Supports Doc, Sheet, Table, and image OCR. Incremental updates only; no full graph rebuild.
@@ -101,8 +144,10 @@ Notes:
 
 ### Configuration and book registry
 
-All knowledge-sync entry points accept `--config <file>`. With no input they
-read the repository's `default.toml` (independent of the current directory).
+All knowledge-sync entry points accept `--config <file>`. In a source checkout,
+with no input they read the repository's `default.toml` (independent of the current
+directory). A wheel installation instead reads `./dogpdkb.toml` from the caller's
+working directory; `dogpdkb init-config` creates portable, disabled examples.
 `DOGPDKB_CONFIG` can select another file; an explicit `--config` wins. A selected
 file replaces `default.toml`, rather than merging with it.
 

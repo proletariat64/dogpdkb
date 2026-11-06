@@ -51,7 +51,7 @@ def seed_from_main(destination: Path, lockfile: Path) -> None:
             continue
         records = []
         for record in distribution.files or ():
-            source = Path(distribution.locate_file(record)).resolve()
+            source = Path(str(distribution.locate_file(record))).resolve()
             if not source.is_file() or "__pycache__" in source.parts:
                 continue
             if not source.is_relative_to(source_prefix):
@@ -164,12 +164,13 @@ def main() -> None:
     )
     verification = """
 import pathlib, sys
-import mdocr, pytest, requests, ruff
+import dogpdkb, mdocr, pytest, requests, ruff
 from PIL import Image
 root = pathlib.Path(sys.argv[1]).resolve()
 assert pathlib.Path(sys.prefix).resolve() == root / '.venv', sys.prefix
 expected = root / 'src/mdocr/__init__.py'
 assert pathlib.Path(mdocr.__file__).resolve() == expected, mdocr.__file__
+assert pathlib.Path(dogpdkb.__file__).resolve() == root / 'src/dogpdkb/__init__.py'
 print('bootstrap: PASS; environment and source belong to', root)
 """
     subprocess.run(

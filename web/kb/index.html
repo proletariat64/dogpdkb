@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="全球资金平台产品知识库：语雀文档、产品主题与知识图谱的统一入口。">
+  <title>dogpdkb · 产品知识库</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="release.css?v=1">
+  <script src="app.js" defer></script>
+  <script src="release.js?v=1" defer></script>
+</head>
+<body>
+<header class="site-header">
+  <a class="brand" href="./"><span class="brand-icon">k.</span> dogpdkb <span class="brand-sub">/ knowledge</span></a>
+  <nav aria-label="页面导航">
+    <a class="active" href="#overview">知识总览</a>
+    <a href="#topics">主题速览</a>
+    <a href="map/">知识地图</a>
+    <a href="#documents">文档检索</a>
+    <a href="#install">安装平台</a>
+    <a class="primary" href="https://yuque.antfin.com/global-fund-platform/gom7xx" target="_blank" rel="noopener">语雀源库 ↗</a>
+  </nav>
+</header>
+<main>
+  <section id="overview" class="hero">
+    <div>
+      <p class="eyebrow">THE GLOBAL FUND PLATFORM KNOWLEDGE GRAPH</p>
+      <h1>让分散的产品知识，<br>彼此连接<span>。</span></h1>
+      <p class="intro">从语雀文档到可追溯的知识图谱。<br>在一个入口中探索产品概念、业务关系与原始知识脉络。</p>
+      <div class="hero-links"><a href="#documents" class="primary">检索知识 ↓</a><span id="snapshot-label">正在读取知识快照</span></div>
+    </div>
+    <aside class="terminal" aria-label="知识图谱运行摘要">
+      <div class="terminal-head"><span>● ● ●</span><span>graphify / read-only snapshot</span></div>
+      <p><span class="muted"># 用自然语言探索产品知识</span></p>
+      <p><span class="green">$</span> graphify query <span class="muted">"跨境付款如何清算？"</span></p>
+      <hr>
+      <div class="terminal-line"><span class="green">✓</span> 语雀增量同步，保留文档来源</div>
+      <div class="terminal-line"><span class="green">✓</span> OCR 图片文本进入知识体系</div>
+      <div class="terminal-line"><span class="green">✓</span> 概念、关系与主题统一连接</div>
+      <div class="terminal-stats">
+        <div><strong id="document-count">—</strong><span>Documents</span></div>
+        <div><strong id="node-count">—</strong><span>Nodes</span></div>
+        <div><strong id="edge-count">—</strong><span>Relations</span></div>
+        <div><strong id="community-count">—</strong><span>Communities</span></div>
+      </div>
+    </aside>
+  </section>
+
+  <section id="install" class="install-panel" aria-labelledby="install-title">
+    <div class="install-intro">
+      <p class="eyebrow">BUILD YOUR KNOWLEDGE PLATFORM</p>
+      <h2 id="install-title">把知识连接，带到你的服务器。</h2>
+      <p>安装 dogpdkb，同步文档、处理图片、维护知识图谱。<br>一条命令开始，配置与数据由你掌握。</p>
+      <div class="install-badges"><span class="platform-badge">Linux only</span><span id="release-version" class="release-badge">正在读取版本</span></div>
+      <a id="release-link" class="release-link" href="https://code.alipay.com/pd.pt/dogpdkb/releases" target="_blank" rel="noopener noreferrer">AntCode Releases · 版本与下载 ↗</a>
+    </div>
+    <div class="install-console">
+      <div class="install-console-head"><span><span class="install-dot" aria-hidden="true"></span> INSTALL / UPGRADE</span><button id="copy-install" type="button" disabled>复制命令</button></div>
+      <label for="install-command" class="visually-hidden">Linux 安装命令</label>
+      <textarea id="install-command" readonly spellcheck="false" aria-describedby="install-status" placeholder="正在获取安装命令…" rows="3"></textarea>
+      <p id="install-status" role="status" aria-live="polite">正在读取发布信息…</p>
+      <p class="install-footnote">无需 AntCode 登录 · 已安装时可升级 · 保留配置与数据</p>
+      <p class="install-caveat">仅安装程序，不启动同步。首次使用仍需配置知识源、认证与 Graphify。</p>
+      <noscript><p>请启用 JavaScript，或前往 AntCode Releases 获取对应版本的 install.sh。</p></noscript>
+    </div>
+  </section>
+
+  <div id="global-status" class="notice" role="status">正在加载知识快照…</div>
+
+  <section id="topics" class="section">
+    <div class="section-top">
+      <div><p class="eyebrow">EXPLORE KNOWLEDGE DOMAINS</p><h2>主题地图 <span id="topic-total" class="count">—</span></h2></div>
+      <p class="section-note">由图谱社区自动聚类，呈现知识之间的连接。</p>
+    </div>
+    <div id="topic-grid" class="topic-grid"></div>
+  </section>
+
+  <section id="documents" class="section">
+    <div class="section-top">
+      <div><p class="eyebrow">SEARCH THE CORPUS</p><h2>文档检索 <span id="document-total" class="count">—</span></h2></div>
+      <label class="search"><span>⌕</span><input id="search" type="search" placeholder="搜索标题、目录或产品概念…" aria-label="搜索知识库文档"><kbd>/</kbd></label>
+    </div>
+    <div class="filters" role="group" aria-label="按知识领域筛选">
+      <button type="button" class="selected" data-group="all">全部知识</button>
+      <button type="button" data-group="收付款">收付款 <span>Payment</span></button>
+      <button type="button" data-group="核算">核算 <span>Accounting</span></button>
+      <button type="button" data-group="资金方案">资金方案 <span>Funding</span></button>
+      <button type="button" data-group="外汇">外汇 <span>FX</span></button>
+      <button type="button" data-group="流动性">流动性 <span>Liquidity</span></button>
+      <button type="button" data-group="Whale">Whale <span>Program</span></button>
+      <button type="button" data-group="项目规划">项目规划 <span>Planning</span></button>
+    </div>
+    <div class="results-bar"><span id="results" role="status">正在加载文档…</span><label>排序 <select id="sort" aria-label="文档排序"><option value="recent">最近更新</option><option value="title">标题 A–Z</option></select></label></div>
+    <div id="document-grid" class="document-grid"></div>
+    <p id="empty" class="empty" hidden>没有匹配的文档。试试其他关键词或知识领域。</p>
+    <button id="load-more" class="outline load-more" type="button" hidden>加载更多文档</button>
+  </section>
+
+  <section class="contribute">
+    <div><p class="eyebrow">SOURCE OF TRUTH</p><h2>知识持续生长，来源始终可追溯。</h2><p>语雀是内容源库，dogpdkb 负责增量同步、OCR 与知识图谱维护。本页面只读展示当前快照。</p></div>
+    <a href="https://yuque.antfin.com/global-fund-platform/gom7xx" class="outline" target="_blank" rel="noopener">访问语雀知识库 ↗</a>
+  </section>
+</main>
+<footer><span>dogpdkb / 全球资金平台产品知识库。</span><div><a href="/">Web 主页</a><a href="catalog.json">JSON 快照</a><span id="generated-at">Snapshot —</span></div></footer>
+
+<dialog id="detail">
+  <button id="detail-close" class="close" type="button" aria-label="关闭详情">×</button>
+  <p id="detail-type" class="eyebrow">KNOWLEDGE DETAIL</p>
+  <h2 id="detail-title">知识详情</h2>
+  <div id="detail-content" class="detail-content"></div>
+</dialog>
+</body>
+</html>

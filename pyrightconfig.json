@@ -1,11 +1,11 @@
 {
   "venvPath": ".",
   "venv": ".venv",
-  "include": ["src/mdocr", "tests", "scripts"],
+  "include": ["src", "tests", "scripts"],
   "executionEnvironments": [
     {
       "root": ".",
-      "extraPaths": ["src"]
+      "extraPaths": ["src", "src/dogpdkb/workflows"]
     }
   ]
 }
