@@ -228,6 +228,30 @@ An ad-hoc `--skylark-url` uses the `adhoc` key: provide separate `--input`,
 The pipeline forwards `--config` to every child entry point and records effective
 non-secret settings in its checkpoint. Resume rejects changed configuration;
 older checkpoints without configuration metadata require a new staging run.
+Read-only MCP requests retry recognized temporary timeouts, rate limits, and
+service/network failures with bounded exponential backoff and jitter.
+`skylark.max_retries` counts retries after the initial attempt. Authentication,
+permission, parameter, and unknown failures stop without that retry loop. Logs
+distinguish the local wait deadline from a timeout returned by the remote call;
+a returned `Request timeout for 15000 ms` does not describe the local timeout
+setting.
+
+On failure or cancellation, keep the staging directory and use the printed
+`Retry:` command with the same configuration and environment. An incomplete
+listing is fetched in full on resume: saved offset pages are diagnostic files,
+not a consistent remote snapshot. A completed plan is reused. For that fixed
+plan, valid export and OCR checkpoints are reused; missing artifacts are redone.
+Resume does not request every completed document's latest remote version.
+
+Required export or OCR failures leave a failed diagnostic manifest and prevent
+corpus publication, planned deletion, sync-state updates, and graph/Web stages.
+This also applies to direct `apply` and `apply --no-merge`; an empty new document
+may be explicitly skipped, while an existing document becoming empty is updated.
+After successful recovery, publication uses the whole fixed batch. Once
+publication begins, disk errors or cancellation may leave some files published;
+there is no transaction across the entire corpus and no automatic rollback of
+partial batches published by older versions.
+
 Graph updates also pin the original graph artifacts before extraction, build
 from that backup, and compare bytes before publication. A staging directory from
 before this baseline checkpoint was introduced must be replaced by a new run.

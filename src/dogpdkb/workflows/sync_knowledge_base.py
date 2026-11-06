@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 from collections.abc import Callable
@@ -14,6 +15,7 @@ SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 
 from apply_sync_updates import corpus_max_date
+from get_sync_updates import safe_diagnostic
 
 from mdocr.config import (
     SyncConfig,
@@ -40,6 +42,7 @@ class PipelineOptions:
     settings: SyncConfig | None = None
     book_name: str = ""
     rebase_graph: bool = False
+    book_key: str | None = None
 
 
 def read_json(path: Path) -> dict:
@@ -74,6 +77,36 @@ def _config(options: PipelineOptions) -> dict:
         "settings": options.settings.snapshot() if options.settings else None,
         "book_name": options.book_name,
     }
+
+
+def recovery_command(options: PipelineOptions) -> str:
+    """Reproduce the same task selection without exposing environment credentials."""
+    command = [sys.executable, str(SCRIPTS / "sync_knowledge_base.py"), "--resume"]
+    for flag, path in (
+        ("--staging", options.staging),
+        ("--input", options.input_dir),
+        ("--graph-dir", options.graph_dir),
+        ("--web-dir", options.web_dir),
+        ("--graphify-python", options.graphify_python),
+    ):
+        command.extend([flag, str(path.expanduser().absolute())])
+    if options.settings:
+        command.extend(["--config", str(options.settings.file)])
+    if options.book_key:
+        command.extend(["--book", options.book_key])
+    else:
+        command.extend(["--skylark-url", options.source_url])
+    if options.cutoff is not None:
+        command.extend(["--cutoff", options.cutoff])
+    for flag, enabled in (
+        ("--dry-run", options.dry_run),
+        ("--skip-graph", options.skip_graph),
+        ("--skip-web", options.skip_web),
+        ("--rebase-graph", options.rebase_graph),
+    ):
+        if enabled:
+            command.append(flag)
+    return shlex.join(command)
 
 
 def run_pipeline(
@@ -122,28 +155,96 @@ def run_pipeline(
             state["outputs"].pop(stage, None)
         write_json(state_path, state)
 
+    def record_failure(name: str, error: BaseException) -> None:
+        if isinstance(error, subprocess.CalledProcessError):
+            reason = f"subprocess exited {error.returncode}"
+        else:
+            reason = safe_diagnostic(error) or "cancelled"
+        state["stages"][name] = "retry_required"
+        state["status"] = "failed"
+        state["error"] = reason
+        write_json(state_path, state)
+        print(
+            f"[{name}] failed: {reason}; completed_stages="
+            f"{sum(value == 'completed' for value in state['stages'].values())}; "
+            f"staging kept at {staging}",
+            file=sys.stderr,
+        )
+        if name == "plan":
+            print(
+                "Plan incomplete: completed=0 failed=1; resume will refetch the entire listing; "
+                "saved offset pages are diagnostic only (no remote snapshot token).",
+                file=sys.stderr,
+            )
+        elif name == "corpus":
+            try:
+                manifest = read_json(staging / "manifest.json")
+            except (OSError, ValueError):
+                manifest = {}
+            failures = manifest.get("failures") or [
+                row
+                for row in manifest.get("skipped") or []
+                if row.get("reason") != "empty document body"
+            ]
+            completed_exports = len(manifest.get("exported") or [])
+            try:
+                progress = read_json(staging / "export-progress.json")
+            except (OSError, ValueError):
+                pass
+            else:
+                completed_exports = sum(
+                    row.get("status") == "exported"
+                    and (staging / "raw" / row.get("file", "")).is_file()
+                    for row in (progress.get("documents") or {}).values()
+                )
+            print(
+                f"Corpus: completed_exports={completed_exports} "
+                f"failed={len(failures) or 1}; valid export/OCR checkpoints will be reused; "
+                "a completed plan will be reused. Publication may be partial if it had started.",
+                file=sys.stderr,
+            )
+            for row in failures[:10]:
+                unit = row.get("id", row.get("file", "unknown"))
+                print(
+                    f"  {safe_diagnostic(row.get('stage', 'export'), 30)} "
+                    f"unit={safe_diagnostic(unit, 100)}: "
+                    f"{safe_diagnostic(row.get('reason', 'failed'))}",
+                    file=sys.stderr,
+                )
+        print("Retry with the same configuration and environment:", file=sys.stderr)
+        print(f"Retry: {recovery_command(options)}", file=sys.stderr)
+
     def with_config(command: list[str]) -> list[str]:
         if options.settings:
             command.extend(["--config", str(options.settings.file)])
         return command
 
     def execute(name: str, command: list[str], output: Path) -> None:
-        if state["stages"].get(name) == "completed":
-            if not output.is_file():
-                raise RuntimeError(f"cannot resume {name}: missing {output}")
-            print(f"[{name}] reuse {output}", flush=True)
-            return
+        reuse = state["stages"].get(name) == "completed"
         state["current_stage"] = name
         state["status"] = "running"
         write_json(state_path, state)
         try:
-            runner(with_config(command))
+            if reuse:
+                print(f"[{name}] reuse {output}", flush=True)
+            else:
+                runner(with_config(command))
             if not output.is_file():
                 raise RuntimeError(f"{name} did not produce {output}")
+            if name == "corpus":
+                manifest = read_json(output)
+                failures = manifest.get("failures") or [
+                    row
+                    for row in manifest.get("skipped") or []
+                    if row.get("reason") != "empty document body"
+                ]
+                if failures or manifest.get("status") not in (None, "completed"):
+                    raise RuntimeError(
+                        f"corpus incomplete: {len(failures)} failed units; "
+                        f"manifest status={manifest.get('status', 'legacy')}"
+                    )
         except BaseException as error:
-            state["status"] = "failed"
-            state["error"] = str(error)
-            write_json(state_path, state)
+            record_failure(name, error)
             raise
         state["stages"][name] = "completed"
         state["outputs"][name] = str(output)
@@ -175,9 +276,7 @@ def run_pipeline(
                 raise RuntimeError("plan did not produce a sync JSON")
             plan_output = plans[-1]
         except BaseException as error:
-            state["status"] = "failed"
-            state["error"] = str(error)
-            write_json(state_path, state)
+            record_failure("plan", error)
             raise
         state["stages"]["plan"] = "completed"
         state["outputs"]["plan"] = str(plan_output)
@@ -224,19 +323,6 @@ def run_pipeline(
     ]
     apply_command.extend(["--cutoff", state["cutoff"]])
     execute("corpus", apply_command, manifest_path)
-    manifest = read_json(manifest_path)
-    failed_exports = [
-        row
-        for row in manifest.get("skipped") or []
-        if row.get("reason") != "empty document body"
-    ]
-    if failed_exports and state["stages"].get("corpus") == "completed":
-        state["stages"]["corpus"] = "retry_required"
-        state["status"] = "failed"
-        state["error"] = f"{len(failed_exports)} documents failed to export"
-        write_json(state_path, state)
-        raise RuntimeError(state["error"])
-
     graph_result_path = staging / "graph-update" / "result.json"
     if options.skip_graph:
         state["stages"]["graph"] = "skipped"
@@ -356,10 +442,16 @@ def main() -> None:
         settings=config,
         book_name=source.name,
         rebase_graph=args.rebase_graph,
+        book_key=source.key if args.skylark_url is None else None,
     )
     if args.resume:
         print(f"Resuming completed stages in {options.staging}", flush=True)
-    run_pipeline(options)
+    try:
+        run_pipeline(options)
+    except KeyboardInterrupt:
+        parser.exit(130, "sync cancelled; retained checkpoints can be resumed\n")
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+        parser.exit(1, f"sync failed: {safe_diagnostic(error)}\n")
 
 
 if __name__ == "__main__":
