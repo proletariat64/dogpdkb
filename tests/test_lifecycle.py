@@ -17,6 +17,7 @@ from tests.test_install import Installer
 def managed(tmp_path, monkeypatch):
     installer = Installer(tmp_path)
     assert installer.run().returncode == 0
+    monkeypatch.setattr(lifecycle.importlib.metadata, "version", lambda name: "0.1.0")
     monkeypatch.setenv("HOME", str(installer.home))
     monkeypatch.setattr(
         lifecycle.sys, "prefix", str((installer.prefix / "current").resolve())
