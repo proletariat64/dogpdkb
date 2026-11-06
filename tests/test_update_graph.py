@@ -304,3 +304,82 @@ def test_blank_document_removes_old_semantics_without_extraction(
     assert filename in manifest
     assert "old-[1].md" not in manifest
     assert manifest["outside-[2].md"] == {"keep": True}
+
+
+@pytest.mark.parametrize("change", ["update", "empty", "delete"])
+def test_rebased_delta_removes_third_filename_for_same_document(
+    tmp_path, monkeypatch, change
+):
+    from pathlib import Path
+    from types import ModuleType
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    current = "current-[1].md"
+    (corpus / current).write_text("new" if change == "update" else "")
+    graph = corpus / "graphify-out"
+    graph.mkdir()
+    untouched = {"id": "other", "label": "Keep", "source_file": "other-[2].md"}
+    baseline = {
+        "directed": True,
+        "graph": {},
+        "nodes": [
+            {"id": "stale", "label": "Stale concept", "source_file": "third-[1].md"},
+            untouched,
+        ],
+        "links": [
+            {"source": "stale", "target": "other", "source_file": "third-[1].md"}
+        ],
+        "hyperedges": [{"nodes": ["stale", "other"], "source_file": "third-[1].md"}],
+    }
+    update_graph.write_json(graph / "graph.json", baseline)
+    update_graph.write_json(
+        graph / "manifest.json", {"third-[1].md": {}, "other-[2].md": {"keep": True}}
+    )
+    staging = tmp_path / "stage"
+    staging.mkdir()
+    base = update_graph.prepare_base(graph, staging)
+    monkeypatch.setattr(update_graph, "analysis_artifacts", lambda *args: {})
+    monkeypatch.setattr(
+        update_graph,
+        "extract_semantic",
+        lambda *args: (
+            {
+                "nodes": [
+                    {"id": "new", "label": "New concept", "source_file": current}
+                ],
+                "edges": [],
+                "hyperedges": [],
+            },
+            {"input_tokens": 0, "output_tokens": 0},
+        ),
+    )
+    detect = ModuleType("graphify.detect")
+
+    def save_manifest(files, *, manifest_path, **kwargs):
+        path = Path(manifest_path)
+        payload = update_graph.load_json(path)
+        payload.update({Path(name).name: {} for name in files["document"]})
+        update_graph.write_json(path, payload)
+
+    detect.save_manifest = save_manifest
+    monkeypatch.setitem(sys.modules, "graphify.detect", detect)
+    candidate, _ = update_graph.build_candidate(
+        corpus,
+        graph,
+        staging,
+        [] if change == "delete" else [current],
+        ["original-[1].md"],
+        ["original-[1].md"] if change == "delete" else [],
+        {},
+        base_dir=base,
+    )
+    result = update_graph.load_json(candidate / "graph.json")
+    assert "stale" not in {node["id"] for node in result["nodes"]}
+    assert untouched in result["nodes"]
+    assert result["links"] == []
+    assert result["hyperedges"] == []
+    assert len(result["nodes"]) == (2 if change == "update" else 1)
+    manifest = update_graph.load_json(candidate / "manifest.json")
+    assert "third-[1].md" not in manifest
+    assert manifest["other-[2].md"] == {"keep": True}

@@ -212,6 +212,31 @@ def build_candidate(
     base_dir: Path,
 ) -> tuple[Path, dict[str, Any]]:
     old = load_json(base_dir / "graph.json")
+    # A rebase can introduce another filename for a document in this delta.
+    # Derive ownership from the pinned baseline, not only the corpus backup.
+    affected_ids = {
+        identity
+        for name in [*current_files, *old_files, *deleted_files]
+        if (identity := doc_id(name)) is not None
+    }
+    baseline_sources = {
+        Path(str(record.get("source_file") or "")).name
+        for kind in ("nodes", "links", "hyperedges")
+        for record in old.get(kind, [])
+    }
+    baseline_manifest = base_dir / "manifest.json"
+    if baseline_manifest.exists():
+        baseline_sources.update(
+            Path(name).name for name in load_json(baseline_manifest)
+        )
+    old_files = sorted(
+        set(old_files)
+        | {
+            name
+            for name in baseline_sources
+            if doc_id(name) in affected_ids and name not in current_files
+        }
+    )
     labels_path = base_dir / ".graphify_labels.json"
     labels = load_json(labels_path) if labels_path.exists() else {}
     # Empty tracked documents have no concepts to extract. Treat their former
