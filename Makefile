@@ -3,7 +3,7 @@ export DEV_PYTHON=.venv/bin/python
 UV ?= uv
 DIST_DIR ?= dist
 
-.PHONY: bootstrap doc-guard test lint check build smoke doctor
+.PHONY: bootstrap doc-guard test lint check build smoke doctor release publish-release publish-site-release
 
 bootstrap:
 	$(PYTHON) -B scripts/bootstrap.py
@@ -21,6 +21,16 @@ smoke: build
 
 doctor:
 	$(DEV_PYTHON) -m dogpdkb doctor $(DOCTOR_ARGS)
+
+release:
+	VERSION="$(VERSION)" DRY_RUN="$(DRY_RUN)" RETRY="$(RETRY)" \
+		$(DEV_PYTHON) scripts/release.py
+
+publish-release:
+	$(DEV_PYTHON) scripts/publish_release.py --tag "$(TAG)" --dist "$(DIST_DIR)" $(PUBLISH_ARGS)
+
+publish-site-release:
+	$(DEV_PYTHON) scripts/publish_site_release.py --tag "$(TAG)"
 
 test:
 	$(DEV_PYTHON) -m pytest -q --durations=20
