@@ -57,16 +57,30 @@ Graphify and operational authentication remain separate prerequisites; see
 ## Upgrade and retry
 
 Stop active sync/OCR/graph jobs before upgrading or uninstalling. From an
-installer-managed deployment starting with v0.1.1:
+AntCode installer-managed deployment starting with v0.1.1:
 
 ```bash
 dogpdkb update --version 0.1.2  # example: must already be published
 ```
 
 The version is explicit: this command does not guess the latest release or require
-an AntCode login. It downloads the matching installer from the fixed HTTPS Release
+an AntCode login. It downloads the matching installer from the fixed AntCode HTTPS Release
 origin and uses the same installation flow. A v0.1.0 installation does not have the
 new commands; run the newer version's curl installer once to upgrade it.
+
+For GitHub releases, upgrade by running the target version's GitHub installer:
+
+```bash
+# Example: v0.1.2 must already be published with public installation assets.
+bash -o pipefail -c 'curl -fsSL https://github.com/proletariat64/dogpdkb/releases/download/v0.1.2/install.sh | bash'
+```
+
+`dogpdkb update` does not infer the installation's provider: it always uses AntCode,
+so it cannot retrieve GitHub-only versions. The GitHub installer uses the same
+upgrade flow described below. For a custom installation, pass the original
+`DOGPDKB_HOME`, `DOGPDKB_BIN_DIR` and `DOGPDKB_CONFIG_DIR` to the installer again;
+otherwise it targets the default paths. Keep any required `DOGPDKB_PYPI_INDEX`
+override as well.
 
 A fresh virtual environment is built and checked before an atomic `current`
 symlink switch. A failed download, checksum, package install or doctor leaves the

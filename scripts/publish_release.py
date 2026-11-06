@@ -132,7 +132,9 @@ def publish(tag, dist, project, require_token=False, target="antcode"):
             {
                 "id": value["id"],
                 "tag_name": value["tag_name"],
-                "revision": value["target_commitish"],
+                # An existing tag ignores target_commitish (often a branch name).
+                # The local and remote tag commits are verified before show().
+                "revision": head,
                 "is_draft": value["draft"],
                 "description": value["body"],
                 "assets": [

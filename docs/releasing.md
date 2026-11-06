@@ -64,6 +64,11 @@ creation, upload, download and finalization. Its installer points to GitHub
 release downloads. GitHub access follows repository visibility; private-repo
 assets are not anonymously downloadable by the curl installer.
 
+GitHub installations are upgraded by rerunning the target version's GitHub
+`install.sh`, preserving any custom installation paths. `dogpdkb update` currently
+uses AntCode only and cannot fetch GitHub-only versions; see the
+[GitHub upgrade command](installing.md#upgrade-and-retry).
+
 The homepage helper is AntCode-specific. GitHub releases skip that step and
 need neither AntCode CLI nor `poolab`; the existing AntCode homepage remains
 managed by the default release flow. Retry with the same `TARGET` to resume

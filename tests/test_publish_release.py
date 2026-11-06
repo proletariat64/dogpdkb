@@ -557,7 +557,7 @@ class FakeGitHub(FakeCLI):
                 self.release = {
                     "id": 12,
                     "tag_name": TAG,
-                    "target_commitish": HEAD,
+                    "target_commitish": "master",
                     "draft": True,
                     "body": args[args.index("--notes") + 1],
                 }
@@ -625,9 +625,7 @@ def test_github_lookup_errors_do_not_create(github, status, capsys):
     assert "secret-provider-body" not in str(capsys.readouterr())
 
 
-@pytest.mark.parametrize(
-    "field,value", [("body", "unrelated"), ("target_commitish", "b" * 40)]
-)
+@pytest.mark.parametrize("field,value", [("body", "unrelated"), ("tag_name", "v9.9.9")])
 def test_github_identity_mismatch_blocks_retry(github, field, value):
     fake, _ = github
     assert run_github() == 0
@@ -646,3 +644,22 @@ def test_github_metadata_is_never_replaced(github):
     assert run_github() == 1
     assert fake.release["draft"] is True
     assert fake.files["install.sh"] == b"conflicting installer"
+
+
+@pytest.mark.parametrize("commitish", ["master", "main", "b" * 40])
+def test_github_retry_uses_verified_tag_not_release_commitish(github, commitish):
+    fake, _ = github
+    fake.fail_upload = SDIST
+    assert run_github() == 1
+    fake.release["target_commitish"] = commitish
+    fake.fail_upload = None
+    assert run_github() == 0
+    assert fake.release["draft"] is False
+
+
+def test_github_tag_mismatch_still_blocks_publication(github):
+    fake, _ = github
+    fake.tag_commit = "b" * 40
+    assert run_github() == 1
+    assert fake.release is None
+    assert all(args[0] == "git" for args in fake.calls)
