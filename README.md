@@ -18,8 +18,18 @@ with an existing Release tag:
 curl -fsSL https://code.alipay.com/pd.pt/dogpdkb/releases/download/v0.1.1/install.sh | bash
 ```
 
-No AntCode CLI or login is required on the server. Run a new version's command
-to upgrade while preserving configuration and data. See
+No AntCode CLI or login is required on the server. Installer-managed deployments
+from v0.1.1 provide explicit lifecycle commands:
+
+```bash
+dogpdkb update --version 0.1.2  # choose an existing published version
+dogpdkb uninstall              # confirm interactively; --yes for automation
+```
+
+An upgrade builds and checks a fresh environment, switches to it, then removes the
+previous managed environment. Uninstall removes managed program files and command
+links, not configuration or user data. A v0.1.0 installation must first run the
+new version's curl installer to gain these commands. See
 [installation, paths and prerequisites](docs/installing.md).
 
 ## Repository layout

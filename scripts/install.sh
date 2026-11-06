@@ -12,7 +12,7 @@ fail() { printf 'dogpdkb install: %s\n' "$*" >&2; exit 1; }
 [[ "$WHEEL_SHA256" =~ ^[a-f0-9]{64}$ ]] || fail 'Invalid release checksum.'
 [[ "$RELEASE_BASE_URL" == https://* ]] || fail 'Release downloads require HTTPS.'
 [[ "$(uname -s)" == Linux ]] || fail 'This installer supports Linux.'
-for tool in curl sha256sum mktemp readlink; do
+for tool in curl sha256sum mktemp readlink flock; do
     command -v "$tool" >/dev/null || fail "Missing prerequisite: $tool"
 done
 
@@ -22,16 +22,54 @@ CONFIG_DIR="${DOGPDKB_CONFIG_DIR:-$HOME/.config/dogpdkb}"
 # Company network default. Override for another trusted mirror or public PyPI.
 INDEX="${DOGPDKB_PYPI_INDEX:-https://pypi.antfin-inc.com/simple/}"
 for path in "$PREFIX" "$BIN_DIR" "$CONFIG_DIR"; do
-    [[ "$path" == /* && "$path" != / ]] || fail 'Installation paths must be absolute and not /.'
+    [[ "$path" == /* && "$path" != / && "$path" != *$'\n'* ]] || fail 'Installation paths must be absolute, single-line, and not /.'
 done
 mkdir -p "$PREFIX" "$BIN_DIR"
 PREFIX=$(cd "$PREFIX" && pwd -P)
 BIN_DIR=$(cd "$BIN_DIR" && pwd -P)
+CONFIG_DIR=$(readlink -m -- "$CONFIG_DIR")
+[[ ! -L "$PREFIX/versions" ]] || fail 'Refusing a symlinked versions directory.'
+for path in "$BIN_DIR" "$CONFIG_DIR"; do
+    [[ "$path" != "$PREFIX/versions" && "$path" != "$PREFIX/versions/"* &&
+       "$PREFIX/versions" != "$path" && "$PREFIX/versions" != "$path/"* ]] || fail 'Configuration and commands must not overlap disposable environments.'
+done
+[[ ! -L "$PREFIX/.lifecycle.lock" ]] || fail 'Refusing a symlinked installation lock.'
+if [[ -n "${DOGPDKB_LOCK_FD:-}" ]]; then
+    [[ "$DOGPDKB_LOCK_FD" =~ ^[0-9]+$ ]] || fail 'Invalid inherited installation lock.'
+    [[ "$(readlink "/proc/$$/fd/$DOGPDKB_LOCK_FD")" == "$PREFIX/.lifecycle.lock" ]] || fail 'Invalid inherited installation lock.'
+    exec 9>&"$DOGPDKB_LOCK_FD"
+else
+    exec 9>"$PREFIX/.lifecycle.lock"
+fi
+flock -n 9 || fail 'Another installation operation is running.'
 
+validate_environment() {
+    local directory="$1"
+    [[ "${directory%/*}" == "$PREFIX/versions" &&
+       "${directory##*/}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[A-Za-z0-9]{6}$ &&
+       ! -L "$directory" && "$(readlink -m -- "$directory")" == "$directory" &&
+       -f "$directory/pyvenv.cfg" && -f "$directory/bin/dogpdkb" && -f "$directory/bin/mdocr" ]] || fail 'Refusing an unmanaged environment.'
+    if [[ -e "$directory/.dogpdkb-managed" || -L "$directory/.dogpdkb-managed" ]]; then
+        [[ ! -L "$directory/.dogpdkb-managed" ]] || fail 'Invalid ownership marker.'
+        local rows=()
+        mapfile -t rows < "$directory/.dogpdkb-managed"
+        [[ "${#rows[@]}" == 4 && "${rows[0]}" == 1 && "${rows[1]}" == "$PREFIX" &&
+           "${rows[2]}" == "$BIN_DIR" && "${rows[3]}" == "$CONFIG_DIR" ]] || fail 'Invalid ownership marker or changed installation paths.'
+    else
+        [[ "$PREFIX" == "$HOME/.local/share/dogpdkb" && "$BIN_DIR" == "$HOME/.local/bin" &&
+           "$CONFIG_DIR" == "$HOME/.config/dogpdkb" &&
+           -L "$BIN_DIR/dogpdkb" && "$(readlink "$BIN_DIR/dogpdkb")" == "$PREFIX/current/bin/dogpdkb" ]] || fail 'Unmarked custom installations cannot be replaced safely.'
+    fi
+}
+OLD_ENV=''
 check_links() {
     if [[ -e "$PREFIX/current" || -L "$PREFIX/current" ]]; then
         [[ -L "$PREFIX/current" ]] || fail 'Refusing to replace an unmanaged current path.'
-        [[ "$(readlink "$PREFIX/current")" == "$PREFIX/versions/"* ]] || fail 'Refusing to replace an unmanaged current link.'
+        local selected
+        selected=$(readlink "$PREFIX/current")
+        [[ "$selected" == "$PREFIX/versions/"* ]] || fail 'Refusing to replace an unmanaged current link.'
+        validate_environment "$selected"
+        OLD_ENV="$selected"
     fi
     for name in dogpdkb mdocr; do
         if [[ -e "$BIN_DIR/$name" || -L "$BIN_DIR/$name" ]]; then
@@ -84,6 +122,8 @@ ENV_DIR=$(mktemp -d "$PREFIX/versions/$VERSION.XXXXXX")
 "$UV" pip install --no-config --python "$ENV_DIR/bin/python" --default-index "$INDEX" "$TMP/$WHEEL"
 [[ "$("$ENV_DIR/bin/dogpdkb" --version)" == "dogpdkb $VERSION" ]] || fail 'Installed version does not match the Release.'
 "$ENV_DIR/bin/dogpdkb" doctor --package
+# This marker records paths, not authority to remove arbitrary directories.
+printf '1\n%s\n%s\n%s\n' "$PREFIX" "$BIN_DIR" "$CONFIG_DIR" > "$ENV_DIR/.dogpdkb-managed"
 
 # Preserve existing or partially configured instances, including symlinks.
 if [[ ! -e "$CONFIG_DIR/dogpdkb.toml" && ! -L "$CONFIG_DIR/dogpdkb.toml" && \
@@ -100,6 +140,11 @@ CURRENT_LINK="$PREFIX/.current.$$"
 mv -Tf -- "$CURRENT_LINK" "$PREFIX/current"
 CURRENT_LINK=''
 ACTIVATED=1
+# Remove only the previously selected, validated environment. Never sweep versions.
+if [[ -n "$OLD_ENV" && "$OLD_ENV" != "$ENV_DIR" ]]; then
+    validate_environment "$OLD_ENV"
+    rm -rf -- "$OLD_ENV"
+fi
 printf 'Installed dogpdkb %s\nCommands: %s/dogpdkb and %s/mdocr\nConfiguration: %s\n' "$VERSION" "$BIN_DIR" "$BIN_DIR" "$CONFIG_DIR"
 printf 'Edit the disabled examples before syncing; Graphify and gateway setup remain separate.\n'
 case ":$PATH:" in

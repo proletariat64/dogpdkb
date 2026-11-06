@@ -67,7 +67,28 @@ def main(argv: list[str] | None = None) -> int:
         "init-config", help="create portable example configuration"
     )
     initialize.add_argument("-o", "--output", type=Path, default=Path.cwd())
+    upgrade = commands.add_parser(
+        "update", help="install a specified Release; retain configuration and data"
+    )
+    upgrade.add_argument("--version", required=True, help="MAJOR.MINOR.PATCH")
+    remove = commands.add_parser(
+        "uninstall", help="remove managed program; retain configuration and data"
+    )
+    remove.add_argument(
+        "--yes", action="store_true", help="confirm noninteractive removal"
+    )
     args = parser.parse_args(arguments)
+    if args.command in ("update", "uninstall"):
+        from dogpdkb import lifecycle
+
+        try:
+            return (
+                lifecycle.update(args.version)
+                if args.command == "update"
+                else lifecycle.uninstall(args.yes)
+            )
+        except (OSError, ValueError) as error:
+            parser.exit(1, f"dogpdkb {args.command}: {error}\n")
     if args.command == "doctor":
         from dogpdkb.doctor import diagnose, print_report
 

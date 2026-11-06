@@ -44,6 +44,8 @@ class Installer:
             "ln",
             "mv",
             "sh",
+            "bash",
+            "flock",
         ):
             (self.tools / name).symlink_to(shutil.which(name))
         self.python_script(
@@ -90,6 +92,7 @@ if args[0] == 'venv':
     directory = pathlib.Path(args[-1]) / 'bin'
     directory.mkdir(parents=True)
     (directory / 'python').symlink_to(sys.executable)
+    (directory.parent / 'pyvenv.cfg').write_text('home = test fixture\\n')
     body = pathlib.Path(os.environ['FAKE_CLI_SOURCE']).read_text().replace('@TEST_VERSION@', os.environ['TEST_VERSION'])
     for name in ('dogpdkb', 'mdocr'):
         path = directory / name
@@ -169,10 +172,13 @@ def test_install_and_upgrade_preserve_config_and_data(installer):
     assert installer.run("0.1.1").returncode == 0
     assert installer.version() == "dogpdkb 0.1.1"
     assert (installer.prefix / "current").resolve() != old
-    assert old.is_dir()
+    assert not old.exists()
     assert config.read_text() == "# user configuration\n"
     assert data.read_text() == "user data"
+    previous = (installer.prefix / "current").resolve()
     assert installer.run("0.1.1").returncode == 0
+    assert not previous.exists()
+    assert len(list((installer.prefix / "versions").iterdir())) == 1
     assert config.read_text() == "# user configuration\n"
 
 
@@ -254,6 +260,47 @@ def test_override_paths_and_mirror(installer):
     assert pip[pip.index("--default-index") + 1] == "https://pypi.org/simple"
 
 
+@pytest.mark.parametrize("damage", ["marker", "current-escape", "versions-link"])
+def test_installer_rejects_unsafe_existing_environment(installer, damage):
+    assert installer.run().returncode == 0
+    old = (installer.prefix / "current").resolve()
+    if damage == "marker":
+        (old / ".dogpdkb-managed").write_text("invalid")
+    elif damage == "current-escape":
+        (installer.prefix / "current").unlink()
+        (installer.prefix / "current").symlink_to(installer.root)
+    else:
+        versions = installer.prefix / "versions"
+        versions.rename(installer.root / "elsewhere")
+        versions.symlink_to(installer.root / "elsewhere")
+    result = installer.run("0.1.1")
+    assert result.returncode != 0
+    assert (installer.config / "books.json").is_file()
+
+
+@pytest.mark.parametrize("relative", ["versions", "versions/config", "."])
+def test_installer_rejects_configuration_overlapping_disposable_environments(
+    installer, relative
+):
+    installer.env["DOGPDKB_CONFIG_DIR"] = str(installer.prefix / relative)
+    result = installer.run()
+    assert result.returncode != 0
+    assert "overlap" in result.stderr
+    assert not (installer.prefix / "current").exists()
+
+
+def test_installer_does_not_sweep_unrelated_versions(installer):
+    assert installer.run().returncode == 0
+    unknown = installer.prefix / "versions/9.9.9.aaaaaa"
+    unknown.mkdir()
+    (unknown / "data.txt").write_text("keep")
+    linked = installer.prefix / "versions/8.8.8.bbbbbb"
+    linked.symlink_to(installer.config)
+    assert installer.run("0.1.1").returncode == 0
+    assert (unknown / "data.txt").read_text() == "keep"
+    assert linked.is_symlink()
+
+
 def test_signal_immediately_after_activation_keeps_environment(installer):
     assert installer.run().returncode == 0
     old = (installer.prefix / "current").resolve()
@@ -273,3 +320,9 @@ if sys.argv[-1].endswith('/current'):
     assert (installer.prefix / "current").resolve().is_dir()
     assert installer.version() == "dogpdkb 0.1.1"
     assert old.is_dir()
+    interrupted = (installer.prefix / "current").resolve()
+    (installer.tools / "mv").unlink()
+    (installer.tools / "mv").symlink_to(real_mv)
+    assert installer.run("0.1.2").returncode == 0
+    assert (installer.prefix / "current").resolve().is_dir()
+    assert not interrupted.exists()
