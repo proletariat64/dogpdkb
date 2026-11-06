@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -42,6 +43,7 @@ from get_sync_updates import (
     corpus_filename,
     load_sync_state,
     resolve_book,
+    safe_diagnostic,
     save_sync_state,
     toc_paths,
 )
@@ -289,6 +291,31 @@ def run_mdocr(files: list[Path], out_dir: Path) -> int:
     return proc.returncode
 
 
+class OCRFailure(RuntimeError):
+    def __init__(self, message: str, file: str) -> None:
+        super().__init__(safe_diagnostic(message))
+        self.file = file
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
+def _write_failure_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    """Keep the original failure and retry output if diagnostic storage fails."""
+    try:
+        _write_json(path, manifest)
+    except OSError as error:
+        print(
+            f"cannot persist failure manifest {path}: {safe_diagnostic(error)}",
+            file=sys.stderr,
+        )
+
+
 def run_ocr_with_resume(files: list[Path], out_dir: Path, state_dir: Path) -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = state_dir / "ocr-complete.json"
@@ -304,11 +331,21 @@ def run_ocr_with_resume(files: list[Path], out_dir: Path, state_dir: Path) -> No
         output = out_dir / path.name
         if path.name in completed and output.is_file():
             continue
-        rc = run_mdocr([path], out_dir)
+        # Missing output invalidates the old completion before OCR can write a
+        # partial replacement and fail or be interrupted.
+        if path.name in completed:
+            completed.remove(path.name)
+            _write_json(checkpoint, {"files": sorted(completed)})
+        try:
+            rc = run_mdocr([path], out_dir)
+        except (OSError, RuntimeError) as error:
+            raise OCRFailure(
+                f"mdocr failed for {path.name}: {error}", path.name
+            ) from error
         if rc != 0:
-            raise RuntimeError(f"mdocr exited {rc} for {path.name}")
+            raise OCRFailure(f"mdocr exited {rc} for {path.name}", path.name)
         if not output.is_file():
-            raise RuntimeError(f"mdocr did not write {output}")
+            raise OCRFailure(f"mdocr did not write {output}", path.name)
         completed.add(path.name)
         temporary = checkpoint.with_suffix(".json.tmp")
         temporary.write_text(
@@ -372,6 +409,28 @@ def main() -> None:
     staging = (
         args.staging or config.staging / source.key / f"sync-{date.today():%Y%m%d}"
     )
+    retry_command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--config",
+        str(config.file),
+        "-i",
+        str(input_dir),
+        "-s",
+        source.url,
+        "--sync-json",
+        str(sync_path),
+        "--staging",
+        str(staging),
+        "--cutoff",
+        cutoff.isoformat(),
+    ]
+    if args.no_merge:
+        retry_command.append("--no-merge")
+
+    def print_retry() -> None:
+        print(f"Retry: {shlex.join(retry_command)}", file=sys.stderr)
+
     raw_dir = staging / "raw"
     ocr_dir = staging / "md"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -380,6 +439,12 @@ def main() -> None:
     source_identity = {
         "path": str(sync_path.resolve()),
         "mtime_ns": sync_path.stat().st_mtime_ns,
+    }
+    configuration = {
+        "input_dir": str(input_dir.resolve()),
+        "source_url": source.url,
+        "cutoff": cutoff.isoformat(),
+        "settings": config.snapshot(),
     }
     completed: dict[str, dict[str, Any]] = {}
     if checkpoint.exists():
@@ -391,13 +456,20 @@ def main() -> None:
             raise SystemExit(
                 "staging belongs to a different sync plan; use a new staging dir"
             )
+        if "configuration" in progress and progress["configuration"] != configuration:
+            raise SystemExit("staging configuration changed; use a new staging dir")
         completed = progress.get("documents") or {}
 
     def save_progress(errors: list[dict[str, Any]]) -> None:
         temporary = checkpoint.with_suffix(".json.tmp")
         temporary.write_text(
             json.dumps(
-                {"source": source_identity, "documents": completed, "errors": errors},
+                {
+                    "source": source_identity,
+                    "configuration": configuration,
+                    "documents": completed,
+                    "errors": errors,
+                },
                 ensure_ascii=False,
                 indent=1,
             ),
@@ -413,6 +485,7 @@ def main() -> None:
     exported: list[tuple[Path, dict[str, Any]]] = []
     skipped: list[tuple[int, str]] = []
     errors: list[dict[str, Any]] = []
+    export_cancellation: KeyboardInterrupt | None = None
     for i, doc in enumerate(delta, 1):
         doc_id = doc["id"]
         prior = completed.get(str(doc_id)) or {}
@@ -434,14 +507,23 @@ def main() -> None:
         if prior.get("status") == "skipped_empty" and doc["kind"] == "new":
             skipped.append((doc_id, "empty document body"))
             continue
+        if prior:
+            completed.pop(str(doc_id), None)
+            save_progress(errors)
         try:
             body, detail = export_doc(doc_id, doc.get("format"))
+        except KeyboardInterrupt as error:
+            export_cancellation = error
+            skipped.append((doc_id, "cancelled"))
+            errors.append({"id": doc_id, "reason": "cancelled"})
+            break
         except SkylarkError as error:
-            skipped.append((doc_id, str(error)))
-            errors.append({"id": doc_id, "reason": str(error)})
+            reason = safe_diagnostic(error)
+            skipped.append((doc_id, reason))
+            errors.append({"id": doc_id, "reason": reason})
             save_progress(errors)
             print(
-                f"  [{i}/{len(delta)}] FAIL {doc_id} {doc['title']}: {error}",
+                f"  [{i}/{len(delta)}] FAIL {doc_id}: {reason}",
                 file=sys.stderr,
             )
             continue
@@ -468,7 +550,12 @@ def main() -> None:
         trail = paths.get(doc_id, [])
         naming_doc = {**doc, "title": title, "content_updated_at": remote_stamp}
         target = raw_dir / corpus_filename(naming_doc, trail, parse_date(doc["stamp"]))
-        target.write_text(body, encoding="utf-8")
+        # A regenerated raw file invalidates OCR even when its filename is unchanged.
+        # Invalidate first so interruption cannot leave a completed stale OCR result.
+        (ocr_dir / target.name).unlink(missing_ok=True)
+        temporary = target.with_suffix(".md.tmp")
+        temporary.write_text(body, encoding="utf-8")
+        temporary.replace(target)
         exported.append((target, doc))
         completed[str(doc_id)] = {
             "status": "exported",
@@ -483,17 +570,9 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    print(
-        f"exported {len(exported)}, skipped {len(skipped)}; running mdocr ocr ...",
-        file=sys.stderr,
-    )
-    try:
-        run_ocr_with_resume([p for p, _ in exported], ocr_dir, staging / "checkpoints")
-    except RuntimeError as error:
-        print(f"{error} — staging kept, merge skipped", file=sys.stderr)
-        raise SystemExit(1) from error
-
     manifest = {
+        "status": "failed" if errors else "staged",
+        "failures": [{"stage": "export", **error} for error in errors],
         "cutoff": cutoff.isoformat(),
         "staging": str(staging),
         "exported": [
@@ -511,31 +590,85 @@ def main() -> None:
         "deleted": [record for _, record in deletions],
     }
     manifest_path = staging / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8"
+    if errors:
+        _write_failure_manifest(manifest_path, manifest)
+    else:
+        _write_json(manifest_path, manifest)
+    if export_cancellation is not None:
+        print(
+            f"[export] cancelled doc_id={doc_id}; completed={len(exported)} "
+            f"failed={len(errors)}; staging kept at {staging}; "
+            "valid export/OCR checkpoints will be reused",
+            file=sys.stderr,
+        )
+        print_retry()
+        raise export_cancellation
+    print(
+        f"exported {len(exported)}, skipped {len(skipped)}; running mdocr ocr ...",
+        file=sys.stderr,
     )
-    print(f"wrote {manifest_path}")
+    try:
+        run_ocr_with_resume([p for p, _ in exported], ocr_dir, staging / "checkpoints")
+    except (OSError, RuntimeError, KeyboardInterrupt) as error:
+        failure = {"stage": "ocr", "reason": safe_diagnostic(error) or "cancelled"}
+        if isinstance(error, OCRFailure):
+            failure["file"] = error.file
+        manifest["status"] = "failed"
+        manifest["failures"].append(failure)
+        _write_failure_manifest(manifest_path, manifest)
+        print(
+            f"[ocr] {failure['reason']}; staging kept at {staging}; valid checkpoints will be reused",
+            file=sys.stderr,
+        )
+        print_retry()
+        if isinstance(error, KeyboardInterrupt):
+            raise
+        raise SystemExit(1) from error
+    if errors:
+        print(
+            f"[export] completed={len(exported)} failed={len(errors)}; "
+            f"staging kept at {staging}; valid export/OCR checkpoints will be reused",
+            file=sys.stderr,
+        )
+        print_retry()
+        raise SystemExit(1)
 
+    print(f"wrote {manifest_path}")
     if args.no_merge:
         print(f"--no-merge: staged in {staging}, not merged into {input_dir}")
         return
 
-    result = publish_documents(exported, ocr_dir, input_dir, staging / "backup")
-    result.update(remove_documents(deletions, staging / "backup"))
-    state = load_sync_state(input_dir)
-    for path, doc in exported:
-        if doc["remote_content_updated_at"]:
-            state[str(doc["id"])] = {
-                "file": path.name,
-                "content_updated_at": doc["remote_content_updated_at"],
-            }
-    for _, record in deletions:
-        state.pop(str(record["id"]), None)
-    save_sync_state(input_dir, state)
+    try:
+        state = load_sync_state(input_dir)
+        result = publish_documents(exported, ocr_dir, input_dir, staging / "backup")
+        result.update(remove_documents(deletions, staging / "backup"))
+        for path, doc in exported:
+            if doc["remote_content_updated_at"]:
+                state[str(doc["id"])] = {
+                    "file": path.name,
+                    "content_updated_at": doc["remote_content_updated_at"],
+                }
+        for _, record in deletions:
+            state.pop(str(record["id"]), None)
+        save_sync_state(input_dir, state)
+    except (OSError, RuntimeError, KeyboardInterrupt, SystemExit) as error:
+        manifest["status"] = "failed"
+        manifest["failures"].append(
+            {"stage": "publish", "reason": safe_diagnostic(error) or "cancelled"}
+        )
+        _write_failure_manifest(manifest_path, manifest)
+        print(
+            f"[publish] failed: {safe_diagnostic(error) or 'cancelled'}; "
+            f"staging kept at {staging}; publication may be partial",
+            file=sys.stderr,
+        )
+        print_retry()
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise SystemExit(1) from error
+    manifest["status"] = "completed"
     manifest["published"] = result
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8"
-    )
+    _write_json(manifest_path, manifest)
     print(
         f"merged into {input_dir}: {result['added']} added, "
         f"{result['replaced']} stale copies replaced, "
