@@ -3,12 +3,34 @@
 import json
 import os
 import sys
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
 from dogpdkb import cli, doctor
 from mdocr import config as settings
+
+
+def test_graph_runtime_can_import_user_installed_packages(tmp_path, monkeypatch):
+    user_base = tmp_path / "user"
+    site_packages = (
+        user_base
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    site_packages.mkdir(parents=True)
+    (site_packages / "doctor_user_dependency.py").write_text("backend = True\n")
+    monkeypatch.setenv("PYTHONUSERBASE", str(user_base))
+    monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
+    monkeypatch.setattr(
+        doctor,
+        "GRAPH_PROBE",
+        "import json; from doctor_user_dependency import backend; "
+        "print(json.dumps({'backend': backend}))",
+    )
+    assert doctor.graph_runtime(Path(sys._base_executable)) == (True, True)
 
 
 @pytest.fixture(autouse=True)
