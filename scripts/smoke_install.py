@@ -246,6 +246,7 @@ def smoke(dist: Path) -> None:
             ]
         )
         assert run([str(command), "--version"]).strip() == f"dogpdkb {version}"
+        assert run([str(mdocr), "--version"]).strip() == f"mdocr {version}"
         for subcommand in (
             "sync",
             "discover",

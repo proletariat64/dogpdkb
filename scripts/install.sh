@@ -28,6 +28,9 @@ mkdir -p "$PREFIX" "$BIN_DIR"
 PREFIX=$(cd "$PREFIX" && pwd -P)
 BIN_DIR=$(cd "$BIN_DIR" && pwd -P)
 CONFIG_DIR=$(readlink -m -- "$CONFIG_DIR")
+DEFAULT_PREFIX=$(readlink -m -- "$HOME/.local/share/dogpdkb")
+DEFAULT_BIN_DIR=$(readlink -m -- "$HOME/.local/bin")
+DEFAULT_CONFIG_DIR=$(readlink -m -- "$HOME/.config/dogpdkb")
 [[ ! -L "$PREFIX/versions" ]] || fail 'Refusing a symlinked versions directory.'
 for path in "$BIN_DIR" "$CONFIG_DIR"; do
     [[ "$path" != "$PREFIX/versions" && "$path" != "$PREFIX/versions/"* &&
@@ -56,8 +59,8 @@ validate_environment() {
         [[ "${#rows[@]}" == 4 && "${rows[0]}" == 1 && "${rows[1]}" == "$PREFIX" &&
            "${rows[2]}" == "$BIN_DIR" && "${rows[3]}" == "$CONFIG_DIR" ]] || fail 'Invalid ownership marker or changed installation paths.'
     else
-        [[ "$PREFIX" == "$HOME/.local/share/dogpdkb" && "$BIN_DIR" == "$HOME/.local/bin" &&
-           "$CONFIG_DIR" == "$HOME/.config/dogpdkb" &&
+        [[ "$PREFIX" == "$DEFAULT_PREFIX" && "$BIN_DIR" == "$DEFAULT_BIN_DIR" &&
+           "$CONFIG_DIR" == "$DEFAULT_CONFIG_DIR" &&
            -L "$BIN_DIR/dogpdkb" && "$(readlink "$BIN_DIR/dogpdkb")" == "$PREFIX/current/bin/dogpdkb" ]] || fail 'Unmarked custom installations cannot be replaced safely.'
     fi
 }

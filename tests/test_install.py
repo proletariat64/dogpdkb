@@ -326,3 +326,42 @@ if sys.argv[-1].endswith('/current'):
     assert installer.run("0.1.2").returncode == 0
     assert (installer.prefix / "current").resolve().is_dir()
     assert not interrupted.exists()
+
+
+@pytest.mark.parametrize(
+    "location", ["home", ".local", ".local/bin", ".config/dogpdkb"]
+)
+@pytest.mark.parametrize("owned_link", [True, False])
+def test_legacy_default_upgrade_resolves_symlinked_paths(
+    installer, location, owned_link
+):
+    target = installer.root / "physical-directory"
+    target.mkdir()
+    link = installer.home if location == "home" else installer.home / location
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target, target_is_directory=True)
+    assert installer.run().returncode == 0
+    old = (installer.prefix / "current").resolve()
+    # v0.1.0 used this layout and canonical links, but did not write a marker.
+    (old / ".dogpdkb-managed").unlink()
+    config = installer.config / "dogpdkb.toml"
+    config.write_text("# preserve configuration\n")
+    data = installer.config / "user.md"
+    data.write_text("preserve data")
+    if not owned_link:
+        installer.binary.unlink()
+        installer.binary.write_text("unrelated command")
+    result = installer.run("0.1.1")
+    if owned_link:
+        assert result.returncode == 0, result.stderr
+        assert installer.version() == "dogpdkb 0.1.1"
+        assert not old.exists()
+    else:
+        assert result.returncode != 0
+        assert "cannot be replaced safely" in result.stderr
+        assert (installer.prefix / "current").resolve() == old
+        assert old.is_dir()
+        assert installer.binary.read_text() == "unrelated command"
+    assert link.is_symlink()
+    assert config.read_text() == "# preserve configuration\n"
+    assert data.read_text() == "preserve data"
