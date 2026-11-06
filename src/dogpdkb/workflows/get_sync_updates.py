@@ -269,10 +269,6 @@ def _remote_error(payload: Any, source: str) -> SkylarkError:
     )
 
 
-def _is_retryable(envelope: dict[str, Any]) -> bool:
-    return _remote_error(envelope, "remote envelope").retryable
-
-
 def _call_once(tool: str, args: dict[str, Any]) -> Any:
     """One MCP round trip over a freshly spawned utoo-proxy (line-delimited
     JSON-RPC on stdio: initialize -> notifications/initialized -> tools/call)."""
@@ -422,7 +418,9 @@ def _call_once(tool: str, args: dict[str, Any]) -> Any:
     result = responses[2].get("result")
     if not isinstance(result, dict):
         raise SkylarkError(f"{tool} returned invalid MCP result", source="remote MCP")
-    content = result.get("content") or []
+    content = result.get("content")
+    if not isinstance(content, list):
+        raise SkylarkError(f"{tool} returned invalid MCP content", source="remote MCP")
     text = (
         content[0].get("text") if content and isinstance(content[0], dict) else ""
     ) or ""

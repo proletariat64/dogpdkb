@@ -32,7 +32,8 @@ def scripted_proxy(tmp_path, monkeypatch, outcomes):
         "outcomes=json.loads(plan.read_text()); outcome=outcomes.pop(0); plan.write_text(json.dumps(outcomes))\n"
         "if outcome.get('disconnect'): sys.exit(0)\n"
         "if outcome.get('partial'): sys.stdout.write('{'); sys.stdout.flush(); __import__('time').sleep(5)\n"
-        "if 'mcp_error' in outcome: reply={'id':2,'result':{'isError':True,'content':[{'text':outcome['mcp_error']}]}}\n"
+        "if 'raw_result' in outcome: reply={'id':2,'result':outcome['raw_result']}\n"
+        "elif 'mcp_error' in outcome: reply={'id':2,'result':{'isError':True,'content':[{'text':outcome['mcp_error']}]}}\n"
         "elif 'rpc_error' in outcome: reply={'id':2,'error':outcome['rpc_error']}\n"
         "else: reply={'id':2,'result':{'content':[{'text':json.dumps(outcome)}]}}\n"
         "print(json.dumps(reply),flush=True)\n"
@@ -341,3 +342,26 @@ def test_cancelled_listing_interrupts_retry_backoff_without_new_attempt(tmp_path
         if child.poll() is None:
             child.kill()
         child.communicate()
+
+
+@pytest.mark.parametrize(
+    "content", [{"text": "secret response body"}, 7, "secret response body"]
+)
+def test_malformed_mcp_content_is_bounded_and_not_retried(
+    tmp_path, monkeypatch, content
+):
+    calls = scripted_proxy(
+        tmp_path, monkeypatch, [{"raw_result": {"content": content}}]
+    )
+    monkeypatch.setattr(sync, "server_url", lambda: "https://example.invalid/mcp")
+
+    with pytest.raises(sync.SkylarkError, match="invalid MCP content") as error:
+        sync.call_tool("skylark_doc_detail", {"doc_id": 17})
+
+    assert len(calls.read_text().splitlines()) == 1
+    assert not error.value.retryable
+    assert error.value.source == "remote MCP"
+    assert "attempt=1/3" in str(error.value)
+    assert "doc_id=17" in str(error.value)
+    assert "secret response body" not in str(error.value)
+    assert len(str(error.value)) <= 300
