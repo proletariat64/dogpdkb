@@ -531,8 +531,28 @@ class FakeGitHub(FakeCLI):
         assert args[0] == "gh"
         output, status, error = "", 0, ""
         if args[1] == "api":
-            assert args[2] == f"repos/proletariat64/dogpdkb/releases/tags/{TAG}"
-            if self.release is None:
+            endpoint = args[2]
+            if endpoint == "repos/proletariat64/dogpdkb/releases":
+                assert "--paginate" in args and "--slurp" in args
+                # Drafts are discoverable in the authenticated listing, not by tag.
+                rows = (
+                    []
+                    if self.release is None
+                    else [
+                        dict(
+                            self.release,
+                            assets=[
+                                {"name": name, "size": len(body)}
+                                for name, body in self.files.items()
+                            ],
+                        )
+                    ]
+                )
+                return subprocess.CompletedProcess(
+                    args, 0, stdout=json.dumps([[], rows]), stderr=""
+                )
+            assert endpoint == f"repos/proletariat64/dogpdkb/releases/tags/{TAG}"
+            if self.release is None or self.release["draft"]:
                 status, error = (
                     1,
                     f"gh: error (HTTP {self.show_status}) secret-provider-body",
@@ -629,7 +649,9 @@ def test_github_lookup_errors_do_not_create(github, status, capsys):
 def test_github_identity_mismatch_blocks_retry(github, field, value):
     fake, _ = github
     assert run_github() == 0
-    fake.release["draft"] = True
+    # A mismatched tag returned by the by-tag endpoint must fail validation.
+    # Draft listings legitimately contain other tags, which must be ignored.
+    fake.release["draft"] = field != "tag_name"
     fake.release[field] = value
     fake.calls.clear()
     assert run_github() == 1
@@ -663,3 +685,21 @@ def test_github_tag_mismatch_still_blocks_publication(github):
     assert run_github() == 1
     assert fake.release is None
     assert all(args[0] == "git" for args in fake.calls)
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+def test_github_draft_listing_failure_never_creates(github, monkeypatch, status):
+    fake, _ = github
+    original = fake.__call__
+
+    def execute(args, **kwargs):
+        if args[:3] == ("gh", "api", "repos/proletariat64/dogpdkb/releases"):
+            return subprocess.CompletedProcess(
+                args, 1, stdout="", stderr=f"HTTP {status}"
+            )
+        return original(args, **kwargs)
+
+    monkeypatch.setattr(publisher.subprocess, "run", execute)
+    assert run_github() == 1
+    assert fake.release is None
+    assert not any(args[:3] == ("gh", "release", "create") for args in fake.calls)
