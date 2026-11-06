@@ -48,7 +48,6 @@ def graph_runtime(interpreter: Path) -> tuple[bool, bool]:
             [
                 str(interpreter),
                 "-B",
-                "-I",
                 "-c",
                 GRAPH_PROBE,
                 str(Path(mdocr.__file__).resolve().parents[1]),

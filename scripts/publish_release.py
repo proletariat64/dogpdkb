@@ -69,13 +69,21 @@ def decode(output):
     try:
         value = json.loads(output)
     except (ValueError, TypeError):
-        raise PublishError("Invalid AntCode JSON response") from None
+        raise PublishError("Invalid release provider JSON response") from None
     if not isinstance(value, dict):
-        raise PublishError("Invalid AntCode JSON object")
+        raise PublishError("Invalid release provider JSON object")
     return value
 
 
-def publish(tag, dist, project, require_token=False):
+def publish(tag, dist, project, require_token=False, target="antcode"):
+    if target not in {"antcode", "github"}:
+        raise PublishError("Target must be antcode or github")
+    if target == "github" and project != "proletariat64/dogpdkb":
+        raise PublishError("GitHub destination must be the trusted source repository")
+    if target == "github" and require_token:
+        raise PublishError(
+            "--require-token is AntCode-only; authenticate with gh auth login"
+        )
     if require_token and not os.environ.get("ANTCODE_SECRET_TOKEN", "").strip():
         raise PublishError("ANTCODE_SECRET_TOKEN is required")
     with (ROOT / "pyproject.toml").open("rb") as stream:
@@ -99,6 +107,48 @@ def publish(tag, dist, project, require_token=False):
     def api(*args, absent_ok=False):
         return command("antcode", *args, "--project", project, absent_ok=absent_ok)
 
+    def github_show(absent_ok=False):
+        # gh api provides numeric HTTP errors, so only a real 404 permits creation.
+        response = command(
+            "gh",
+            "api",
+            f"repos/{project}/releases/tags/{tag}",
+            absent_ok=absent_ok,
+        )
+        if response is None:
+            return None
+        value = decode(response)
+        if (
+            not {"id", "tag_name", "target_commitish", "draft", "body", "assets"}
+            <= value.keys()
+        ):
+            raise PublishError("Incomplete GitHub release JSON")
+        if not isinstance(value["assets"], list) or any(
+            not isinstance(row, dict) or not {"name", "size"} <= row.keys()
+            for row in value["assets"]
+        ):
+            raise PublishError("Invalid GitHub release assets")
+        return json.dumps(
+            {
+                "id": value["id"],
+                "tag_name": value["tag_name"],
+                # An existing tag ignores target_commitish (often a branch name).
+                # The local and remote tag commits are verified before show().
+                "revision": head,
+                "is_draft": value["draft"],
+                "description": value["body"],
+                "assets": [
+                    {"filename": row["name"], "size": row["size"]}
+                    for row in value["assets"]
+                ],
+            }
+        )
+
+    def show(absent_ok=False):
+        if target == "github":
+            return github_show(absent_ok)
+        return api("release", "show", tag, "--json", absent_ok=absent_ok)
+
     origin = (command("git", "remote", "get-url", "origin") or "").strip()
     if origin not in {SOURCE_REMOTE, "git@github.com:proletariat64/dogpdkb.git"}:
         raise PublishError("origin must identify the trusted GitHub dogpdkb repository")
@@ -119,7 +169,7 @@ def publish(tag, dist, project, require_token=False):
     remote_head = refs.get(f"refs/tags/{tag}^{{}}") or refs.get(f"refs/tags/{tag}")
     if remote_head != head:
         raise PublishError("GitHub source tag commit does not match HEAD")
-    response = api("release", "show", tag, "--json", absent_ok=True)
+    response = show(absent_ok=True)
     release = decode(response) if response is not None else None
 
     def validate(value):
@@ -138,7 +188,9 @@ def publish(tag, dist, project, require_token=False):
         if not isinstance(value["revision"], str) or not re.fullmatch(
             r"[0-9a-f]{40}", value["revision"]
         ):
-            raise PublishError("Invalid AntCode carrier revision")
+            raise PublishError("Invalid release revision")
+        if target == "github" and value["revision"] != head:
+            raise PublishError("GitHub release revision does not match HEAD")
         value.setdefault("assets", [])
         if not isinstance(value["assets"], list):
             raise PublishError("Invalid release assets")
@@ -169,7 +221,7 @@ def publish(tag, dist, project, require_token=False):
     if release is not None:
         validate(release)
         if not release["is_draft"]:
-            if release.get("is_anonymous") is not True:
+            if target == "antcode" and release.get("is_anonymous") is not True:
                 raise PublishError(
                     "Published release is not confirmed anonymous; refusing mutation"
                 )
@@ -194,11 +246,33 @@ def publish(tag, dist, project, require_token=False):
         f"# {tag}\n\nSource-Commit: {head}\n"
         f"Source-URL: {SOURCE_URL}/commit/{head}\n"
         f"Source-Tag: {SOURCE_URL}/tree/{tag}\n\n"
-        "AntCode revision is an artifact-host carrier, not the source commit.\n\n"
-        f"Recent commit subjects (capped at 8):\n{subjects}\n"
+        + (
+            "AntCode revision is an artifact-host carrier, not the source commit.\n\n"
+            if target == "antcode"
+            else "GitHub release targets the source commit.\n\n"
+        )
+        + f"Recent commit subjects (capped at 8):\n{subjects}\n"
     )
     if release is not None and isinstance(release.get("description"), str):
         notes = release["description"]
+    if release is None and target == "github":
+        command(
+            "gh",
+            "release",
+            "create",
+            tag,
+            "--repo",
+            project,
+            "--target",
+            head,
+            "--verify-tag",
+            "--draft",
+            "--title",
+            tag,
+            "--notes",
+            notes,
+        )
+        release = validate(decode(show()))
     if release is None:
         branch = decode(api("branch", "show", "main", "--json"))
         carrier = (
@@ -236,13 +310,35 @@ def publish(tag, dist, project, require_token=False):
     with tempfile.TemporaryDirectory(prefix="dogpdkb-release-") as directory:
         temporary = Path(directory)
 
+        provider = target
+
         def download(name, target):
-            api("release", "download", tag, name, "--output", str(target), "--quiet")
+            if provider == "github":
+                command(
+                    "gh",
+                    "release",
+                    "download",
+                    tag,
+                    "--repo",
+                    project,
+                    "--pattern",
+                    name,
+                    "--output",
+                    str(target),
+                    "--clobber",
+                )
+            else:
+                api(
+                    "release", "download", tag, name, "--output", str(target), "--quiet"
+                )
             if not target.is_file():
                 raise PublishError("Asset download did not produce a file")
 
         def upload(path):
-            api("release", "upload", tag, str(path), "--quiet")
+            if target == "github":
+                command("gh", "release", "upload", tag, str(path), "--repo", project)
+            else:
+                api("release", "upload", tag, str(path), "--quiet")
 
         sums = []
         wheel_digest = ""
@@ -265,7 +361,7 @@ def publish(tag, dist, project, require_token=False):
         template = (ROOT / "scripts/install.sh").read_text(encoding="utf-8")
         replacements = {
             "@VERSION@": version,
-            "@RELEASE_BASE_URL@": f"https://code.alipay.com/{project}/releases/download/{tag}",
+            "@RELEASE_BASE_URL@": f"https://{'github.com' if target == 'github' else 'code.alipay.com'}/{project}/releases/download/{tag}",
             "@WHEEL@": wheel_name,
             "@WHEEL_SHA256@": wheel_digest,
         }
@@ -293,27 +389,31 @@ def publish(tag, dist, project, require_token=False):
                     raise PublishError(f"Existing {name} differs; refusing overwrite")
             else:
                 upload(generated)
-        current = validate(decode(api("release", "show", tag, "--json")))
+        current = validate(decode(show()))
         if current["revision"] != carrier or not current["is_draft"]:
             raise PublishError("Draft changed during publication")
         if not expected <= assets(current):
             raise PublishError("Release attachments are incomplete")
-        finalized = validate(
-            decode(
-                api(
-                    "release",
-                    "update",
-                    tag,
-                    "--draft=false",
-                    "--anonymous=true",
-                    "--json",
+        if target == "github":
+            command("gh", "release", "edit", tag, "--repo", project, "--draft=false")
+            finalized = validate(decode(show()))
+        else:
+            finalized = validate(
+                decode(
+                    api(
+                        "release",
+                        "update",
+                        tag,
+                        "--draft=false",
+                        "--anonymous=true",
+                        "--json",
+                    )
                 )
             )
-        )
         if (
             finalized["is_draft"]
             or finalized["revision"] != carrier
-            or finalized.get("is_anonymous") is not True
+            or (target == "antcode" and finalized.get("is_anonymous") is not True)
         ):
             raise PublishError("Release finalization was not confirmed")
     print(f"Published {tag}")
@@ -323,11 +423,17 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--dist", type=Path, default=Path("dist"))
-    parser.add_argument("--project", default="pd.pt/dogpdkb")
+    parser.add_argument("--target", choices=["antcode", "github"], default="antcode")
+    parser.add_argument(
+        "--project", help="destination namespace/project (provider default if omitted)"
+    )
     parser.add_argument("--require-token", action="store_true")
     args = parser.parse_args(argv)
     try:
-        publish(args.tag, args.dist.resolve(), args.project, args.require_token)
+        project = args.project or (
+            "proletariat64/dogpdkb" if args.target == "github" else "pd.pt/dogpdkb"
+        )
+        publish(args.tag, args.dist.resolve(), project, args.require_token, args.target)
     except (PublishError, OSError, KeyError, ValueError):
         # Never print exceptions originating from files or provider responses.
         error = sys.exc_info()[1]

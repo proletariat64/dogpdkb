@@ -4,7 +4,8 @@
 
 GitHub `proletariat64/dogpdkb` is the source repository. Development, PR checks
 and merges stay on GitHub, whose default branch is `master`. AntCode
-`pd.pt/dogpdkb` hosts installation artifacts only.
+`pd.pt/dogpdkb` hosts installation artifacts by default. Alternatively, publish
+artifacts to the GitHub source repository with `TARGET=github`.
 
 If a new version is needed, edit `project.version` in `pyproject.toml` and run
 `uv lock` in the normal development PR. Merge that PR after its checks pass.
@@ -40,6 +41,40 @@ tag-write permission, AntCode Release-write permission, Python 3.12, uv, Git,
 and a working `poolab` default connection with homepage write access. There is
 no cloud publishing job or separate publishing token requirement.
 
+## Choose the release target
+
+```bash
+make release                       # default: antcode CLI
+make release TARGET=antcode         # explicit AntCode target
+make release TARGET=github          # gh CLI, using its existing login
+make release TARGET=github DRY_RUN=1
+make release TARGET=github RETRY=1   # also use when the tag already exists on GitHub
+```
+
+The Python entry points accept `--target antcode|github`, defaulting to
+`antcode`. For upload only, use `make publish-release TAG=v0.1.1 TARGET=github`.
+The GitHub destination is `proletariat64/dogpdkb`; AntCode keeps its existing
+`pd.pt/dogpdkb` default and optional `--project` override. `--require-token`
+remains AntCode-only; authenticate GitHub with `gh auth login`.
+
+Both targets use the same merged-source/tag checks, draft-first publication,
+canonical remote package checksums, immutable attachments and retry behavior.
+GitHub publication uses `gh api` for release metadata and `gh release` for
+creation, upload, download and finalization. Its installer points to GitHub
+release downloads. GitHub access follows repository visibility; private-repo
+assets are not anonymously downloadable by the curl installer.
+
+GitHub installations are upgraded by rerunning the target version's GitHub
+`install.sh`, preserving any custom installation paths. `dogpdkb update` currently
+uses AntCode only and cannot fetch GitHub-only versions; see the
+[GitHub upgrade command](installing.md#upgrade-and-retry).
+
+The homepage helper is AntCode-specific. GitHub releases skip that step and
+need neither AntCode CLI nor `poolab`; the existing AntCode homepage remains
+managed by the default release flow. Retry with the same `TARGET` to resume
+that provider. To publish the same source version to the other provider, use
+its target together with `RETRY=1`, since the source tag already exists.
+
 ## Source identity and artifact hosting
 
 The local source tag and its remote GitHub tag must both resolve to HEAD.
@@ -73,7 +108,7 @@ The Release contains a wheel, source archive, version-bound `install.sh`,
 to eight visible commit subjects.
 
 Publication starts as a draft and finalizes after the expected files are present.
-Releases are deliberately anonymous: metadata and installation attachments can be
+AntCode Releases are deliberately anonymous: metadata and installation attachments can be
 downloaded without an AntCode account. This does not change repository visibility;
 anonymous access is not itself an internal-network restriction. Never package
 credentials, production configuration or corpus data.

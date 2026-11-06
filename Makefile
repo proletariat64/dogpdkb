@@ -2,6 +2,7 @@ PYTHON ?= python3.12
 export DEV_PYTHON=.venv/bin/python
 UV ?= uv
 DIST_DIR ?= dist
+TARGET ?= antcode
 
 .PHONY: bootstrap doc-guard test lint check build smoke doctor release publish-release publish-site-release
 
@@ -24,10 +25,10 @@ doctor:
 
 release:
 	VERSION="$(VERSION)" DRY_RUN="$(DRY_RUN)" RETRY="$(RETRY)" \
-		$(DEV_PYTHON) scripts/release.py
+		$(DEV_PYTHON) scripts/release.py --target "$(TARGET)"
 
 publish-release:
-	$(DEV_PYTHON) scripts/publish_release.py --tag "$(TAG)" --dist "$(DIST_DIR)" $(PUBLISH_ARGS)
+	$(DEV_PYTHON) scripts/publish_release.py --target "$(TARGET)" --tag "$(TAG)" --dist "$(DIST_DIR)" $(PUBLISH_ARGS)
 
 publish-site-release:
 	$(DEV_PYTHON) scripts/publish_site_release.py --tag "$(TAG)"
@@ -38,3 +39,4 @@ test:
 lint:
 	$(DEV_PYTHON) -m ruff check .
 	$(DEV_PYTHON) -m ruff format --check .
+

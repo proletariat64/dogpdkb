@@ -167,7 +167,9 @@ def test_publication_order(repository, commands):
     smoke = commands.index(["make", "smoke"])
     tag = next(i for i, args in enumerate(commands) if args[:3] == ["git", "tag", "-a"])
     push = next(i for i, args in enumerate(commands) if "push" in args)
-    publish = commands.index(["make", "publish-release", "TAG=v0.1.0"])
+    publish = commands.index(
+        ["make", "publish-release", "TAG=v0.1.0", "TARGET=antcode"]
+    )
     homepage = commands.index(["make", "publish-site-release", "TAG=v0.1.0"])
     assert check < smoke < tag < push < publish < homepage
 
@@ -192,7 +194,16 @@ def test_failures_resume_same_version(repository, monkeypatch, commands, failure
     monkeypatch.setattr(tool, "run", original)
     commands.clear()
     assert tool.release(root, retry=True) == "v0.1.0"
-    assert commands.index(["make", "publish-release", "TAG=v0.1.0"]) < commands.index(
-        ["make", "publish-site-release", "TAG=v0.1.0"]
-    )
+    assert commands.index(
+        ["make", "publish-release", "TAG=v0.1.0", "TARGET=antcode"]
+    ) < commands.index(["make", "publish-site-release", "TAG=v0.1.0"])
     assert any("push" in args for args in commands) is (failure == "push")
+
+
+def test_github_target_skips_antcode_homepage(repository, commands):
+    assert tool.release(repository[0], provider="github") == "v0.1.0"
+    assert ["make", "publish-release", "TAG=v0.1.0", "TARGET=github"] in commands
+    assert not any("publish-site-release" in args for args in commands)
+    commands.clear()
+    assert tool.release(repository[0], provider="github", retry=True) == "v0.1.0"
+    assert not any("push" in args for args in commands)
