@@ -129,5 +129,7 @@ job. GitHub owns source PRs, checks and merges; AntCode only hosts installation
 attachments. Release builds and uploads run locally; see [releasing](releasing.md).
 Branch protection remains
 a separate administrator setting. The Release installer performs isolated install
-and upgrade; build/preflight commands do not deploy services. Scheduler, Nginx,
-uninstall and automatic rollback management remain outside this scope.
+and upgrade; `dogpdkb update --version X.Y.Z` and `dogpdkb uninstall` manage only
+installer-owned deployments. Successful upgrades discard the previous environment;
+configuration and user data remain separate. Build/preflight commands do not deploy
+services. Scheduler, Nginx and rollback management remain outside this scope.

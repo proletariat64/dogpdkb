@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from importlib.metadata import version
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,13 @@ def test_no_args_shows_help(capsys):
     assert "usage: mdocr" in out
     assert "prepare" in out
     assert "ocr" in out
+
+
+def test_version_matches_platform_distribution(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--version"])
+    assert exc.value.code == 0
+    assert capsys.readouterr().out.strip() == f"mdocr {version('dogpdkb')}"
 
 
 def test_help_flag_exits_zero():

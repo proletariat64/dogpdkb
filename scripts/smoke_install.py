@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -42,6 +43,7 @@ def inspect_artifacts(wheel: Path, sdist: Path) -> None:
     required = {
         "dogpdkb/cli.py",
         "dogpdkb/doctor.py",
+        "dogpdkb/lifecycle.py",
         "mdocr/cli.py",
         "dogpdkb/resources/dogpdkb.toml",
         "dogpdkb/resources/books.json",
@@ -67,6 +69,79 @@ def inspect_artifacts(wheel: Path, sdist: Path) -> None:
             raise RuntimeError(
                 "distribution contains local configuration or corpus artifacts"
             )
+
+
+def smoke_managed_install(work: Path, wheel: Path, version: str, env: dict) -> None:
+    """Exercise the real installer and installed uninstall without remote releases."""
+    home = work / "managed-home"
+    prefix = home / ".local/share/dogpdkb"
+    config = home / ".config/dogpdkb"
+    binary = home / ".local/bin/dogpdkb"
+    tools = work / "managed-tools"
+    tools.mkdir()
+    # Only wheel download is replaced. uv, the wheel, Bash, doctor and CLI are real.
+    curl = tools / "curl"
+    curl.write_text(
+        f"#!{sys.executable}\n"
+        "import pathlib, shutil, sys\n"
+        "args = sys.argv[1:]\n"
+        f"assert {wheel.name!r} in ' '.join(args)\n"
+        f"shutil.copyfile({str(wheel)!r}, args[args.index('--output') + 1])\n"
+    )
+    curl.chmod(0o755)
+    body = (ROOT / "scripts/install.sh").read_text()
+    for token, value in {
+        "VERSION": version,
+        "RELEASE_BASE_URL": f"https://code.alipay.com/pd.pt/dogpdkb/releases/download/v{version}",
+        "WHEEL": wheel.name,
+        "WHEEL_SHA256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+    }.items():
+        body = body.replace(f"@{token}@", value)
+    installer = work / "managed-install.sh"
+    installer.write_text(body)
+    managed_env = {
+        **env,
+        "HOME": str(home),
+        "PATH": f"{tools}:{env.get('PATH', '')}",
+        "DOGPDKB_PYTHON": sys.executable,
+        "DOGPDKB_PYPI_INDEX": "https://pypi.org/simple",
+    }
+
+    def run(*args):
+        subprocess.run(
+            args,
+            cwd=work,
+            env=managed_env,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+
+    run("bash", str(installer))
+    old = (prefix / "current").resolve()
+    settings = config / "dogpdkb.toml"
+    settings.write_text("# user settings\n")
+    data = prefix / "user-data.txt"
+    data.write_text("user data\n")
+    # Exercise the installed CLI update with only installer transport replaced.
+    run(
+        str(old / "bin/python"),
+        "-I",
+        "-c",
+        "from pathlib import Path; from dogpdkb import lifecycle,cli; "
+        f"lifecycle.download_installer = lambda version: Path({str(installer)!r}).read_bytes(); "
+        f"raise SystemExit(cli.main(['update', '--version', {version!r}]))",
+    )
+    active = (prefix / "current").resolve()
+    assert active != old and not old.exists()
+    assert settings.read_text() == "# user settings\n"
+    run(str(binary), "uninstall", "--yes")
+    assert not active.exists()
+    assert not binary.is_symlink()
+    assert not (binary.parent / "mdocr").is_symlink()
+    assert settings.read_text() == "# user settings\n"
+    assert data.read_text() == "user data\n"
 
 
 def smoke(dist: Path) -> None:
@@ -171,6 +246,7 @@ def smoke(dist: Path) -> None:
             ]
         )
         assert run([str(command), "--version"]).strip() == f"dogpdkb {version}"
+        assert run([str(mdocr), "--version"]).strip() == f"mdocr {version}"
         for subcommand in (
             "sync",
             "discover",
@@ -178,9 +254,15 @@ def smoke(dist: Path) -> None:
             "update-graph",
             "publish-web",
             "doctor",
+            "update",
+            "uninstall",
         ):
             run([str(command), subcommand, "--help"])
         run([str(mdocr), "--help"])
+        # A plain wheel/venv is not owned by the shell installer.
+        run([str(command), "uninstall", "--yes"], expected=1)
+        run([str(command), "update", "--version", version], expected=1)
+        assert command.is_file()
         # The configured graph interpreter can be separate from the platform venv.
         graph_env = work / "graph-env"
         run(
@@ -259,8 +341,9 @@ def smoke(dist: Path) -> None:
         run([str(mdocr), "prepare", "-f", "image.md", "-o", "prepared"])
         assert (work / "prepared/image.md").is_file()
         assert list((work / "prepared/assets").rglob("*.jpg"))
+        smoke_managed_install(work, wheel, version, env)
     print(
-        "smoke: PASS (wheel/sdist contents, isolated install, CLI, doctor, Web data, image prepare)"
+        "smoke: PASS (wheel/sdist, CLI, doctor, Web, images, managed upgrade/uninstall)"
     )
 
 
@@ -276,6 +359,7 @@ def main() -> int:
         RuntimeError,
         AssertionError,
         subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
         tarfile.TarError,
         zipfile.BadZipFile,
     ) as error:

@@ -10,8 +10,8 @@ curl -fsSL https://code.alipay.com/pd.pt/dogpdkb/releases/download/v0.1.1/instal
 ```
 
 The Release and its attachments are anonymous. The server does not need an
-AntCode CLI, account, token, Git checkout or sudo. Linux, Bash, curl, sha256sum
-and standard GNU file utilities are required. As with any curl-to-shell installer,
+AntCode CLI, account, token, Git checkout or sudo. Linux, Bash, curl, sha256sum,
+flock and standard GNU file utilities are required. As with any curl-to-shell installer,
 trust the HTTPS origin and inspect the script first if required by your policy.
 Use `bash -o pipefail -c 'curl -fsSL <URL> | bash'` in automation when download
 failure must also determine the enclosing shell's exit status.
@@ -56,21 +56,58 @@ Graphify and operational authentication remain separate prerequisites; see
 
 ## Upgrade and retry
 
-Stop an active sync, then run the same curl command with the new version's tag.
+Stop active sync/OCR/graph jobs before upgrading or uninstalling. From an
+installer-managed deployment starting with v0.1.1:
+
+```bash
+dogpdkb update --version 0.1.2  # example: must already be published
+```
+
+The version is explicit: this command does not guess the latest release or require
+an AntCode login. It downloads the matching installer from the fixed HTTPS Release
+origin and uses the same installation flow. A v0.1.0 installation does not have the
+new commands; run the newer version's curl installer once to upgrade it.
+
 A fresh virtual environment is built and checked before an atomic `current`
 symlink switch. A failed download, checksum, package install or doctor leaves the
-previous working version selected. A successful reinstall of the same version
-also builds a fresh environment; no files in the old environment are changed.
+previous working version selected. After successful activation the previous managed
+environment is deleted, including on a same-version reinstall. This is a complete
+installation, not a delta patch. There is no version-history retention or rollback
+command. An interruption after activation may leave an old directory behind;
+unknown directories are never swept just because they are under `versions/`.
 
-Configuration and data are outside the versioned environments and are never
-replaced. If either configuration file already exists, including a symlink, both
-are left alone, even if setup is partial. Old environments remain for inspection;
-there is no automatic data cleanup. An unrelated command occupying the chosen
-bin path, or an unmanaged `current` path, causes refusal instead of overwrite.
-There is no automatic service restart, schema migration or uninstall in this scope.
+Configuration and user data must remain outside the disposable virtual environments.
+They are never replaced or deleted by lifecycle commands. If either configuration
+file already exists, including a symlink, both are left alone even if setup is partial.
+An unrelated command occupying the chosen bin path, or an unmanaged `current` path,
+causes refusal instead of overwrite. Do not store documents or configuration inside
+a versioned virtual environment: that directory contains disposable program files.
+There is no automatic service restart or schema migration.
+
+## Uninstall
+
+```bash
+dogpdkb uninstall        # interactive confirmation
+dogpdkb uninstall --yes  # automation; no prompt
+```
+
+Uninstall removes only the managed installation and its matching command links.
+It preserves configuration, corpus/graph/Web data, unrelated files and links,
+system Python, and shared uv tools/caches. It does not remove the served homepage.
+An arbitrary pip/uv virtual environment or source checkout is not an installer-owned
+deployment; use its original environment manager instead. Removing the executable
+does not stop existing jobs, so stop them first.
+
+## Custom installation paths
 
 Override directories with `DOGPDKB_HOME`, `DOGPDKB_BIN_DIR`, and
-`DOGPDKB_CONFIG_DIR` on the **bash** side of the pipeline. They must be absolute.
+`DOGPDKB_CONFIG_DIR` on the **bash** side of the installation pipeline. They must be
+absolute. New installations record these paths so lifecycle commands can locate
+them without re-exporting the variables. Legacy custom installations without this
+record are refused rather than guessing ownership. Upgrade those into a fresh
+managed prefix using separate command paths and the existing configuration directory;
+remove the old deployment separately using its original installation method.
 `DOGPDKB_PYTHON` selects another supported interpreter (the package requires
-Python 3.10+); normal uv network/cache/mirror variables remain usable. Do not run
-installers concurrently against the same command and configuration directories.
+Python 3.10+); normal uv network/cache/mirror variables remain usable. Lifecycle
+operations serialize changes to an installation; do not share the same command
+or configuration directories between independent installation prefixes.

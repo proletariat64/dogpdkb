@@ -1,3 +1,8 @@
 """mdocr — prepare and OCR images referenced by Markdown."""
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("dogpdkb")
+except PackageNotFoundError:
+    __version__ = "uninstalled"
