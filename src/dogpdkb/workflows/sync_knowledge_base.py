@@ -79,6 +79,15 @@ def _config(options: PipelineOptions) -> dict:
     }
 
 
+def manifest_failures(manifest: dict) -> list[dict]:
+    """Retain compatibility with manifests that predate explicit failure records."""
+    return manifest.get("failures") or [
+        row
+        for row in manifest.get("skipped") or []
+        if row.get("reason") != "empty document body"
+    ]
+
+
 def recovery_command(options: PipelineOptions) -> str:
     """Reproduce the same task selection without exposing environment credentials."""
     command = [sys.executable, str(SCRIPTS / "sync_knowledge_base.py"), "--resume"]
@@ -181,11 +190,7 @@ def run_pipeline(
                 manifest = read_json(staging / "manifest.json")
             except (OSError, ValueError):
                 manifest = {}
-            failures = manifest.get("failures") or [
-                row
-                for row in manifest.get("skipped") or []
-                if row.get("reason") != "empty document body"
-            ]
+            failures = manifest_failures(manifest)
             completed_exports = len(manifest.get("exported") or [])
             try:
                 progress = read_json(staging / "export-progress.json")
@@ -233,11 +238,7 @@ def run_pipeline(
                 raise RuntimeError(f"{name} did not produce {output}")
             if name == "corpus":
                 manifest = read_json(output)
-                failures = manifest.get("failures") or [
-                    row
-                    for row in manifest.get("skipped") or []
-                    if row.get("reason") != "empty document body"
-                ]
+                failures = manifest_failures(manifest)
                 if failures or manifest.get("status") not in (None, "completed"):
                     raise RuntimeError(
                         f"corpus incomplete: {len(failures)} failed units; "

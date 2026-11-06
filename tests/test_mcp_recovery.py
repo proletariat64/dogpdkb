@@ -1,7 +1,12 @@
 """Recovery through the read-only MCP adapter and fresh listing boundary."""
 
 import json
+import os
+import select
+import signal
+import subprocess
 import sys
+import time
 
 import pytest
 
@@ -238,3 +243,101 @@ def test_setup_failure_releases_spawned_proxy(tmp_path, monkeypatch):
     assert len(processes) == 1
     assert processes[0].poll() is not None
     assert processes[0].stdin.closed and processes[0].stdout.closed
+
+
+def test_cancelled_threaded_listing_releases_proxy_and_stops_queued_pages(tmp_path):
+    calls = tmp_path / "active.jsonl"
+    release = tmp_path / "release"
+    proxy = tmp_path / "blocked-proxy"
+    proxy.write_text(
+        f"#!{sys.executable}\n"
+        "import json,os,sys,time\nfrom pathlib import Path\n"
+        "sys.stdin.readline()\n"
+        "print(json.dumps({'id':1,'result':{}}),flush=True)\n"
+        "sys.stdin.readline()\n"
+        "request=json.loads(sys.stdin.readline())\n"
+        f"with Path({str(calls)!r}).open('a') as stream: stream.write(json.dumps({{'pid':os.getpid(),'offset':request['params']['arguments']['offset']}})+'\\n')\n"
+        "if request['params']['arguments']['offset']==0:\n"
+        " print(json.dumps({'id':2,'result':{'content':[{'text':json.dumps({'ok':True,'data':[{'id':i} for i in range(50)]})}]}}),flush=True); sys.exit(0)\n"
+        f"while not Path({str(release)!r}).exists(): time.sleep(0.01)\n"
+        "print(json.dumps({'id':2,'result':{'content':[{'text':json.dumps({'ok':False,'message':'cancel test finished'})}]}}),flush=True)\n"
+    )
+    proxy.chmod(0o755)
+    program = (
+        "from types import SimpleNamespace\nfrom pathlib import Path\n"
+        "from scripts import get_sync_updates as sync\n"
+        f"sync.proxy_bin=lambda: {str(proxy)!r}\n"
+        "sync.server_url=lambda: 'https://example.invalid/mcp'\n"
+        "sync.current_config=lambda: SimpleNamespace(concurrency=1)\n"
+        "sync.timeout_s=lambda: 30\nsync.max_retries=lambda: 2\n"
+        f"try: sync.fetch_doc_list(123,150,Path({str(tmp_path / 'pages')!r}))\n"
+        "except KeyboardInterrupt: print('cancelled',flush=True)\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", program],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if calls.exists() and len(calls.read_text().splitlines()) >= 2:
+                break
+            time.sleep(0.01)
+        assert calls.exists() and len(calls.read_text().splitlines()) == 2, (
+            "proxy never reached the blocking request"
+        )
+        child.send_signal(signal.SIGINT)
+        output, errors = child.communicate(timeout=1)
+        assert "cancelled" in output
+        records = [json.loads(line) for line in calls.read_text().splitlines()]
+        assert [row["offset"] for row in records] == [0, 50]
+        assert (tmp_path / "pages" / "page-123-0000000.json").is_file()
+        assert not (tmp_path / "pages" / "page-123-0000050.json").exists()
+        assert "retry" not in errors
+        for row in records:
+            with pytest.raises(ProcessLookupError):
+                os.kill(row["pid"], 0)
+    finally:
+        release.touch()
+        try:
+            child.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.communicate()
+
+
+def test_cancelled_listing_interrupts_retry_backoff_without_new_attempt(tmp_path):
+    calls = tmp_path / "attempts"
+    program = (
+        "from types import SimpleNamespace\nfrom pathlib import Path\n"
+        "from scripts import get_sync_updates as sync\n"
+        "sync.current_config=lambda: SimpleNamespace(concurrency=1)\n"
+        "sync.max_retries=lambda: 2\n"
+        "sync.random.uniform=lambda low,high: 0\n"
+        "def fail(tool,args):\n"
+        f" with Path({str(calls)!r}).open('a') as stream: stream.write('attempt\\n')\n"
+        " raise sync.SkylarkError('disconnect',retryable=True)\n"
+        "sync._call_once=fail\n"
+        "try: sync.fetch_doc_list(123,100)\n"
+        "except KeyboardInterrupt: print('cancelled',flush=True)\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", program],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ready, _, _ = select.select([child.stderr], [], [], 5)
+        assert ready, "listing never entered retry backoff"
+        assert "retry 1/2" in child.stderr.readline()
+        child.send_signal(signal.SIGINT)
+        output, _errors = child.communicate(timeout=0.5)
+        assert "cancelled" in output
+        assert calls.read_text().splitlines() == ["attempt"]
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.communicate()

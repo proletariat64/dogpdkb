@@ -39,8 +39,10 @@ import sys
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from datetime import date, datetime, timezone
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 from mdocr.config import (
@@ -54,6 +56,26 @@ from mdocr.config import (
 PROTOCOL_VERSION = "2024-11-05"
 PAGE_SIZE = 50
 MAX_RETRY_DELAY_S = 30.0
+_LISTING_CANCEL: ContextVar[Event | None] = ContextVar("listing_cancel", default=None)
+
+
+def _check_cancelled() -> None:
+    cancelled = _LISTING_CANCEL.get()
+    if cancelled is not None and cancelled.is_set():
+        raise KeyboardInterrupt
+
+
+def _retry_wait(delay: float) -> None:
+    if _LISTING_CANCEL.get() is None:
+        time.sleep(delay)
+        return
+    while delay > 0:
+        _check_cancelled()
+        interval = min(delay, 0.1)
+        time.sleep(interval)
+        delay -= interval
+    _check_cancelled()
+
 
 LOCAL_NAME_RE = re.compile(r"-(\d{4}-\d{2}-\d{2})-\[(\d+)\]\.md$")
 
@@ -254,6 +276,7 @@ def _is_retryable(envelope: dict[str, Any]) -> bool:
 def _call_once(tool: str, args: dict[str, Any]) -> Any:
     """One MCP round trip over a freshly spawned utoo-proxy (line-delimited
     JSON-RPC on stdio: initialize -> notifications/initialized -> tools/call)."""
+    _check_cancelled()
     try:
         proc = subprocess.Popen(
             [proxy_bin(), server_url(), "-t", "STREAMABLE_HTTP"],
@@ -289,6 +312,7 @@ def _call_once(tool: str, args: dict[str, Any]) -> Any:
 
     def wait_for(request_id: int) -> None:
         while request_id not in responses:
+            _check_cancelled()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise SkylarkError(
@@ -297,7 +321,12 @@ def _call_once(tool: str, args: dict[str, Any]) -> Any:
                     source="local timeout",
                 )
             if b"\n" not in pending:
-                if not sel.select(timeout=remaining):
+                poll_timeout = (
+                    min(remaining, 0.1)
+                    if _LISTING_CANCEL.get() is not None
+                    else remaining
+                )
+                if not sel.select(timeout=poll_timeout):
                     continue
                 try:
                     chunk = os.read(stdout.fileno(), 65536)
@@ -453,9 +482,13 @@ def call_tool(tool: str, args: dict[str, Any]) -> Any:
     )
     location = f"stage={stage} {safe_diagnostic(tool, 80)} {context}".rstrip()
     for attempt in range(retries + 1):
+        _check_cancelled()
         try:
-            return _call_once(tool, args)
+            result = _call_once(tool, args)
+            _check_cancelled()
+            return result
         except SkylarkError as error:
+            _check_cancelled()
             if attempt >= retries or not error.retryable:
                 raise SkylarkError(
                     f"{location} attempt={attempt + 1}/{retries + 1}: {error}",
@@ -469,7 +502,7 @@ def call_tool(tool: str, args: dict[str, Any]) -> Any:
                 f"wait={delay:.2f}s source={error.source}: {error}",
                 file=sys.stderr,
             )
-            time.sleep(delay)
+            _retry_wait(delay)
     raise SkylarkError(f"{tool} failed after {retries + 1} attempts")
 
 
@@ -526,17 +559,30 @@ def fetch_doc_list(
             temporary.replace(cache)
         return data
 
-    def fetch(index: int) -> None:
-        offset = offsets[index]
-        data = fetch_page(offset)
-        pages[index] = data
-        print(
-            f"  page {index + 1}/{len(offsets)} offset={offset} items={len(data)}",
-            file=sys.stderr,
-        )
+    cancelled = Event()
 
-    with ThreadPoolExecutor(max_workers=current_config().concurrency) as pool:
+    def fetch(index: int) -> None:
+        token = _LISTING_CANCEL.set(cancelled)
+        try:
+            _check_cancelled()
+            offset = offsets[index]
+            data = fetch_page(offset)
+            pages[index] = data
+            print(
+                f"  page {index + 1}/{len(offsets)} offset={offset} items={len(data)}",
+                file=sys.stderr,
+            )
+        finally:
+            _LISTING_CANCEL.reset(token)
+
+    pool = ThreadPoolExecutor(max_workers=current_config().concurrency)
+    try:
         list(pool.map(fetch, range(len(offsets))))
+    except BaseException:
+        cancelled.set()
+        raise
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
     docs: dict[int, dict[str, Any]] = {}
 
