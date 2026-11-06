@@ -305,6 +305,17 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _write_failure_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    """Keep the original failure and retry output if diagnostic storage fails."""
+    try:
+        _write_json(path, manifest)
+    except OSError as error:
+        print(
+            f"cannot persist failure manifest {path}: {safe_diagnostic(error)}",
+            file=sys.stderr,
+        )
+
+
 def run_ocr_with_resume(files: list[Path], out_dir: Path, state_dir: Path) -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = state_dir / "ocr-complete.json"
@@ -577,7 +588,10 @@ def main() -> None:
         "deleted": [record for _, record in deletions],
     }
     manifest_path = staging / "manifest.json"
-    _write_json(manifest_path, manifest)
+    if errors:
+        _write_failure_manifest(manifest_path, manifest)
+    else:
+        _write_json(manifest_path, manifest)
     try:
         run_ocr_with_resume([p for p, _ in exported], ocr_dir, staging / "checkpoints")
     except (OSError, RuntimeError, KeyboardInterrupt) as error:
@@ -586,7 +600,7 @@ def main() -> None:
             failure["file"] = error.file
         manifest["status"] = "failed"
         manifest["failures"].append(failure)
-        _write_json(manifest_path, manifest)
+        _write_failure_manifest(manifest_path, manifest)
         print(
             f"[ocr] {failure['reason']}; staging kept at {staging}; valid checkpoints will be reused",
             file=sys.stderr,
@@ -595,8 +609,6 @@ def main() -> None:
         if isinstance(error, KeyboardInterrupt):
             raise
         raise SystemExit(1) from error
-    print(f"wrote {manifest_path}")
-
     if errors:
         print(
             f"[export] completed={len(exported)} failed={len(errors)}; "
@@ -606,14 +618,15 @@ def main() -> None:
         print_retry()
         raise SystemExit(1)
 
+    print(f"wrote {manifest_path}")
     if args.no_merge:
         print(f"--no-merge: staged in {staging}, not merged into {input_dir}")
         return
 
     try:
+        state = load_sync_state(input_dir)
         result = publish_documents(exported, ocr_dir, input_dir, staging / "backup")
         result.update(remove_documents(deletions, staging / "backup"))
-        state = load_sync_state(input_dir)
         for path, doc in exported:
             if doc["remote_content_updated_at"]:
                 state[str(doc["id"])] = {
@@ -623,18 +636,19 @@ def main() -> None:
         for _, record in deletions:
             state.pop(str(record["id"]), None)
         save_sync_state(input_dir, state)
-    except (OSError, RuntimeError, KeyboardInterrupt) as error:
+    except (OSError, RuntimeError, KeyboardInterrupt, SystemExit) as error:
         manifest["status"] = "failed"
         manifest["failures"].append(
             {"stage": "publish", "reason": safe_diagnostic(error) or "cancelled"}
         )
-        _write_json(manifest_path, manifest)
+        _write_failure_manifest(manifest_path, manifest)
         print(
-            f"[publish] failed; staging kept at {staging}; publication may be partial",
+            f"[publish] failed: {safe_diagnostic(error) or 'cancelled'}; "
+            f"staging kept at {staging}; publication may be partial",
             file=sys.stderr,
         )
         print_retry()
-        if isinstance(error, KeyboardInterrupt):
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
             raise
         raise SystemExit(1) from error
     manifest["status"] = "completed"

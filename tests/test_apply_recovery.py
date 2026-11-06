@@ -2,6 +2,7 @@
 
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -296,3 +297,66 @@ def test_cancelled_export_preserves_only_finished_checkpoints(run, monkeypatch):
 
     assert exports == [2]
     assert (corpus / "Doc-1-2026-11-01-[1].md").read_text() == "new 1"
+
+
+@pytest.mark.parametrize("state", ["not JSON", '{"version": 2, "documents": {}}'])
+def test_invalid_sync_state_fails_before_publication_with_retry_diagnostics(
+    run, capsys, state
+):
+    invoke, corpus, staging, _failures, _exports, _ocr, _plan = run
+    (corpus / ".sync-state.json").write_text(state)
+    before = snapshot(corpus)
+
+    with pytest.raises(SystemExit) as error:
+        invoke()
+
+    assert error.value.code != 0
+    assert snapshot(corpus) == before
+    manifest = json.loads((staging / "manifest.json").read_text())
+    assert manifest["status"] == "failed"
+    assert manifest["failures"][0]["stage"] == "publish"
+    output = capsys.readouterr().err
+    assert "[publish] failed" in output and "Retry:" in output
+
+
+@pytest.mark.parametrize("stage", ["export", "ocr", "publish", "cancel"])
+def test_failure_retry_output_survives_unwritable_diagnostic_manifest(
+    run, monkeypatch, capsys, stage
+):
+    invoke, corpus, _staging, failures, _exports, _ocr, _plan = run
+    before = snapshot(corpus)
+    if stage == "export":
+        failures.add(2)
+    elif stage == "ocr":
+        monkeypatch.setattr(apply_sync, "run_mdocr", lambda files, out_dir: 1)
+    elif stage == "cancel":
+
+        def cancel(files, out_dir):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(apply_sync, "run_mdocr", cancel)
+    else:
+        (corpus / ".sync-state.json").write_text("invalid state")
+        before = snapshot(corpus)
+    replace = Path.replace
+
+    def cannot_save_failure(path, target):
+        if (
+            path.name == "manifest.json.tmp"
+            and json.loads(path.read_text())["status"] == "failed"
+        ):
+            raise OSError("disk full token=credential-value")
+        return replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", cannot_save_failure)
+    with pytest.raises(KeyboardInterrupt if stage == "cancel" else SystemExit) as error:
+        invoke()
+
+    if stage != "cancel":
+        assert error.value.code != 0
+    assert snapshot(corpus) == before
+    output = capsys.readouterr().err
+    assert "Retry:" in output
+    assert "cannot persist failure manifest" in output
+    assert "credential-value" not in output
+    assert f"[{stage if stage != 'cancel' else 'ocr'}]" in output
