@@ -23,6 +23,11 @@ __pycache__/
 # Virtualenv
 .venv/
 
+# docs
+wash/
+tmp/
+graphify_flatten_ready/
+
 # Pre-existing scripts/ tooling, kept out of version control
 scripts/audit_luna_ocr.py
 scripts/graphify-watchdog-uat.py
@@ -31,3 +36,10 @@ scripts/ocr_qa_checkpoint.py
 scripts/paddleocr_convert.py
 scripts/queue_next_luna_batch.py
 scripts/test_paddleocr_convert.py
+
+# Local configuration and generated state
+config.local.toml
+.env
+skylark_books/state/
+web-output/
+.code-review-graph/

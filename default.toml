@@ -1,0 +1,92 @@
+# Default project configuration. --config selects a replacement TOML file.
+# Paths are relative to this file; credentials belong in environment variables.
+[source]
+books_file = "skylark_books/roots.json"
+
+[paths]
+corpus = "graphify_flatten_ready"
+staging = "wash"
+state = "skylark_books/state"
+web = "web-output"
+# graph_dir defaults to <selected corpus>/graphify-out
+# graphify_python defaults to the current interpreter
+
+[skylark]
+mcp_url = "https://mcpgwoffice-prod.alipay.com/mcpgw/v1/shttpproxy/message/MAIN_CHAIR_mcp.ant.faas.skylarkmcpserver.skylarkmcpserver"
+proxy_bin = "~/.utoo-proxy/utoo-proxy"
+timeout_seconds = 60
+max_retries = 5
+concurrency = 2
+
+[images]
+url_rewrites = [
+  { from = "https://intranetproxy.alipay.com/skylark/lark/", to = "https://yuque.antfin.com/images/lark/" },
+]
+
+[web]
+community_limit = 120
+
+[web.groups]
+"收付款产品" = "收付款"
+"Accounting" = "核算"
+"资金方案中心管控" = "资金方案"
+"Liquidity" = "流动性"
+"Whale" = "Whale"
+"Planning-and-progress-of-key-projects" = "项目规划"
+
+[web.group_prefixes]
+"外汇" = "外汇"
+
+[[web.topics]]
+id = 1397
+name = "Whale 专项"
+domain = "项目规划"
+description = "全球资金网络升级的项目规划、战役拆解与实施脉络。"
+
+[[web.topics]]
+id = 0
+name = "USD 美元"
+domain = "跨境清算"
+description = "美元收单站、清算账户与跨境资金结算相关知识。"
+
+[[web.topics]]
+id = 13
+name = "One Portal"
+domain = "平台产品"
+description = "平台户入驻、交易支持与汇率运营产品能力。"
+
+[[web.topics]]
+id = 22
+name = "内部户"
+domain = "账户体系"
+description = "内部账户、账龄管理与账户监控产品体系。"
+
+[[web.topics]]
+id = 3
+name = "SWIFT (跨境)"
+domain = "清算网络"
+description = "SWIFT 跨境清算网络、报文与银行账户规则。"
+
+[[web.topics]]
+id = 19
+name = "核算分录验证"
+domain = "核算账务"
+description = "核算方案、分录验证与虚拟资金流。"
+
+[[web.topics]]
+id = 20
+name = "外汇兑换协议"
+domain = "外汇产品"
+description = "收单站流入、清算与来账兑换协议。"
+
+[[web.topics]]
+id = 1516
+name = "流动性定价引擎"
+domain = "流动性"
+description = "FTP 评价、监测、定价与流动性管理。"
+
+[[web.topics]]
+id = 99
+name = "外部清偿"
+domain = "资金清算"
+description = "主体间协议、集中清算与外部清偿。"
