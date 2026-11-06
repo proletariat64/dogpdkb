@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -19,6 +20,11 @@ if sys.version_info >= (3, 11):
     import tomllib
 else:
     import tomli as tomllib
+
+if __package__:
+    from .process import run as run_process
+else:
+    from process import run as run_process
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = (
@@ -104,16 +110,17 @@ def smoke_managed_install(work: Path, wheel: Path, version: str, env: dict) -> N
         "HOME": str(home),
         "PATH": f"{tools}:{env.get('PATH', '')}",
         "DOGPDKB_PYTHON": sys.executable,
-        "DOGPDKB_PYPI_INDEX": "https://pypi.org/simple",
+        "DOGPDKB_PYPI_INDEX": env["UV_DEFAULT_INDEX"],
     }
 
     def run(*args):
-        subprocess.run(
+        run_process(
             args,
             cwd=work,
             env=managed_env,
             check=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             timeout=180,
         )
@@ -168,6 +175,18 @@ def smoke(dist: Path) -> None:
             "UTOO_PROXY_BIN",
         }
     }
+    # Resolve before changing HOME; all installation passes share the real cache.
+    env["UV_CACHE_DIR"] = str(
+        Path(
+            subprocess.check_output([uv, "cache", "dir"], text=True, env=env).strip()
+        ).resolve()
+    )
+    env["UV_DEFAULT_INDEX"] = os.environ.get(
+        "DOGPDKB_PYPI_INDEX",
+        os.environ.get("UV_DEFAULT_INDEX", "https://pypi.org/simple"),
+    )
+    env["UV_OFFLINE"] = os.environ.get("UV_OFFLINE", "1")
+    env["UV_PYTHON_DOWNLOADS"] = "never"
     with tempfile.TemporaryDirectory(prefix="dogpdkb-install-") as temporary:
         work = Path(temporary)
         environment = work / "env"
@@ -176,12 +195,13 @@ def smoke(dist: Path) -> None:
         mdocr = environment / "bin/mdocr"
 
         def run(arguments: list[str], *, expected=0, cwd=work) -> str:
-            result = subprocess.run(
+            result = run_process(
                 arguments,
                 cwd=cwd,
                 env=env,
                 text=True,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 timeout=180,
                 check=False,
             )
@@ -208,6 +228,7 @@ def smoke(dist: Path) -> None:
             ),
             encoding="utf-8",
         )
+        env["UV_CONSTRAINT"] = str(constraints)
         run(
             [
                 uv,
@@ -230,7 +251,7 @@ def smoke(dist: Path) -> None:
                 str(constraints),
                 str(wheel),
                 "--default-index",
-                "https://pypi.org/simple",
+                env["UV_DEFAULT_INDEX"],
             ]
         )
         run(
@@ -348,6 +369,10 @@ def smoke(dist: Path) -> None:
 
 
 def main() -> int:
+    def cancel(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, cancel)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dist", type=Path, default=ROOT / "dist")
     args = parser.parse_args()
@@ -364,6 +389,8 @@ def main() -> int:
         zipfile.BadZipFile,
     ) as error:
         print(f"smoke: FAIL: {error}", file=sys.stderr)
+        if isinstance(error, subprocess.CalledProcessError):
+            print(error.stderr or error.stdout or "", file=sys.stderr)
         return 1
     return 0
 

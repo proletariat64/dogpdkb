@@ -165,3 +165,11 @@ catalog, graph, Nginx or installed program.
 
 See [homepage delivery](homepage.md) for UI deployment and preview behavior.
 For server installation and upgrades, see [the curl installer](installing.md).
+
+Local build and installation smoke checks default to offline uv cache reuse.
+They reuse the selected Python and preserve the real uv cache even when testing
+with a temporary HOME. Every smoke installation uses the exported lockfile
+constraints. Set `DOGPDKB_PYPI_INDEX` to select a trusted mirror; when explicitly
+preparing missing cache entries, `UV_OFFLINE=0 make smoke` permits downloads.
+The installer requires an existing Python (default 3.12); use `DOGPDKB_PYTHON`
+to select it. It does not download Python.

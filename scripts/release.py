@@ -14,6 +14,11 @@ if sys.version_info >= (3, 11):
 else:
     import tomli as tomllib
 
+if __package__:
+    from .process import run as run_process
+else:
+    from process import run as run_process
+
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT = "pd.pt/dogpdkb"
 REMOTE = "https://github.com/proletariat64/dogpdkb.git"
@@ -22,11 +27,15 @@ GIT = ["git"]
 
 
 def run(arguments: list[str], root: Path) -> str:
-    result = subprocess.run(
+    local_gate = arguments[:2] in (["make", "check"], ["make", "smoke"])
+    if arguments[0] == "make":
+        print("release: " + " ".join(arguments), flush=True)
+    result = run_process(
         arguments,
         cwd=root,
         text=True,
-        capture_output=True,
+        stdout=None if local_gate else subprocess.PIPE,
+        stderr=None if local_gate else subprocess.PIPE,
         timeout=600,
         check=False,
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
@@ -36,7 +45,7 @@ def run(arguments: list[str], root: Path) -> str:
         raise RuntimeError(
             f"command failed: {' '.join(arguments[:3])} (exit {result.returncode})"
         )
-    return result.stdout.strip()
+    return (result.stdout or "").strip()
 
 
 def package_version(root: Path) -> str:
