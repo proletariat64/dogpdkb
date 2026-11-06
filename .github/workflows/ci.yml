@@ -32,3 +32,5 @@ jobs:
         run: make bootstrap PYTHON="$(uv python find --managed-python)"
       - name: Run quality gate
         run: make check
+      - name: Build and verify isolated platform installation
+        run: make smoke

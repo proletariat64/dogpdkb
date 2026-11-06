@@ -1,0 +1,14 @@
+# Portable example only. Edit the gateway and enable your source in books.json.
+# Credentials stay in environment variables. Paths are relative to this file.
+[source]
+books_file = "books.json"
+
+[paths]
+corpus = "corpus"
+staging = "staging"
+state = "state"
+web = "web"
+
+[skylark]
+mcp_url = "https://example.invalid/mcp"
+proxy_bin = "utoo-proxy"

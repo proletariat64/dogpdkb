@@ -10,11 +10,12 @@ import re
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
-try:
+if sys.version_info >= (3, 11):
     import tomllib
-except ModuleNotFoundError:  # Python 3.10
+else:  # Python 3.10
     import tomli as tomllib
 
 
@@ -22,7 +23,15 @@ class ConfigError(ValueError):
     """Invalid user configuration."""
 
 
-DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "default.toml"
+_REPOSITORY_CONFIG = Path(__file__).resolve().parents[2] / "default.toml"
+DEFAULT_CONFIG = _REPOSITORY_CONFIG
+
+
+def default_config() -> Path:
+    """Keep source-checkout defaults; installed platforms use caller-owned config."""
+    if DEFAULT_CONFIG.is_file():
+        return DEFAULT_CONFIG
+    return Path.cwd() / "dogpdkb.toml"
 
 
 @dataclass(frozen=True)
@@ -56,7 +65,10 @@ class SyncConfig:
 
     def snapshot(self) -> dict:
         """Non-secret effective settings for resume compatibility checks."""
-        return json.loads(json.dumps(asdict(self), default=str))
+        try:
+            return json.loads(json.dumps(asdict(self), default=str))
+        except (TypeError, ValueError) as error:
+            raise ConfigError("cannot serialize configuration snapshot") from error
 
 
 def _url(value: str, key: str) -> str:
@@ -71,13 +83,13 @@ def _url(value: str, key: str) -> str:
 
 
 def load_config(path: Path | str | None = None) -> SyncConfig:
-    """Explicit file / DOGPDKB_CONFIG, otherwise repository default.toml.
+    """Explicit file / DOGPDKB_CONFIG, otherwise checkout or caller-owned config.
 
     A supplied file replaces default.toml; absent optional keys use portable
     defaults. Relative file paths are anchored to the selected config file.
     Environment path overrides are anchored to the caller's working directory.
     """
-    selected = Path(path or os.environ.get("DOGPDKB_CONFIG") or DEFAULT_CONFIG)
+    selected = Path(path or os.environ.get("DOGPDKB_CONFIG") or default_config())
     selected = selected.expanduser().resolve()
     try:
         with selected.open("rb") as stream:
@@ -104,7 +116,7 @@ def load_config(path: Path | str | None = None) -> SyncConfig:
         if unknown:
             raise ConfigError(f"unknown config keys in {section}: {sorted(unknown)}")
 
-    def value(section, key, default=None, env=None):
+    def value(section, key, default=None, env=None) -> Any:
         result = os.environ.get(env) if env else None
         if result is None:
             result = data.get(section, {}).get(key, default)
@@ -127,7 +139,17 @@ def load_config(path: Path | str | None = None) -> SyncConfig:
         path = base / resolved
         return path.absolute() if preserve_symlinks else path.resolve()
 
-    def number(section, key, default, env=None, integer=False, minimum=0):
+    def required_path(
+        section, key, default, env=None, *, preserve_symlinks=False
+    ) -> Path:
+        result = file_path(
+            section, key, default, env, preserve_symlinks=preserve_symlinks
+        )
+        if result is None:
+            raise ConfigError(f"{section}.{key}: expected a path")
+        return result
+
+    def number(section, key, default, env=None, integer=False, minimum: float = 0):
         raw = value(section, key, default, env)
         try:
             parsed = float(raw)
@@ -182,15 +204,17 @@ def load_config(path: Path | str | None = None) -> SyncConfig:
         proxy = str(file_path("skylark", "proxy_bin", "utoo-proxy", "UTOO_PROXY_BIN"))
     return SyncConfig(
         file=selected,
-        books_file=file_path(
+        books_file=required_path(
             "source", "books_file", "skylark_books/roots.json", "DOGPDKB_BOOKS_FILE"
         ),
-        corpus=file_path("paths", "corpus", "graphify_flatten_ready", "DOGPDKB_CORPUS"),
-        staging=file_path("paths", "staging", "wash", "DOGPDKB_STAGING"),
-        state=file_path("paths", "state", "skylark_books/state", "DOGPDKB_STATE"),
-        web=file_path("paths", "web", "web-output", "DOGPDKB_WEB"),
+        corpus=required_path(
+            "paths", "corpus", "graphify_flatten_ready", "DOGPDKB_CORPUS"
+        ),
+        staging=required_path("paths", "staging", "wash", "DOGPDKB_STAGING"),
+        state=required_path("paths", "state", "skylark_books/state", "DOGPDKB_STATE"),
+        web=required_path("paths", "web", "web-output", "DOGPDKB_WEB"),
         graph_dir=file_path("paths", "graph_dir", env="DOGPDKB_GRAPH_DIR"),
-        graphify_python=file_path(
+        graphify_python=required_path(
             "paths",
             "graphify_python",
             sys.executable,
@@ -202,17 +226,26 @@ def load_config(path: Path | str | None = None) -> SyncConfig:
         ),
         proxy_bin=proxy,
         timeout_seconds=timeout,
-        max_retries=number(
-            "skylark", "max_retries", 5, "SKYLARK_MAX_RETRIES", integer=True
+        max_retries=int(
+            number("skylark", "max_retries", 5, "SKYLARK_MAX_RETRIES", integer=True)
         ),
-        concurrency=number(
-            "skylark", "concurrency", 2, "SKYLARK_CONCURRENCY", integer=True, minimum=1
+        concurrency=int(
+            number(
+                "skylark",
+                "concurrency",
+                2,
+                "SKYLARK_CONCURRENCY",
+                integer=True,
+                minimum=1,
+            )
         ),
         image_url_rewrites=tuple(pairs),
         groups=groups,
         group_prefixes=prefixes,
         topics=tuple(topics),
-        community_limit=number("web", "community_limit", 120, integer=True, minimum=1),
+        community_limit=int(
+            number("web", "community_limit", 120, integer=True, minimum=1)
+        ),
     )
 
 
@@ -295,7 +328,9 @@ def cli_path(value: str) -> Path:
 
 def config_arguments(parser: argparse.ArgumentParser, *, book=False) -> None:
     parser.add_argument(
-        "--config", type=Path, help="TOML config (default: default.toml)"
+        "--config",
+        type=Path,
+        help="TOML config (checkout: default.toml; installed: ./dogpdkb.toml)",
     )
     if book:
         parser.add_argument("--book", help="enabled key from the configured books file")
@@ -310,7 +345,7 @@ def configure(parser: argparse.ArgumentParser, path: Path | None) -> SyncConfig:
     return _active
 
 
-def configured_book(parser, config, args, url=None) -> Book:
+def configured_book(parser: argparse.ArgumentParser, config, args, url=None) -> Book:
     try:
         return select_book(config, args.book, url)
     except ValueError as error:
