@@ -28,6 +28,7 @@ Env overrides (same as the skylark pi extension):
 """
 
 import argparse
+import errno
 import json
 import os
 import random
@@ -82,39 +83,194 @@ def _parse_ts(value: Any) -> datetime | None:
         return None
 
 
+def safe_diagnostic(value: object, limit: int = 300) -> str:
+    """Bound a diagnostic and redact common credential forms before persistence."""
+    text = str(value)
+    text = re.sub(r"(?i)\b(?:Bearer|Basic)\s+[^\s,;\"']+", "[redacted]", text)
+    text = re.sub(
+        r"(?i)([\"']?(?:[\w-]*(?:token|password|secret|credential|api[_-]?key)|authorization|cookie)[\"']?\s*[:=]\s*)"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+        r"\1[redacted]",
+        text,
+    )
+    text = re.sub(r"(https?://)[^/\s@]+@", r"\1[redacted]@", text)
+    text = re.sub(r"(https?://[^\s?#]+)\?[^\s]+", r"\1?[redacted]", text)
+    return " ".join(text.split())[:limit]
+
+
 class SkylarkError(RuntimeError):
-    def __init__(self, message: str, retryable: bool = False) -> None:
-        super().__init__(message)
+    def __init__(
+        self,
+        message: str,
+        retryable: bool = False,
+        *,
+        source: str = "remote",
+        code: Any = None,
+    ) -> None:
+        super().__init__(safe_diagnostic(message))
         self.retryable = retryable
+        self.source = source
+        self.code = code
+
+
+def _remote_error(payload: Any, source: str) -> SkylarkError:
+    """Classify known wire signals without exposing arbitrary response content."""
+    fields: list[dict[str, Any]] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            fields.append(value)
+            for key in ("details", "data", "error"):
+                collect(value.get(key))
+
+    collect(payload)
+    codes = [
+        str(row[key]).upper()
+        for row in fields
+        for key in ("error_code", "code")
+        if key in row
+    ]
+    statuses = [
+        str(row[key])
+        for row in fields
+        for key in ("statusCode", "status_code", "status", "http_status")
+        if key in row
+    ]
+    messages = [
+        str(row[key]).strip()
+        for row in fields
+        for key in ("error_msg", "message")
+        if key in row
+    ]
+    permanent_codes = {
+        "-32700",
+        "-32600",
+        "-32601",
+        "-32602",
+        "400",
+        "401",
+        "403",
+        "422",
+        "UNAUTHORIZED",
+        "FORBIDDEN",
+        "AUTHENTICATION_FAILED",
+        "AUTHENTICATION_REQUIRED",
+        "UNAUTHENTICATED",
+        "ACCESS_DENIED",
+        "TOKEN_EXPIRED",
+        "INVALID_TOKEN",
+        "AUTH_REQUIRED",
+        "PERMISSION_DENIED",
+        "INVALID_PARAMS",
+        "INVALID_ARGUMENT",
+        "BAD_REQUEST",
+    }
+    permanent = bool(
+        set(codes) & permanent_codes or set(statuses) & {"400", "401", "403", "422"}
+    )
+    permanent = permanent or any(
+        re.search(
+            r"\b(?:authentication (?:failed|required)|unauthorized|forbidden|permission denied|access denied|invalid (?:params|parameters|arguments?))\b",
+            message,
+            re.IGNORECASE,
+        )
+        for message in messages
+    )
+    temporary_codes = {
+        "UPSTREAM_RETRYABLE",
+        "ETIMEDOUT",
+        "ECONNRESET",
+        "ECONNREFUSED",
+        "EPIPE",
+        "ENETUNREACH",
+        "EHOSTUNREACH",
+        "REQUEST_TIMEOUT",
+        "GATEWAY_TIMEOUT",
+        "SERVICE_UNAVAILABLE",
+        "TOO_MANY_REQUESTS",
+        "RATE_LIMITED",
+        "408",
+        "429",
+        "502",
+        "503",
+        "504",
+    }
+    timeout = next(
+        (
+            message
+            for message in messages
+            if re.fullmatch(
+                r"Request timeout for [0-9]+ ms",
+                message,
+                re.IGNORECASE,
+            )
+        ),
+        None,
+    )
+    retryable = not permanent and bool(
+        any(row.get("retryable") is True for row in fields)
+        or set(codes) & temporary_codes
+        or set(statuses) & {"408", "429", "502", "503", "504"}
+        or timeout
+        or any(
+            re.fullmatch(
+                r"(?:HTTP (?:408|429|502|503|504)|Service Unavailable|Connection reset by peer)",
+                message,
+                re.IGNORECASE,
+            )
+            for message in messages
+        )
+    )
+    reason = (
+        "authentication, permission or parameter error"
+        if permanent
+        else timeout
+        or (
+            "temporary upstream failure" if retryable else "unrecognized upstream error"
+        )
+    )
+    # Wire codes are preserved as metadata; diagnostics include only bounded numeric
+    # or uppercase identifier codes, never arbitrary response data.
+    code = next(
+        (row[key] for row in fields for key in ("error_code", "code") if key in row),
+        None,
+    )
+    labels = [
+        f"code={item}" for item in codes if re.fullmatch(r"[A-Z_0-9-]{1,50}", item)
+    ]
+    labels += [f"status={item}" for item in statuses if re.fullmatch(r"[0-9]{3}", item)]
+    return SkylarkError(
+        f"{source}: {reason}" + (" " + " ".join(labels) if labels else ""),
+        retryable=retryable,
+        source=source,
+        code=code,
+    )
 
 
 def _is_retryable(envelope: dict[str, Any]) -> bool:
-    if envelope.get("retryable") is True:
-        return True
-    if envelope.get("error_code") == "UPSTREAM_RETRYABLE":
-        return True
-    details = envelope.get("details") or {}
-    status = details.get("statusCode", details.get("status_code"))
-    return status in (429, "429")
+    return _remote_error(envelope, "remote envelope").retryable
 
 
 def _call_once(tool: str, args: dict[str, Any]) -> Any:
     """One MCP round trip over a freshly spawned utoo-proxy (line-delimited
     JSON-RPC on stdio: initialize -> notifications/initialized -> tools/call)."""
-    proc = subprocess.Popen(
-        [proxy_bin(), server_url(), "-t", "STREAMABLE_HTTP"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        bufsize=1,
-    )
+    try:
+        proc = subprocess.Popen(
+            [proxy_bin(), server_url(), "-t", "STREAMABLE_HTTP"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as error:
+        raise SkylarkError(
+            "cannot start utoo-proxy; check the configured executable",
+            source="local transport",
+            code=error.errno,
+        ) from None
     stdin, stdout = proc.stdin, proc.stdout
-    if stdin is None or stdout is None:  # pragma: no cover - pipes requested
-        raise SkylarkError("failed to open utoo-proxy pipes")
-    sel = selectors.DefaultSelector()
-    os.set_blocking(stdout.fileno(), False)
-    sel.register(stdout, selectors.EVENT_READ)
+    sel = None
     deadline = time.monotonic() + timeout_s()
     responses: dict[int, dict[str, Any]] = {}
     pending = bytearray()
@@ -125,7 +281,10 @@ def _call_once(tool: str, args: dict[str, Any]) -> Any:
             stdin.flush()
         except OSError as error:
             raise SkylarkError(
-                f"utoo-proxy exited during {tool}: {error}", retryable=True
+                f"utoo-proxy exited during {tool}",
+                retryable=True,
+                source="local transport",
+                code=error.errno,
             ) from error
 
     def wait_for(request_id: int) -> None:
@@ -133,7 +292,9 @@ def _call_once(tool: str, args: dict[str, Any]) -> Any:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise SkylarkError(
-                    f"{tool} timed out after {timeout_s():.0f}s", retryable=True
+                    f"local wait for {tool} timed out after {timeout_s():.2f}s",
+                    retryable=True,
+                    source="local timeout",
                 )
             if b"\n" not in pending:
                 if not sel.select(timeout=remaining):
@@ -144,7 +305,9 @@ def _call_once(tool: str, args: dict[str, Any]) -> Any:
                     continue
                 if not chunk:
                     raise SkylarkError(
-                        f"utoo-proxy exited early during {tool}", retryable=True
+                        f"utoo-proxy exited early during {tool}",
+                        retryable=True,
+                        source="local transport",
                     )
                 pending.extend(chunk)
                 continue
@@ -162,12 +325,17 @@ def _call_once(tool: str, args: dict[str, Any]) -> Any:
             mid = message.get("id")
             if isinstance(mid, int):
                 if "error" in message:
-                    raise SkylarkError(
-                        f"MCP error in {tool}: {json.dumps(message['error'])[:300]}"
-                    )
+                    raise _remote_error(message["error"], "remote JSON-RPC")
                 responses[mid] = message
 
     try:
+        if stdin is None or stdout is None:  # pragma: no cover - pipes requested
+            raise SkylarkError(
+                "failed to open utoo-proxy pipes", source="local transport"
+            )
+        sel = selectors.DefaultSelector()
+        os.set_blocking(stdout.fileno(), False)
+        sel.register(stdout, selectors.EVENT_READ)
         send(
             {
                 "jsonrpc": "2.0",
@@ -191,49 +359,116 @@ def _call_once(tool: str, args: dict[str, Any]) -> Any:
             }
         )
         wait_for(2)
+    except OSError as error:
+        raise SkylarkError(
+            f"local transport failed during {tool}",
+            retryable=error.errno
+            in {
+                errno.ETIMEDOUT,
+                errno.ECONNRESET,
+                errno.ECONNREFUSED,
+                errno.EPIPE,
+                errno.ENETUNREACH,
+                errno.EHOSTUNREACH,
+            },
+            source="local transport",
+            code=error.errno,
+        ) from None
     finally:
-        sel.close()
+        if sel is not None:
+            sel.close()
         try:
             proc.kill()
         except OSError:
             pass
         proc.wait()
         try:
-            stdin.close()
+            if stdin is not None:
+                stdin.close()
         except OSError:
             pass
-        stdout.close()
+        if stdout is not None:
+            stdout.close()
 
-    content = ((responses[2].get("result") or {}).get("content")) or []
-    text = (content[0].get("text") if content else "") or ""
-    if not text.startswith("{"):
-        raise SkylarkError(f"{tool} returned non-JSON payload: {text[:200]}")
+    result = responses[2].get("result")
+    if not isinstance(result, dict):
+        raise SkylarkError(f"{tool} returned invalid MCP result", source="remote MCP")
+    content = result.get("content") or []
+    text = (
+        content[0].get("text") if content and isinstance(content[0], dict) else ""
+    ) or ""
+    if not isinstance(text, str):
+        raise SkylarkError(f"{tool} returned invalid text", source="remote MCP")
+    if result.get("isError") is True:
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            payload = {"message": text}
+        raise _remote_error(payload, "remote MCP")
+    if not text.lstrip().startswith("{"):
+        raise SkylarkError(
+            f"{tool} returned non-JSON payload", source="remote envelope"
+        )
     try:
         envelope = json.loads(text)
     except ValueError as error:
         raise SkylarkError(f"{tool} returned invalid JSON") from error
-    if envelope.get("ok") is not True:
-        message = (
-            envelope.get("error_msg")
-            or envelope.get("message")
-            or json.dumps(envelope)[:300]
-        )
+    if not isinstance(envelope, dict):
         raise SkylarkError(
-            f"{tool} failed: {message}", retryable=_is_retryable(envelope)
+            f"{tool} returned invalid envelope", source="remote envelope"
         )
+    if envelope.get("ok") is not True:
+        raise _remote_error(envelope, "remote envelope")
     return envelope.get("data")
 
 
 def call_tool(tool: str, args: dict[str, Any]) -> Any:
-    retries = max_retries()
+    read_tools = {
+        "skylark_resolve_url",
+        "skylark_book_detail",
+        "skylark_doc_list",
+        "skylark_doc_detail",
+        "skylark_book_toc",
+    }
+    read_only = tool in read_tools or (
+        tool == "skylark_table_call"
+        and args.get("action")
+        in {
+            "table.list",
+            "table.get",
+            "record.list",
+        }
+    )
+    retries = max_retries() if read_only else 0
+    stage = {
+        "skylark_doc_list": "list",
+        "skylark_doc_detail": "export",
+        "skylark_book_toc": "toc",
+        "skylark_table_call": "export",
+    }.get(tool, "plan" if tool in read_tools else "call")
+    context = " ".join(
+        f"{key}={args[key]}"
+        for key in ("book_id", "offset", "doc_id")
+        if key in args and re.fullmatch(r"[0-9]+", str(args[key]))
+    )
+    location = f"stage={stage} {safe_diagnostic(tool, 80)} {context}".rstrip()
     for attempt in range(retries + 1):
         try:
             return _call_once(tool, args)
         except SkylarkError as error:
             if attempt >= retries or not error.retryable:
-                raise
+                raise SkylarkError(
+                    f"{location} attempt={attempt + 1}/{retries + 1}: {error}",
+                    retryable=error.retryable,
+                    source=error.source,
+                    code=error.code,
+                ) from None
             delay = min(2.0**attempt + random.uniform(0, 0.5), MAX_RETRY_DELAY_S)
-            print(f"  retry {attempt + 1}/{retries} {tool}: {error}", file=sys.stderr)
+            print(
+                f"  retry {attempt + 1}/{retries} {location} "
+                f"wait={delay:.2f}s source={error.source}: {error}",
+                file=sys.stderr,
+            )
             time.sleep(delay)
     raise SkylarkError(f"{tool} failed after {retries + 1} attempts")
 
