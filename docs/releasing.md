@@ -160,4 +160,3 @@ catalog, graph, Nginx or installed program.
 
 See [homepage delivery](homepage.md) for UI deployment and preview behavior.
 For server installation and upgrades, see [the curl installer](installing.md).
-
