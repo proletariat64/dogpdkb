@@ -200,6 +200,22 @@ def analysis_artifacts(
     }
 
 
+def assert_deletions_absent(corpus: Path, deleted_files: list[str]) -> None:
+    deleted_ids = {doc_id(name) for name in deleted_files} - {None}
+    if not deleted_ids:
+        return
+    restored = sorted(
+        path.name
+        for path in corpus.glob("*.md")
+        if path.is_file() and doc_id(path.name) in deleted_ids
+    )
+    if restored:
+        raise RuntimeError(
+            f"deleted documents restored in corpus: {restored}; "
+            "refresh the sync plan before applying these deletions"
+        )
+
+
 def build_candidate(
     corpus: Path,
     graph_dir: Path,
@@ -211,6 +227,7 @@ def build_candidate(
     *,
     base_dir: Path,
 ) -> tuple[Path, dict[str, Any]]:
+    assert_deletions_absent(corpus, deleted_files)
     old = load_json(base_dir / "graph.json")
     # A rebase can introduce another filename for a document in this delta.
     # Derive ownership from the pinned baseline, not only the corpus backup.
@@ -496,6 +513,7 @@ def main() -> None:
                 ),
             },
         )
+    assert_deletions_absent(corpus, deleted_files)
     publish_candidate(candidate, graph_dir, staging)
     result = {
         **audit,

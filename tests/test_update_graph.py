@@ -316,7 +316,8 @@ def test_rebased_delta_removes_third_filename_for_same_document(
     corpus = tmp_path / "corpus"
     corpus.mkdir()
     current = "current-[1].md"
-    (corpus / current).write_text("new" if change == "update" else "")
+    if change != "delete":
+        (corpus / current).write_text("new" if change == "update" else "")
     graph = corpus / "graphify-out"
     graph.mkdir()
     untouched = {"id": "other", "label": "Keep", "source_file": "other-[2].md"}
@@ -383,3 +384,76 @@ def test_rebased_delta_removes_third_filename_for_same_document(
     manifest = update_graph.load_json(candidate / "manifest.json")
     assert "third-[1].md" not in manifest
     assert manifest["other-[2].md"] == {"keep": True}
+
+
+@pytest.mark.parametrize("cached_candidate", [False, True])
+def test_rebased_deletion_rejects_restored_document(
+    tmp_path, monkeypatch, cached_candidate
+):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    graph = corpus / "graphify-out"
+    graph.mkdir()
+    live_graph = {
+        "nodes": [{"id": "restored", "source_file": "restored-[1].md"}],
+        "links": [],
+    }
+    update_graph.write_json(graph / "graph.json", live_graph)
+    update_graph.write_json(
+        graph / "manifest.json", {"restored-[1].md": {"keep": True}}
+    )
+    manifest = tmp_path / "manifest.json"
+    update_graph.write_json(
+        manifest, {"deleted": [{"id": 1, "local_file": "deleted-[1].md"}]}
+    )
+    staging = tmp_path / "stage"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "update_graph",
+            "-i",
+            str(corpus),
+            "--manifest",
+            str(manifest),
+            "--staging",
+            str(staging),
+            "--rebase",
+        ],
+    )
+    restored = corpus / "restored-[1].md"
+    timestamp = corpus / ".sync-state.json"
+    timestamp.write_text('{"1": {"content_updated_at": "2026-11-06"}}')
+    if cached_candidate:
+
+        def build(*args, **kwargs):
+            candidate = staging / "candidate"
+            candidate.mkdir()
+            update_graph.write_json(
+                candidate / "graph.json", {"nodes": [], "links": []}
+            )
+            return candidate, {}
+
+        monkeypatch.setattr(update_graph, "build_candidate", build)
+        monkeypatch.setattr(
+            update_graph,
+            "publish_candidate",
+            lambda *args: (_ for _ in ()).throw(OSError("before publish")),
+        )
+        with pytest.raises(OSError, match="before publish"):
+            update_graph.main()
+        monkeypatch.setattr(sys, "argv", sys.argv[:-1])
+        monkeypatch.setattr(
+            update_graph,
+            "publish_candidate",
+            lambda *args: pytest.fail("stale candidate published"),
+        )
+    restored.write_text("restored content")
+    with pytest.raises(RuntimeError, match="deleted documents restored in corpus"):
+        update_graph.main()
+    assert update_graph.load_json(graph / "graph.json") == live_graph
+    assert update_graph.load_json(graph / "manifest.json") == {
+        "restored-[1].md": {"keep": True}
+    }
+    assert restored.read_text() == "restored content"
+    assert timestamp.read_text() == '{"1": {"content_updated_at": "2026-11-06"}}'
