@@ -17,3 +17,5 @@ Implemented in 59ed843. Required export/OCR failures now stop before publication
 ## Comments
 
 Review follow-up 1410008 reads formal sync state before publication, records its nonzero SystemExit failure, and preserves failure/retry diagnostics when the failed manifest cannot be persisted. Invalid-state and diagnostic-storage regressions pass in the final 516-test suite.
+
+PR #10 follow-up: the export-cancellation review finding was valid. Direct apply now records a failed export manifest with the cancelled document ID, prints the same-staging recovery command, and re-raises KeyboardInterrupt without starting OCR or publication. Completed exports remain reusable. Regressions replay the emitted command in normal and no-merge modes and preserve diagnostics when manifest storage is unavailable. Final `make check` passed 518 tests plus lint, formatting and documentation checks. The first full run hit an unrelated 100 ms proxy timing timeout; that test passed in isolation and the unchanged full rerun passed. Greptile was not retriggered.

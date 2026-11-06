@@ -1,6 +1,7 @@
 """Apply recovery uses retained staging without publishing incomplete batches."""
 
 import json
+import shlex
 import sys
 from pathlib import Path
 
@@ -274,8 +275,11 @@ def test_failed_missing_ocr_regeneration_never_trusts_partial_output(
     assert (corpus / "Doc-1-2026-11-01-[1].md").read_text() == "new 1"
 
 
-def test_cancelled_export_preserves_only_finished_checkpoints(run, monkeypatch):
-    invoke, corpus, staging, _failures, exports, _ocr, _plan = run
+@pytest.mark.parametrize("no_merge", [False, True])
+def test_cancelled_export_reports_recovery_and_reuses_finished_checkpoints(
+    run, monkeypatch, capsys, no_merge
+):
+    invoke, corpus, staging, _failures, exports, ocr, plan = run
     before = snapshot(corpus)
     export = apply_sync.export_doc
 
@@ -286,17 +290,38 @@ def test_cancelled_export_preserves_only_finished_checkpoints(run, monkeypatch):
 
     monkeypatch.setattr(apply_sync, "export_doc", interrupted)
     with pytest.raises(KeyboardInterrupt):
-        invoke()
+        invoke(*(["--no-merge"] if no_merge else []))
     assert snapshot(corpus) == before
+    assert ocr == []
     progress = json.loads((staging / "export-progress.json").read_text())
     assert set(progress["documents"]) == {"1"}
+    manifest = json.loads((staging / "manifest.json").read_text())
+    assert manifest["status"] == "failed"
+    assert manifest["failures"] == [{"stage": "export", "id": 2, "reason": "cancelled"}]
+    assert "published" not in manifest
+    output = capsys.readouterr().err
+    assert "[export]" in output and "cancelled" in output
+    assert "valid export/OCR checkpoints will be reused" in output
+    retry = next(
+        line.removeprefix("Retry: ")
+        for line in output.splitlines()
+        if line.startswith("Retry: ")
+    )
+    command = shlex.split(retry)
+    assert command[command.index("--staging") + 1] == str(staging)
+    assert command[command.index("--sync-json") + 1] == str(plan)
+    assert ("--no-merge" in command) is no_merge
     exports.clear()
     monkeypatch.setattr(apply_sync, "export_doc", export)
-
-    invoke()
+    monkeypatch.setattr(sys, "argv", command[1:])
+    apply_sync.main()
 
     assert exports == [2]
-    assert (corpus / "Doc-1-2026-11-01-[1].md").read_text() == "new 1"
+    if no_merge:
+        assert snapshot(corpus) == before
+    else:
+        assert (corpus / "Doc-1-2026-11-01-[1].md").read_text() == "new 1"
+        assert (corpus / "Doc-2-2026-11-01-[2].md").read_text() == "new 2"
 
 
 @pytest.mark.parametrize("state", ["not JSON", '{"version": 2, "documents": {}}'])
@@ -319,7 +344,9 @@ def test_invalid_sync_state_fails_before_publication_with_retry_diagnostics(
     assert "[publish] failed" in output and "Retry:" in output
 
 
-@pytest.mark.parametrize("stage", ["export", "ocr", "publish", "cancel"])
+@pytest.mark.parametrize(
+    "stage", ["export", "ocr", "publish", "cancel", "export_cancel"]
+)
 def test_failure_retry_output_survives_unwritable_diagnostic_manifest(
     run, monkeypatch, capsys, stage
 ):
@@ -327,6 +354,15 @@ def test_failure_retry_output_survives_unwritable_diagnostic_manifest(
     before = snapshot(corpus)
     if stage == "export":
         failures.add(2)
+    elif stage == "export_cancel":
+        export = apply_sync.export_doc
+
+        def cancel_export(doc_id, doc_format=None):
+            if doc_id == 2:
+                raise KeyboardInterrupt()
+            return export(doc_id, doc_format)
+
+        monkeypatch.setattr(apply_sync, "export_doc", cancel_export)
     elif stage == "ocr":
         monkeypatch.setattr(apply_sync, "run_mdocr", lambda files, out_dir: 1)
     elif stage == "cancel":
@@ -349,14 +385,16 @@ def test_failure_retry_output_survives_unwritable_diagnostic_manifest(
         return replace(path, target)
 
     monkeypatch.setattr(Path, "replace", cannot_save_failure)
-    with pytest.raises(KeyboardInterrupt if stage == "cancel" else SystemExit) as error:
+    cancelled = stage in {"cancel", "export_cancel"}
+    with pytest.raises(KeyboardInterrupt if cancelled else SystemExit) as error:
         invoke()
 
-    if stage != "cancel":
+    if not cancelled:
         assert error.value.code != 0
     assert snapshot(corpus) == before
     output = capsys.readouterr().err
     assert "Retry:" in output
     assert "cannot persist failure manifest" in output
     assert "credential-value" not in output
-    assert f"[{stage if stage != 'cancel' else 'ocr'}]" in output
+    expected_stage = {"cancel": "ocr", "export_cancel": "export"}.get(stage, stage)
+    assert f"[{expected_stage}]" in output

@@ -485,6 +485,7 @@ def main() -> None:
     exported: list[tuple[Path, dict[str, Any]]] = []
     skipped: list[tuple[int, str]] = []
     errors: list[dict[str, Any]] = []
+    export_cancellation: KeyboardInterrupt | None = None
     for i, doc in enumerate(delta, 1):
         doc_id = doc["id"]
         prior = completed.get(str(doc_id)) or {}
@@ -511,6 +512,11 @@ def main() -> None:
             save_progress(errors)
         try:
             body, detail = export_doc(doc_id, doc.get("format"))
+        except KeyboardInterrupt as error:
+            export_cancellation = error
+            skipped.append((doc_id, "cancelled"))
+            errors.append({"id": doc_id, "reason": "cancelled"})
+            break
         except SkylarkError as error:
             reason = safe_diagnostic(error)
             skipped.append((doc_id, reason))
@@ -564,10 +570,6 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    print(
-        f"exported {len(exported)}, skipped {len(skipped)}; running mdocr ocr ...",
-        file=sys.stderr,
-    )
     manifest = {
         "status": "failed" if errors else "staged",
         "failures": [{"stage": "export", **error} for error in errors],
@@ -592,6 +594,19 @@ def main() -> None:
         _write_failure_manifest(manifest_path, manifest)
     else:
         _write_json(manifest_path, manifest)
+    if export_cancellation is not None:
+        print(
+            f"[export] cancelled doc_id={doc_id}; completed={len(exported)} "
+            f"failed={len(errors)}; staging kept at {staging}; "
+            "valid export/OCR checkpoints will be reused",
+            file=sys.stderr,
+        )
+        print_retry()
+        raise export_cancellation
+    print(
+        f"exported {len(exported)}, skipped {len(skipped)}; running mdocr ocr ...",
+        file=sys.stderr,
+    )
     try:
         run_ocr_with_resume([p for p, _ in exported], ocr_dir, staging / "checkpoints")
     except (OSError, RuntimeError, KeyboardInterrupt) as error:
