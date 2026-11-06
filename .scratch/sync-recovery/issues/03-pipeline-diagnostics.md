@@ -1,7 +1,7 @@
 # Pipeline completion and recovery diagnostics
 
 Type: task
-Status: ready-for-agent
+Status: claimed
 Blocked by: 01, 02
 
 Spec: [spec.md](../spec.md)
