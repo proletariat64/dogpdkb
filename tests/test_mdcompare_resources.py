@@ -317,3 +317,64 @@ def test_resource_budget_excess_is_unknown_not_truncated_equality(tmp_path):
     assert (
         "RESOURCE_BUDGET_EXCEEDED" in report["results"][0]["resources"]["reason_codes"]
     )
+
+
+@pytest.mark.parametrize(
+    "markup",
+    [
+        "`![screen](screen.png)``\n",
+        "``![screen](screen.png)`\n",
+        "````![screen](screen.png)```\n",
+        "\\\\![screen](screen.png)\n",
+        "\\\\![screen](opaque-target)\n",
+    ],
+)
+def test_unmatched_code_runs_and_even_escapes_do_not_hide_dependencies(
+    tmp_path, markup
+):
+    markdown = tmp_path / "document.md"
+    markdown.write_text(markup)
+    completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
+    assert completed.returncode == 2
+    assert report["results"][0]["resources"]["status"] == "UNKNOWN"
+    assert report["results"][0]["action"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize(
+    "markup",
+    [
+        "\\`![screen](opaque-target)\\`\n",
+        "```\n```not-a-close\n```\n![screen](opaque-target)\n",
+        "```invalid`info\n![screen](opaque-target)\n",
+        "```\nexample\n   ```\n![screen](opaque-target)\n",
+        "`unmatched paragraph\n\n![screen](opaque-target)\n`\n",
+        '<a title="`">![screen](opaque-target)`',
+    ],
+)
+def test_unproven_or_ended_code_scope_does_not_hide_real_images(tmp_path, markup):
+    markdown = tmp_path / "document.md"
+    markdown.write_text(markup)
+    completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
+    assert completed.returncode == 2
+    assert report["results"][0]["resources"]["status"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize(
+    "markup",
+    [
+        "`![screen](opaque-target)`\n",
+        "``![screen](opaque-target)``\n",
+        "example ````![screen](opaque-target)````\n",
+        "`![screen](opaque-target)\\`\n",
+        "```md\n![screen](opaque-target)\n```\n",
+        "```md\n![screen](opaque-target)\n",
+        "~~~~\n![screen](opaque-target)\n~~~\n",
+        "\\![screen](opaque-target)\n",
+    ],
+)
+def test_proven_code_and_escaped_image_marker_remain_resource_free(tmp_path, markup):
+    markdown = tmp_path / "document.md"
+    markdown.write_text(markup)
+    completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
+    assert completed.returncode == 0
+    assert report["results"][0]["action"] == "SKIP_VERIFIED"
