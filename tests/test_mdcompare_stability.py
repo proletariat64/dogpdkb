@@ -231,3 +231,12 @@ def test_file_budget_limits_document_without_truncating_it_to_equal(tmp_path):
     assert report["results"][0]["action"] == "UNKNOWN"
     assert "FILE_BUDGET_EXCEEDED" in report["results"][0]["reason_codes"]
     assert raw.read_bytes() == b"123456789"
+
+
+def test_manifest_change_during_read_preserves_explicit_reason(tmp_path):
+    manifest = tmp_path / "incoming.json"
+    result, output = run_cli(tmp_path, [], [], hook=mutation_hook(manifest, manifest))
+    assert result.returncode == 1
+    assert result.stderr.strip() == "mdcompare: INPUT_CHANGED"
+    assert result.stdout == ""
+    assert not output.exists()

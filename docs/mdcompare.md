@@ -106,8 +106,11 @@ status and provenance verification. Each evidence region has one-based old/new
 line locations, removed/added text and optional character insert/delete details.
 Clipped evidence is explanatory, not a complete patch or an equality proof.
 Resources and OCR include independent per-resource items and processing lists;
-confirmed local changes survive an aggregate UNKNOWN. Metadata includes changed
-meaningful fields and a separate sync timestamp flag.
+confirmed local changes survive an aggregate UNKNOWN. Read failures retain these
+same dimension keys: unverified `byte_equal` and `references_changed` are null,
+`comparison_complete` is false, and evidence/work lists contain only confirmed
+items (possibly empty). Empty lists or null facts never establish no dependencies
+or unchanged content. Metadata includes changed meaningful fields and a separate sync timestamp flag.
 
 | Action | Required evidence / caller work |
 | --- | --- |
@@ -139,14 +142,17 @@ created.
 | `--max-char-region` | 4096 combined removed/added characters | Omit optional character detail; keep the line comparison. |
 
 File limits must be positive; diff/evidence/region limits may be zero. Resource and
-OCR declarations/occurrences have explicit 10,000-item limits. Prepared JPEGs also
-have a 20-million-pixel validation limit. Budget exhaustion never proves equality.
+OCR declarations/occurrences have explicit 10,000-item limits. Resource discovery
+has a separate fixed cumulative syntax work estimate capped at 20,000,000 before
+code masking and matching; exceeding it is RESOURCE_BUDGET_EXCEEDED. See the
+[resource limits](mdcompare-resources.md) for its conservative calculation.
+Prepared JPEGs also have a 20-million-pixel validation limit. Budget exhaustion never proves equality.
 
 Reason codes are machine-readable identifiers; inspect dimension-specific reasons,
 not just the final action. Common groups are:
 
 - Input/global: MANIFEST_UNREADABLE_OR_INVALID, MANIFEST_SCHEMA_INVALID,
-  DUPLICATE_DOCUMENT_ID, MANIFEST_CHANGED, INPUT_READ_FAILED, INPUT_CHANGED,
+  DUPLICATE_DOCUMENT_ID, DUPLICATE_JSON_FIELD, MANIFEST_CHANGED, INPUT_READ_FAILED, INPUT_CHANGED,
   FILE_BUDGET_EXCEEDED, REPORT_INPUT_COLLISION, REPORT_WRITE_FAILED.
 - Text: TEXT_BYTES_EQUAL, TEXT_BYTES_DIFFER, TEXT_NORMALIZED_EQUAL,
   TEXT_ENCODING_UNSUPPORTED, DIFF_BUDGET_EXCEEDED, NEW_DOCUMENT.

@@ -317,3 +317,24 @@ def test_cyclic_artifact_image_reference_is_private_unknown(tmp_path):
     assert report["results"][0]["action"] == "UNKNOWN"
     assert "OCR_ARTIFACT_MAPPING_UNVERIFIED" in report["results"][0]["reason_codes"]
     assert result.stdout == result.stderr == ""
+
+
+@pytest.mark.parametrize("obsolete_records", ["malformed", "oversized"])
+def test_changed_image_does_not_validate_obsolete_ocr_inventory(
+    tmp_path, obsolete_records
+):
+    baseline, incoming = captured_pair(tmp_path)
+    if obsolete_records == "malformed":
+        baseline["ocr"]["images"] = [None]
+    else:
+        baseline["ocr"]["images"] *= 10_001
+    replacement = tmp_path / "replacement.png"
+    replacement.write_bytes(b"changed original bytes")
+    incoming["resources"][0]["path"] = str(replacement)
+    completed, report = invoke(tmp_path, [baseline], [incoming])
+    assert completed.returncode == 0
+    assert report is not None
+    row = report["results"][0]
+    assert row["action"] == "PROCESS_CHANGED_RESOURCES"
+    assert row["ocr"]["processing_required"] == ["limit"]
+    assert row["ocr"]["reusable"] == []

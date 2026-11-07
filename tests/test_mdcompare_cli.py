@@ -26,7 +26,7 @@ def document(path, document_id="1", knowledge_base="book", **updates):
     return value
 
 
-def invoke(tmp_path, baseline, incoming, *extra):
+def invoke(tmp_path, baseline, incoming, *extra, timeout=None):
     old = tmp_path / "baseline.json"
     new = tmp_path / "incoming.json"
     out = tmp_path / "report.json"
@@ -51,6 +51,7 @@ def invoke(tmp_path, baseline, incoming, *extra):
         capture_output=True,
         text=True,
         env=env,
+        timeout=timeout,
     )
     return result, json.loads(out.read_text()) if out.is_file() else None
 
@@ -229,3 +230,82 @@ def test_invalid_or_ambiguous_manifest_is_global_failure(tmp_path, payload):
     assert result.returncode == 1
     assert not output.exists()
     assert "Traceback" not in result.stderr
+    if payload == '{"schema_version": "1.0", "documents": [], "documents": []}':
+        assert result.stderr.strip() == "mdcompare: DUPLICATE_JSON_FIELD"
+
+
+@pytest.mark.parametrize("unread_side", ["baseline", "incoming"])
+def test_unread_raw_retains_complete_unknown_dimension_schema(tmp_path, unread_side):
+    raw = tmp_path / "raw.md"
+    raw.write_text("same")
+    missing = tmp_path / "missing.md"
+    old = document(missing if unread_side == "baseline" else raw)
+    new = document(missing if unread_side == "incoming" else raw)
+    completed, report = invoke(tmp_path, [old], [new])
+    assert completed.returncode == 2
+    assert report is not None
+    row = report["results"][0]
+    assert row["action"] == "UNKNOWN"
+    assert {
+        "status",
+        "reason_codes",
+        "differences",
+        "byte_equal",
+        "comparison_complete",
+        "evidence_truncated",
+    } <= row["text"].keys()
+    assert row["text"]["byte_equal"] is None
+    assert row["text"]["comparison_complete"] is False
+    assert row["text"]["evidence_truncated"] is False
+    assert {
+        "status",
+        "reason_codes",
+        "items",
+        "processing_required",
+        "references_changed",
+    } <= row["resources"].keys()
+    assert row["resources"]["references_changed"] is None
+    assert row["resources"]["items"] == []
+    assert row["resources"]["processing_required"] == []
+    assert {
+        "status",
+        "reason_codes",
+        "items",
+        "reusable",
+        "processing_required",
+    } <= row["ocr"].keys()
+    assert row["ocr"]["status"] == "UNKNOWN"
+    assert row["ocr"]["items"] == []
+    assert row["ocr"]["reusable"] == []
+    assert row["ocr"]["processing_required"] == []
+
+
+def test_manifest_byte_budget_keeps_explicit_private_reason(tmp_path):
+    baseline = tmp_path / "baseline.json"
+    incoming = tmp_path / "private-token-incoming.json"
+    output = tmp_path / "report.json"
+    baseline.write_text('{"schema_version": "1.0", "documents": []}')
+    incoming.write_bytes(b" " * (16 * 1024 * 1024 + 1))
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mdcompare",
+            "compare",
+            "--baseline",
+            str(baseline),
+            "--incoming",
+            str(incoming),
+            "--output",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=dict(os.environ, PYTHONPATH=str(Path(__file__).parents[1] / "src")),
+    )
+    assert result.returncode == 1
+    assert result.stderr.strip() == "mdcompare: FILE_BUDGET_EXCEEDED"
+    assert result.stdout == ""
+    assert "private-token" not in result.stderr
+    assert not output.exists()

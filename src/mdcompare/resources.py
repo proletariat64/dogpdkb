@@ -12,12 +12,13 @@ from .io import InputError, InputReader
 from .model import CompareOptions, Document
 
 MAX_RESOURCE_REFERENCES = 10_000
+MAX_RESOURCE_SYNTAX_WORK = 20_000_000
 INLINE = re.compile(
-    r'(!?)\[([^\]\n]*)\]\((?:<([^>\n]+)>|([^\s)]+))(?:\s+([\'"])(.*?)\5)?\)'
+    r'(!?)\[([^\]\r\n]*)\]\((?:<([^>\r\n]+)>|([^\s)]+))(?:\s+([\'"])(.*?)\5)?\)'
 )
-REFERENCE = re.compile(r"(!?)\[([^\]\n]*)\](?:\[([^\]\n]*)\])?")
+REFERENCE = re.compile(r"(!?)\[([^\]\r\n]*)\](?:\[([^\]\r\n]*)\])?")
 DEFINITION = re.compile(
-    r'^ {0,3}\[([^\]]+)\]:[ \t]*(?:<([^>]+)>|(\S+))(?:[ \t]+([\'"])(.*?)\4)?[ \t]*$',
+    r'^ {0,3}\[([^\]\r\n]+)\]:[ \t]*(?:<([^>\r\n]+)>|(\S+))(?:[ \t]+([\'"])(.*?)\4)?[ \t]*$',
     re.MULTILINE,
 )
 DOWNLOAD_SUFFIXES = {
@@ -45,7 +46,7 @@ DOWNLOAD_SUFFIXES = {
     ".webm",
 }
 RESOURCE_TAG = re.compile(
-    r"<(img|video|audio|source|iframe|object|embed|script|link|image|use)\b",
+    r"<(img|video|audio|source|iframe|object|embed|script|link|image|use|input|style)\b",
     re.IGNORECASE,
 )
 
@@ -108,7 +109,7 @@ def _mask_spans(line: str) -> str:
 
 
 def _mask_code(text: str) -> str:
-    lines = text.splitlines(keepends=True)
+    lines = text.split("\n")
     fence = None
     prior_html = False
     for i, line in enumerate(lines):
@@ -132,9 +133,12 @@ def _mask_code(text: str) -> str:
             fence = marker.group(1)
             lines[i] = _spaces(line)
         else:
-            lines[i] = _mask_spans(line)
+            # Raw HTML blocks do not interpret backticks as Markdown code.
+            # Without a full block parser, leave uncertain HTML context visible.
+            if not prior_html and not re.match(r"^ {0,3}<", line):
+                lines[i] = _mask_spans(line)
             prior_html = prior_html or "<" in line
-    return "".join(lines)
+    return "\n".join(lines)
 
 
 class _EmbeddedResources(HTMLParser):
@@ -159,10 +163,44 @@ class _EmbeddedResources(HTMLParser):
             "link",
             "image",
             "use",
+            "input",
+            "style",
         }
         if relevant:
             self.tags += 1
         if len(pairs) != len(attrs) and relevant:
+            self.reasons.append("RESOURCE_SYNTAX_UNVERIFIED")
+        # Only understood target attributes can establish a complete dependency
+        # inventory. Unknown HTML/CSS may load resources without an img tag.
+        supported = {
+            "src": {"img", "video", "audio", "source", "iframe", "embed", "script"},
+            "srcset": {"img", "video", "audio", "source", "iframe", "embed", "script"},
+            "poster": {"img", "video", "audio", "source", "iframe", "embed", "script"},
+            "data": {"object"},
+            "href": {"a", "link", "image", "use"},
+            "xlink:href": {"image", "use"},
+        }
+        if (
+            any(
+                name
+                in {
+                    "style",
+                    "srcdoc",
+                    "background",
+                    "manifest",
+                    "archive",
+                    "codebase",
+                    "classid",
+                }
+                or name.startswith("on")
+                or name in supported
+                and tag not in supported[name]
+                or name.endswith((":src", ":href"))
+                and name not in supported
+                for name in pairs
+            )
+            or "-" in tag
+        ):
             self.reasons.append("RESOURCE_SYNTAX_UNVERIFIED")
         targets = []
         if tag in {"img", "video", "audio", "source", "iframe", "embed", "script"}:
@@ -214,9 +252,19 @@ def _uses(
     data: bytes, declarations: dict[str, dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[str]]:
     try:
-        text = _mask_code(data.decode("utf-8"))
+        # CommonMark line boundaries are LF, CRLF and CR only. This is a
+        # parsing view; comparison text and its byte identity stay untouched.
+        text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     except UnicodeDecodeError:
         return [], ["RESOURCE_SYNTAX_UNVERIFIED"]
+    # Regex candidates can rescan a malformed line. Bound that work before
+    # matching; a byte cap alone permits quadratic unmatched-bracket inputs.
+    syntax_work = 0
+    for line in text.split("\n"):
+        syntax_work += len(line) * sum(line.count(char) for char in "[<`~")
+        if syntax_work > MAX_RESOURCE_SYNTAX_WORK:
+            return [], ["RESOURCE_BUDGET_EXCEEDED"]
+    text = _mask_code(text)
     if text.count("![") + len(RESOURCE_TAG.findall(text)) > MAX_RESOURCE_REFERENCES:
         return [], ["RESOURCE_BUDGET_EXCEEDED"]
     declared_urls = {entry["url"] for entry in declarations.values()}
@@ -409,6 +457,10 @@ def compare_resources(
             if current
             else [],
         }
+        if current is None:
+            item.update(status="CHANGED", operation="removed")
+            items.append(item)
+            continue
         try:
             previous_data = (
                 reader.read_bytes(old.resolve(previous["path"]))
@@ -423,9 +475,7 @@ def compare_resources(
                 if current and isinstance(current.get("path"), str) and current["path"]
                 else None
             )
-            if current is None:
-                item.update(status="CHANGED", operation="removed")
-            elif previous is None and (
+            if previous is None and (
                 current_data is not None or _immutable_version(current) is not None
             ):
                 item.update(
