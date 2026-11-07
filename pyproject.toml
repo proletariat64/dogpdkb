@@ -23,10 +23,11 @@ dev = [
 [project.scripts]
 dogpdkb = "dogpdkb.cli:main"
 mdocr = "mdocr.cli:main"
+mdcompare = "mdcompare.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["dogpdkb*", "mdocr*"]
+include = ["dogpdkb*", "mdocr*", "mdcompare*"]
 namespaces = false
 
 [tool.setuptools.package-data]
