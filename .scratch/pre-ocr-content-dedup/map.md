@@ -5,7 +5,7 @@
 - Scope: approved pre-OCR content comparison spec in this feature directory; CLI name is mdcompare.
 - Seven vertical slices were approved by the user. Each ticket owns its CLI acceptance tests.
 - Work the frontier: a ready-for-agent ticket may start when all its blockers are resolved. Claim with Status: claimed; finish with Status: resolved plus an Answer containing verification evidence; append its context pointer to Decisions-so-far here.
-- No implementation has started. No production integration, OCR execution, baseline advancement or Graphify work is authorized by these tickets.
+- Implementation is active on integration branch pre-ocr-content-dedup. No production integration, OCR execution, baseline advancement or Graphify work is authorized by these tickets.
 
 ## Tickets
 
@@ -18,6 +18,8 @@
 - [07: 真实文件 UAT 与最终交付验收](issues/07-real-uat-delivery.md) — blocked by: 02, 04, 05, 06
 
 ## Decisions-so-far
+
+- [01 resolved](issues/01-cli-raw-comparison.md): merged as adf9e30; standalone CLI foundation, schema 1.0, private reports and 16 black-box tests. Parallel frontier 02, 03, 06 assigned independent worktrees.
 
 - CLI name: mdcompare. Input comparison is offline and read-only; evidence gaps stay UNKNOWN.
 - Real UAT uses the co.bot package at `/home/admin/workspace/dogpdkb/tmp/mdcompare-uat-20261107/`; start by reading its README. Access, 98 old/new/diff files each, and 4,757 index entries were verified during preparation. Recheck availability at execution time.
