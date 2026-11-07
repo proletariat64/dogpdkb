@@ -5,7 +5,7 @@
 - Scope: approved pre-OCR content comparison spec in this feature directory; CLI name is mdcompare.
 - Seven vertical slices were approved by the user. Each ticket owns its CLI acceptance tests.
 - Work the frontier: a ready-for-agent ticket may start when all its blockers are resolved. Claim with Status: claimed; finish with Status: resolved plus an Answer containing verification evidence; append its context pointer to Decisions-so-far here.
-- Implementation is active on integration branch pre-ocr-content-dedup. No production integration, OCR execution, baseline advancement or Graphify work is authorized by these tickets.
+- Implementation is complete on integration branch pre-ocr-content-dedup; tickets 01–07 are resolved. No production integration, OCR execution, baseline advancement or Graphify work is authorized by these tickets.
 
 ## Tickets
 
@@ -19,7 +19,15 @@
 
 ## Decisions-so-far
 
-- [01 resolved](issues/01-cli-raw-comparison.md): merged as adf9e30; standalone CLI foundation, schema 1.0, private reports and 16 black-box tests. Parallel frontier 02, 03, 06 assigned independent worktrees.
+- [02 resolved](issues/02-text-diff-normalization.md): bounded Myers and explicit LF rule, integrated as `0aa4838`.
+- [03 resolved](issues/03-resource-comparison.md): independent resource evidence, integrated as `0c2ee10`; conservative delimiter correction `888920f`.
+- [04 resolved](issues/04-ocr-reuse-decisions.md): prepared-image/OCR provenance and six actions, integrated as `eac5fa0`.
+- [05 resolved](issues/05-historical-inputs.md): verified raw source views or explicit legacy UNKNOWN, integrated as `a60d2a7`; shared full-JPEG validation correction `88bd9ba`.
+- [06 resolved](issues/06-input-stability-failures.md): bounded fixed views, failure diagnostics, alias protection and private report publication, integrated as `da6c451`.
+- [07 resolved](issues/07-real-uat-delivery.md): real UAT, installation and final gates; feature merge `212b1d9`, final review corrections `0ca16a8`. Full suite 722 passed, 194 focused comparator cases, type/lint/doc/build/install checks passed.
+- [Final review](../../docs/mdcompare-review.md): material findings fixed and independently rechecked. Real UAT remains98 UNKNOWN, complete/deterministic/read-only; lack of old raw/paired resource evidence is an explicit acceptance limit.
+
+- [01 resolved](issues/01-cli-raw-comparison.md): merged as adf9e30; standalone CLI foundation, schema 1.0, private reports and 16 black-box tests. That frontier was implemented in independent worktrees and is now resolved.
 
 - CLI name: mdcompare. Input comparison is offline and read-only; evidence gaps stay UNKNOWN.
 - Real UAT uses the co.bot package at `/home/admin/workspace/dogpdkb/tmp/mdcompare-uat-20261107/`; start by reading its README. Access, 98 old/new/diff files each, and 4,757 index entries were verified during preparation. Recheck availability at execution time.

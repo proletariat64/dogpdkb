@@ -51,7 +51,7 @@ Observed on the integrated comparator containing the prepared-JPEG validation fi
 | Exit codes | 2, 2; stdout/stderr empty |
 | Historical scope | HISTORICAL_ENRICHED_TO_RAW and provenance_verified=false for all 98 |
 | Missing raw reason | HISTORICAL_RAW_UNAVAILABLE for all 98 |
-| Resource and OCR dimensions | 89 UNKNOWN, 9 NOT_APPLICABLE each; no verified OCR reuse |
+| Resource and OCR dimensions | 92 UNKNOWN, 6 NOT_APPLICABLE each; no verified OCR reuse |
 | Bounded text evidence | 87 documents; every document's displayed body evidence at most 8,000 characters |
 | Diff budget limit | 11 DIFF_BUDGET_EXCEEDED at default work budget 2,000,000; never treated as equal |
 | Determinism | Both JSON files and both human reports byte-identical |
@@ -71,7 +71,7 @@ bounded observed differences:
 | --- | --- |
 | 559193484 | Default display clipping was explicit. A separate bounded 128,000-character display run showed the old 100k and new 300k values; no clipping, same UNKNOWN action and unchanged diff work budget. |
 | 558886610 | The old APD and new AP2 values remained visible in default bounded differences; UNKNOWN was preserved. |
-| 587484756 | Observed text differences retained; OCR/resources not applicable, but missing historical raw still prevents a skip. |
+| 587484756 | Observed text differences retained; conservative dependency discovery leaves resources/OCR unverified, and missing historical raw still prevents a skip. |
 | 576210508 | Observed mixed historical/raw differences retained with unverified resources/OCR. |
 | 518275144 | Unmarked/unclear historical transcription did not become a verified deletion or equality conclusion. |
 
@@ -101,6 +101,9 @@ to prove that a built wheel contains the CLI and can run independently outside t
 source checkout; it is separate from the real-file acceptance above.
 
 Final repository checks and the independent standards/specification review are
-recorded in ticket 07's Answer. That ticket stays claimed until the integration
-owner completes the review gate. No remote CI or publication is implied by local
+recorded in ticket 07's Answer. Ticket 07 is resolved after the integration owner completed the review gate and final checks. No remote CI or publication is implied by local
 checks.
+
+## Final post-review verification
+
+The final runtime integration is `0ca16a88a46df11a2c5137223fcb54a9e4190cc1`. After review fixes, both real-file runs, the amount spotlight, the full 722-test suite, type/lint/document checks and rebuilt isolated installation smoke passed again. Resource/OCR applicability changed from the pre-review 89 UNKNOWN / 9 NOT_APPLICABLE to 92 UNKNOWN / 6 NOT_APPLICABLE; all 98 document actions remained UNKNOWN. The earlier reports and artifacts are retained privately under `results/pre-review/`. Final verification and rebuilt artifacts use the existing private results paths. The [review record](mdcompare-review.md) separates original findings from post-fix validation.

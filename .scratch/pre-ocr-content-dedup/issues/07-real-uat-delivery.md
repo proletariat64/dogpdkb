@@ -2,7 +2,7 @@
 
 Type: task
 Blocked by: 02, 04, 05, 06
-Status: claimed
+Status: resolved
 
 **What to build:** 用 co.bot 已固定的 98 对真实材料运行 mdcompare，并完成全部契约的集成验收、使用文档、代码审查和交付记录。UAT 必须使用真实文件，不用合成文件冒充现场证据。
 
@@ -13,8 +13,8 @@ Status: claimed
 - [x] 记录真实资料实际覆盖与缺口。真实材料不足以证明正常旧 raw 对新 raw 或完整图片复用时如实报告，不伪造已成功发布基线；合成反例属于开发测试，不冒充真实 UAT。
 - [x] 不得远端抓取、运行 OCR、Graphify、生产同步、推进基线或修改现场输入与同步状态；仅生成调用者指定的报告。
 - [x] 使用文档说明安装调用、清单／报告 schema、规范化、比较预算、原因码、动作优先级、退出码、隐私边界及历史输入限制，明确比较结果不等于业务正确或生产上线证明。
-- [ ] 核对规范全部必测项和六种动作，运行适用类型检查及仓库要求的检查，最终运行完整测试套件，完成代码审查并修复发现的问题。
-- [ ] 交付记录列出真实 UAT 命令、输入来源、结果计数、退出码、限制与审查证据；按本地 tracker 规范附验证依据并解决所有 tickets，不把资料整理当作 UAT 执行成功。
+- [x] 核对规范全部必测项和六种动作，运行适用类型检查及仓库要求的检查，最终运行完整测试套件，完成代码审查并修复发现的问题。
+- [x] 交付记录列出真实 UAT 命令、输入来源、结果计数、退出码、限制与审查证据；按本地 tracker 规范附验证依据并解决所有 tickets，不把资料整理当作 UAT 执行成功。
 
 ## Answer
 
@@ -81,3 +81,12 @@ open for that integration closure.
 - Twenty-nine additional CLI regression cases cover these corrections. The focused comparator/distribution suite passes 194 tests. Ruff/format, doc-guard, and Pyright over the comparator plus all seven comparator test files pass; Pyright reports zero errors/warnings.
 - The successful external OCR review selected/completed 15 files, failed none and reported seven comments. Its reported code issues are addressed in this correction; root will independently recheck and aggregate review dispositions.
 - Final full-suite, real-file UAT repeats, rebuilt installation smoke and closure remain the integration owner's gates. Earlier reports/artifacts must be preserved before final replacements. Status remains claimed.
+
+## Final integration acceptance
+
+- Runtime integration: `0ca16a88a46df11a2c5137223fcb54a9e4190cc1`; review corrections: `02ea393ab8bece7184bff8ab0b3cf26acddaa0ec`. All tickets are resolved; no production caller integration or release was performed.
+- Final full repository run: `PYTHONPATH=src .venv/bin/python -m pytest -q --durations=10` — **722 passed in 31.61s**. Focused comparator/distribution suite: **194 passed**. Ruff check/format (123 files), doc-guard and cached Pyright for all mdcompare source and new tests passed with zero type errors/warnings.
+- Rebuilt final wheel/sdist offline with `UV_OFFLINE=1 make build`; isolated `UV_OFFLINE=1 .venv/bin/python scripts/smoke_install.py --dist dist` passed, including installed mdcompare comparison. This is local installation proof, not authenticated release-download or production UAT proof.
+- Repeated real-file UAT on final runtime: 98 results and 98 UNKNOWN each, exit codes 2/2, byte-identical JSON/human reports, all 307 input files unchanged. Resources and OCR now each 92 UNKNOWN / 6 NOT_APPLICABLE after dependency fixes. Default bounded evidence remains 87 documents / 11 diff-budget limits. Real amount and field-value spotlights remain visible with their documented display budgets.
+- Standards and Spec reviewed the full integration diff from actual default branch `origin/master`; local OCR completed 15/15 selected code items, zero failures. All material code findings and both OCR low code cleanups were fixed; independent Spec recheck found no remaining material issue. One low intermediate merge-subject convention deviation is retained rather than rewriting the evidence-linked history; subsequent merge messages use conventional prefixes. Full findings and dispositions: [review record](../../../docs/mdcompare-review.md).
+- Private source, final UAT reports, verification, review summaries and rebuilt artifacts are retained under ignored `tmp/mdcompare-uat-20261107/`. Earlier evidence is retained under `results/pre-review/`. No old raw or paired image evidence was invented; no baseline was promoted.
