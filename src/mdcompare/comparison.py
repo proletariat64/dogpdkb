@@ -46,9 +46,12 @@ def compare_documents(
         try:
             new_bytes = reader.read_bytes(new.path)
             old_bytes = reader.read_bytes(old.path) if old else None
-            text = compare_history(old, new, old_bytes, new_bytes, reader, options)
-            if text is None:
+            history = compare_history(old, new, old_bytes, new_bytes, reader, options)
+            if history is None:
                 text = compare_text(old_bytes, new_bytes, options)
+            else:
+                text = history.text
+                old_bytes, new_bytes = history.old_bytes, history.new_bytes
             resources = compare_resources(
                 old, new, old_bytes, new_bytes, reader, options
             )

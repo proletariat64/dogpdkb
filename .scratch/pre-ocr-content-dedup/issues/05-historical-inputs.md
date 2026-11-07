@@ -2,7 +2,7 @@
 
 Type: task
 Blocked by: 02
-Status: ready-for-agent
+Status: claimed
 
 **What to build:** 调用者明确声明历史 OCR 富化旧输入后，可以看到差异及来源限制；缺失旧 raw 或无法区分派生转写时得到 UNKNOWN，避免把真实删除解释成无变化。
 
