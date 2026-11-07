@@ -30,7 +30,7 @@ def repository(tmp_path, monkeypatch, commands):
     (root / "pyproject.toml").write_text('[project]\nversion = "0.1.0"\n')
     (root / "uv.lock").write_text("version = 1\n")
     (root / "Makefile").write_text(
-        "check:\n\t@true\nsmoke:\n\t@true\npublish-release:\n\t@true\n"
+        "bootstrap:\n\t@true\ncheck:\n\t@true\nsmoke:\n\t@true\npublish-release:\n\t@true\n"
         "publish-site-release:\n\t@true\n"
     )
     git(root, "add", ".")
@@ -145,7 +145,7 @@ def test_mismatching_tag_is_never_replaced(repository, remote_tag):
         tool.release(root, retry=True)
 
 
-@pytest.mark.parametrize("gate", ["check", "smoke"])
+@pytest.mark.parametrize("gate", ["bootstrap", "check", "smoke"])
 def test_checks_fail_before_any_tag(repository, monkeypatch, gate):
     root, remote, original = repository
 
@@ -163,6 +163,7 @@ def test_checks_fail_before_any_tag(repository, monkeypatch, gate):
 
 def test_publication_order(repository, commands):
     tool.release(repository[0])
+    bootstrap = commands.index(["make", "bootstrap"])
     check = commands.index(["make", "check"])
     smoke = commands.index(["make", "smoke"])
     tag = next(i for i, args in enumerate(commands) if args[:3] == ["git", "tag", "-a"])
@@ -171,7 +172,25 @@ def test_publication_order(repository, commands):
         ["make", "publish-release", "TAG=v0.1.0", "TARGET=antcode"]
     )
     homepage = commands.index(["make", "publish-site-release", "TAG=v0.1.0"])
-    assert check < smoke < tag < push < publish < homepage
+    assert bootstrap < check < smoke < tag < push < publish < homepage
+
+
+def test_release_refreshes_stale_environment_before_checks(repository):
+    root, _, _ = repository
+    (root / ".gitignore").write_text(".installed-version\n")
+    (root / "Makefile").write_text(
+        "bootstrap:\n\t@echo 0.1.0 > .installed-version\n"
+        'check:\n\t@test "$$(cat .installed-version)" = 0.1.0\n'
+        "smoke:\n\t@true\npublish-release:\n\t@true\n"
+        "publish-site-release:\n\t@true\n"
+    )
+    git(root, "add", ".")
+    git(root, "commit", "-qm", "test: require current environment")
+    git(root, "push", "-q", str(repository[1]), "master")
+    for retry in (False, True):
+        (root / ".installed-version").write_text("0.0.9\n")
+        assert tool.release(root, retry=retry) == "v0.1.0"
+        assert (root / ".installed-version").read_text().strip() == "0.1.0"
 
 
 @pytest.mark.parametrize("failure", ["push", "publish-release", "publish-site-release"])

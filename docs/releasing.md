@@ -29,7 +29,8 @@ credentials. The command:
 1. Requires trusted GitHub `origin`, clean checkout and attached `master`.
 2. Fetches GitHub `master` and requires HEAD to match the fetched commit exactly.
 3. Rejects conflicting or already existing version tags unless explicitly retrying.
-4. Runs `make check` and `make smoke` before creating a tag.
+4. Runs `make bootstrap` to refresh the local editable install and locked
+   dependencies, then `make check` and `make smoke` before creating a tag.
 5. Creates an annotated `v<project.version>` tag and pushes only that tag to GitHub.
 6. Publishes anonymous installation attachments through the local AntCode CLI.
 7. Verifies the published installer and updates the homepage's `release.json`
@@ -40,6 +41,10 @@ running checks or performing network writes. Actual release requires GitHub
 tag-write permission, AntCode Release-write permission, Python 3.12, uv, Git,
 and a working `poolab` default connection with homepage write access. There is
 no cloud publishing job or separate publishing token requirement.
+
+Bootstrap also runs on `RETRY=1`, so pulling a version bump cannot leave the
+development environment reporting the previous `dogpdkb`/`mdocr` version during
+checks. It reuses the existing environment and retains extra installed packages.
 
 ## Choose the release target
 
