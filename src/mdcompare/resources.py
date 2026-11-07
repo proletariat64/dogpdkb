@@ -13,9 +13,9 @@ from .model import CompareOptions, Document
 
 MAX_RESOURCE_REFERENCES = 10_000
 INLINE = re.compile(
-    r'(?<!\\)(!?)\[([^\]\n]*)\]\((?:<([^>\n]+)>|([^\s)]+))(?:\s+([\'"])(.*?)\5)?\)'
+    r'(!?)\[([^\]\n]*)\]\((?:<([^>\n]+)>|([^\s)]+))(?:\s+([\'"])(.*?)\5)?\)'
 )
-REFERENCE = re.compile(r"(?<!\\)(!?)\[([^\]\n]*)\](?:\[([^\]\n]*)\])?")
+REFERENCE = re.compile(r"(!?)\[([^\]\n]*)\](?:\[([^\]\n]*)\])?")
 DEFINITION = re.compile(
     r'^ {0,3}\[([^\]]+)\]:[ \t]*(?:<([^>]+)>|(\S+))(?:[ \t]+([\'"])(.*?)\4)?[ \t]*$',
     re.MULTILINE,
@@ -62,22 +62,79 @@ def _download(url: str) -> bool:
     return any(path.endswith(suffix) for suffix in DOWNLOAD_SUFFIXES)
 
 
+def _escaped(text: str, offset: int) -> bool:
+    start = offset
+    while start > 0 and text[start - 1] == "\\":
+        start -= 1
+    return (offset - start) % 2 == 1
+
+
+def _spaces(fragment: str) -> str:
+    return "".join(char if char in "\r\n" else " " for char in fragment)
+
+
+def _mask_spans(line: str) -> str:
+    """Mask only exact-run code spans proven within one physical line."""
+    runs = list(re.finditer(r"`+", line))
+    following = {}
+    closers = {}
+    for index in range(len(runs) - 1, -1, -1):
+        length = len(runs[index].group())
+        closers[index] = following.get(length)
+        following[length] = index
+    # Backticks inside an HTML-looking tag are not proven span openers.
+    angles = list(re.finditer(r"<[^>\r\n]*(?:>|$)", line))
+    angle_index = 0
+    index = 0
+    parts = []
+    previous = 0
+    while index < len(runs):
+        run = runs[index]
+        while angle_index < len(angles) and angles[angle_index].end() <= run.start():
+            angle_index += 1
+        in_angle = (
+            angle_index < len(angles) and angles[angle_index].start() <= run.start()
+        )
+        end_index = closers[index]
+        if _escaped(line, run.start()) or in_angle or end_index is None:
+            index += 1
+            continue
+        end = runs[end_index].end()
+        parts.extend((line[previous : run.start()], _spaces(line[run.start() : end])))
+        previous = end
+        index = end_index + 1
+    parts.append(line[previous:])
+    return "".join(parts)
+
+
 def _mask_code(text: str) -> str:
     lines = text.splitlines(keepends=True)
     fence = None
+    prior_html = False
     for i, line in enumerate(lines):
-        marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
-        if marker:
-            token = marker.group(1)
-            if fence is None:
-                fence = token
-            elif token[0] == fence[0] and len(token) >= len(fence):
+        if fence is not None:
+            marker = re.fullmatch(r" {0,3}(`+|~+)[ \t]*(?:\r?\n)?", line)
+            if (
+                marker
+                and marker.group(1)[0] == fence[0]
+                and len(marker.group(1)) >= len(fence)
+            ):
                 fence = None
-            lines[i] = " " * len(line)
-        elif fence is not None:
-            lines[i] = " " * len(line)
-    masked = "".join(lines)
-    return re.sub(r"(`+)([^`]|(?!\1)`)*?\1", lambda m: " " * len(m.group(0)), masked)
+            lines[i] = _spaces(line)
+            continue
+        # Container-indented or HTML-context fences are not proven top-level code.
+        marker = re.fullmatch(r"(`{3,}|~{3,})([^\r\n]*)(?:\r?\n)?", line)
+        if (
+            marker
+            and not prior_html
+            and not (marker.group(1)[0] == "`" and "`" in marker.group(2))
+        ):
+            fence = marker.group(1)
+            lines[i] = _spaces(line)
+        else:
+            lines[i] = _mask_spans(line)
+            prior_html = prior_html or "<" in line
+    return "".join(lines)
 
 
 class _EmbeddedResources(HTMLParser):
@@ -175,7 +232,10 @@ def _uses(
         covered.append(m.span())
     for m in INLINE.finditer(text):
         url = m.group(3) or m.group(4)
-        kind = "image" if m.group(1) else "attachment"
+        escaped = _escaped(text, m.start())
+        if escaped and not m.group(1):
+            continue
+        kind = "image" if m.group(1) and not escaped else "attachment"
         if "(" in url and m.group(3) is None:
             reasons.append("RESOURCE_SYNTAX_UNVERIFIED")
         if kind == "image" or _download(url) or url in declared_urls:
@@ -205,22 +265,27 @@ def _uses(
                 }
             )
     for m in REFERENCE.finditer(unclaimed_text):
+        escaped = _escaped(text, m.start())
+        if escaped and not m.group(1):
+            continue
+        image = bool(m.group(1)) and not escaped
         target = definitions.get(_label(m.group(3) or m.group(2)))
-        if m.group(1) and target is None:
+        if image and target is None:
             reasons.append("RESOURCE_SYNTAX_UNVERIFIED")
         elif target is not None:
             url, title = target
             if m.group(1) or _download(url) or url in declared_urls:
                 uses.append(
                     {
-                        "kind": "image" if m.group(1) else "attachment",
+                        "kind": "image" if image else "attachment",
                         "url": url,
                         "alt": m.group(2),
                         "title": title,
                         "offset": m.start(),
                     }
                 )
-    if len(re.findall(r"(?<!\\)!\[", text)) != sum(u["kind"] == "image" for u in uses):
+    image_count = sum(not _escaped(text, m.start()) for m in re.finditer(r"!\[", text))
+    if image_count != sum(u["kind"] == "image" for u in uses):
         reasons.append("RESOURCE_SYNTAX_UNVERIFIED")
     html = _EmbeddedResources(text)
     try:

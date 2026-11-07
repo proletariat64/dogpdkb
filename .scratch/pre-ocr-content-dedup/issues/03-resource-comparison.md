@@ -23,3 +23,10 @@ TDD at the approved CLI seam observed red before green for replaced image bytes,
 Verification after merging integration da6c451: all four mdcompare test modules passed, 97 tests; Ruff check and format passed; Pyright for src/mdcompare reported zero errors/warnings with the explicit cached typeshed; doc-guard passed 34 documents; git diff --check passed. The graph was refreshed and impact analysis identified comparison/CLI orchestration; subprocess CLI coverage is proven by the tests rather than inferred graph edges.
 
 Resource equality does not authorize OCR reuse. The initial OCR boundary still conservatively returns UNKNOWN for images; ticket04 independently verifies prepared images, provenance/configuration and artifacts before complete actions become available. No network requests, persistent hash index, production mutations or corpus operations were introduced. Immutable proof is limited to the explicit caller-captured non-null s3-version-id-v1 contract, documented with AWS primary-source references.
+
+
+## Comments
+
+Post-merge corrective verification found a false resource-free decision from a regex matching only part of a backtick closing run. Replaced regex code masking with exact maximal-run scanning, respecting opener escape parity and preserving uncertain multiline/HTML/container contexts. Corrected fenced-code info/closer rules and even-backslash image markers. Added CLI regressions for mismatched runs, escaped openers, closing backslashes inside proven spans, invalid fence closers/openers, indented closers, valid unclosed fences, paragraph boundaries, HTML-looking contexts, and odd/even image escapes. CommonMark 0.31.2 primary rules are linked in the resource guide.
+
+Corrective red → green: three explicit mismatch/even-escape cases first reproduced unsafe skip; a subsequent indented valid closer test caught an overly narrow close rule before commit. Final resource tests: 43 passed; all four current mdcompare modules: 116 passed. Pyright: zero errors/warnings. Original inputs remain read-only; no new dependencies or production operations.

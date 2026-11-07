@@ -77,8 +77,10 @@ def compare_documents(
                 text = (
                     compare_text(old_bytes, new_bytes, options)
                     if history is None
-                    else history
+                    else history.text
                 )
+                if history is not None:
+                    old_bytes, new_bytes = history.old_bytes, history.new_bytes
             except InputError as exc:
                 _record_error(errors, new, exc, text)
             try:
