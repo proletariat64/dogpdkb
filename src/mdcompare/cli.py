@@ -7,7 +7,13 @@ from pathlib import Path
 
 from . import __version__
 from .comparison import compare_documents
-from .io import InputReader, atomic_write
+from .io import (
+    InputError,
+    InputReader,
+    publish_reports,
+    referenced_paths,
+    validate_outputs,
+)
 from .manifest import ManifestError, load_manifest
 from .model import CompareOptions
 
@@ -15,6 +21,13 @@ from .model import CompareOptions
 class ArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         self.exit(1, "mdcompare: INVALID_ARGUMENTS\n")
+
+
+def _positive_file_limit(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("File limit must be positive")
+    return parsed
 
 
 def main(argv=None) -> int:
@@ -33,23 +46,32 @@ def main(argv=None) -> int:
         action="store_true",
         help="Include bounded body evidence in reports",
     )
+    compare.add_argument(
+        "--max-file-bytes",
+        type=_positive_file_limit,
+        default=16 * 1024 * 1024,
+        help="Maximum bytes per document or evidence file; oversized inputs stay UNKNOWN",
+    )
     args = parser.parse_args(argv)
-    options = CompareOptions(include_evidence=args.include_evidence)
+    options = CompareOptions(
+        include_evidence=args.include_evidence, max_file_bytes=args.max_file_bytes
+    )
     try:
-        baseline = load_manifest(args.baseline)
-        incoming = load_manifest(args.incoming)
         reader = InputReader(options.max_file_bytes)
+        baseline = load_manifest(args.baseline, reader)
+        incoming = load_manifest(args.incoming, reader)
         report = compare_documents(baseline, incoming, options, reader)
-        protected = (
-            reader.paths
-            | {args.baseline.resolve(), args.incoming.resolve()}
-            | {d.path.resolve() for d in baseline + incoming}
-        )
+        if reader.changed_paths() & {
+            args.baseline.absolute(),
+            args.incoming.absolute(),
+        }:
+            raise ManifestError("MANIFEST_CHANGED")
+        protected = reader.paths | {args.baseline, args.incoming}
+        for document in baseline + incoming:
+            protected.update(referenced_paths(document))
         outputs = [p for p in (args.output, args.report) if p is not None]
-        if len({p.resolve() for p in outputs}) != len(outputs) or any(
-            p.resolve() in protected for p in outputs
-        ):
-            raise ManifestError("REPORT_INPUT_COLLISION")
+        validate_outputs(outputs, protected)
+        reports = []
         if args.report:
             lines = [
                 "# mdcompare report",
@@ -57,15 +79,42 @@ def main(argv=None) -> int:
                 f"Documents: {report['summary']['total']}",
                 "",
             ]
-            lines += [
-                f"- {r['knowledge_base']} / {r['document_id']}: {r['action']}"
-                for r in report["results"]
-            ]
-            atomic_write(args.report, "\n".join(lines) + "\n")
-        atomic_write(
-            args.output,
-            json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            for row in report["results"]:
+                lines += [
+                    f"## {row['knowledge_base']} / {row['document_id']}",
+                    "",
+                    f"Action: {row['action']}",
+                    "",
+                    "Reasons: " + ", ".join(row["reason_codes"]),
+                    "",
+                ]
+                lines += [
+                    f"- {name}: {row[name]['status']}"
+                    for name in ("text", "resources", "metadata", "ocr")
+                ]
+                if options.include_evidence and row["text"].get("differences"):
+                    lines += [
+                        "",
+                        "Text differences (bounded JSON):",
+                        "",
+                        "```json",
+                        json.dumps(
+                            row["text"]["differences"], ensure_ascii=False, indent=2
+                        ),
+                        "```",
+                    ]
+                lines.append("")
+            reports.append((args.report, "\n".join(lines) + "\n"))
+        reports.append(
+            (
+                args.output,
+                json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            )
         )
+        publish_reports(reports)
+    except InputError as exc:
+        print(f"mdcompare: {exc.reason_code}", file=sys.stderr)
+        return 1
     except ManifestError as exc:
         print(f"mdcompare: {exc}", file=sys.stderr)
         return 1

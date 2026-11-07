@@ -12,6 +12,22 @@ from .resources import compare_resources
 from .text import compare_text
 
 
+def _record_error(
+    errors: list[dict[str, str]],
+    document: Document,
+    exc: InputError,
+    dimension: dict[str, Any],
+) -> None:
+    dimension.update(status="UNKNOWN", reason_codes=[exc.reason_code])
+    errors.append(
+        {
+            "knowledge_base": document.knowledge_base,
+            "document_id": document.document_id,
+            "reason_code": exc.reason_code,
+        }
+    )
+
+
 def compare_documents(
     baseline: list[Document],
     incoming: list[Document],
@@ -22,7 +38,8 @@ def compare_documents(
     new_ids = {d.identity for d in incoming}
     results = []
     errors = []
-    for new in incoming:
+    for new in sorted(incoming, key=lambda d: d.identity):
+        reader.begin_document(new.identity)
         old = old_by_id.get(new.identity)
         changed = [
             k
@@ -43,33 +60,38 @@ def compare_documents(
             "document_id": new.document_id,
             "metadata": metadata,
         }
+        text = {"status": "UNKNOWN", "reason_codes": [], "differences": []}
+        resources = {"status": "UNKNOWN", "reason_codes": [], "items": []}
+        ocr = {"status": "UNKNOWN", "reason_codes": []}
+
         try:
             new_bytes = reader.read_bytes(new.path)
             old_bytes = reader.read_bytes(old.path) if old else None
-            text = compare_history(old, new, old_bytes, new_bytes, reader, options)
-            if text is None:
-                text = compare_text(old_bytes, new_bytes, options)
-            resources = compare_resources(
-                old, new, old_bytes, new_bytes, reader, options
-            )
-            ocr = compare_ocr(old, new, resources, reader, options)
-            action = choose_action(old is not None, text, resources, metadata, ocr)
         except InputError as exc:
-            text = {
-                "status": "UNKNOWN",
-                "reason_codes": [exc.reason_code],
-                "differences": [],
-            }
-            resources = {"status": "UNKNOWN", "reason_codes": [], "items": []}
-            ocr = {"status": "UNKNOWN", "reason_codes": []}
-            action = "UNKNOWN"
-            errors.append(
-                {
-                    "knowledge_base": new.knowledge_base,
-                    "document_id": new.document_id,
-                    "reason_code": exc.reason_code,
-                }
-            )
+            _record_error(errors, new, exc, text)
+        else:
+            try:
+                history = compare_history(
+                    old, new, old_bytes, new_bytes, reader, options
+                )
+                text = (
+                    compare_text(old_bytes, new_bytes, options)
+                    if history is None
+                    else history
+                )
+            except InputError as exc:
+                _record_error(errors, new, exc, text)
+            try:
+                resources = compare_resources(
+                    old, new, old_bytes, new_bytes, reader, options
+                )
+            except InputError as exc:
+                _record_error(errors, new, exc, resources)
+            try:
+                ocr = compare_ocr(old, new, resources, reader, options)
+            except InputError as exc:
+                _record_error(errors, new, exc, ocr)
+        action = choose_action(old is not None, text, resources, metadata, ocr)
         row.update(
             text=text,
             resources=resources,
@@ -84,6 +106,18 @@ def compare_documents(
             ),
         )
         results.append(row)
+    affected = reader.affected_documents(reader.changed_paths())
+    for row in results:
+        if (row["knowledge_base"], row["document_id"]) in affected:
+            row["action"] = "UNKNOWN"
+            row["reason_codes"] = sorted(set(row["reason_codes"]) | {"INPUT_CHANGED"})
+            errors.append(
+                {
+                    "knowledge_base": row["knowledge_base"],
+                    "document_id": row["document_id"],
+                    "reason_code": "INPUT_CHANGED",
+                }
+            )
     counts = Counter(r["action"] for r in results)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -95,5 +129,17 @@ def compare_documents(
             if d.identity not in new_ids
         ],
         "summary": {"total": len(results), "actions": {a: counts[a] for a in ACTIONS}},
-        "errors": errors,
+        "errors": [
+            {"knowledge_base": book, "document_id": identifier, "reason_code": reason}
+            for book, identifier, reason in sorted(
+                {
+                    (
+                        error["knowledge_base"],
+                        error["document_id"],
+                        error["reason_code"],
+                    )
+                    for error in errors
+                }
+            )
+        ],
     }
