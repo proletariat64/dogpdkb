@@ -9,7 +9,7 @@ from .io import InputError, InputReader
 from .model import ACTIONS, SCHEMA_VERSION, CompareOptions, Document
 from .ocr import compare_ocr
 from .resources import compare_resources
-from .text import compare_text
+from .text import compare_text, text_rules
 
 
 def compare_documents(
@@ -87,7 +87,7 @@ def compare_documents(
     counts = Counter(r["action"] for r in results)
     return {
         "schema_version": SCHEMA_VERSION,
-        "rules": [{"name": "identity", "version": "1"}],
+        "rules": text_rules(options),
         "results": results,
         "baseline_only": [
             {"knowledge_base": d.knowledge_base, "document_id": d.document_id}

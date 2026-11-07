@@ -21,3 +21,43 @@ Exit 0: complete no unknown; 2: complete with unknown or item errors; 1: global 
 - `comparison.compare_documents(baseline_docs, incoming_docs, options, reader)` orchestrates dimensions; minimal shared glue, coordinate changes rather than duplicating decisions. Feature tests should use the CLI seam.
 
 The initial implementation cannot verify resources, OCR reuse or enriched history and deliberately returns UNKNOWN for those cases. Later tickets replace these safe placeholders.
+
+## Text comparison and explanation
+
+The default identity rule preserves every byte, including Markdown whitespace,
+Unicode, links, HTML and unknown extensions. `--normalize-line-endings` explicitly
+selects `line-endings-lf` version `1`: CRLF and lone CR become LF; every other byte
+is preserved. The selected rule and its contract appear in top-level `rules` via
+`text_rules(options)`. Exact byte equality is checked first, independent of diff
+budget. Normalized equality additionally records `TEXT_NORMALIZED_EQUAL` while
+`byte_equal` remains false.
+
+Changed UTF-8 text uses Myers shortest insert/delete edits at line level,
+preserving line terminators and final-newline differences. Changed content that
+cannot decode as UTF-8 is UNKNOWN with `TEXT_ENCODING_UNSUPPORTED`; it is never
+silently decoded with character replacement. The CLI exposes these limits:
+
+- `--max-diff-work` (default 2000000): frontier cells plus matched snake steps,
+  shared by line and requested character comparisons. Exhaustion produces
+  UNKNOWN, `comparison_complete: false`, and `DIFF_BUDGET_EXCEEDED`; known byte
+  inequality remains visible. Zero allows only exact or normalized equality.
+- `--max-evidence-chars` (default 8000): total Unicode code points of removed,
+  added and character snippets per document. This only bounds display; clipped
+  evidence sets `evidence_truncated` without pretending the comparison was equal.
+- `--max-char-region` (default 4096): maximum combined removed/added region length
+  eligible for character explanation. Larger regions keep their line explanation
+  and set `characters_omitted`; this optional detail omission does not make a
+  complete line comparison unknown. Zero disables character explanation.
+
+All limits accept nonnegative integers. Body snippets require
+`--include-evidence`; absent that flag, `differences` is empty and the reports
+still contain classifications and reasons. No snippets appear on stdout/stderr.
+
+Each text result includes `byte_equal`, `comparison_complete`, and
+`evidence_truncated`. Evidence regions appear in source order, with one-based
+`old_start_line`/`new_start_line`, verbatim `removed`/`added` strings, `characters`,
+and `characters_omitted`. Character edits have `operation` (`delete` or `insert`),
+zero-based `old_offset`/`new_offset` within that region, and `text`. Deterministic
+Myers tie-breaking prefers deletion when frontier choices reach equally far;
+ambiguous alignments therefore stay repeatable. Evidence clipping can stop within
+a line and must not be read as a complete replacement patch.
