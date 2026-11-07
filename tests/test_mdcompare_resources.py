@@ -29,6 +29,7 @@ def test_same_url_replaced_bytes_reports_changed_resource(tmp_path):
         resources=[resource("limit", "https://example.invalid/limit.png", new_image)],
     )
     completed, report = invoke(tmp_path, [old], [new])
+    assert report is not None
     row = report["results"][0]
     assert row["resources"]["status"] == "CHANGED"
     assert row["resources"]["processing_required"] == ["limit"]
@@ -44,6 +45,7 @@ def test_reference_image_and_html_embed_without_declared_evidence_are_unknown(tm
         '![screen][picture]\n\n[picture]: https://example.invalid/screen.png\n<video src="https://example.invalid/demo.mp4"></video>'
     )
     completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
+    assert report is not None
     row = report["results"][0]
     assert completed.returncode == 2
     assert row["resources"]["status"] == "UNKNOWN"
@@ -63,6 +65,7 @@ def test_version_qualified_s3_capture_can_prove_same_resource_without_bytes(tmp_
     }
     value = document(markdown, resources=[resource("screen", url, immutable=proof)])
     _, report = invoke(tmp_path, [value], [value])
+    assert report is not None
     row = report["results"][0]
     assert row["resources"]["status"] == "UNCHANGED"
     assert row["resources"]["items"][0]["basis"] == "s3-version-id-v1"
@@ -82,6 +85,7 @@ def test_different_urls_same_bytes_preserve_text_and_reference_changes(tmp_path)
         new_md, resources=[resource("picture", "https://example.invalid/new.png", data)]
     )
     _, report = invoke(tmp_path, [old], [new])
+    assert report is not None
     row = report["results"][0]
     assert row["resources"]["status"] == "UNCHANGED"
     assert row["text"]["status"] == "CHANGED"
@@ -101,6 +105,7 @@ def test_resource_occurrences_preserve_order_duplicates_and_alt_changes(tmp_path
         [document(old_md, resources=entries)],
         [document(new_md, resources=entries)],
     )
+    assert report is not None
     row = report["results"][0]
     assert row["resources"]["status"] == "UNCHANGED"
     assert row["resources"]["references_changed"] is True
@@ -130,6 +135,7 @@ def test_mixed_changed_and_missing_resource_keeps_known_work_and_unknown(tmp_pat
         [document(markdown, resources=old)],
         [document(markdown, resources=new)],
     )
+    assert report is not None
     row = report["results"][0]
     assert completed.returncode == 2
     assert row["action"] == "UNKNOWN"
@@ -155,6 +161,7 @@ def test_one_digit_change_in_a_long_screenshot_is_a_resource_change(tmp_path):
         [document(markdown, resources=[resource("limit", "limit.png", paths[0])])],
         [document(markdown, resources=[resource("limit", "limit.png", paths[1])])],
     )
+    assert report is not None
     assert report["results"][0]["resources"]["status"] == "CHANGED"
 
 
@@ -174,6 +181,7 @@ def test_unmapped_dependencies_are_never_resource_free(tmp_path, markup):
     markdown.write_text(markup)
     completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
     assert completed.returncode == 2
+    assert report is not None
     assert report["results"][0]["resources"]["status"] == "UNKNOWN"
 
 
@@ -184,6 +192,7 @@ def test_navigation_links_and_literal_code_do_not_require_downloads(tmp_path):
     )
     completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
     assert completed.returncode == 0
+    assert report is not None
     assert report["results"][0]["action"] == "SKIP_VERIFIED"
 
 
@@ -238,6 +247,7 @@ def test_untrusted_or_mutable_version_evidence_is_unknown(tmp_path, url, proof):
     entry = document(markdown, resources=[resource("screen", url, immutable=proof)])
     completed, report = invoke(tmp_path, [entry], [entry])
     assert completed.returncode == 2
+    assert report is not None
     assert report["results"][0]["resources"]["status"] == "UNKNOWN"
 
 
@@ -255,6 +265,7 @@ def test_mixed_html_and_markdown_occurrence_order_is_preserved(tmp_path):
         [document(markdown, resources=entries)],
         [document(markdown, resources=entries)],
     )
+    assert report is not None
     items = {
         item["resource_id"]: item for item in report["results"][0]["resources"]["items"]
     }
@@ -267,6 +278,7 @@ def test_autolink_download_without_evidence_cannot_skip(tmp_path):
     markdown.write_text("<https://example.invalid/manual.pdf>")
     completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
     assert completed.returncode == 2
+    assert report is not None
     assert report["results"][0]["resources"]["status"] == "UNKNOWN"
 
 
@@ -275,6 +287,7 @@ def test_indented_list_image_is_not_mistaken_for_literal_code(tmp_path):
     markdown.write_text("- item\n    ![screen](screen.png)")
     completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
     assert completed.returncode == 2
+    assert report is not None
     assert report["results"][0]["resources"]["status"] == "UNKNOWN"
 
 
@@ -288,6 +301,7 @@ def test_unrecognized_parenthesized_target_cannot_use_a_partial_mapping(tmp_path
     )
     completed, report = invoke(tmp_path, [value], [value])
     assert completed.returncode == 2
+    assert report is not None
     assert report["results"][0]["resources"]["status"] == "UNKNOWN"
 
 
@@ -301,6 +315,7 @@ def test_angle_bracket_image_target_is_one_image_occurrence(tmp_path):
         resources=[resource("screen", "https://example.invalid/screen.png", image)],
     )
     _, report = invoke(tmp_path, [value], [value])
+    assert report is not None
     resources = report["results"][0]["resources"]
     assert resources["status"] == "UNCHANGED"
     assert resources["items"][0]["occurrences_after"] == [0]
@@ -313,6 +328,7 @@ def test_resource_budget_excess_is_unknown_not_truncated_equality(tmp_path):
     value = document(markdown, resources=entries)
     completed, report = invoke(tmp_path, [value], [value])
     assert completed.returncode == 2
+    assert report is not None
     assert report["results"][0]["resources"]["status"] == "UNKNOWN"
     assert (
         "RESOURCE_BUDGET_EXCEEDED" in report["results"][0]["resources"]["reason_codes"]
@@ -336,6 +352,7 @@ def test_unmatched_code_runs_and_even_escapes_do_not_hide_dependencies(
     markdown.write_text(markup)
     completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
     assert completed.returncode == 2
+    assert report is not None
     assert report["results"][0]["resources"]["status"] == "UNKNOWN"
     assert report["results"][0]["action"] == "UNKNOWN"
 
@@ -356,6 +373,7 @@ def test_unproven_or_ended_code_scope_does_not_hide_real_images(tmp_path, markup
     markdown.write_text(markup)
     completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
     assert completed.returncode == 2
+    assert report is not None
     assert report["results"][0]["resources"]["status"] == "UNKNOWN"
 
 
@@ -377,4 +395,5 @@ def test_proven_code_and_escaped_image_marker_remain_resource_free(tmp_path, mar
     markdown.write_text(markup)
     completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
     assert completed.returncode == 0
+    assert report is not None
     assert report["results"][0]["action"] == "SKIP_VERIFIED"

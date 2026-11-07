@@ -59,6 +59,12 @@ def inspect_artifacts(wheel: Path, sdist: Path) -> None:
         wheel_names = set(archive.namelist())
     with tarfile.open(sdist) as archive:
         source_names = {name.split("/", 1)[-1] for name in archive.getnames()}
+    comparator = {"mdcompare/__init__.py", "mdcompare/__main__.py", "mdcompare/cli.py"}
+    if (
+        not comparator <= wheel_names
+        or not {f"src/{name}" for name in comparator} <= source_names
+    ):
+        raise RuntimeError("distribution is missing mdcompare modules")
     if (
         not required <= wheel_names
         or not {f"src/{name}" for name in required} <= source_names
@@ -193,6 +199,7 @@ def smoke(dist: Path) -> None:
         python = environment / "bin/python"
         command = environment / "bin/dogpdkb"
         mdocr = environment / "bin/mdocr"
+        mdcompare = environment / "bin/mdcompare"
 
         def run(arguments: list[str], *, expected=0, cwd=work) -> str:
             result = run_process(
@@ -260,9 +267,10 @@ def smoke(dist: Path) -> None:
                 "-I",
                 "-c",
                 (
-                    "import pathlib,sys,dogpdkb,mdocr; "
+                    "import pathlib,sys,dogpdkb,mdocr,mdcompare; "
                     "assert pathlib.Path(dogpdkb.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix)); "
-                    "assert pathlib.Path(mdocr.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix))"
+                    "assert pathlib.Path(mdocr.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix)); "
+                    "assert pathlib.Path(mdcompare.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix))"
                 ),
             ]
         )
@@ -280,6 +288,56 @@ def smoke(dist: Path) -> None:
         ):
             run([str(command), subcommand, "--help"])
         run([str(mdocr), "--help"])
+        comparator_version = run(
+            [str(python), "-I", "-c", "import mdcompare; print(mdcompare.__version__)"]
+        ).strip()
+        assert run([str(mdcompare), "--version"]).strip() == comparator_version
+        run([str(mdcompare), "compare", "--help"])
+        (work / "old.md").write_text("# Limit\n100k\n", encoding="utf-8")
+        (work / "new.md").write_text("# Limit\n300k\n", encoding="utf-8")
+        for name, content in (("baseline", "old.md"), ("incoming", "new.md")):
+            (work / f"{name}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1.0",
+                        "documents": [
+                            {
+                                "knowledge_base": "installation-smoke",
+                                "document_id": "1",
+                                "content_kind": "raw",
+                                "path": content,
+                                "metadata": {
+                                    "name": "Limit",
+                                    "logical_path": "",
+                                    "source_ref": "installation-smoke:1",
+                                },
+                                "resources": [],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+        run(
+            [
+                str(mdcompare),
+                "compare",
+                "--baseline",
+                "baseline.json",
+                "--incoming",
+                "incoming.json",
+                "--output",
+                "comparison.json",
+                "--include-evidence",
+            ]
+        )
+        comparison = parse_json((work / "comparison.json").read_text())
+        assert comparison["summary"]["total"] == 1
+        assert comparison["results"][0]["action"] == "UPDATE_TEXT_REUSE_OCR"
+        assert comparison["results"][0]["text"]["byte_equal"] is False
+        assert "300k" in json.dumps(comparison["results"][0]["text"]["differences"])
+        assert (work / "old.md").read_text() == "# Limit\n100k\n"
+        assert (work / "new.md").read_text() == "# Limit\n300k\n"
         # A plain wheel/venv is not owned by the shell installer.
         run([str(command), "uninstall", "--yes"], expected=1)
         run([str(command), "update", "--version", version], expected=1)
@@ -364,7 +422,7 @@ def smoke(dist: Path) -> None:
         assert list((work / "prepared/assets").rglob("*.jpg"))
         smoke_managed_install(work, wheel, version, env)
     print(
-        "smoke: PASS (wheel/sdist, CLI, doctor, Web, images, managed upgrade/uninstall)"
+        "smoke: PASS (wheel/sdist, CLI, mdcompare, doctor, Web, images, managed upgrade/uninstall)"
     )
 
 

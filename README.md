@@ -36,6 +36,7 @@ new version's curl installer to gain these commands. See
 
 - `src/dogpdkb/`: installed platform CLI, doctor, configuration templates and workflows.
 - `src/mdocr/`: included Markdown image preparation and OCR component.
+- `src/mdcompare/`: standalone offline content comparison and OCR reuse advice.
 - `scripts/`: development helpers and backwards-compatible workflow entry points.
 - `tests/`: offline automated tests.
 - `web/kb/`: product homepage and independent installation/release panel.
@@ -43,6 +44,15 @@ new version's curl installer to gain these commands. See
 - `skylark_books/`: source registry and legacy source reference.
 - `inbox/`: incoming knowledge materials.
 - `graphify_flatten_ready/`: local corpus and graph artifacts, ignored by Git.
+
+## mdcompare — offline content comparison CLI
+
+`mdcompare compare` independently compares captured raw Markdown, resources and
+OCR reuse evidence before processing. It emits versioned JSON, bounded optional
+differences and conservative UNKNOWN decisions; it does not run a sync or OCR.
+See the [mdcompare guide](docs/mdcompare.md), [evidence contracts](docs/mdcompare-contract.md)
+and [real-file UAT record](docs/mdcompare-uat.md). It is included in the wheel;
+production pipeline integration and managed installer command links are unchanged.
 
 ## mdocr — Markdown image prepare/OCR CLI
 
@@ -52,7 +62,7 @@ activate the worktree-local environment:
 
 ```bash
 make bootstrap
-source .venv/bin/activate  # exposes both `dogpdkb` and `mdocr`
+source .venv/bin/activate  # exposes `dogpdkb`, `mdocr` and `mdcompare`
 ```
 
 Run `make check` before pushing: it runs `make doc-guard`, `make lint`, and
