@@ -13,14 +13,14 @@ Exit 0: complete no unknown; 2: complete with unknown or item errors; 1: global 
 - `model.Document`: knowledge_base, document_id, content_kind, path (resolved Path), metadata, resources, base_dir, ocr, provenance. `identity` scopes ID; `resolve(str)` resolves evidence file paths against the manifest directory.
 - `model.CompareOptions`: normalize_line_endings=False, include_evidence=False, max_file_bytes=16777216, max_diff_work=2000000, max_evidence_chars=8000, max_char_region=4096. Text ticket owns normalization/diff option flags and rules reporting.
 - `text.compare_text(old_bytes_or_none, new_bytes, options) -> text dimension`. Text ticket owns this file. New baseline is None; returns NEW. Text rules must also flow into top-level rules (currently identity version 1).
-- `resources.compare_resources(old_doc_or_none, new_doc, old_bytes_or_none, new_bytes, reader, options) -> resource dimension`. Resource ticket owns resource extraction/association, local-byte evidence schema and this module. Current conservative placeholder treats Markdown links as unverified dependencies.
+- `resources.compare_resources(old_doc_or_none, new_doc, old_bytes_or_none, new_bytes, reader, options) -> resource dimension`. Resource ticket owns resource extraction/association, local-byte evidence schema and this module. See resource evidence rules in mdcompare-resources.md.
 - `history.compare_history(old_doc_or_none, new_doc, old_bytes_or_none, new_bytes, reader, options) -> HistoryComparison or None`. None delegates to text.compare_text. HistoryComparison carries text plus the source-view bytes for resource discovery; these remain the original stage bytes when provenance is unknown, and become retained raw bytes only after complete verification. See [historical input contract](mdcompare-history.md).
 - `ocr.compare_ocr(old_doc_or_none, new_doc, resources_dimension, reader, options) -> OCR dimension`. OCR ticket owns this and decisions.choose_action.
-- `decisions.choose_action(old_exists, text, resources, metadata, ocr) -> action`. Initial version safely returns UNKNOWN when any content/OCR dimension is UNKNOWN.
+- `decisions.choose_action(old_exists, text, resources, metadata, ocr) -> action`. Returns UNKNOWN when any content/OCR prerequisite is UNKNOWN; see the complete priority in mdcompare-ocr.md.
 - `io.InputReader(max_file_bytes).read_bytes(Path)` raises InputError(reason_code); `paths` retains resolved reads. All evidence reads must use this boundary; stability ticket owns fixed-view/failure/alias protection. It also owns atomic_write and CLI publication behavior.
 - `comparison.compare_documents(baseline_docs, incoming_docs, options, reader)` orchestrates dimensions; minimal shared glue, coordinate changes rather than duplicating decisions. Feature tests should use the CLI seam.
 
-The initial implementation cannot verify resources, OCR reuse or enriched history and deliberately returns UNKNOWN for those cases. Later tickets replace these safe placeholders.
+Resource, OCR and historical provenance verification are implemented under their explicit evidence contracts. Unsupported or incomplete evidence deliberately stays UNKNOWN.
 
 ## Text comparison and explanation
 

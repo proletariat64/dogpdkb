@@ -61,6 +61,7 @@ def test_same_raw_without_resources_skips_and_preserves_inputs(tmp_path):
     original = raw.read_bytes()
     result, report = invoke(tmp_path, [document(raw)], [document(raw)])
     assert result.returncode == 0, result.stderr
+    assert report is not None
     assert report["results"][0]["action"] == "SKIP_VERIFIED"
     assert report["results"][0]["ocr"]["status"] == "NOT_APPLICABLE"
     assert report["summary"]["total"] == 1
@@ -82,6 +83,7 @@ def test_pairs_by_scoped_id_reports_new_absent_and_metadata(tmp_path):
     new = [document(b, "1", "another"), document(a, "new"), renamed]
     result, report = invoke(tmp_path, old, new)
     assert result.returncode == 0, result.stderr
+    assert report is not None
     rows = {(r["knowledge_base"], r["document_id"]): r for r in report["results"]}
     assert rows[("book", "1")]["action"] == "UPDATE_METADATA_ONLY"
     assert rows[("another", "1")]["action"] == "SKIP_VERIFIED"
@@ -113,10 +115,12 @@ def test_timestamp_only_changes_remain_skippable_and_empty_input_is_complete(tmp
     new["metadata"]["sync_timestamp"] = "today"
     result, report = invoke(tmp_path, [old], [new])
     assert result.returncode == 0
+    assert report is not None
     assert report["results"][0]["action"] == "SKIP_VERIFIED"
     assert report["results"][0]["metadata"]["sync_timestamp_changed"] is True
     result, report = invoke(tmp_path, [], [])
     assert result.returncode == 0
+    assert report is not None
     assert report["results"] == []
     assert sum(report["summary"]["actions"].values()) == report["summary"]["total"] == 0
 
@@ -126,6 +130,7 @@ def test_unknown_dependency_and_historical_input_cannot_skip(tmp_path):
     raw.write_text("![unverified](https://example.invalid/a.png)")
     result, report = invoke(tmp_path, [document(raw)], [document(raw)])
     assert result.returncode == 2
+    assert report is not None
     assert report["results"][0]["action"] == "UNKNOWN"
     assert report["results"][0]["resources"]["status"] == "UNKNOWN"
     raw.write_text("no image")
@@ -133,6 +138,7 @@ def test_unknown_dependency_and_historical_input_cannot_skip(tmp_path):
         tmp_path, [document(raw, content_kind="historical_enriched")], [document(raw)]
     )
     assert result.returncode == 2
+    assert report is not None
     assert "HISTORICAL_RAW_UNAVAILABLE" in report["results"][0]["reason_codes"]
 
 
@@ -140,6 +146,7 @@ def test_item_read_failure_is_reported_without_leaking_path_or_body(tmp_path):
     raw = tmp_path / "secret-token-raw.md"
     result, report = invoke(tmp_path, [], [document(raw)])
     assert result.returncode == 2
+    assert report is not None
     assert report["results"][0]["action"] == "UNKNOWN"
     assert report["errors"][0]["reason_code"] == "INPUT_READ_FAILED"
     assert "secret-token" not in result.stdout + result.stderr
@@ -152,6 +159,7 @@ def test_text_changes_without_resources_remain_changes(tmp_path):
     new.write_text("300k")
     result, report = invoke(tmp_path, [document(old)], [document(new)])
     assert result.returncode == 0
+    assert report is not None
     assert report["results"][0]["text"]["status"] == "CHANGED"
     assert report["results"][0]["action"] == "UPDATE_TEXT_REUSE_OCR"
     assert report["results"][0]["ocr"]["status"] == "NOT_APPLICABLE"
@@ -162,6 +170,7 @@ def test_relative_document_paths_resolve_against_manifest_directory(tmp_path):
     raw.write_text("same")
     result, report = invoke(tmp_path, [document("raw.md")], [document("raw.md")])
     assert result.returncode == 0
+    assert report is not None
     assert report["results"][0]["action"] == "SKIP_VERIFIED"
 
 
