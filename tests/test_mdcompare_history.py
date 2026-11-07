@@ -272,3 +272,48 @@ def test_historical_explanation_respects_limits_and_remains_deterministic(tmp_pa
     text = report["results"][0]["text"]
     assert text["comparison_complete"] is False
     assert "DIFF_BUDGET_EXCEEDED" in text["reason_codes"]
+
+
+def test_truncated_prepared_jpeg_cannot_verify_historical_source(tmp_path):
+    old, new = mapped_history(tmp_path)
+    prepared = tmp_path / "prepared.jpg"
+    prepared.write_bytes(prepared.read_bytes()[:-2])
+    result, report = invoke(tmp_path, [old], [new], "--include-evidence")
+    text = report["results"][0]["text"]
+    assert result.returncode == 2
+    assert text["status"] == "UNKNOWN"
+    assert text["provenance_verified"] is False
+    assert "HISTORICAL_PREPARED_IMAGE_INVALID" in text["reason_codes"]
+
+
+def test_historical_prepared_image_pixel_budget_is_unknown(tmp_path):
+    from PIL import Image
+
+    old, new = mapped_history(tmp_path)
+    Image.new("RGB", (5001, 4000), "white").save(tmp_path / "prepared.jpg", "JPEG")
+    result, report = invoke(tmp_path, [old], [new], "--include-evidence")
+    text = report["results"][0]["text"]
+    assert result.returncode == 2
+    assert text["status"] == "UNKNOWN"
+    assert text["provenance_verified"] is False
+    assert "OCR_PREPARED_IMAGE_BUDGET_EXCEEDED" in text["reason_codes"]
+    assert "DecompressionBombWarning" not in result.stderr
+
+
+@pytest.mark.parametrize("collection", ["blocks", "resources"])
+def test_oversized_historical_mapping_is_unknown_before_reconstruction(
+    tmp_path, collection
+):
+    old, new = mapped_history(tmp_path)
+    if collection == "blocks":
+        old["provenance"]["blocks"] *= 10_001
+    else:
+        old["resources"].extend(
+            {"resource_id": str(n), "kind": "image", "url": "image.png"}
+            for n in range(10_000)
+        )
+    result, report = invoke(tmp_path, [old], [new], "--include-evidence")
+    text = report["results"][0]["text"]
+    assert result.returncode == 2
+    assert text["status"] == "UNKNOWN"
+    assert "HISTORICAL_PROVENANCE_BUDGET_EXCEEDED" in text["reason_codes"]
