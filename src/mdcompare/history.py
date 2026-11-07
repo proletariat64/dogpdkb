@@ -31,8 +31,7 @@ class ProvenanceError(ValueError):
 def _source_view(
     doc: Document, data: bytes, reader: InputReader, options: CompareOptions
 ) -> bytes:
-    if doc.content_kind == "raw":
-        return data
+    """Validate the historical stage selected by compare_history."""
     provenance = doc.provenance
     if (
         provenance.get("contract") != "mdocr-raw-snapshot-v1"

@@ -85,7 +85,10 @@ The OCR dimension reports `status`, `reason_codes`, `items`, `reusable` and
 `processing_required` resource IDs. Known reusable entries remain visible when a
 different entry is unknown. Newly added or changed original images are processing
 work and do not require obsolete OCR reuse proof. Unchanged images still require
-the complete proof above. Removed images require no OCR. Attachments and media are
+the complete proof above. OCR record maps and original-resource ID indexes are
+built once per document, lazily when the first unchanged image needs reuse
+verification. Changed/new images do not parse obsolete reuse records; per-image
+read/provenance failures still preserve independently confirmed reuse and work. Removed images require no OCR. Attachments and media are
 not image OCR inputs under this contract; documents without images need no
 nonexistent OCR record. Unresolved resource dependencies keep applicability UNKNOWN.
 

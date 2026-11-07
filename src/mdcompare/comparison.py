@@ -60,9 +60,28 @@ def compare_documents(
             "document_id": new.document_id,
             "metadata": metadata,
         }
-        text = {"status": "UNKNOWN", "reason_codes": [], "differences": []}
-        resources = {"status": "UNKNOWN", "reason_codes": [], "items": []}
-        ocr = {"status": "UNKNOWN", "reason_codes": []}
+        text = {
+            "status": "UNKNOWN",
+            "reason_codes": [],
+            "differences": [],
+            "byte_equal": None,
+            "comparison_complete": False,
+            "evidence_truncated": False,
+        }
+        resources = {
+            "status": "UNKNOWN",
+            "reason_codes": [],
+            "items": [],
+            "processing_required": [],
+            "references_changed": None,
+        }
+        ocr = {
+            "status": "UNKNOWN",
+            "reason_codes": [],
+            "items": [],
+            "reusable": [],
+            "processing_required": [],
+        }
 
         try:
             new_bytes = reader.read_bytes(new.path)
@@ -90,7 +109,7 @@ def compare_documents(
             except InputError as exc:
                 _record_error(errors, new, exc, resources)
             try:
-                ocr = compare_ocr(old, new, resources, reader, options)
+                ocr = compare_ocr(old, new, resources, reader)
             except InputError as exc:
                 _record_error(errors, new, exc, ocr)
         action = choose_action(old is not None, text, resources, metadata, ocr)

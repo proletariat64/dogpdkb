@@ -18,7 +18,10 @@ Only regular input files are read. --max-file-bytes bounds each document or
 evidence read (default 16 MiB); oversize inputs produce UNKNOWN with
 FILE_BUDGET_EXCEEDED rather than comparing a truncated prefix. Manifest parsing
 has its own fixed 16 MiB input limit, with global failure for unreadable, unstable
-or invalid manifests. Reading or comparing one document unsuccessfully does not
+or invalid manifests. Explicit duplicate-JSON-field, read-budget and observed
+read-time drift codes are preserved rather than flattened into a generic parse
+error; these remain global exit-1 failures with no input values or paths logged.
+Reading or comparing one document unsuccessfully does not
 remove it from the report or discard other documents' results. A later resource
 or OCR read failure does not overwrite an already determined text dimension.
 

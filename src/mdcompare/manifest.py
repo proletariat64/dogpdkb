@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .io import InputReader
+from .io import InputError, InputReader
 from .model import SCHEMA_VERSION, Document
 
 
@@ -30,6 +30,8 @@ def load_manifest(path: Path, reader: InputReader | None = None) -> list[Documen
         reader = reader or InputReader(16 * 1024 * 1024)
         data = reader.read_bytes(path, max_bytes=16 * 1024 * 1024)
         value = json.loads(data, object_pairs_hook=_unique_object)
+    except (ManifestError, InputError):
+        raise
     except (OSError, ValueError) as exc:
         raise ManifestError("MANIFEST_UNREADABLE_OR_INVALID") from exc
     if (

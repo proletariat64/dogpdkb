@@ -1,11 +1,12 @@
 """Verify captured original-to-prepared-to-OCR evidence without executing OCR."""
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .io import InputError, InputReader
-from .model import CompareOptions, Document
+from .model import Document
 from .prepared_image import is_prepared_jpeg
 
 CONTRACT = "prepared-jpeg-ocr-v1"
@@ -44,17 +45,40 @@ def _records(document: Document) -> dict[str, dict[str, Any]] | None:
     return result
 
 
+@dataclass(frozen=True)
+class _ReuseInputs:
+    old_records: dict[str, dict[str, Any]] | None
+    new_records: dict[str, dict[str, Any]] | None
+    old_resources: dict[str, dict[str, Any]]
+    new_resources: dict[str, dict[str, Any]]
+
+
+def _resource_index(document: Document) -> dict[str, dict[str, Any]]:
+    result = {}
+    for entry in document.resources:
+        identifier = entry.get("resource_id")
+        if isinstance(identifier, str):
+            result.setdefault(identifier, entry)
+    return result
+
+
+def _reuse_inputs(old: Document, new: Document) -> _ReuseInputs:
+    return _ReuseInputs(
+        _records(old), _records(new), _resource_index(old), _resource_index(new)
+    )
+
+
 def _path(document: Document, record: dict[str, Any], key: str) -> Path | None:
     value = record.get(key)
     return document.resolve(value) if isinstance(value, str) and value else None
 
 
 def _prepared(
-    document: Document, record: dict[str, Any], resource_id: str, reader: InputReader
+    document: Document,
+    record: dict[str, Any],
+    declared: dict[str, Any],
+    reader: InputReader,
 ) -> tuple[bytes | None, dict[str, Any] | None]:
-    declared = next(
-        (r for r in document.resources if r.get("resource_id") == resource_id), {}
-    )
     source = _path(document, record, "source_path")
     original = _path(document, declared, "path")
     prepared = _path(document, record, "prepared_image")
@@ -109,14 +133,16 @@ def _artifact(
 
 
 def _verify(
-    old: Document, new: Document, identifier: str, reader: InputReader
+    old: Document,
+    new: Document,
+    identifier: str,
+    reader: InputReader,
+    inputs: _ReuseInputs,
 ) -> dict[str, Any]:
-    if old.ocr is None:
-        return _outcome("CHANGED", "OCR_SUCCESS_RECORD_MISSING")
-    old_records, new_records = _records(old), _records(new)
-    if old_records is None or new_records is None:
+    if inputs.old_records is None or inputs.new_records is None:
         return _outcome("UNKNOWN", "OCR_PROVENANCE_INCOMPLETE")
-    previous, desired = old_records.get(identifier), new_records.get(identifier)
+    previous = inputs.old_records.get(identifier)
+    desired = inputs.new_records.get(identifier)
     if previous is None:
         return _outcome("CHANGED", "OCR_SUCCESS_RECORD_MISSING")
     if previous.get("status") in ("failed", "pending"):
@@ -130,10 +156,14 @@ def _verify(
             return _outcome("UNKNOWN", "OCR_CONFIGURATION_UNVERIFIED")
         if before != after:
             return _outcome("CHANGED", "OCR_CONFIGURATION_INCOMPATIBLE")
-    old_image, issue = _prepared(old, previous, identifier, reader)
+    old_image, issue = _prepared(
+        old, previous, inputs.old_resources.get(identifier, {}), reader
+    )
     if issue is not None:
         return issue
-    new_image, issue = _prepared(new, desired, identifier, reader)
+    new_image, issue = _prepared(
+        new, desired, inputs.new_resources.get(identifier, {}), reader
+    )
     if issue is not None:
         return issue
     if old_image != new_image:
@@ -147,9 +177,10 @@ def compare_ocr(
     new: Document,
     resources: dict[str, Any],
     reader: InputReader,
-    options: CompareOptions,
 ) -> dict[str, Any]:
     items = []
+    inputs = None
+    inputs_error = None
     for resource in resources.get("items", []):
         if resource.get("kind") != "image" or resource.get("operation") == "removed":
             continue
@@ -158,11 +189,24 @@ def compare_ocr(
             outcome = _outcome("NEW", "OCR_PROCESS_RESOURCE")
         elif resource["status"] == "UNKNOWN":
             outcome = _outcome("UNKNOWN", "OCR_RESOURCE_UNVERIFIED")
+        elif old.ocr is None:
+            outcome = _outcome("CHANGED", "OCR_SUCCESS_RECORD_MISSING")
         else:
-            try:
-                outcome = _verify(old, new, identifier, reader)
-            except InputError as exc:
-                outcome = _outcome("UNKNOWN", exc.reason_code)
+            # Index only when an unchanged image needs reuse proof; keep a
+            # document-wide mapping failure from triggering repeated scans.
+            if inputs is None and inputs_error is None:
+                try:
+                    inputs = _reuse_inputs(old, new)
+                except InputError as exc:
+                    inputs_error = exc.reason_code
+            if inputs_error is not None:
+                outcome = _outcome("UNKNOWN", inputs_error)
+            else:
+                assert inputs is not None
+                try:
+                    outcome = _verify(old, new, identifier, reader, inputs)
+                except InputError as exc:
+                    outcome = _outcome("UNKNOWN", exc.reason_code)
         items.append({"resource_id": identifier, **outcome})
     statuses = {item["status"] for item in items}
     if resources["status"] == "UNKNOWN":

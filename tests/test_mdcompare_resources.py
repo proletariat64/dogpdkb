@@ -397,3 +397,157 @@ def test_proven_code_and_escaped_image_marker_remain_resource_free(tmp_path, mar
     assert completed.returncode == 0
     assert report is not None
     assert report["results"][0]["action"] == "SKIP_VERIFIED"
+
+
+@pytest.mark.parametrize(
+    "markup",
+    [
+        '<input type="image" src="https://example.invalid/image">',
+        '<style>@import "https://example.invalid/style.css";</style>',
+        '<svg><feImage href="https://example.invalid/image" /></svg>',
+        '<body background="https://example.invalid/background">Text</body>',
+        '<div style="background: \\75rl(https://example.invalid/image)">Text</div>',
+        "<div onclick=\"fetch('https://example.invalid/data')\">Text</div>",
+        '<iframe srcdoc="&lt;img src=external&gt;"></iframe>',
+    ],
+)
+def test_unsupported_embedded_html_and_css_cannot_skip(tmp_path, markup):
+    markdown = tmp_path / "document.md"
+    markdown.write_text(markup)
+    completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
+    assert completed.returncode == 2
+    assert report is not None
+    row = report["results"][0]
+    assert row["action"] == "UNKNOWN"
+    assert row["resources"]["status"] == "UNKNOWN"
+    assert "RESOURCE_SYNTAX_UNVERIFIED" in row["resources"]["reason_codes"]
+
+
+def test_static_html_table_and_navigation_remain_resource_free(tmp_path):
+    markdown = tmp_path / "document.md"
+    markdown.write_text('<table><tr><td>100k</td></tr></table><a href="/help">Help</a>')
+    completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
+    assert completed.returncode == 0
+    assert report is not None
+    assert report["results"][0]["action"] == "SKIP_VERIFIED"
+
+
+@pytest.mark.parametrize(
+    "markup", ["[" * 64_000, "<" * 64_000 + "\r", "`" * 64_000 + "\r"]
+)
+def test_malformed_link_syntax_exceeds_budget_before_expensive_matching(
+    tmp_path, markup
+):
+    markdown = tmp_path / "document.md"
+    markdown.write_text(markup)
+    completed, report = invoke(
+        tmp_path,
+        [document(markdown)],
+        [document(markdown)],
+        "--max-diff-work",
+        "0",
+        timeout=3,
+    )
+    assert completed.returncode == 2
+    assert report is not None
+    row = report["results"][0]
+    assert row["action"] == "UNKNOWN"
+    assert "RESOURCE_BUDGET_EXCEEDED" in row["resources"]["reason_codes"]
+
+
+def test_resource_syntax_budget_accumulates_across_lines(tmp_path):
+    markdown = tmp_path / "document.md"
+    markdown.write_text(("[" * 1_200 + "\n") * 15)
+    completed, report = invoke(
+        tmp_path, [document(markdown)], [document(markdown)], timeout=3
+    )
+    assert completed.returncode == 2
+    assert report is not None
+    assert report["results"][0]["action"] == "UNKNOWN"
+    assert (
+        "RESOURCE_BUDGET_EXCEEDED" in report["results"][0]["resources"]["reason_codes"]
+    )
+
+
+@pytest.mark.parametrize("ending", ["\r\n", "\r"])
+@pytest.mark.parametrize("reference", ["image", "download"])
+def test_commonmark_line_endings_keep_reference_dependencies(
+    tmp_path, ending, reference
+):
+    markdown = tmp_path / "document.md"
+    label = "![report][attachment]" if reference == "image" else "[report][attachment]"
+    markup = (
+        label
+        + ending
+        + ending
+        + "[attachment]: https://example.invalid/report.pdf"
+        + ending
+    )
+    markdown.write_bytes(markup.encode())
+    completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
+    assert completed.returncode == 2
+    assert report is not None
+    row = report["results"][0]
+    assert row["action"] == "UNKNOWN"
+    assert row["resources"]["status"] == "UNKNOWN"
+    assert "RESOURCE_REFERENCE_UNMAPPED" in row["resources"]["reason_codes"]
+    assert row["text"]["byte_equal"] is True
+
+
+@pytest.mark.parametrize("separator", ["\u000b", "\u0085", "\u2028"])
+def test_unicode_separators_do_not_start_commonmark_fences(tmp_path, separator):
+    markdown = tmp_path / "document.md"
+    markdown.write_text(
+        "prefix" + separator + "```\n![x](https://example.invalid/image)\n```\n"
+    )
+    completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
+    assert completed.returncode == 2
+    assert report is not None
+    row = report["results"][0]
+    assert row["action"] == "UNKNOWN"
+    assert row["resources"]["status"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize(
+    "markup",
+    [
+        '<div>\n`<img src="https://example.invalid/image">`\n</div>\n',
+        '<div>`<img src="https://example.invalid/image">`</div>\n',
+    ],
+)
+def test_raw_html_block_backticks_do_not_hide_images(tmp_path, markup):
+    markdown = tmp_path / "document.md"
+    markdown.write_text(markup)
+    completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
+    assert completed.returncode == 2
+    assert report is not None
+    assert report["results"][0]["action"] == "UNKNOWN"
+    assert report["results"][0]["resources"]["status"] == "UNKNOWN"
+
+
+def test_standalone_inline_html_code_example_remains_resource_free(tmp_path):
+    markdown = tmp_path / "document.md"
+    markdown.write_text('`<img src="https://example.invalid/image">`\n')
+    completed, report = invoke(tmp_path, [document(markdown)], [document(markdown)])
+    assert completed.returncode == 0
+    assert report is not None
+    assert report["results"][0]["action"] == "SKIP_VERIFIED"
+
+
+def test_confirmed_removal_does_not_require_missing_old_resource_bytes(tmp_path):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    old.write_text("![old](old.png)")
+    new.write_text("Image removed")
+    baseline = document(
+        old, resources=[resource("old", "old.png", tmp_path / "missing.png")]
+    )
+    completed, report = invoke(tmp_path, [baseline], [document(new)])
+    assert completed.returncode == 0
+    assert report is not None
+    row = report["results"][0]
+    assert row["resources"]["status"] == "CHANGED"
+    assert row["resources"]["items"][0]["operation"] == "removed"
+    assert row["resources"]["processing_required"] == []
+    assert row["ocr"]["processing_required"] == []
+    assert "INPUT_READ_FAILED" not in row["reason_codes"]

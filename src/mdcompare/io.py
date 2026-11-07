@@ -199,7 +199,3 @@ def publish_reports(reports: list[tuple[Path, str]]) -> None:
         for backup in backups.values():
             if backup is not None:
                 backup.unlink(missing_ok=True)
-
-
-def atomic_write(path: Path, content: str) -> None:
-    publish_reports([(path, content)])

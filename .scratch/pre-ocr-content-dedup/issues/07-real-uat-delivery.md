@@ -67,3 +67,17 @@ remaining review gate.
 Pending: integration-wide code review, fixes if needed, then root resolves this
 ticket and updates the implementation map. The final two acceptance boxes remain
 open for that integration closure.
+
+
+### Final review corrections (pending integrated revalidation)
+
+- Spec review's high finding was reproduced through the CLI: image inputs and CSS imports with no resource evidence incorrectly returned SKIP_VERIFIED. Unsupported resource-bearing HTML/CSS attributes and active content now retain UNKNOWN; ordinary navigation/static tables and proven standalone code examples remain resource-free.
+- CRLF and lone-CR reference destinations are recognized in an internal CommonMark parsing view, without changing the text comparison. VT, NEL and Unicode line separators cannot manufacture fenced-code boundaries. Backticks in uncertain raw-HTML-block context do not hide active images. Each unsafe case was reproduced red before correction.
+- Malformed bracket, angle and backtick inputs exceeded a 3-second CLI timeout before correction. A cumulative per-document syntax estimate now runs before masking or regex matching and returns RESOURCE_BUDGET_EXCEEDED above 20,000,000; a multiline regression proves the cap accumulates across lines.
+- OCR's medium stable-schema finding was reproduced for unread baseline and incoming files. Complete UNKNOWN dimension shapes are preserved, with null unverified equality/reference facts and no invented false equality; known later-stage partial evidence is retained.
+- Confirmed resource removals are recorded before obsolete byte reads, so a missing removed resource does not erase the known removal or create processing work. Explicit duplicate-JSON-field, file-budget and read-time drift reason codes remain global exit-1 diagnostics instead of being flattened; CLI regressions prove no body/path leakage.
+- OCR record maps and original-resource ID indexes are created once per document, lazily when unchanged images need reuse verification. Changed images bypass malformed/oversized obsolete records; mixed per-image reuse and uncertainty remain visible. No persistent index or hash was added.
+- Removed the unused atomic_write wrapper, unused compare_ocr options argument and unreachable raw-history guard; internal documentation follows the live interfaces. The one historical default merge subject is retained to preserve commit/evidence pointers; subsequent task merges and corrective commits use conventional prefixes.
+- Twenty-nine additional CLI regression cases cover these corrections. The focused comparator/distribution suite passes 194 tests. Ruff/format, doc-guard, and Pyright over the comparator plus all seven comparator test files pass; Pyright reports zero errors/warnings.
+- The successful external OCR review selected/completed 15 files, failed none and reported seven comments. Its reported code issues are addressed in this correction; root will independently recheck and aggregate review dispositions.
+- Final full-suite, real-file UAT repeats, rebuilt installation smoke and closure remain the integration owner's gates. Earlier reports/artifacts must be preserved before final replacements. Status remains claimed.
