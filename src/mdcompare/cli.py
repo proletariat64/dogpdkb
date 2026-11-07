@@ -23,11 +23,21 @@ class ArgumentParser(argparse.ArgumentParser):
         self.exit(1, "mdcompare: INVALID_ARGUMENTS\n")
 
 
+def nonnegative_int(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected nonnegative integer") from exc
+    if result < 0:
+        raise argparse.ArgumentTypeError("expected nonnegative integer")
+    return result
+
+
 def _positive_file_limit(value: str) -> int:
-    parsed = int(value)
-    if parsed < 1:
+    result = nonnegative_int(value)
+    if result == 0:
         raise argparse.ArgumentTypeError("File limit must be positive")
-    return parsed
+    return result
 
 
 def main(argv=None) -> int:
@@ -52,9 +62,37 @@ def main(argv=None) -> int:
         default=16 * 1024 * 1024,
         help="Maximum bytes per document or evidence file; oversized inputs stay UNKNOWN",
     )
+    compare.add_argument(
+        "--normalize-line-endings",
+        action="store_true",
+        help="Explicitly normalize CRLF and lone CR to LF (rule version 1)",
+    )
+    compare.add_argument(
+        "--max-diff-work",
+        type=nonnegative_int,
+        default=CompareOptions.max_diff_work,
+        help="Maximum Myers frontier and matching steps (default: 2000000)",
+    )
+    compare.add_argument(
+        "--max-evidence-chars",
+        type=nonnegative_int,
+        default=CompareOptions.max_evidence_chars,
+        help="Maximum body characters across text evidence (default: 8000)",
+    )
+    compare.add_argument(
+        "--max-char-region",
+        type=nonnegative_int,
+        default=CompareOptions.max_char_region,
+        help="Maximum combined region length for character explanation (default: 4096)",
+    )
     args = parser.parse_args(argv)
     options = CompareOptions(
-        include_evidence=args.include_evidence, max_file_bytes=args.max_file_bytes
+        include_evidence=args.include_evidence,
+        max_file_bytes=args.max_file_bytes,
+        normalize_line_endings=args.normalize_line_endings,
+        max_diff_work=args.max_diff_work,
+        max_evidence_chars=args.max_evidence_chars,
+        max_char_region=args.max_char_region,
     )
     try:
         reader = InputReader(options.max_file_bytes)
