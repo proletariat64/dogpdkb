@@ -1,18 +1,14 @@
 """Verify captured original-to-prepared-to-OCR evidence without executing OCR."""
 
-import io
 import json
-import warnings
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
-
 from .io import InputError, InputReader
 from .model import CompareOptions, Document
+from .prepared_image import is_prepared_jpeg
 
 CONTRACT = "prepared-jpeg-ocr-v1"
-MAX_PREPARED_PIXELS = 20_000_000
 
 
 def _outcome(status: str, reason: str) -> dict[str, Any]:
@@ -48,25 +44,6 @@ def _records(document: Document) -> dict[str, dict[str, Any]] | None:
     return result
 
 
-def _jpeg(data: bytes) -> bool:
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(io.BytesIO(data)) as image:
-                if image.format != "JPEG":
-                    return False
-                if image.width * image.height > MAX_PREPARED_PIXELS:
-                    raise InputError("OCR_PREPARED_IMAGE_BUDGET_EXCEEDED")
-                image.load()
-        return True
-    except InputError:
-        raise
-    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
-        raise InputError("OCR_PREPARED_IMAGE_BUDGET_EXCEEDED") from exc
-    except (OSError, ValueError, SyntaxError):
-        return False
-
-
 def _path(document: Document, record: dict[str, Any], key: str) -> Path | None:
     value = record.get(key)
     return document.resolve(value) if isinstance(value, str) and value else None
@@ -86,7 +63,7 @@ def _prepared(
     if reader.read_bytes(source) != reader.read_bytes(original):
         return None, _outcome("UNKNOWN", "OCR_SOURCE_MAPPING_MISMATCH")
     data = reader.read_bytes(prepared)
-    if not _jpeg(data):
+    if not is_prepared_jpeg(data):
         return None, _outcome("CHANGED", "OCR_PREPARED_IMAGE_INVALID")
     return data, None
 

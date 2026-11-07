@@ -1,21 +1,20 @@
 """History comparison requires an exact raw snapshot and complete source mapping."""
 
-import io
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, UnidentifiedImageError
-
 from .io import InputError, InputReader
 from .model import CompareOptions, Document
+from .prepared_image import is_prepared_jpeg
 from .text import compare_text
 
 # A deliberately narrow mapping contract, not a Markdown cleaner. Unsupported
 # source forms remain unknown. These markers are mdocr's existing block format.
 _IMAGE = re.compile(rb"!\[[^\]\r\n]*\]\(([^\s()<>]+)\)")
 _MARKER = b"<!-- mdocr:ocr-"
+MAX_PROVENANCE_RECORDS = 10_000
 
 
 @dataclass(frozen=True)
@@ -27,17 +26,6 @@ class HistoryComparison:
 
 class ProvenanceError(ValueError):
     pass
-
-
-def _prepared_is_jpeg(data: bytes) -> bool:
-    try:
-        with Image.open(io.BytesIO(data)) as image:
-            if image.format != "JPEG":
-                return False
-            image.verify()
-    except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError):
-        return False
-    return True
 
 
 def _source_view(
@@ -53,6 +41,11 @@ def _source_view(
         or not isinstance(provenance.get("blocks"), list)
     ):
         raise ProvenanceError("HISTORICAL_BLOCK_PROVENANCE_INCOMPLETE")
+    if (
+        len(provenance["blocks"]) > MAX_PROVENANCE_RECORDS
+        or len(doc.resources) > MAX_PROVENANCE_RECORDS
+    ):
+        raise ProvenanceError("HISTORICAL_PROVENANCE_BUDGET_EXCEEDED")
     raw = reader.read_bytes(doc.resolve(provenance["raw_path"]))
     if _MARKER in raw:
         raise ProvenanceError("HISTORICAL_RAW_STAGE_UNVERIFIED")
@@ -64,6 +57,7 @@ def _source_view(
     pieces: list[bytes] = []
     offset = 0
     total = 0
+    validated_prepared: set[Path] = set()
     for block in provenance["blocks"]:
         if not isinstance(block, dict):
             raise ProvenanceError("HISTORICAL_BLOCK_PROVENANCE_INCOMPLETE")
@@ -99,8 +93,12 @@ def _source_view(
         prepared_path = doc.resolve(block["prepared_image"])
         if (doc.path.parent / Path(source)).resolve() != prepared_path.resolve():
             raise ProvenanceError("HISTORICAL_BLOCK_SOURCE_MISMATCH")
-        if not _prepared_is_jpeg(reader.read_bytes(prepared_path)):
-            raise ProvenanceError("HISTORICAL_PREPARED_IMAGE_INVALID")
+        prepared_data = reader.read_bytes(prepared_path)
+        prepared_identity = prepared_path.resolve()
+        if prepared_identity not in validated_prepared:
+            if not is_prepared_jpeg(prepared_data):
+                raise ProvenanceError("HISTORICAL_PREPARED_IMAGE_INVALID")
+            validated_prepared.add(prepared_identity)
         try:
             artifact = reader.read_bytes(doc.resolve(block["artifact_path"])).decode(
                 "utf-8"

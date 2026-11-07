@@ -42,3 +42,20 @@ default work budget. Its report is private and remains outside Git; final UAT is
 owned by ticket 07 and must not interpret manual classifications as action gold.
 
 Contract: [historical input documentation](../../../docs/mdcompare-history.md).
+
+
+## Validation correction
+
+A final integration check found that Pillow JPEG `verify()` accepted a file
+missing its final two bytes. Added a CLI regression that first failed with
+incorrect verified/UNCHANGED history, then passed after sharing OCR's full JPEG
+decoder with historical provenance. The shared validator preserves the existing
+20,000,000-pixel/decompression-warning budget and reason code. A prepared-file
+validation cache avoids repeatedly decoding the same fixed-view input within a
+map. Added explicit 10,000 block-map and resource-record limits before any
+per-block reconstruction; both oversized-map CLI cases failed before the guard
+and passed afterward. New historical pixel-budget coverage also passes.
+
+The correction preserves all existing mdcompare CLI cases and adds four
+regressions; focused history/OCR tests, Ruff and Pyright pass. This changes no
+production input, baseline, OCR execution or CLI schema.

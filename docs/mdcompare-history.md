@@ -45,7 +45,11 @@ supported simple inline Markdown image, `![alt](target)`, whose target equals th
 version deliberately leaves more complex image syntax unverified. Unsupported
 syntax is not cleaned or silently accepted.
 
-`prepared_image` must read as a JPEG. `source_reference` must refer to that same
+`prepared_image` must fully decode as a JPEG, using the same validator as OCR
+reuse verification. JPEG header/marker verification alone is insufficient for
+truncated files. Prepared images are limited to 20,000,000 pixels; decompression
+warnings or over-budget images remain UNKNOWN with
+`OCR_PREPARED_IMAGE_BUDGET_EXCEEDED`. `source_reference` must refer to that same
 local file relative to the historical Markdown document and must be suitable for
 the existing mdocr marker/link grammar. `artifact_path` contains the UTF-8 OCR
 Markdown that was placed in the block; no OCR is executed. All evidence file paths
@@ -62,6 +66,11 @@ unmarked transcription, missing blocks, changed artifacts or altered source text
 cause `HISTORICAL_RECONSTRUCTION_MISMATCH`; a marker alone proves nothing. Nested
 OCR markers in either the retained raw or the OCR artifact are unsupported.
 Reconstruction is bounded by `--max-file-bytes`, including all generated blocks.
+Both the source block map and resource inventory are limited to 10,000 records
+before any per-block decoding or reconstruction; overflow records
+`HISTORICAL_PROVENANCE_BUDGET_EXCEEDED`. Repeated prepared-image paths are decoded
+only once per mapping verification while every evidence read retains the input
+reader's fixed-view checks.
 An empty block list is valid only when the complete historical bytes equal the
 retained raw bytes.
 
