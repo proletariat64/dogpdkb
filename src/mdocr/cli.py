@@ -5,8 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import threading
-import time
+import uuid
 from pathlib import Path
 from typing import NoReturn
 
@@ -37,11 +36,15 @@ class _HelpfulParser(argparse.ArgumentParser):
 
 def atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(
-        f".{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
-    )
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    # Keep the temporary basename short even when path.name is near NAME_MAX.
+    tmp = path.with_name(f".mdocr-{uuid.uuid4().hex}.tmp")
+    stream = tmp.open("x", encoding="utf-8")
+    try:
+        with stream:
+            stream.write(text)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
