@@ -192,13 +192,13 @@ def test_missing_raw_snapshot_keeps_observed_difference_and_unknown_reason(tmp_p
     assert text["differences"]
 
 
-def test_malformed_provenance_path_is_unknown_without_traceback(tmp_path):
+def test_malformed_block_reference_is_unknown_without_traceback(tmp_path):
     old, new = mapped_history(tmp_path)
-    old["provenance"]["blocks"][0]["prepared_image"] = "bad\x00path.jpg"
+    old["provenance"]["blocks"][0]["source_reference"] = "bad\x00reference.jpg"
     result, report = invoke(tmp_path, [old], [new], "--include-evidence")
     assert result.returncode == 2
     assert report["results"][0]["action"] == "UNKNOWN"
-    assert "HISTORICAL_BLOCK_PROVENANCE_INVALID" in report["results"][0]["reason_codes"]
+    assert "HISTORICAL_BLOCK_SOURCE_MISMATCH" in report["results"][0]["reason_codes"]
     assert "Traceback" not in result.stderr
 
 

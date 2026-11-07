@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .io import InputReader
 from .model import SCHEMA_VERSION, Document
 
 
@@ -24,9 +25,11 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def load_manifest(path: Path) -> list[Document]:
+def load_manifest(path: Path, reader: InputReader | None = None) -> list[Document]:
     try:
-        value = json.loads(path.read_bytes(), object_pairs_hook=_unique_object)
+        reader = reader or InputReader(16 * 1024 * 1024)
+        data = reader.read_bytes(path, max_bytes=16 * 1024 * 1024)
+        value = json.loads(data, object_pairs_hook=_unique_object)
     except (OSError, ValueError) as exc:
         raise ManifestError("MANIFEST_UNREADABLE_OR_INVALID") from exc
     if (
