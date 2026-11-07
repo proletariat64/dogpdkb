@@ -27,7 +27,11 @@ GIT = ["git"]
 
 
 def run(arguments: list[str], root: Path) -> str:
-    local_gate = arguments[:2] in (["make", "check"], ["make", "smoke"])
+    local_gate = arguments[:2] in (
+        ["make", "bootstrap"],
+        ["make", "check"],
+        ["make", "smoke"],
+    )
     if arguments[0] == "make":
         print("release: " + " ".join(arguments), flush=True)
     result = run_process(
@@ -112,7 +116,7 @@ def release(
         )
         print(
             f"Current merged version: {version}. Plan: fetch origin/master; verify HEAD; "
-            "make check; make smoke; create/push GitHub tag only; publish locally"
+            "make bootstrap; make check; make smoke; create/push GitHub tag only; publish locally"
             + ("; update homepage." if provider == "antcode" else ".")
         )
         return tag
@@ -144,6 +148,9 @@ def release(
         raise ValueError("remote tag points elsewhere; refusing to replace it")
     if not retry and (local or existing):
         raise ValueError(f"{tag} already exists; use make release RETRY=1")
+    # Pulling a version bump leaves editable-install metadata at the old version.
+    # Refresh it before test collection imports and caches CLI version strings.
+    run(["make", "bootstrap"], root)
     run(["make", "check"], root)
     run(["make", "smoke"], root)
     if run(["git", "status", "--porcelain"], root):
