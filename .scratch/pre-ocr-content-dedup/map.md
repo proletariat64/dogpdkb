@@ -2,12 +2,18 @@
 
 ## Notes
 
+- 后续产品化规格：[dogpdkb 日常知识增量与 mdcompare 产品化](../daily-knowledge-sync/spec.md)（Status: ready-for-agent）。覆盖现有 v3 交付、统一正文视图、正式日常增量、审核后的文档级编译和固定业务验收；只发布规格，不授权生产动作。以下01–09记录保留为当时交付证据，不代表该新流程已上线。
+
 - Scope: approved pre-OCR content comparison spec in this feature directory; CLI name is mdcompare.
 - Seven vertical slices were approved by the user. Each ticket owns its CLI acceptance tests.
 - Work the frontier: a ready-for-agent ticket may start when all its blockers are resolved. Claim with Status: claimed; finish with Status: resolved plus an Answer containing verification evidence; append its context pointer to Decisions-so-far here.
 - Implementation is complete on integration branch pre-ocr-content-dedup; tickets 01–07 are resolved. No production integration, OCR execution, baseline advancement or Graphify work is authorized by these tickets.
 
 ## Tickets
+
+- [09: 消除正文误报并独立规划提取成本](issues/09-cost-aware-body-routing.md) — blocked by: 08
+
+- [08: 正文知识复用与增量](issues/08-body-knowledge-delta.md) — 用户后续范围；图片/OCR完全排除，独立于旧严格比较验收
 
 - [01: 独立 CLI 与无资源文档比较](issues/01-cli-raw-comparison.md) — blocked by: none
 - [02: 文本变化解释与有限规范化](issues/02-text-diff-normalization.md) — blocked by: 01
@@ -18,6 +24,10 @@
 - [07: 真实文件 UAT 与最终交付验收](issues/07-real-uat-delivery.md) — blocked by: 02, 04, 05, 06
 
 ## Decisions-so-far
+
+- [09 resolved](issues/09-cost-aware-body-routing.md): 修正REVIEW等同Graphify任务的错误解释；表示去噪及独立成本计划已交付。4,752篇中2,087保留、1,861挂起、804文本候选；804不等于真实更新，尚未满足业务自动重提取验收。[真实记录](../../docs/mdcompare-business-uat.md)。
+
+- [08 resolved](issues/08-body-knowledge-delta.md): 用户后续要求正文知识复用，图片/OCR完全排除。新 `knowledge` 命令支持部分复用与增量，保留旧严格 `compare`。790测试及真实UAT通过运行与输入保持验证；识别116,420个非标题正文复用块，语义与元数据限制见[验收记录](../../docs/mdcompare-knowledge-uat.md)。
 
 - [02 resolved](issues/02-text-diff-normalization.md): bounded Myers and explicit LF rule, integrated as `0aa4838`.
 - [03 resolved](issues/03-resource-comparison.md): independent resource evidence, integrated as `0c2ee10`; conservative delimiter correction `888920f`.
@@ -35,5 +45,7 @@
 - Dependencies: 01 unlocks 02, 03 and 06; 02 unlocks 05; 03 unlocks 04; 02, 04, 05 and 06 unlock 07.
 
 ## Fog
+
+- 正文业务自动门槛仍待验证：不能把804文本候选批量送Graphify，也未证明候选全部是真实新增。当前整来源替换不支持安全片段更新；实际缓存命中与LLM费用未审计。
 
 - The existing real UAT package cannot establish a successful old raw baseline or full image/OCR reuse proof. Record this gap at acceptance; do not fabricate evidence or relax the spec.

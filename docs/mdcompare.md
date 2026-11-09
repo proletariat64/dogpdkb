@@ -1,4 +1,18 @@
-# mdcompare: offline content comparison
+# mdcompare: body knowledge and offline content comparison
+
+For knowledge-base deduplication, use `mdcompare knowledge`. It reports reusable
+body units and actual additions or possible revisions, with source locations.
+Images and OCR are completely excluded from that command and cannot block body
+results. See the [body knowledge guide](mdcompare-knowledge.md).
+
+```bash
+mdcompare knowledge --baseline baseline.json --incoming incoming.json \
+  --output knowledge.json --report knowledge.md
+```
+
+The remainder of this page documents the separate, strict `compare` command and
+its existing schema 1.0 contract. Its whole-file actions and resource/OCR gates
+are not the knowledge command's acceptance criteria.
 
 `mdcompare compare` compares captured baseline and incoming Markdown by knowledge
 base plus document ID. It reports text, resource, metadata and OCR reuse evidence

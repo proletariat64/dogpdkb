@@ -14,6 +14,7 @@ from .io import (
     referenced_paths,
     validate_outputs,
 )
+from .knowledge import compare_knowledge_documents, render_knowledge_report
 from .manifest import ManifestError, load_manifest
 from .model import CompareOptions
 
@@ -44,7 +45,9 @@ def main(argv=None) -> int:
     parser = ArgumentParser(prog="mdcompare")
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
-    compare = sub.add_parser("compare")
+    compare = sub.add_parser(
+        "compare", help="Strict file and processing-evidence comparison"
+    )
     compare.add_argument("--baseline", type=Path, required=True)
     compare.add_argument("--incoming", type=Path, required=True)
     compare.add_argument("--output", type=Path, required=True)
@@ -85,20 +88,62 @@ def main(argv=None) -> int:
         default=CompareOptions.max_char_region,
         help="Maximum combined region length for character explanation (default: 4096)",
     )
+    knowledge = sub.add_parser(
+        "knowledge",
+        help="Compare body knowledge; ignore images and OCR",
+        description=(
+            "Report reusable, added, revised and unresolved body knowledge. "
+            "Images and marked OCR blocks are ignored; no image/OCR tasks are created."
+        ),
+    )
+    knowledge.add_argument("--baseline", type=Path, required=True)
+    knowledge.add_argument("--incoming", type=Path, required=True)
+    knowledge.add_argument("--output", type=Path, required=True)
+    knowledge.add_argument(
+        "--report", type=Path, help="Optional private human-readable knowledge report"
+    )
+    knowledge.add_argument(
+        "--include-evidence", action="store_true", help="Include bounded body evidence"
+    )
+    knowledge.add_argument(
+        "--max-file-bytes",
+        type=_positive_file_limit,
+        default=CompareOptions.max_file_bytes,
+        help="Maximum bytes per Markdown file; oversized inputs stay UNKNOWN",
+    )
+    knowledge.add_argument(
+        "--max-diff-work",
+        type=nonnegative_int,
+        default=CompareOptions.max_diff_work,
+        help="Maximum fuzzy knowledge-alignment work; exact reuse is still evaluated",
+    )
+    knowledge.add_argument(
+        "--max-evidence-chars",
+        type=nonnegative_int,
+        default=CompareOptions.max_evidence_chars,
+        help="Maximum body evidence characters per document (default: 8000)",
+    )
     args = parser.parse_args(argv)
     options = CompareOptions(
         include_evidence=args.include_evidence,
         max_file_bytes=args.max_file_bytes,
-        normalize_line_endings=args.normalize_line_endings,
+        normalize_line_endings=getattr(args, "normalize_line_endings", False),
         max_diff_work=args.max_diff_work,
         max_evidence_chars=args.max_evidence_chars,
-        max_char_region=args.max_char_region,
+        max_char_region=getattr(
+            args, "max_char_region", CompareOptions.max_char_region
+        ),
     )
     try:
         reader = InputReader(options.max_file_bytes)
-        baseline = load_manifest(args.baseline, reader)
-        incoming = load_manifest(args.incoming, reader)
-        report = compare_documents(baseline, incoming, options, reader)
+        if args.command == "knowledge":
+            baseline = load_manifest(args.baseline, reader, body_only=True)
+            incoming = load_manifest(args.incoming, reader, body_only=True)
+            report = compare_knowledge_documents(baseline, incoming, options, reader)
+        else:
+            baseline = load_manifest(args.baseline, reader)
+            incoming = load_manifest(args.incoming, reader)
+            report = compare_documents(baseline, incoming, options, reader)
         if reader.changed_paths() & {
             args.baseline.absolute(),
             args.incoming.absolute(),
@@ -110,7 +155,9 @@ def main(argv=None) -> int:
         outputs = [p for p in (args.output, args.report) if p is not None]
         validate_outputs(outputs, protected)
         reports = []
-        if args.report:
+        if args.report and args.command == "knowledge":
+            reports.append((args.report, render_knowledge_report(report)))
+        elif args.report:
             lines = [
                 "# mdcompare report",
                 "",
@@ -159,4 +206,11 @@ def main(argv=None) -> int:
     except OSError:
         print("mdcompare: REPORT_WRITE_FAILED", file=sys.stderr)
         return 1
+    if args.command == "knowledge":
+        statuses = report["summary"]["statuses"]
+        return (
+            2
+            if statuses.get("UNKNOWN") or statuses.get("REVIEW") or report["errors"]
+            else 0
+        )
     return 2 if report["summary"]["actions"]["UNKNOWN"] or report["errors"] else 0

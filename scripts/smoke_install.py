@@ -338,6 +338,32 @@ def smoke(dist: Path) -> None:
         assert "300k" in json.dumps(comparison["results"][0]["text"]["differences"])
         assert (work / "old.md").read_text() == "# Limit\n100k\n"
         assert (work / "new.md").read_text() == "# Limit\n300k\n"
+        run([str(mdcompare), "knowledge", "--help"])
+        (work / "old.md").write_text(
+            "# Limit\n\n- 单笔限额10万元。\n![old](missing-old.png)\n", encoding="utf-8"
+        )
+        (work / "new.md").write_text(
+            "# Limit\n\n- 单笔限额100000元。\n![new](missing-new.png)\n- 每日结算。\n",
+            encoding="utf-8",
+        )
+        run(
+            [
+                str(mdcompare),
+                "knowledge",
+                "--baseline",
+                "baseline.json",
+                "--incoming",
+                "incoming.json",
+                "--output",
+                "knowledge.json",
+            ]
+        )
+        knowledge = parse_json((work / "knowledge.json").read_text())
+        assert knowledge["scope"] == "body_only"
+        assert knowledge["results"][0]["status"] == "DELTA"
+        assert knowledge["results"][0]["counts"]["reuse"] >= 1
+        assert knowledge["results"][0]["counts"]["add"] == 1
+        assert "media_pending" not in knowledge["results"][0]
         # A plain wheel/venv is not owned by the shell installer.
         run([str(command), "uninstall", "--yes"], expected=1)
         run([str(command), "update", "--version", version], expected=1)

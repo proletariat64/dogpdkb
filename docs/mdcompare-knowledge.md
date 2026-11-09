@@ -1,0 +1,218 @@
+# mdcompare: body knowledge reuse and increments
+
+`mdcompare knowledge` compares the knowledge in captured Markdown bodies. It
+reports reusable units, additions, possible revisions and old units missing from
+the incoming body. A document may reuse most of its knowledge while retaining a
+single changed rule as an increment. This command is read-only: it does not merge
+knowledge, delete source documents, run downstream processing or advance a
+baseline.
+
+## Run
+
+```bash
+mdcompare knowledge --baseline baseline.json --incoming incoming.json \
+  --output knowledge.json --report knowledge.md
+```
+
+Use the [manifest schema](mdcompare.md#input-schema-10) with scoped document IDs
+and paths to immutable local Markdown snapshots. Paths are relative to the
+manifest directory unless absolute. The command pairs documents by knowledge base
+plus document ID; filenames and directory moves do not establish identity. New
+document IDs have no paired old body, but their units can reuse matching knowledge
+from another supplied baseline document in the same knowledge base. Later
+incoming documents can also reuse units from earlier incoming documents in stable
+scoped-ID order. Baseline-only documents are listed separately, without inferring
+remote deletion.
+
+Create output parent directories first. Reports are private and atomically
+replaced. JSON is the automation result. Body text is omitted by default;
+`--include-evidence` explicitly permits bounded body evidence in the requested
+reports. Ordinary logs do not print body text. See [input and report
+safety](mdcompare-input-safety.md).
+
+## Body-only scope
+
+Images and OCR do not participate in this command. It does not open images, check
+image equality, inspect OCR artifacts or configurations, compare recognized text,
+or produce image/OCR tasks. Image references, including their alt text and image
+URLs, and explicitly marked OCR enrichment blocks are excluded from body
+comparison. Missing image files or OCR artifacts cannot block a body result.
+There is no `media_pending` output.
+
+Resource, OCR and provenance declarations in the input manifest are ignored for
+knowledge decisions. This does not authorize report output to overwrite those
+declared input files. Ordinary body links remain meaningful; their targets are
+preserved for comparison.
+
+Historical enriched input does not require a retained old raw snapshot to compare
+the observed body. The command can exclude explicitly marked OCR blocks, but it
+cannot discover which unmarked historical passages originated in OCR. Results
+describe the available body and retain that source limitation; they do not certify
+reconstruction of the historical raw document.
+
+## Knowledge units and decisions
+
+The comparison uses structure and local context rather than one whole-document
+similarity score. It preserves section context, table bindings, code indentation,
+ordinary link targets and ordered-list order. Supported normalization can reuse
+equivalent forms such as decimal quantity units, whitelisted presentation-only
+HTML wrappers and wholly empty table body rows. It retains actual changes to
+amounts, subjects, conditions, negation or rules, and keeps every nonempty table
+row, column position and cell binding.
+
+| Unit kind | Meaning |
+| --- | --- |
+| `reuse` | An old unit covers the new unit under the implemented normalization and context rules. Retain the new source reference when reusing knowledge. |
+| `add` | A new unit has no supported old counterpart. |
+| `revise` | A similar old unit is a possible revision. Preserve both source locations; similarity is not a semantic-equivalence proof. |
+| `old_only_review` | An old unit was not observed in the incoming body. It may have been removed, moved or omitted from the available input; do not delete knowledge automatically. |
+| `unresolved` | The comparison could not establish a result for this unit, including work-budget exhaustion. |
+
+Reordered independent facts can remain reusable. Reordered workflow steps or
+changed table bindings must not become reusable solely because the same words or
+numbers remain present. A fuzzy score can locate a possible revision; it cannot
+authorize reuse.
+
+Cross-document reuse requires the same knowledge base, `metadata.name`,
+`metadata.logical_path`, unit kind, section context and normalized unit key.
+The name must be nonempty. A paired document's name change keeps otherwise
+reusable units unresolved because the title may carry a changed business subject.
+This is context uncertainty, not proof that business knowledge changed.
+Condition or subject lead-ins also remain part of the context for their following
+units, rather than being discarded as formatting.
+Matching generic headings alone cannot establish a common subject. The rule is
+reported as `cross_document: "same_book_name_path_and_unit_context"`. A reused unit
+preserves the actual source document ID and line location. `old_side` identifies
+whether the source is `baseline` or an earlier `incoming` document. This is narrow
+contextual matching, not broad semantic retrieval; it does not merge sources or
+modify the knowledge base.
+
+This implementation does not run a semantic model. It cannot promise to recognize
+every paraphrase or find equivalent knowledge under different section contexts.
+Fuzzy cross-document retrieval requires separate evaluation and implementation.
+
+## Output and exit codes
+
+The JSON report declares `schema_version: "knowledge-1.0"` and
+`scope: "body_only"`. It contains `results`, `baseline_only`, `summary` and
+`errors`. Each incoming document has exactly one result in stable scoped-ID order,
+with `knowledge_base`, `document_id`, `status`, unit `counts`, `units` and
+`reason_codes`. Unit entries carry their comparison basis and available old/new
+source locations: `old` and `new` are null or contain `knowledge_base`,
+`document_id`, `start_line` and `end_line`. Each unit also has `kind`, `unit_type`, `basis` and
+`similarity`. Optional `evidence` contains bounded old/new body text. Body evidence
+remains opt-in, with one shared evidence character budget per document.
+`unit_type` distinguishes headings from paragraphs, bullets, ordered sequences,
+tables and code. Summary counts include these structural units; they are not a
+count of independently verified business facts.
+
+Each unit also exposes `new_body_chars`, `body_seen_before` and `existing_body`.
+`body_seen_before: true` means the same normalized unit type and key were observed
+somewhere in the paired old document; `existing_body` points to that old source
+location. It does not establish equivalent section, subject or conditions, and
+does not change the unit's `kind` to `reuse`. Repeated wording under a changed
+business context remains a context question rather than newly unseen body text.
+
+`presentation_seen_before` and `existing_presentation_body` identify a narrower
+presentation-only planning match to a paired old source location. This compares
+unfenced supported rich HTML, or a table containing that rich HTML, through the
+same conservative body/table normalization, including empty rich wrappers and
+wholly empty table body rows. A strict rich-layout pseudo-code unit can match its
+plain paragraph or table counterpart. The projection does not include fenced or
+other literal code, preformatted/executable `pre`, `code`, `script` or `style`
+content, `white-space` CSS, unknown XML, or changed values. The unit's comparison
+kind remains unchanged; this field is not knowledge-equivalence proof.
+
+| Document status | Meaning |
+| --- | --- |
+| `REUSE` | All observed incoming body units are reusable, with no old-only or unresolved units. |
+| `DELTA` | Body additions are reported, with no revision candidates, old-only or unresolved units. |
+| `REVIEW` | Revision candidates, old-only or unresolved units need interpretation. Known reusable or added units remain visible. |
+| `NO_BODY` | No comparable body units were present. This does not establish anything about images or other excluded content. |
+| `UNKNOWN` | A body read, decoding or input-stability failure prevents comparison. |
+
+The summary contains the total incoming document count, status counts and unit
+counts. Document and unit counts conserve their respective reported sets.
+`REVIEW` counts documents needing interpretation; it is not a count of actual
+knowledge updates or documents to send to an extraction model.
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | All documents have determinate body results; additions are allowed. |
+| 2 | A complete report was written, with `REVIEW`, `UNKNOWN` or item errors. |
+| 1 | Invalid input manifests or a global read/publication failure; do not consume a new report as complete. |
+
+## Graphify planning and cost boundaries
+
+Each document has a separate `graphify_plan`, so comparison uncertainty cannot
+silently become extraction permission:
+
+| Plan action | Meaning |
+| --- | --- |
+| `KEEP_EXISTING` | The document is reusable; retain existing graph knowledge. |
+| `HOLD_EXISTING` | No concrete new-side body candidate is available, or comparison is unavailable/incomplete. Keep existing knowledge and the stated uncertainty. |
+| `BODY_DELTA_CANDIDATE` | New-side non-heading additions, revision candidates or ambiguous alignment units whose normalized wording was not seen in the paired old body need assessment. This is a candidate list, not confirmed new knowledge or an extraction command. |
+
+All plans declare `plan_only: true`, `automatic_extraction_allowed: false` and
+`full_document_fallback: false`. Historical old-only content, title/subject
+uncertainty alone, and unknown or work-budget-limited comparisons do not authorize
+automatic model calls. Mixed documents can retain those uncertainties while
+listing independently observed new-side candidates.
+
+`candidate_unit_indexes` contains zero-based indexes into the document's `units`
+array. `context_review_unit_indexes` separately lists non-reused units whose
+wording was already observed in the paired old body, plus changed heading units.
+`presentation_review_unit_indexes` lists non-reused units with the supported
+presentation match. Both sets are excluded from new-body candidates. The plan
+retains context or presentation review and holds existing knowledge when there
+are no other candidates; it does not automatically skip business-scope changes
+or declare those units reusable.
+
+For example, changing a section from USD to EUR while retaining its rule text
+requires context review and holds existing knowledge; it does not queue the whole
+document for re-extraction. Changing a condition in a paragraph from A to B can
+produce one new-body candidate for that paragraph, while unchanged child wording
+goes to context review instead of being repeatedly counted as new body.
+
+`candidate_body_chars` counts the complete new-side text of candidate units,
+excluding headings and additional context payload. It is not a minimal text diff.
+The summary's `graphify_plan` contains action counts, the combined candidate
+character count, `context_review_documents`, `presentation_review_documents` and
+`automatic_full_document_extractions: 0`. Character counts are neither actual
+model token counts nor measured cost savings; required contextual payload and
+provider tokenization can add work.
+
+Candidates need inexpensive local inspection or targeted factual confirmation
+before any extraction decision. A high aggregate review count must not trigger a
+whole-document re-extraction fallback. This command does not integrate the plan
+into the sync or Graphify caller and has not measured production cost reduction.
+
+The existing caller already uses a file-level Graphify semantic cache, but its
+[graph merge replaces affected source ownership](../src/dogpdkb/workflows/graph_sync.py)
+and [the updater expects complete source extraction](../src/dogpdkb/workflows/update_graph.py).
+It cannot safely consume changed-block patches as whole-source replacements.
+Executing a delta plan requires a separate unit-to-graph coverage and merge
+contract that preserves untouched knowledge; until then these plans remain
+read-only advice.
+
+## Limits and acceptance
+
+`--max-file-bytes` bounds each Markdown read (default 16 MiB).
+`--max-diff-work` bounds candidate alignment work; exhausted work remains
+unresolved rather than being silently discarded. `--max-evidence-chars` bounds
+displayed body evidence (default 8,000 characters per document); clipping evidence
+does not prove coverage. `--include-evidence` enables that evidence.
+
+The knowledge command's acceptance target is useful, traceable body reuse with
+actual increments retained. It is not the number of whole files skipped. Real UAT
+must separately assess erroneous reuse, missed reuse, revision interpretation and
+unresolved units. Synthetic fixtures are development checks, not real UAT results.
+
+See the [body-only real UAT record](mdcompare-knowledge-uat.md) for the captured
+scope, unit counts, metadata limitations and installation evidence.
+The later [business-change and cost record](mdcompare-business-uat.md) explains
+why comparison review must not be interpreted as a Graphify extraction queue.
+
+The older [`mdcompare compare`](mdcompare.md) command retains its strict file,
+resource and OCR evidence contract for callers that require it. Its whole-file
+actions are not the body-knowledge result described here.

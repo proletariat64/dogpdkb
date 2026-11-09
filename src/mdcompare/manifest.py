@@ -25,7 +25,9 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def load_manifest(path: Path, reader: InputReader | None = None) -> list[Document]:
+def load_manifest(
+    path: Path, reader: InputReader | None = None, *, body_only: bool = False
+) -> list[Document]:
     try:
         reader = reader or InputReader(16 * 1024 * 1024)
         data = reader.read_bytes(path, max_bytes=16 * 1024 * 1024)
@@ -61,14 +63,16 @@ def load_manifest(path: Path, reader: InputReader | None = None) -> list[Documen
         ):
             raise ManifestError("METADATA_SCHEMA_INVALID")
         resources = row.get("resources")
-        if not isinstance(resources, list) or any(
-            not isinstance(r, dict) for r in resources
+        if not body_only and (
+            not isinstance(resources, list)
+            or any(not isinstance(r, dict) for r in resources)
         ):
             raise ManifestError("RESOURCE_SCHEMA_INVALID")
         ocr = row.get("ocr")
         provenance = row.get("provenance", {})
-        if (ocr is not None and not isinstance(ocr, dict)) or not isinstance(
-            provenance, dict
+        if not body_only and (
+            (ocr is not None and not isinstance(ocr, dict))
+            or not isinstance(provenance, dict)
         ):
             raise ManifestError("PROVENANCE_SCHEMA_INVALID")
         identity = row["knowledge_base"], row["document_id"]
@@ -82,10 +86,10 @@ def load_manifest(path: Path, reader: InputReader | None = None) -> list[Documen
                 row["content_kind"],
                 reference if reference.is_absolute() else path.parent / reference,
                 metadata,
-                resources,
+                resources if isinstance(resources, list) else [],
                 path.parent,
-                ocr,
-                provenance,
+                ocr if isinstance(ocr, dict) else None,
+                provenance if isinstance(provenance, dict) else {},
             )
         )
     return sorted(documents, key=lambda d: d.identity)
