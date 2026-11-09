@@ -7,7 +7,7 @@
 - 11 月 7 日完整观察：7,548 个文档 ID，来自冻结同步计划四类数组的去重并集；等价 ISO 时间表示先转换为 UTC 瞬时。
 - 11 月 9 日完整观察：7,550 个文档 ID；六个所选文档使用冻结 raw 和详情导出记录。
 - 旧正文仅取冻结 `incoming-0.json` 中明确 `content_kind=raw` 的记录，没有把历史富化文件当成 11 月 7 日 raw。
-- 私有输入、适配器、raw、计划、候选图和执行报告位于 `/tmp/daily-knowledge-sync-ticket05-uat-v1/`。目录和文件分别限制为 0700/0600；公开文档不包含正文、认证说明或凭证。
+- 私有输入、适配器、raw、计划、候选图和执行报告位于 `/tmp/daily-knowledge-sync-ticket05-uat-v1/`。根目录为 0700，主要 JSON 文件为 0600；部分子目录/派生文件权限不同，但受 0700 父目录保护。公开文档不包含正文、认证说明或凭证。
 - 输入只读，未运行 OCR、真实 Graphify 提取、生产同步、远端发布或生产基线推进。
 
 ## 正式发现与正文比较
@@ -77,4 +77,4 @@ Graphify 边界使用确定性外部替身，输入是正式计划冻结的完�
 
 隔离 smoke 发现并修复一个真实发布缺口：`--graphify-python` 曾解析 venv 的 `bin/python` 符号链接，导致子进程落到基础解释器、丢失 Graphify 环境。现在保留调用路径，并新增真实 CLI 回归测试。
 
-仓库完整门禁和最终复验数值记录在 [票 05 Answer](../.scratch/daily-knowledge-sync/issues/05-acceptance-release.md#answer)。本页所有通过结论均不包含真实 Graphify 重编译或生产知识正确性证明；固定案例是有界质量门槛，不证明全部知识无损。
+仓库完整门禁和最终复验数值记录在 [票 05 Answer](../.scratch/daily-knowledge-sync/issues/05-acceptance-release.md#answer)；本次只读复核日志及 wheel/sdist 留存在 `/tmp/daily-knowledge-sync-ticket05-final.H9DDAjhR/`，隔离安装 venv 由 smoke 自动清理。本页所有通过结论均不包含真实 Graphify 重编译或生产知识正确性证明；固定案例是有界质量门槛，不证明全部知识无损。
