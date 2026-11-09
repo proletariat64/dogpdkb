@@ -1,7 +1,7 @@
 # 05: 完成正式UAT、安装与使用交付
 
 Type: task
-Status: resolved
+Status: claimed
 Blocked by: 04
 
 ## Context
@@ -23,6 +23,8 @@ Blocked by: 04
 在独立worktree基于集成分支工作；读取tdd skill及相关测试指引，一条失败的CLI行为测试开始再实现；每轮记录red/green证据。完成后合入最新集成分支再测试，提交本票实现并将Status改resolved，Answer列实际验证和公开合同。任何测试失败/部分实现保持claimed，不假结案。不得运行reset/clean或删私有实物。
 
 ## Answer
+
+> 当前复核：原门禁在手动安装未声明的 `networkx` 后才通过，干净 dev bootstrap 尚未验收；本票暂回 claimed，修复并复验后方可重新 resolved。以下保留原报告和失败证据。
 
 ### 集成与交付合同
 
