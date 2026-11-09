@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from tests.test_knowledge_sync import captured_update, snapshot, write_raw_baseline
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1880,3 +1882,51 @@ def test_graphify_python_symlink_preserves_virtual_environment(tmp_path: Path):
     report = json.loads((staging / "execution-result.json").read_text())
     assert report["counts"]["graph_successes"] == 1
     assert report["quality_gate"]["status"] == "passed"
+
+
+@pytest.mark.parametrize("recover_report", [False, True])
+@pytest.mark.parametrize("changed_field", ["where", "required", "satisfied"])
+def test_completed_execution_rechecks_changed_quality_assertions(
+    tmp_path: Path, recover_report: bool, changed_field: str
+):
+    plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
+    graph_dir.mkdir()
+    write_json(graph_dir / "graph.json", {"nodes": [], "links": []})
+    write_json(tmp_path / "approvals.json", approval_document(plan))
+    quality = quality_document(plan)
+    write_json(tmp_path / "quality.json", quality)
+    stub = install_graphify_stub(tmp_path)
+    log = tmp_path / "graphify-calls.jsonl"
+    env = {
+        "PYTHONPATH": os.pathsep.join([str(stub), str(ROOT / "src")]),
+        "GRAPHIFY_STUB_LOG": str(log),
+    }
+    arguments = execute_arguments(
+        tmp_path, snapshot_path, state_path, staging, graph_dir
+    )
+    first = sync(*arguments, env=env)
+    assert first.returncode == 0, first.stderr
+    report_path = staging / "execution-result.json"
+    if recover_report:
+        report_path.unlink()
+    if changed_field == "where":
+        quality["cases"][0]["where"] = {"label": "Unobserved updated rule"}
+    elif changed_field == "required":
+        quality["cases"][0]["required"]["rationale"].append("unobserved condition")
+    else:
+        quality["cases"][0]["required"]["rationale"].append("Refund")
+    write_json(tmp_path / "quality.json", quality)
+    protected = [graph_dir / "graph.json", state_path, log]
+    if not recover_report:
+        protected.append(report_path)
+    before = {path: path.read_bytes() for path in protected}
+
+    repeated = sync(*arguments, env=env)
+
+    if changed_field == "satisfied":
+        assert repeated.returncode == 0, repeated.stderr
+    else:
+        assert repeated.returncode != 0
+        assert "quality case failed: new-limit" in repeated.stderr
+    assert {path: path.read_bytes() for path in protected} == before
+    assert report_path.exists() is (not recover_report or changed_field == "satisfied")
