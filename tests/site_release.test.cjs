@@ -7,7 +7,8 @@ const { test } = require('node:test');
 const script = fs.readFileSync(path.join(__dirname, '../web/kb/release.js'), 'utf8');
 const base = 'https://code.alipay.com/pd.pt/dogpdkb/releases';
 const stable = {
-  schema_version: 1, version: '0.1.1', tag: 'v0.1.1', channel: 'stable',
+  schema_version: 1, product: 'dogpdkb', version: '0.1.1', tag: 'v0.1.1',
+  channel: 'stable', provider: 'antcode', auth: 'none',
   installer_url: `${base}/download/v0.1.1/install.sh`, release_url: base,
 };
 async function load(data = stable, options = {}) {
@@ -47,7 +48,7 @@ async function load(data = stable, options = {}) {
 
 test('stable install command is exact and metadata bypasses browser cache', async () => {
   const page = await load();
-  assert.equal(page.request.url, 'release.json');
+  assert.equal(page.request.url, '../releases/dogpdkb.json');
   assert.equal(page.request.settings.cache, 'no-store');
   assert.equal(page.elements.get('install-command').value, `curl -fsSL ${stable.installer_url} | bash`);
   assert.equal(page.elements.get('release-version').textContent, '稳定版 v0.1.1');
@@ -68,6 +69,9 @@ for (const [name, override] of Object.entries({
   credentials: { installer_url: 'https://u:p@code.alipay.com/pd.pt/dogpdkb/releases/download/v0.1.1/install.sh' },
   releaseLink: { release_url: 'javascript:alert(1)' },
   schema: { schema_version: 2 },
+  product: { product: 'other' },
+  provider: { provider: 'github' },
+  auth: { auth: 'github-token' },
   array: { version: ['0.1.1'] },
 })) {
   test(`invalid ${name} metadata disables copying and exposes no command`, async () => {

@@ -16,8 +16,10 @@
   // Metadata is an instruction visitors paste into a shell. Accept only our exact
   // HTTPS release origin and safe tag shapes; never render arbitrary shell text.
   function validate(data) {
-    if (!data || data.schema_version !== 1 || typeof data.version !== 'string' ||
-        typeof data.tag !== 'string' || !versionPattern.test(data.version)) return false;
+    if (!data || data.schema_version !== 1 || data.product !== 'dogpdkb' ||
+        data.provider !== 'antcode' || data.auth !== 'none' ||
+        typeof data.version !== 'string' || typeof data.tag !== 'string' ||
+        !versionPattern.test(data.version)) return false;
     if (!['stable', 'preview'].includes(data.channel)) return false;
     const validTag = data.channel === 'stable'
       ? data.tag === `v${data.version}`
@@ -52,7 +54,7 @@
   window.addEventListener('resize', resizeCommand);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10000);
-  fetch('release.json', { cache: 'no-store', signal: controller.signal })
+  fetch('../releases/dogpdkb.json', { cache: 'no-store', signal: controller.signal })
     .then((response) => {
       if (!response.ok) throw new Error('Release metadata unavailable');
       return response.json();
