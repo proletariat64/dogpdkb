@@ -278,7 +278,9 @@ def merge_graph_records(
         for edge in new["edges"]
     ):
         raise ValueError("fresh edge is dangling after source replacement")
-    if any(set(members(hyperedge)) > set(nodes) for hyperedge in new["hyperedges"]):
+    if any(
+        not set(members(hyperedge)) <= set(nodes) for hyperedge in new["hyperedges"]
+    ):
         raise ValueError("fresh hyperedge is dangling after source replacement")
 
     def endpoint_key(edge: dict[str, Any]) -> tuple[str, str]:

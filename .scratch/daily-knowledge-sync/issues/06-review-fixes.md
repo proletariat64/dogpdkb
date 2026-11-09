@@ -46,4 +46,10 @@ Blocked by: 01, 02, 03, 04, 05
 - 首次v1复跑因测试脚本让正负例共享负例缓存而未通过，未计为产品缺陷或通过；v2隔离缓存根后完成。历史实物未修改。
 - 审查历史及逐项定位：`docs/daily-knowledge-sync-review.md`。共享进度：`/tmp/daily-knowledge-sync-fix-progress.md`。
 
-最终`make check`：**928 passed**，doc-guard 65篇，Ruff及171文件格式检查通过，日志`/tmp/daily-knowledge-sync-ticket06-make-check-final.log`。离线build和隔离安装smoke通过，日志`/tmp/daily-knowledge-sync-ticket06-make-smoke-final.log`。最终10文件主动LSP为7 clean、3个warning文件、0 error；warning均为0700规则误报或既有有界数字转换，未宣称全clean。集成tip未前进且仍为当前分支祖先；实施分支提交后由集成merger合入。
+此前`make check`：**928 passed**，doc-guard 65篇，Ruff及171文件格式检查通过，日志`/tmp/daily-knowledge-sync-ticket06-make-check-final.log`。离线build和隔离安装smoke通过，日志`/tmp/daily-knowledge-sync-ticket06-make-smoke-final.log`。当时10文件主动LSP为7 clean、3个warning文件、0 error；warning均为0700规则误报或既有有界数字转换，未宣称全clean。
+
+### SPEC-6尾部补充
+
+主线程合并前发现fresh hyperedge检查误用proper superset `>`。新增真实CLI/外部替身反例：doc1旧节点被替换，doc2无关节点保留，fresh hyperedge同时引用fresh node和消失旧节点，合法审批及质量case下旧代码返回0并静默丢弃超边发布，red成立。后置guard改为真正的subset检查后，提取后拒绝且原图/state字节不变；全部成员有效的fresh hyperedge正例发布成功。原直接merge测试改用有效超边，继续验证alias保留而不再依赖有损丢弃。
+
+聚焦graph/execute反例4 passed，完整execute 28 passed，graph_sync/update_graph 25 passed。最终`make check`：**930 passed**，doc-guard 65篇，Ruff及171文件格式检查通过，日志`/tmp/daily-knowledge-sync-ticket06-spec6-make-check.log`。源码变化后的离线build/隔离安装smoke通过，日志`/tmp/daily-knowledge-sync-ticket06-spec6-make-smoke.log`。未重复冻结UAT、真实模型或生产操作。集成tip `5ffc866` 未前进，保留`caa4f2c`全部成果；实施分支提交后由集成merger合入。

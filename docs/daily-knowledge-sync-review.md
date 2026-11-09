@@ -60,4 +60,10 @@
 
 四个原始复现脚本均得到预期拒绝/恢复结果。新冻结UAT位于`/tmp/daily-knowledge-sync-ticket06-uat-v2`：输入与票05实物逐字节一致；7548→7550、2 new/4 updated、6捕获，2个批准、4个质量案例及2个图谱成功；负例图/state不变。全部Graphify为确定性外部替身，token也是合成值，不是实际模型或生产证据。
 
-最终门禁：`make check` **928 passed**，doc-guard 65篇，Ruff及171文件格式检查通过（`/tmp/daily-knowledge-sync-ticket06-make-check-final.log`）。离线build和隔离安装smoke通过（`/tmp/daily-knowledge-sync-ticket06-make-smoke-final.log`）。最终10文件主动LSP为7 clean、3个既有/规则误报warning文件、0 error；0700私有权限不建议改为0644，数字转换为既有有界输入，未将这些warning冒充clean。
+此前门禁：`make check` **928 passed**，doc-guard 65篇，Ruff及171文件格式检查通过（`/tmp/daily-knowledge-sync-ticket06-make-check-final.log`）。离线build和隔离安装smoke通过（`/tmp/daily-knowledge-sync-ticket06-make-smoke-final.log`）。当时10文件主动LSP为7 clean、3个既有/规则误报warning文件、0 error；0700私有权限不建议改为0644，数字转换为既有有界输入，未将这些warning冒充clean。
+
+### SPEC-6合并前残余修复
+
+主线程实际diff复核发现fresh hyperedge后置guard使用`set(members) > set(nodes)`，只检测proper superset，不能识别“部分成员缺失且集合互不包含”。新CLI/外部替身反例包含被替换的doc1旧节点、保留的doc2无关节点，以及同时引用fresh node和消失旧节点的fresh hyperedge；合法审批和质量case下，修复前错误返回0并丢弃超边发布。改为`not set(members) <= set(nodes)`后，提取后拒绝且原图/state不变。全部成员有效的超边正例通过，未新增hook、hash或事实merge。
+
+最终聚焦graph/execute 4 passed、execute 28 passed、graph_sync/update_graph 25 passed；完整`make check` **930 passed**，doc-guard 65篇、Ruff及171文件格式检查通过（`/tmp/daily-knowledge-sync-ticket06-spec6-make-check.log`）。源码变化后的离线build/隔离安装smoke通过（`/tmp/daily-knowledge-sync-ticket06-spec6-make-smoke.log`）。本补充未重复冻结UAT，未运行真实模型或生产操作。

@@ -157,7 +157,7 @@ def test_retained_reference_uses_current_source_and_member_aliases():
     fresh = {
         "nodes": [{"id": "fresh", "label": "Changed", "source_file": "new-[1].md"}],
         "edges": [],
-        "hyperedges": [{"nodes": ["fresh", "missing"], "source_file": "new-[1].md"}],
+        "hyperedges": [{"nodes": ["fresh"], "source_file": "new-[1].md"}],
     }
 
     candidate, _, _ = graph_sync.merge_graph_records(
@@ -174,9 +174,13 @@ def test_retained_reference_uses_current_source_and_member_aliases():
     nodes = {node["id"]: node for node in candidate["nodes"]}
     assert nodes["stable"]["source_file"] == "new-[1].md"
     assert nodes["stable"]["retained_reference"] is True
-    assert candidate["hyperedges"] == [
-        {"members": ["outside", "stable"], "source_file": "outside-[9].md"}
-    ]
+    assert {
+        "members": ["outside", "stable"],
+        "source_file": "outside-[9].md",
+    } in candidate["hyperedges"]
+    assert any(
+        hyperedge.get("nodes") == ["fresh"] for hyperedge in candidate["hyperedges"]
+    )
 
 
 @pytest.mark.parametrize("reverse", [False, True])

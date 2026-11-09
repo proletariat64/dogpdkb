@@ -681,6 +681,100 @@ def test_invalid_cached_hyperedge_is_rejected_before_lossy_merge(tmp_path: Path)
     assert not (staging / "graph-update" / "candidate-ready.json").exists()
 
 
+def test_partially_missing_fresh_hyperedge_is_rejected_after_replacement(
+    tmp_path: Path,
+):
+    plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
+    graph_dir.mkdir()
+    original = {
+        "directed": True,
+        "nodes": [
+            {
+                "id": "old-only",
+                "label": "Old only",
+                "rationale": "Old rule absent from fresh extraction.",
+                "source_file": "old-[1].md",
+            },
+            {
+                "id": "outside",
+                "label": "Outside",
+                "rationale": "Unrelated source remains in candidate.",
+                "source_file": "outside-[2].md",
+            },
+        ],
+        "links": [],
+        "hyperedges": [],
+    }
+    write_json(graph_dir / "graph.json", original)
+    state_before = state_path.read_bytes()
+    write_json(tmp_path / "approvals.json", approval_document(plan))
+    write_json(tmp_path / "quality.json", quality_document(plan))
+    stub = install_graphify_stub(tmp_path)
+    llm = stub / "graphify" / "llm.py"
+    source = llm.read_text()
+    old = '"edges": current_edges, "hyperedges": []'
+    assert old in source
+    llm.write_text(
+        source.replace(
+            old,
+            '"edges": current_edges, '
+            '"hyperedges": [{"members": ["refund-limit", "old-only"], "source_file": source}]',
+        )
+    )
+
+    result = sync(
+        *execute_arguments(tmp_path, snapshot_path, state_path, staging, graph_dir),
+        env={"PYTHONPATH": os.pathsep.join([str(stub), str(ROOT / "src")])},
+    )
+
+    assert result.returncode != 0
+    assert "candidate-only failed" in result.stderr
+    assert (graph_dir / "graph.json").read_text() == json.dumps(original)
+    assert state_path.read_bytes() == state_before
+    assert not (staging / "execution-result.json").exists()
+    assert not (staging / "graph-update" / "candidate-ready.json").exists()
+
+
+def test_fresh_hyperedge_with_all_members_present_is_published(tmp_path: Path):
+    plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
+    graph_dir.mkdir()
+    write_json(
+        graph_dir / "graph.json",
+        {"directed": True, "nodes": [], "links": [], "hyperedges": []},
+    )
+    write_json(tmp_path / "approvals.json", approval_document(plan))
+    write_json(tmp_path / "quality.json", quality_document(plan))
+    stub = install_graphify_stub(tmp_path)
+    llm = stub / "graphify" / "llm.py"
+    source = llm.read_text()
+    old = '"edges": current_edges, "hyperedges": []'
+    assert old in source
+    llm.write_text(
+        source.replace(
+            old,
+            '"edges": current_edges, '
+            '"hyperedges": [{"members": ["refund-limit", "refund-approval"], "source_file": source}]',
+        )
+    )
+
+    result = sync(
+        *execute_arguments(tmp_path, snapshot_path, state_path, staging, graph_dir),
+        env={"PYTHONPATH": os.pathsep.join([str(stub), str(ROOT / "src")])},
+    )
+
+    assert result.returncode == 0, result.stderr
+    graph = json.loads((graph_dir / "graph.json").read_text())
+    assert len(graph["hyperedges"]) == 1
+    assert set(graph["hyperedges"][0]["members"]) == {
+        "refund-limit",
+        "refund-approval",
+    }
+    assert (
+        json.loads(state_path.read_text())["documents"]["1"]["graph"]["version"]["utc"]
+        == "2026-11-09T00:00:00Z"
+    )
+
+
 def test_unrelated_source_edge_collision_is_safely_rejected(tmp_path: Path):
     plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
     graph_dir.mkdir()
