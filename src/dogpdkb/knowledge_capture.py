@@ -198,6 +198,7 @@ def _load_remote_listing(
     source_url: str, staging: Path
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     from dogpdkb.workflows.get_sync_updates import (
+        PAGE_SIZE,
         SkylarkError,
         fetch_doc_list,
         resolve_book,
@@ -214,14 +215,17 @@ def _load_remote_listing(
     if book["items_count"] != len(documents):
         raise CaptureError("remote book count and complete listing do not match")
     pages = []
-    for path in sorted(pages_dir.glob(f"page-{book['book_id']}-*.json")):
+    # Every offset through the proven count was fetched on this attempt; a full
+    # final page also requires the freshly fetched empty terminating page.
+    for offset in range(0, len(documents) + 1, PAGE_SIZE):
+        path = pages_dir / f"page-{book['book_id']}-{offset:07}.json"
         checkpoint = _read_json(path)
         if not isinstance(checkpoint.get("items"), list):
             raise CaptureError("remote page checkpoint is invalid")
         pages.append(
             {
                 "offset": checkpoint["offset"],
-                "limit": 50,
+                "limit": PAGE_SIZE,
                 "item_count": len(checkpoint["items"]),
             }
         )
@@ -592,10 +596,19 @@ def run_capture(args: Any) -> int:
             reasons.append("baseline_raw_missing")
         labels = sorted(label for label, values in changes.items() if doc_id in values)
         checkpoint_row = checkpoint.get(str(doc_id))
+        detail_matches_listing = False
+        if isinstance(checkpoint_row, dict):
+            try:
+                detail_matches_listing = _instant(
+                    checkpoint_row.get("detail_version") or {}
+                ) == _instant(records[str(doc_id)]["version"])
+            except CaptureError:
+                detail_matches_listing = False
         reused = False
         if (
             isinstance(checkpoint_row, dict)
             and checkpoint_row.get("listing_version") == records[str(doc_id)]["version"]
+            and detail_matches_listing
             and isinstance(checkpoint_row.get("raw_file"), str)
             and Path(checkpoint_row["raw_file"]).name == checkpoint_row["raw_file"]
             and (staging / "raw" / checkpoint_row["raw_file"]).is_file()

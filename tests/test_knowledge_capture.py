@@ -87,7 +87,9 @@ for line in sys.stdin:
             data = {"name": "UAT", "items_count": len(fixture["documents"])}
         elif name == "skylark_doc_list":
             offset = args["offset"]
-            data = fixture["documents"][offset:offset + args["limit"]]
+            data = fixture.get("page_overrides", {}).get(
+                str(offset), fixture["documents"][offset:offset + args["limit"]]
+            )
         elif name == "skylark_book_toc":
             data = [
                 {"type": "DOC", "doc_id": doc["id"], "title": doc["title"], "children": []}
@@ -549,6 +551,101 @@ def test_export_failure_resumes_from_private_checkpoint(tmp_path: Path):
     assert checkpoint_path.stat().st_mode & 0o777 == 0o600
 
 
+def _assert_remote_retry_refetches_mismatched_detail_and_reuses_matching_checkpoint(
+    tmp_path: Path, stale_timestamp: str, anomaly: str
+):
+    old = "2026-11-07T00:00:00Z"
+    new = "2026-11-09T00:00:00Z"
+    documents = [
+        {"id": doc_id, "title": f"Document {doc_id}", "content_updated_at": old}
+        for doc_id in (1, 2)
+    ]
+    config = write_remote_adapter(tmp_path, documents)
+    baseline = tmp_path / "baseline" / "snapshot.json"
+    initial = discover(
+        "--config",
+        str(config),
+        "--snapshot",
+        str(baseline),
+        "-s",
+        "https://example.invalid/book",
+    )
+    assert initial.returncode == 0, initial.stderr
+    baseline_bytes = baseline.read_bytes()
+
+    for document in documents:
+        document["content_updated_at"] = new
+    write_remote_adapter(tmp_path, documents)
+    fixture_path = tmp_path / "remote.json"
+    fixture = json.loads(fixture_path.read_text())
+    fixture["details"]["1"].update(
+        {"body": "stale body", "content_updated_at": stale_timestamp}
+    )
+    fixture["details"]["2"].update(
+        {"body": "matching body", "content_updated_at": "2026-11-09T08:00:00+08:00"}
+    )
+    write_json(fixture_path, fixture)
+    output = tmp_path / "next" / "snapshot.json"
+    staging = tmp_path / "next" / "staging"
+    arguments = [
+        "--config",
+        str(config),
+        "--snapshot",
+        str(output),
+        "--baseline-snapshot",
+        str(baseline),
+        "--staging",
+        str(staging),
+        "-s",
+        "https://example.invalid/book",
+    ]
+
+    failed = discover(*arguments)
+
+    assert failed.returncode != 0
+    first = json.loads(output.read_text())
+    assert first["status"] == "incomplete"
+    assert first["anomalies"] == [{"id": 1, "code": anomaly}]
+    stale_raw = output.parent / first["exports"]["1"]["raw"]["path"]
+    matching_raw = output.parent / first["exports"]["2"]["raw"]["path"]
+    assert stale_raw.read_text() == "stale body"
+    assert matching_raw.read_text() == "matching body"
+    assert first["exports"]["2"]["detail_version"]["value"] == (
+        "2026-11-09T08:00:00+08:00"
+    )
+    fixture["details"]["1"].update(
+        {"body": "fresh body", "content_updated_at": "2026-11-09T01:00:00+01:00"}
+    )
+    del fixture["details"]["2"]  # A second fetch would fail instead of reusing it.
+    write_json(fixture_path, fixture)
+
+    retried = discover(*arguments)
+
+    assert retried.returncode == 0, retried.stderr
+    second = json.loads(output.read_text())
+    assert second["status"] == "captured"
+    assert second["anomalies"] == []
+    assert second["exports"]["1"]["reused"] is False
+    assert second["exports"]["2"]["reused"] is True
+    fresh_raw = output.parent / second["exports"]["1"]["raw"]["path"]
+    assert fresh_raw.read_text() == "fresh body"
+    assert stale_raw.read_text() == "stale body"
+    assert matching_raw.read_text() == "matching body"
+    assert baseline.read_bytes() == baseline_bytes
+
+
+def test_remote_retry_refetches_mismatched_detail_and_reuses_matching_checkpoint(
+    tmp_path: Path,
+):
+    for timestamp, anomaly in [
+        ("2026-11-08T00:00:00Z", "detail_older_than_listing"),
+        ("2026-11-10T00:00:00Z", "detail_newer_than_listing"),
+    ]:
+        _assert_remote_retry_refetches_mismatched_detail_and_reuses_matching_checkpoint(
+            tmp_path / anomaly, timestamp, anomaly
+        )
+
+
 def test_original_raw_reference_is_resolved_from_its_baseline(tmp_path: Path):
     baseline_dir = tmp_path / "baseline"
     baseline_path = baseline_dir / "snapshot.json"
@@ -731,6 +828,109 @@ def test_remote_mode_reuses_book_listing_toc_and_detail_adapters(tmp_path: Path)
     raw_path = output.parent / snapshot["exports"]["1"]["raw"]["path"]
     assert raw_path.read_text() == "body 1"
     assert snapshot["listing"]["pages"] == [{"offset": 0, "limit": 50, "item_count": 1}]
+
+
+def _assert_remote_retry_excludes_unused_pages_from_older_larger_listing(
+    tmp_path: Path, new_count: int, expected_pages: list[dict[str, int]]
+):
+    documents = [
+        {
+            "id": doc_id,
+            "title": f"Document {doc_id}",
+            "content_updated_at": "2026-11-09T00:00:00Z",
+        }
+        for doc_id in range(120)
+    ]
+    documents[-1]["content_updated_at"] = ""
+    config = write_remote_adapter(tmp_path, documents)
+    snapshot_path = tmp_path / "snapshot.json"
+    staging = tmp_path / "staging"
+    arguments = [
+        "--config",
+        str(config),
+        "--snapshot",
+        str(snapshot_path),
+        "--staging",
+        str(staging),
+        "-s",
+        "https://example.invalid/book",
+    ]
+
+    failed = discover(*arguments)
+
+    assert failed.returncode != 0
+    assert "no usable update timestamp" in failed.stderr
+    assert not snapshot_path.exists()
+    stale_page = staging / "pages" / "page-123-0000100.json"
+    stale_bytes = stale_page.read_bytes()
+    write_remote_adapter(tmp_path, documents[:new_count])
+
+    retried = discover(*arguments)
+
+    assert retried.returncode == 0, retried.stderr
+    snapshot = json.loads(snapshot_path.read_text())
+    assert snapshot["status"] == "initialized"
+    assert snapshot["listing"]["document_ids"] == list(range(new_count))
+    assert snapshot["listing"]["pages"] == expected_pages
+    assert stale_page.read_bytes() == stale_bytes
+    assert stale_page.stat().st_mode & 0o777 == 0o600
+
+
+def test_remote_retry_excludes_unused_pages_from_older_larger_listing(tmp_path: Path):
+    cases = [
+        (0, [{"offset": 0, "limit": 50, "item_count": 0}]),
+        (49, [{"offset": 0, "limit": 50, "item_count": 49}]),
+        (
+            50,
+            [
+                {"offset": 0, "limit": 50, "item_count": 50},
+                {"offset": 50, "limit": 50, "item_count": 0},
+            ],
+        ),
+        (
+            51,
+            [
+                {"offset": 0, "limit": 50, "item_count": 50},
+                {"offset": 50, "limit": 50, "item_count": 1},
+            ],
+        ),
+    ]
+    for count, pages in cases:
+        _assert_remote_retry_excludes_unused_pages_from_older_larger_listing(
+            tmp_path / str(count), count, pages
+        )
+
+
+def test_remote_short_nonfinal_page_cannot_claim_complete_coverage(tmp_path: Path):
+    documents = [
+        {
+            "id": doc_id,
+            "title": f"Document {doc_id}",
+            "content_updated_at": "2026-11-09T00:00:00Z",
+        }
+        for doc_id in range(51)
+    ]
+    config = write_remote_adapter(tmp_path, documents)
+    fixture_path = tmp_path / "remote.json"
+    fixture = json.loads(fixture_path.read_text())
+    fixture["page_overrides"] = {"0": documents[:49], "50": documents[49:]}
+    write_json(fixture_path, fixture)
+    output = tmp_path / "snapshot.json"
+
+    result = discover(
+        "--config",
+        str(config),
+        "--snapshot",
+        str(output),
+        "--staging",
+        str(tmp_path / "staging"),
+        "-s",
+        "https://example.invalid/book",
+    )
+
+    assert result.returncode != 0
+    assert "short non-final page" in result.stderr
+    assert not output.exists()
 
 
 def test_existing_raw_reference_survives_an_unchanged_observation(tmp_path: Path):
@@ -986,8 +1186,8 @@ def test_remote_pages_cannot_alias_or_contain_baseline_input(tmp_path: Path):
     assert baseline.read_bytes() == before
 
 
-def test_existing_page_hardlink_to_baseline_is_rejected_before_remote_write(
-    tmp_path: Path,
+def _assert_existing_page_hardlink_to_baseline_is_rejected_before_remote_write(
+    tmp_path: Path, offset: int
 ):
     documents = [
         {
@@ -1015,7 +1215,7 @@ def test_existing_page_hardlink_to_baseline_is_rejected_before_remote_write(
         == 0
     )
     staging = tmp_path / "staging"
-    page = staging / "pages" / "page-123-0000000.json"
+    page = staging / "pages" / f"page-123-{offset:07}.json"
     page.parent.mkdir(parents=True)
     os.link(baseline, page)
     before = baseline.read_bytes()
@@ -1036,6 +1236,15 @@ def test_existing_page_hardlink_to_baseline_is_rejected_before_remote_write(
     assert result.returncode != 0
     assert "REPORT_INPUT_COLLISION" in result.stderr
     assert baseline.read_bytes() == before
+
+
+def test_existing_page_hardlink_to_baseline_is_rejected_before_remote_write(
+    tmp_path: Path,
+):
+    for offset in (0, 100):
+        _assert_existing_page_hardlink_to_baseline_is_rejected_before_remote_write(
+            tmp_path / str(offset), offset
+        )
 
 
 def test_snapshot_cannot_collide_with_selected_raw_output(tmp_path: Path):
