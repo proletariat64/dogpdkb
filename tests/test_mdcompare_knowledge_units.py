@@ -131,10 +131,10 @@ def test_only_image_ocr_changes_produce_no_knowledge_tasks():
     assert compare("", "![new](new.png)") == {"items": [], "complete": True}
 
 
-def test_unclosed_excluded_region_extends_to_eof_without_tasks_or_errors():
+def test_unclosed_excluded_region_is_not_a_reusable_prefix():
     old = "Known body\n\n<!-- mdocr:ocr-begin -->\nold extraction"
-    new = "Known body\n\n<!-- mdocr:ocr-begin -->\nnew extraction"
-    assert incoming_kinds(compare(old, new)) == ["reuse"]
+    with pytest.raises(ValueError, match="BODY_SCOPE_BOUNDARY_UNCLOSED"):
+        extract_units(old)
     assert compare("<svg>old text", "<svg>new text") == {"items": [], "complete": True}
 
 
@@ -363,9 +363,9 @@ old unstable content
     assert incoming_kinds(compare(old, "Known body")) == ["reuse"]
 
 
-def test_unpaired_legacy_label_does_not_remove_following_business_section():
-    units = extract_units("> **图片转写：** generated\n\nBusiness rule is 100 USD")
-    assert any("Business rule" in u.text for u in units)
+def test_unpaired_legacy_label_does_not_reuse_unmarked_following_business_section():
+    with pytest.raises(ValueError, match="BODY_SCOPE_BOUNDARY_UNCLOSED"):
+        extract_units("> **图片转写：** generated\n\nBusiness rule is 100 USD")
 
 
 def test_old_only_non_scope_paragraph_does_not_cascade_into_new_rule():

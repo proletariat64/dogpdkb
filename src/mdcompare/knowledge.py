@@ -11,7 +11,14 @@ from collections import Counter
 from typing import Any
 
 from .io import InputError, InputReader
-from .knowledge_units import Unit, _prose_key, _table_key, align_units, extract_units
+from .knowledge_units import (
+    BodyScopeError,
+    Unit,
+    _prose_key,
+    _table_key,
+    align_units,
+    extract_units,
+)
 from .model import CompareOptions, Document
 
 KINDS = ("reuse", "add", "revise", "old_only_review", "unresolved")
@@ -122,7 +129,10 @@ def _read_units(document: Document, reader: InputReader) -> list[Unit]:
         text = reader.read_bytes(document.path).decode("utf-8")
     except UnicodeDecodeError as exc:
         raise InputError("TEXT_ENCODING_UNSUPPORTED") from exc
-    return extract_units(text)
+    try:
+        return extract_units(text, document.body_scope)
+    except BodyScopeError as exc:
+        raise InputError(exc.reason_code) from exc
 
 
 def _reference(document: Document, unit: Unit) -> dict[str, Any]:
@@ -362,8 +372,9 @@ def compare_knowledge_documents(
         "schema_version": "knowledge-1.0",
         "scope": "body_only",
         "rules": {
-            "version": "body-units-v3",
+            "version": "body-units-v4",
             "reuse": "contextual_normalized_body_equality",
+            "generated_regions": "outside_code_or_verified_generated_regions_v1",
             "similarity": "revision_candidate_only",
             "images_and_ocr": "excluded",
             "cross_document": "same_book_name_path_and_unit_context",

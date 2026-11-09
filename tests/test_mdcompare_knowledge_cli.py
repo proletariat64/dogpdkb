@@ -5,8 +5,9 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
-import pytest
+import pytest  # pyright: ignore[reportMissingImports] -- installed in the test environment
 
 
 def document(path, document_id="1", **updates):
@@ -22,7 +23,9 @@ def document(path, document_id="1", **updates):
     return value
 
 
-def invoke(tmp_path, baseline, incoming, *extra):
+def invoke(
+    tmp_path, baseline, incoming, *extra
+) -> tuple[subprocess.CompletedProcess, Any]:
     old = tmp_path / "baseline.json"
     new = tmp_path / "incoming.json"
     out = tmp_path / "knowledge.json"
@@ -105,6 +108,178 @@ def test_images_and_ocr_do_not_generate_tasks_or_gate_historical_body(tmp_path):
     assert "完全不同的识别结果" not in serialized
 
 
+def test_verified_generated_region_inside_code_fence_is_outside_body(tmp_path):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    template = (
+        "正文规则：退款需要审批。\n\n```text\n"
+        "<!-- mdocr:ocr-begin -->\n{}\n<!-- mdocr:ocr-end -->\n```\n"
+    )
+    old.write_text(template.format("旧派生文字"))
+    new.write_text(template.format("新派生文字"))
+    scope = {
+        "version": "generated-regions-v1",
+        "regions": [{"kind": "mdocr_ocr", "start_line": 4, "end_line": 6}],
+    }
+    result, report = invoke(
+        tmp_path,
+        [document(old, body_scope=scope)],
+        [document(new, body_scope=scope)],
+    )
+    assert result.returncode == 0, result.stderr
+    assert report["rules"]["version"] == "body-units-v4"
+    assert report["rules"]["generated_regions"] == (
+        "outside_code_or_verified_generated_regions_v1"
+    )
+    row = report["results"][0]
+    assert row["status"] == "REUSE"
+    assert row["graphify_plan"]["action"] == "KEEP_EXISTING"
+    assert "旧派生文字" not in json.dumps(report, ensure_ascii=False)
+    assert "新派生文字" not in json.dumps(report, ensure_ascii=False)
+
+
+def test_verified_generated_region_inside_indented_export_is_outside_body(tmp_path):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    template = (
+        "正文规则：退款需要审批。\n\n    <!-- mdocr:ocr-begin -->\n"
+        "    {}\n    <!-- mdocr:ocr-end -->\n"
+    )
+    old.write_text(template.format("旧派生文字"))
+    new.write_text(template.format("新派生文字"))
+    scope = {
+        "version": "generated-regions-v1",
+        "regions": [{"kind": "mdocr_ocr", "start_line": 3, "end_line": 5}],
+    }
+    result, report = invoke(
+        tmp_path,
+        [document(old, body_scope=scope)],
+        [document(new, body_scope=scope)],
+    )
+    assert result.returncode == 0, result.stderr
+    assert report["results"][0]["status"] == "REUSE"
+    assert report["results"][0]["graphify_plan"]["action"] == "KEEP_EXISTING"
+
+
+def test_undeclared_marker_text_in_code_remains_literal(tmp_path):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    template = (
+        "```text\n<!-- mdocr:ocr-begin -->\nvalue={}\n<!-- mdocr:ocr-end -->\n```\n"
+    )
+    old.write_text(template.format("100"))
+    new.write_text(template.format("200"))
+    result, report = invoke(tmp_path, [document(old)], [document(new)])
+    assert result.returncode == 2, result.stderr
+    row = report["results"][0]
+    assert row["status"] == "REVIEW"
+    assert row["graphify_plan"]["action"] == "BODY_DELTA_CANDIDATE"
+    assert row["graphify_plan"]["candidate_body_chars"] > 0
+
+
+def test_generated_region_declaration_must_match_source_location(tmp_path):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    text = (
+        "正文\n\n```text\n<!-- mdocr:ocr-begin -->\n派生\n<!-- mdocr:ocr-end -->\n```\n"
+    )
+    old.write_text(text)
+    new.write_text(text)
+    scope = {
+        "version": "generated-regions-v1",
+        "regions": [{"kind": "mdocr_ocr", "start_line": 5, "end_line": 6}],
+    }
+    result, report = invoke(
+        tmp_path,
+        [document(old, body_scope=scope)],
+        [document(new, body_scope=scope)],
+    )
+    assert result.returncode == 2, result.stderr
+    row = report["results"][0]
+    assert row["status"] == "UNKNOWN"
+    assert row["reason_codes"] == ["BODY_SCOPE_LOCATION_MISMATCH"]
+    assert row["graphify_plan"]["action"] == "HOLD_EXISTING"
+
+
+def test_unclosed_generated_region_is_unknown_and_holds_existing(tmp_path):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    old.write_text("已知正文\n\n<!-- mdocr:ocr-begin -->\n旧尾部")
+    new.write_text("已知正文\n\n<!-- mdocr:ocr-begin -->\n新尾部")
+    result, report = invoke(tmp_path, [document(old)], [document(new)])
+    assert result.returncode == 2, result.stderr
+    row = report["results"][0]
+    assert row["status"] == "UNKNOWN"
+    assert row["comparison_complete"] is False
+    assert row["reason_codes"] == ["BODY_SCOPE_BOUNDARY_UNCLOSED"]
+    assert row["graphify_plan"]["action"] == "HOLD_EXISTING"
+    assert row["graphify_plan"]["candidate_unit_indexes"] == []
+
+
+def test_literal_code_end_marker_does_not_close_outer_generated_region(tmp_path):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    text = "<!-- mdocr:ocr-begin -->\n```text\n<!-- mdocr:ocr-end -->\n```\n"
+    old.write_text(text)
+    new.write_text(text)
+    result, report = invoke(tmp_path, [document(old)], [document(new)])
+    assert result.returncode == 2, result.stderr
+    row = report["results"][0]
+    assert row["status"] == "UNKNOWN"
+    assert row["reason_codes"] == ["BODY_SCOPE_BOUNDARY_UNCLOSED"]
+    assert row["graphify_plan"]["action"] == "HOLD_EXISTING"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "正文\n\n<!-- mdocr:ocr-end -->\n",
+        (
+            "<!-- mdocr:ocr-begin -->\n<!-- mdocr:ocr-begin -->\n"
+            "<!-- mdocr:ocr-end -->\n<!-- mdocr:ocr-end -->\n"
+        ),
+    ],
+)
+def test_orphan_or_nested_generated_boundaries_are_unknown(tmp_path, text):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    old.write_text(text)
+    new.write_text(text)
+    result, report = invoke(tmp_path, [document(old)], [document(new)])
+    assert result.returncode == 2, result.stderr
+    row = report["results"][0]
+    assert row["status"] == "UNKNOWN"
+    assert row["reason_codes"] == ["BODY_SCOPE_BOUNDARY_INVALID"]
+    assert row["graphify_plan"]["action"] == "HOLD_EXISTING"
+
+
+def test_unclosed_legacy_generated_comment_is_unknown(tmp_path):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    old.write_text("已知正文\n\n<!-- 这是一张图片，ocr 内容为：\n旧尾部")
+    new.write_text("已知正文\n\n<!-- 这是一张图片，ocr 内容为：\n新尾部")
+    result, report = invoke(tmp_path, [document(old)], [document(new)])
+    assert result.returncode == 2, result.stderr
+    row = report["results"][0]
+    assert row["status"] == "UNKNOWN"
+    assert row["reason_codes"] == ["BODY_SCOPE_BOUNDARY_UNCLOSED"]
+    assert row["graphify_plan"]["action"] == "HOLD_EXISTING"
+
+
+def test_unpaired_legacy_generated_label_is_unknown_without_tail_reuse(tmp_path):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    text = "> **图片转写：** generated\n\n未标记业务规则：限额100元。"
+    old.write_text(text)
+    new.write_text(text)
+    result, report = invoke(tmp_path, [document(old)], [document(new)])
+    assert result.returncode == 2, result.stderr
+    row = report["results"][0]
+    assert row["status"] == "UNKNOWN"
+    assert row["reason_codes"] == ["BODY_SCOPE_BOUNDARY_UNCLOSED"]
+    assert row["graphify_plan"]["action"] == "HOLD_EXISTING"
+
+
 def test_no_evidence_by_default_and_private_optional_report(tmp_path):
     raw = tmp_path / "body.md"
     secret = "private-body-marker-613"
@@ -131,6 +306,24 @@ def test_empty_body_is_no_body_without_media_review(tmp_path):
     assert result.returncode == 0, result.stderr
     assert report["results"][0]["status"] == "NO_BODY"
     assert not report["errors"]
+
+
+def test_unmarked_historical_text_is_not_guessed_to_be_generated(tmp_path):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    old.write_text("未标记历史说明\n\n业务规则：退款需要审批。")
+    new.write_text("业务规则：退款需要审批。")
+    result, report = invoke(
+        tmp_path,
+        [document(old, content_kind="historical_enriched")],
+        [document(new)],
+    )
+    assert result.returncode == 2, result.stderr
+    row = report["results"][0]
+    assert row["status"] == "REVIEW"
+    assert row["counts"]["old_only_review"] == 1
+    assert row["source_limitations"] == ["HISTORICAL_UNMARKED_TEXT_ORIGIN_UNVERIFIED"]
+    assert row["graphify_plan"]["action"] == "HOLD_EXISTING"
 
 
 def test_old_only_knowledge_requires_review_without_deleting_source(tmp_path):
@@ -228,6 +421,34 @@ def test_ignored_media_is_still_protected_from_report_overwrite(tmp_path):
     assert result.returncode == 1
     assert "REPORT_INPUT_COLLISION" in result.stderr
     assert image.read_bytes() == b"untouched-media"
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("单笔限额100元。", "单笔限额200元。"),
+        ("|主体|限额|\n|---|---|\n|企业A|100|", "|主体|限额|\n|---|---|\n|100|企业A|"),
+        ("[API](https://example.invalid/pay)", "[API](https://example.invalid/refund)"),
+        ("# 流程\n\n1. 申请\n2. 审批", "# 流程\n\n1. 审批\n2. 申请"),
+        (
+            "```python\nif ready:\n    pay()\nsettle()\n```",
+            "```python\nif ready:\n    pay()\n    settle()\n```",
+        ),
+    ],
+)
+def test_meaningful_financial_table_url_order_and_code_changes_remain_candidates(
+    tmp_path, before, after
+):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    old.write_text(before)
+    new.write_text(after)
+    result, report = invoke(tmp_path, [document(old)], [document(new)])
+    assert result.returncode == 2, result.stderr
+    row = report["results"][0]
+    assert row["status"] == "REVIEW"
+    assert row["graphify_plan"]["action"] == "BODY_DELTA_CANDIDATE"
+    assert row["graphify_plan"]["candidate_body_chars"] > 0
 
 
 def test_graphify_plan_counts_only_new_body_units_not_reused_or_headings(tmp_path):

@@ -26,6 +26,7 @@ class Document:
     base_dir: Path
     ocr: dict[str, Any] | None = None
     provenance: dict[str, Any] = field(default_factory=dict)
+    body_scope: dict[str, Any] = field(default_factory=dict)
 
     @property
     def identity(self) -> tuple[str, str]:
