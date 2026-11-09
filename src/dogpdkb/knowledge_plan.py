@@ -27,6 +27,10 @@ class PlanError(ValueError):
     """Inputs cannot produce an auditable knowledge plan."""
 
 
+class _RawSourceReadError(OSError):
+    """A document source could not be read for freezing."""
+
+
 def state_lock_path(state_path: Path) -> Path:
     """Keep the coordination inode separate from atomically replaced state."""
     return state_path.with_name(f".{state_path.name}.lock")
@@ -257,7 +261,10 @@ def _freeze_raw(
         [destination, staging / "plan.json", state_path, state_lock_path(state_path)],
         protected | {raw_path},
     )
-    content = InputReader(CompareOptions.max_file_bytes).read_bytes(raw_path)
+    try:
+        content = InputReader(CompareOptions.max_file_bytes).read_bytes(raw_path)
+    except OSError as error:
+        raise _RawSourceReadError from error
     if destination.exists():
         if destination.read_bytes() != content:
             raise PlanError("frozen planning input already exists with different bytes")
@@ -382,7 +389,10 @@ def _run_planner(args: Any) -> dict[str, Any]:
         capture_anomalies = anomaly_codes.get(numeric_id, [])
         if export.get("status") == "failed":
             capture_anomalies.append("CAPTURE_EXPORT_FAILED")
-        raw_missing = raw_path is not None and not raw_path.is_file()
+        try:
+            raw_missing = raw_path is not None and not raw_path.is_file()
+        except OSError:
+            raw_missing = True
         if raw_missing:
             capture_anomalies.append("CAPTURE_RAW_UNAVAILABLE")
         if raw_path:
@@ -406,7 +416,9 @@ def _run_planner(args: Any) -> dict[str, Any]:
         )
         work = (
             numeric_id in selected
-            or bool(previous_pending)
+            or any(
+                reason != "GRAPH_SOURCE_NOT_REGISTERED" for reason in previous_pending
+            )
             or graph_needs_comparison
             or (graph.get("status") != "covered" and raw_path is not None)
         )
@@ -417,6 +429,8 @@ def _run_planner(args: Any) -> dict[str, Any]:
             "CAPTURE_ANOMALY",
             "CAPTURE_EXPORT_FAILED",
             "CAPTURE_RAW_UNAVAILABLE",
+            "GRAPH_SOURCE_NOT_REGISTERED",
+            "GRAPH_RAW_UNAVAILABLE",
             "NEW_DOCUMENT_NOT_IN_GRAPH",
             "export_failed",
             "detail_newer_than_listing",
@@ -429,21 +443,34 @@ def _run_planner(args: Any) -> dict[str, Any]:
         old = _graph_document(doc_id, graph, book_id, state_path)
         frozen = None
         frozen_old = None
+        source_failure = None
         if work and not capture_anomalies and raw_path is not None:
-            frozen = _freeze_raw(
-                raw_path, staging, book_id, numeric_id, protected, state_path
-            )
-            if old is not None:
-                frozen_old = _freeze_raw(
-                    old.path,
-                    staging,
-                    book_id,
-                    numeric_id,
-                    protected,
-                    state_path,
-                    previous=True,
+            if graph.get("status") == "covered" and old is None:
+                raise PlanError("registered graph source or metadata is invalid")
+            try:
+                frozen = _freeze_raw(
+                    raw_path, staging, book_id, numeric_id, protected, state_path
                 )
-                old = replace(old, path=frozen_old, base_dir=frozen_old.parent)
+                if old is not None:
+                    frozen_old = _freeze_raw(
+                        old.path,
+                        staging,
+                        book_id,
+                        numeric_id,
+                        protected,
+                        state_path,
+                        previous=True,
+                    )
+                    old = replace(old, path=frozen_old, base_dir=frozen_old.parent)
+            except _RawSourceReadError:
+                source_failure = (
+                    "CAPTURE_RAW_UNAVAILABLE"
+                    if frozen is None
+                    else "GRAPH_RAW_UNAVAILABLE"
+                )
+                if frozen is None:
+                    corpus = {**corpus, "status": "pending", "version": None}
+        if frozen is not None and source_failure is None:
             comparison = _compare(old, _document(document, book_id, frozen))
             compared += 1
             action = comparison["graphify_plan"]["action"]
@@ -457,7 +484,9 @@ def _run_planner(args: Any) -> dict[str, Any]:
                 reasons.append("BODY_COMPARISON_REVIEW_REQUIRED")
         elif work:
             action = "HOLD_EXISTING"
-            reasons.extend(capture_anomalies or ["CAPTURE_RAW_UNAVAILABLE"])
+            reasons.extend(
+                capture_anomalies or [source_failure or "CAPTURE_RAW_UNAVAILABLE"]
+            )
         elif graph.get("status") == "covered":
             action = "KEEP_EXISTING"
         else:
