@@ -45,6 +45,107 @@ def parse_json(content: str) -> Any:
         raise RuntimeError("invalid JSON in installation smoke output") from error
 
 
+def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def install_knowledge_graphify_stub(graph_env: Path) -> None:
+    """Install a deterministic external Graphify boundary in the disposable venv."""
+    site = (
+        graph_env
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    (site / "networkx.py").write_text(
+        "class Graph:\n"
+        "    def add_node(self, *args, **kwargs): pass\n"
+        "    def add_edge(self, *args, **kwargs): pass\n"
+        "class DiGraph(Graph): pass\n"
+    )
+    package = site / "graphify"
+    package.mkdir(parents=True, exist_ok=True)
+    (package / "__init__.py").write_text("")
+    (package / "cache.py").write_text(
+        """import json
+from pathlib import Path
+
+def _entry(path, cache_root):
+    return Path(cache_root) / "graphify-out" / "cache" / "semantic-stub" / (Path(path).name + ".json")
+
+def check_semantic_cache(files, root, cache_root, prompt):
+    nodes, edges, hyperedges, missing = [], [], [], []
+    for name in files:
+        entry = _entry(name, cache_root)
+        value = json.loads(entry.read_text()) if entry.exists() else None
+        if value is None or value["body"] != Path(name).read_text():
+            missing.append(name)
+            continue
+        nodes.extend(value["nodes"])
+        edges.extend(value["edges"])
+        hyperedges.extend(value["hyperedges"])
+    return nodes, edges, hyperedges, missing
+"""
+    )
+    (package / "llm.py").write_text(
+        """import json
+from pathlib import Path
+from graphify.cache import _entry
+
+def detect_backend():
+    return "stub"
+
+def _default_model_for_backend(backend):
+    return "stub-model"
+
+def _extraction_system(deep=False):
+    return "stub-prompt"
+
+def extract_corpus_parallel(files, backend, root, cache_root, **kwargs):
+    nodes, edges = [], []
+    for path in files:
+        body = path.read_text()
+        source = path.name
+        current_nodes = [
+            {"id": "refund-approval", "label": "Refund approval", "rationale": "Refund requires approval.", "source_file": source},
+            {"id": "refund-limit", "label": "Refund limit", "rationale": "Refund requires manager approval when amount exceeds 100 USD.", "source_file": source},
+        ]
+        current_edges = [{"source": "refund-limit", "target": "refund-approval", "relation": "requires", "rationale": "manager approval above 100 USD", "source_file": source}]
+        value = {"body": body, "nodes": current_nodes, "edges": current_edges, "hyperedges": []}
+        entry = _entry(path, cache_root)
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_text(json.dumps(value))
+        nodes.extend(current_nodes)
+        edges.extend(current_edges)
+    return {"nodes": nodes, "edges": edges, "hyperedges": [], "input_tokens": 123, "output_tokens": 45, "external_calls": len(files)}
+"""
+    )
+    (package / "detect.py").write_text(
+        """import json
+from pathlib import Path
+def save_manifest(files, *, manifest_path, kind, root):
+    path = Path(manifest_path)
+    value = json.loads(path.read_text())
+    for name in files["document"]:
+        value[Path(name).name] = {"kind": kind}
+    path.write_text(json.dumps(value))
+"""
+    )
+    (package / "analyze.py").write_text(
+        "def god_nodes(graph):\n    return []\n"
+        "def suggest_questions(graph, communities, labels):\n    return []\n"
+        "def surprising_connections(graph, communities):\n    return []\n"
+    )
+    (package / "cluster.py").write_text(
+        "def score_all(graph, communities):\n    return {}\n"
+        "def community_member_sigs(communities):\n    return ''\n"
+    )
+    (package / "report.py").write_text(
+        "def generate(*args, **kwargs):\n    return 'bounded stub report'\n"
+    )
+
+
 def inspect_artifacts(wheel: Path, sdist: Path) -> None:
     required = {
         "dogpdkb/cli.py",
@@ -59,6 +160,29 @@ def inspect_artifacts(wheel: Path, sdist: Path) -> None:
         wheel_names = set(archive.namelist())
     with tarfile.open(sdist) as archive:
         source_names = {name.split("/", 1)[-1] for name in archive.getnames()}
+    comparator = {
+        "mdcompare/__init__.py",
+        "mdcompare/__main__.py",
+        "mdcompare/cli.py",
+        "mdcompare/knowledge.py",
+        "mdcompare/knowledge_units.py",
+    }
+    if (
+        not comparator <= wheel_names
+        or not {f"src/{name}" for name in comparator} <= source_names
+    ):
+        raise RuntimeError("distribution is missing mdcompare modules")
+    knowledge = {
+        "dogpdkb/knowledge_capture.py",
+        "dogpdkb/knowledge_execute.py",
+        "dogpdkb/knowledge_plan.py",
+        "dogpdkb/knowledge_sync.py",
+    }
+    if (
+        not knowledge <= wheel_names
+        or not {f"src/{name}" for name in knowledge} <= source_names
+    ):
+        raise RuntimeError("distribution is missing knowledge workflow modules")
     if (
         not required <= wheel_names
         or not {f"src/{name}" for name in required} <= source_names
@@ -193,6 +317,7 @@ def smoke(dist: Path) -> None:
         python = environment / "bin/python"
         command = environment / "bin/dogpdkb"
         mdocr = environment / "bin/mdocr"
+        mdcompare = environment / "bin/mdcompare"
 
         def run(arguments: list[str], *, expected=0, cwd=work) -> str:
             result = run_process(
@@ -260,9 +385,10 @@ def smoke(dist: Path) -> None:
                 "-I",
                 "-c",
                 (
-                    "import pathlib,sys,dogpdkb,mdocr; "
+                    "import pathlib,sys,dogpdkb,mdocr,mdcompare; "
                     "assert pathlib.Path(dogpdkb.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix)); "
-                    "assert pathlib.Path(mdocr.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix))"
+                    "assert pathlib.Path(mdocr.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix)); "
+                    "assert pathlib.Path(mdcompare.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix))"
                 ),
             ]
         )
@@ -280,6 +406,82 @@ def smoke(dist: Path) -> None:
         ):
             run([str(command), subcommand, "--help"])
         run([str(mdocr), "--help"])
+        comparator_version = run(
+            [str(python), "-I", "-c", "import mdcompare; print(mdcompare.__version__)"]
+        ).strip()
+        assert run([str(mdcompare), "--version"]).strip() == comparator_version
+        run([str(mdcompare), "compare", "--help"])
+        (work / "old.md").write_text("# Limit\n100k\n", encoding="utf-8")
+        (work / "new.md").write_text("# Limit\n300k\n", encoding="utf-8")
+        for name, content in (("baseline", "old.md"), ("incoming", "new.md")):
+            (work / f"{name}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1.0",
+                        "documents": [
+                            {
+                                "knowledge_base": "installation-smoke",
+                                "document_id": "1",
+                                "content_kind": "raw",
+                                "path": content,
+                                "metadata": {
+                                    "name": "Limit",
+                                    "logical_path": "",
+                                    "source_ref": "installation-smoke:1",
+                                },
+                                "resources": [],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+        run(
+            [
+                str(mdcompare),
+                "compare",
+                "--baseline",
+                "baseline.json",
+                "--incoming",
+                "incoming.json",
+                "--output",
+                "comparison.json",
+                "--include-evidence",
+            ]
+        )
+        comparison = parse_json((work / "comparison.json").read_text())
+        assert comparison["summary"]["total"] == 1
+        assert comparison["results"][0]["action"] == "UPDATE_TEXT_REUSE_OCR"
+        assert comparison["results"][0]["text"]["byte_equal"] is False
+        assert "300k" in json.dumps(comparison["results"][0]["text"]["differences"])
+        assert (work / "old.md").read_text() == "# Limit\n100k\n"
+        assert (work / "new.md").read_text() == "# Limit\n300k\n"
+        run([str(mdcompare), "knowledge", "--help"])
+        (work / "old.md").write_text(
+            "# Limit\n\n- 单笔限额10万元。\n![old](missing-old.png)\n", encoding="utf-8"
+        )
+        (work / "new.md").write_text(
+            "# Limit\n\n- 单笔限额100000元。\n![new](missing-new.png)\n- 每日结算。\n",
+            encoding="utf-8",
+        )
+        run(
+            [
+                str(mdcompare),
+                "knowledge",
+                "--baseline",
+                "baseline.json",
+                "--incoming",
+                "incoming.json",
+                "--output",
+                "knowledge.json",
+            ]
+        )
+        knowledge = parse_json((work / "knowledge.json").read_text())
+        assert knowledge["scope"] == "body_only"
+        assert knowledge["results"][0]["status"] == "DELTA"
+        assert knowledge["results"][0]["counts"]["reuse"] >= 1
+        assert knowledge["results"][0]["counts"]["add"] == 1
+        assert "media_pending" not in knowledge["results"][0]
         # A plain wheel/venv is not owned by the shell installer.
         run([str(command), "uninstall", "--yes"], expected=1)
         run([str(command), "update", "--version", version], expected=1)
@@ -308,9 +510,268 @@ def smoke(dist: Path) -> None:
             ]
         ).strip()
         run([str(graph_env / "bin/python"), "-I", graph_script, "--help"])
+        install_knowledge_graphify_stub(graph_env)
+
+        run([str(command), "init-config"])
+        knowledge_root = work / "knowledge"
+        config = knowledge_root / "config.toml"
+        config.parent.mkdir()
+        config.write_text(
+            '[skylark]\nmcp_url="http://127.0.0.1:9/mcp"\n', encoding="utf-8"
+        )
+        source_url = "https://example.invalid/team/book"
+        old_version = "2026-11-07T00:00:00Z"
+        new_version = "2026-11-09T00:00:00Z"
+        old_body = "# Limits\n\nRefund requires approval.\n"
+        new_body = (
+            "# Limits\n\nRefund requires approval.\n\n"
+            "Refund requires manager approval when amount exceeds 100 USD.\n"
+        )
+
+        def listing(version: str) -> dict[str, Any]:
+            return {
+                "book": {
+                    "book_id": 123,
+                    "slug": "uat",
+                    "name": "UAT",
+                    "items_count": 1,
+                },
+                "listing": {
+                    "complete": True,
+                    "document_count": 1,
+                    "pages": [{"offset": 0, "limit": 50, "item_count": 1}],
+                },
+                "documents": [
+                    {
+                        "id": 1,
+                        "title": "Limits",
+                        "slug": "limits",
+                        "format": "markdown",
+                        "content_updated_at": version,
+                    }
+                ],
+            }
+
+        initial_listing = knowledge_root / "initial-listing.json"
+        initial_snapshot = knowledge_root / "initial-snapshot.json"
+        write_json(initial_listing, listing(old_version))
+        run(
+            [
+                str(command),
+                "discover",
+                "--config",
+                str(config),
+                "-s",
+                source_url,
+                "--snapshot",
+                str(initial_snapshot),
+                "--staging",
+                str(knowledge_root / "initial-capture"),
+                "--listing",
+                str(initial_listing),
+            ]
+        )
+        initial = parse_json(initial_snapshot.read_text())
+        assert initial["status"] == "initialized"
+        assert initial["counts"]["selected"] == 0
+
+        current_listing = knowledge_root / "current-listing.json"
+        current_snapshot = knowledge_root / "current-snapshot.json"
+        details = knowledge_root / "details"
+        write_json(current_listing, listing(new_version))
+        write_json(
+            details / "1.json",
+            {"id": 1, "body": new_body, "content_updated_at": new_version},
+        )
+        run(
+            [
+                str(command),
+                "discover",
+                "--config",
+                str(config),
+                "-s",
+                source_url,
+                "--snapshot",
+                str(current_snapshot),
+                "--baseline-snapshot",
+                str(initial_snapshot),
+                "--staging",
+                str(knowledge_root / "current-capture"),
+                "--listing",
+                str(current_listing),
+                "--details-dir",
+                str(details),
+            ]
+        )
+        current = parse_json(current_snapshot.read_text())
+        assert current["status"] == "captured"
+        assert current["changes"]["updated"] == [1]
+        assert current["counts"]["captured"] == 1
+
+        old_raw = knowledge_root / "baseline-raw" / "old.md"
+        old_raw.parent.mkdir()
+        old_raw.write_text(old_body, encoding="utf-8")
+        baseline_manifest = knowledge_root / "baseline.json"
+        write_json(
+            baseline_manifest,
+            {
+                "schema_version": "1.0",
+                "documents": [
+                    {
+                        "knowledge_base": "123",
+                        "document_id": "1",
+                        "content_kind": "raw",
+                        "path": "baseline-raw/old.md",
+                        "metadata": {
+                            "name": "Limits",
+                            "logical_path": "Funds",
+                            "source_ref": "123:1",
+                            "sync_timestamp": old_version,
+                        },
+                    }
+                ],
+            },
+        )
+        knowledge_graph = knowledge_root / "graphify-out"
+        knowledge_graph.mkdir()
+        write_json(
+            knowledge_graph / "graph.json",
+            {
+                "nodes": [
+                    {
+                        "id": "old-refund",
+                        "label": "Old refund",
+                        "source_file": "old-[1].md",
+                        "source_url": "https://example.invalid/team/book/limits",
+                    }
+                ],
+                "links": [],
+            },
+        )
+        state = knowledge_root / "state.json"
+        planning = knowledge_root / "planning"
+        run(
+            [
+                str(command),
+                "sync",
+                "--knowledge",
+                "--snapshot",
+                str(current_snapshot),
+                "--state",
+                str(state),
+                "--staging",
+                str(planning),
+                "--baseline",
+                str(baseline_manifest),
+            ]
+        )
+        plan_path = planning / "plan.json"
+        plan = parse_json(plan_path.read_text())
+        row = plan["results"][0]
+        assert row["action"] == "BODY_DELTA_CANDIDATE"
+        assert plan["counts"]["external_calls"] == 0
+        frozen_raw = planning / row["execution"]["raw"]["path"]
+        assert frozen_raw.read_text() == new_body
+        assert old_raw.read_text() == old_body
+
+        execution = row["execution"]
+        approvals = knowledge_root / "approvals.json"
+        quality = knowledge_root / "quality.json"
+        write_json(
+            approvals,
+            {
+                "schema_version": "knowledge-approvals-2.0",
+                "plan": str(plan_path),
+                "approvals": [
+                    {
+                        "book_id": 123,
+                        "document_id": 1,
+                        "source_version": execution["source_version"],
+                        "raw": execution["raw"],
+                        "source_scope": "whole_document",
+                        "review_dispositions": [
+                            {
+                                "issue_id": issue["issue_id"],
+                                "decision": (
+                                    "approve_removal"
+                                    if "approve_removal" in issue["allowed_decisions"]
+                                    else "accept_revision"
+                                    if "accept_revision" in issue["allowed_decisions"]
+                                    else "acknowledged"
+                                ),
+                            }
+                            for issue in execution["review_issues"]
+                        ],
+                    }
+                ],
+            },
+        )
+
+        def quality_document(fragments: list[str]) -> dict[str, Any]:
+            return {
+                "schema_version": "knowledge-quality-cases-2.0",
+                "plan": str(plan_path),
+                "cases": [
+                    {
+                        "case_id": "new-limit",
+                        "book_id": 123,
+                        "document_id": 1,
+                        "source_version": execution["source_version"],
+                        "record": "node",
+                        "where": {"label": "Refund limit"},
+                        "required": {"rationale": fragments},
+                    },
+                    {
+                        "case_id": "old-restriction",
+                        "book_id": 123,
+                        "document_id": 1,
+                        "source_version": execution["source_version"],
+                        "record": "node",
+                        "where": {"label": "Refund approval"},
+                        "required": {"rationale": ["requires approval"]},
+                    },
+                ],
+            }
+
+        execute = [
+            str(command),
+            "sync",
+            "--knowledge",
+            "--execute",
+            "--snapshot",
+            str(current_snapshot),
+            "--state",
+            str(state),
+            "--staging",
+            str(planning),
+            "--approvals",
+            str(approvals),
+            "--quality-cases",
+            str(quality),
+            "--graph-dir",
+            str(knowledge_graph),
+            "--graphify-python",
+            str(graph_env / "bin/python"),
+        ]
+        original_graph = (knowledge_graph / "graph.json").read_bytes()
+        write_json(quality, quality_document(["manager approval", "500 USD"]))
+        run(execute, expected=1)
+        assert (knowledge_graph / "graph.json").read_bytes() == original_graph
+        retained_state = parse_json(state.read_text())
+        assert (
+            retained_state["documents"]["1"]["graph"]["version"]["utc"] == old_version
+        )
+        write_json(quality, quality_document(["manager approval", "100 USD"]))
+        run(execute)
+        execution_report = parse_json((planning / "execution-result.json").read_text())
+        assert execution_report["counts"]["approved"] == 1
+        assert execution_report["counts"]["graph_successes"] == 1
+        assert execution_report["quality_gate"]["passed_cases"] == 2
+        assert execution_report["cost"]["status"] == "unknown"
+        assert (knowledge_graph / "graph.json").read_bytes() != original_graph
+        assert frozen_raw.read_text() == new_body
         report = parse_json(run([str(command), "doctor", "--package", "--json"]))
         assert report["ok"]
-        run([str(command), "init-config"])
         run([str(command), "init-config"], expected=1)
         # Disabled template sources must not be reported as operationally ready.
         report = parse_json(run([str(command), "doctor", "--json"], expected=1))
@@ -364,7 +825,8 @@ def smoke(dist: Path) -> None:
         assert list((work / "prepared/assets").rglob("*.jpg"))
         smoke_managed_install(work, wheel, version, env)
     print(
-        "smoke: PASS (wheel/sdist, CLI, doctor, Web, images, managed upgrade/uninstall)"
+        "smoke: PASS (wheel/sdist, CLI, mdcompare, knowledge snapshot/plan/approval/quality, "
+        "doctor, Web, images, managed upgrade/uninstall)"
     )
 
 

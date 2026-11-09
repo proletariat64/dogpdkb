@@ -20,6 +20,57 @@ def source_name(item: dict[str, Any]) -> str:
     return Path(str(item.get("source_file") or "")).name
 
 
+def validate_extracted_records(fresh: dict[str, Any], old: dict[str, Any]) -> None:
+    """Reject invalid adapter/cache records before merge can discard them."""
+    if any(
+        not isinstance(fresh.get(kind), list)
+        for kind in ("nodes", "edges", "hyperedges")
+    ):
+        raise ValueError("semantic extraction has invalid record collections")
+    identities = {
+        node.get("id") for node in old.get("nodes", []) if isinstance(node, dict)
+    }
+    owned_ids = set()
+    for node in fresh["nodes"]:
+        if (
+            not isinstance(node, dict)
+            or not isinstance(node.get("id"), str)
+            or not node["id"]
+        ):
+            raise ValueError("semantic extraction contains an invalid node identity")
+        owned_key = (source_name(node), node["id"])
+        if owned_key in owned_ids:
+            raise ValueError(f"duplicate extracted node identity: {owned_key}")
+        owned_ids.add(owned_key)
+        identities.add(node["id"])
+    for edge in fresh["edges"]:
+        if (
+            not isinstance(edge, dict)
+            or not isinstance(edge.get("source"), str)
+            or not isinstance(edge.get("target"), str)
+            or edge["source"] not in identities
+            or edge["target"] not in identities
+        ):
+            raise ValueError("semantic extraction contains a dangling edge")
+    for hyperedge in fresh["hyperedges"]:
+        if not isinstance(hyperedge, dict):
+            raise TypeError("semantic extraction contains an invalid hyperedge")
+        members = next(
+            (
+                hyperedge[key]
+                for key in ("nodes", "members", "node_ids")
+                if key in hyperedge
+            ),
+            [],
+        )
+        if (
+            not isinstance(members, list)
+            or any(not isinstance(member, str) for member in members)
+            or not set(members) <= identities
+        ):
+            raise ValueError("semantic extraction contains a dangling hyperedge")
+
+
 def _namespace_id(source: str, node_id: str) -> str:
     digest = hashlib.sha256(f"{source}\0{node_id}".encode()).hexdigest()[:18]
     return f"sync_{digest}"
@@ -222,6 +273,26 @@ def merge_graph_records(
         nodes[node_id] = restored
         retained += 1
 
+    if any(
+        edge["source"] not in nodes or edge["target"] not in nodes
+        for edge in new["edges"]
+    ):
+        raise ValueError("fresh edge is dangling after source replacement")
+    if any(
+        not set(members(hyperedge)) <= set(nodes) for hyperedge in new["hyperedges"]
+    ):
+        raise ValueError("fresh hyperedge is dangling after source replacement")
+
+    def endpoint_key(edge: dict[str, Any]) -> tuple[str, str]:
+        return (
+            (edge["source"], edge["target"])
+            if old.get("directed")
+            else tuple(sorted((edge["source"], edge["target"])))
+        )
+
+    unrelated_endpoints = {endpoint_key(edge) for edge in kept_old_edges}
+    if any(endpoint_key(edge) in unrelated_endpoints for edge in new["edges"]):
+        raise ValueError("fresh edge would overwrite an unrelated source record")
     edge_map = {}
     for edge in kept_old_edges + new["edges"]:
         if edge["source"] not in nodes or edge["target"] not in nodes:
