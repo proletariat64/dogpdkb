@@ -534,6 +534,10 @@ def _completed_execution(
             raise ExecutionError(
                 "published graph no longer matches the retained candidate"
             )
+        # Case identity alone does not bind its assertions: operators can amend
+        # requirements without renaming the case, including during recovery.
+        retained_graph = _validate_candidate_graph(candidate / "graph.json", selected)
+        _validate_quality_cases(quality, retained_graph, selected)
     if recovering:
         if journal.get("plan") != str(staging / "plan.json") or journal.get(
             "candidate"
