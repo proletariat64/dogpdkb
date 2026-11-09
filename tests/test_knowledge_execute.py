@@ -203,6 +203,11 @@ def _extraction_system(deep=False):
 
 def extract_corpus_parallel(files, backend, root, cache_root, **kwargs):
     nodes, edges = [], []
+    if os.environ.get("GRAPHIFY_STUB_STATE_DRIFT") == "1":
+        state_path = Path(os.environ["GRAPHIFY_STUB_STATE_PATH"])
+        state = json.loads(state_path.read_text())
+        state["documents"]["1"]["observation"]["observed_at"] = "concurrent-writer"
+        state_path.write_text(json.dumps(state))
     for path in files:
         if os.environ.get("GRAPHIFY_STUB_FAIL") == path.stem:
             raise RuntimeError("injected extraction failure")
@@ -562,6 +567,51 @@ def test_concurrent_graph_baseline_change_rejects_publish(tmp_path: Path):
     assert not (staging / "execution-result.json").exists()
 
 
+def test_state_change_during_candidate_build_blocks_publication(tmp_path: Path):
+    plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
+    graph_dir.mkdir()
+    original = {
+        "directed": True,
+        "nodes": [
+            {
+                "id": "old-approval",
+                "label": "Refund approval",
+                "rationale": "Refund requires approval.",
+                "source_file": "old-[1].md",
+            }
+        ],
+        "links": [],
+        "hyperedges": [],
+    }
+    write_json(graph_dir / "graph.json", original)
+    write_json(tmp_path / "approvals.json", approval_document(plan))
+    write_json(tmp_path / "quality.json", quality_document(plan))
+    stub = install_graphify_stub(tmp_path)
+    env = {
+        "PYTHONPATH": os.pathsep.join([str(stub), str(ROOT / "src")]),
+        "GRAPHIFY_STUB_STATE_DRIFT": "1",
+        "GRAPHIFY_STUB_STATE_PATH": str(state_path),
+    }
+
+    result = sync(
+        *execute_arguments(tmp_path, snapshot_path, state_path, staging, graph_dir),
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "knowledge state changed concurrently" in result.stderr
+    assert json.loads((graph_dir / "graph.json").read_text()) == original
+    assert not (staging / "graph-update" / "result.json").exists()
+    assert (staging / "graph-update" / "candidate-ready.json").is_file()
+    assert not (staging / "execution-result.json").exists()
+    assert (
+        json.loads(state_path.read_text())["documents"]["1"]["observation"][
+            "observed_at"
+        ]
+        == "concurrent-writer"
+    )
+
+
 def test_graph_publish_then_state_failure_recovers_without_rebilling(tmp_path: Path):
     plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
     graph_dir.mkdir()
@@ -913,5 +963,97 @@ def test_raw_change_after_approval_is_rejected_before_extraction(tmp_path: Path)
 
     assert result.returncode != 0
     assert "raw input changed" in result.stderr
+    assert not (staging / "execution-result.json").exists()
+    assert not (staging / "graph-update").exists()
+
+
+def test_execution_rejects_input_aliases_and_output_ancestors(tmp_path: Path):
+    for collision in (
+        "result-hardlink",
+        "result-symlink",
+        "raw-hardlink",
+        "candidate-hardlink",
+        "graph-ancestor",
+    ):
+        case_root = tmp_path / collision
+        case_root.mkdir()
+        plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(case_root)
+        graph_dir.mkdir()
+        write_json(graph_dir / "graph.json", {"nodes": [], "links": []})
+        write_json(case_root / "approvals.json", approval_document(plan))
+        quality_path = case_root / "quality.json"
+        quality = quality_document(plan)
+        if collision == "graph-ancestor":
+            quality_path = graph_dir / "quality.json"
+            quality["plan"] = os.path.relpath(staging / "plan.json", graph_dir)
+        write_json(quality_path, quality)
+        frozen = staging / plan["results"][0]["execution"]["raw"]["path"]
+        if collision.startswith("result-"):
+            output = staging / "execution-result.json"
+            if collision == "result-hardlink":
+                os.link(quality_path, output)
+            else:
+                output.symlink_to(quality_path)
+        elif collision == "raw-hardlink":
+            output = staging / "execution-corpus" / "source-[1].md"
+            output.parent.mkdir(parents=True)
+            os.link(frozen, output)
+        elif collision == "candidate-hardlink":
+            output = staging / "graph-update" / "candidate" / "graph.json"
+            output.parent.mkdir(parents=True)
+            os.link(quality_path, output)
+        arguments = execute_arguments(
+            case_root, snapshot_path, state_path, staging, graph_dir
+        )
+        arguments[arguments.index("--quality-cases") + 1] = str(quality_path)
+        protected = [
+            case_root / "approvals.json",
+            quality_path,
+            snapshot_path,
+            state_path,
+            staging / "plan.json",
+            frozen,
+        ]
+        before = {path: path.read_bytes() for path in protected}
+
+        result = sync(*arguments)
+
+        assert result.returncode != 0, collision
+        assert "REPORT_INPUT_COLLISION" in result.stderr, collision
+        assert {path: path.read_bytes() for path in protected} == before, collision
+        assert json.loads((graph_dir / "graph.json").read_text()) == {
+            "nodes": [],
+            "links": [],
+        }
+
+
+def test_execution_outputs_cannot_overwrite_approval_input(tmp_path: Path):
+    plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
+    graph_dir.mkdir()
+    write_json(graph_dir / "graph.json", {"nodes": [], "links": []})
+    approvals = staging / "execution-manifest.json"
+    approval = approval_document(plan)
+    approval["plan"] = "plan.json"
+    write_json(approvals, approval)
+    write_json(tmp_path / "quality.json", quality_document(plan))
+    arguments = execute_arguments(
+        tmp_path, snapshot_path, state_path, staging, graph_dir
+    )
+    arguments[arguments.index("--approvals") + 1] = str(approvals)
+    protected = [
+        approvals,
+        tmp_path / "quality.json",
+        snapshot_path,
+        state_path,
+        staging / "plan.json",
+        staging / plan["results"][0]["execution"]["raw"]["path"],
+    ]
+    before = {path: path.read_bytes() for path in protected}
+
+    result = sync(*arguments)
+
+    assert result.returncode != 0
+    assert "REPORT_INPUT_COLLISION" in result.stderr
+    assert {path: path.read_bytes() for path in protected} == before
     assert not (staging / "execution-result.json").exists()
     assert not (staging / "graph-update").exists()

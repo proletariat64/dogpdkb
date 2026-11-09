@@ -10,9 +10,15 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from dogpdkb.knowledge_plan import _load_snapshot, _relative_raw, _resolve_raw
+from dogpdkb.knowledge_plan import (
+    _load_snapshot,
+    _relative_raw,
+    _resolve_raw,
+    state_lock,
+    state_lock_path,
+)
 from dogpdkb.workflows.graph_sync import doc_id
-from mdcompare.io import publish_reports
+from mdcompare.io import publish_reports, validate_outputs
 
 EXECUTION_SCHEMA = "knowledge-execution-1.0"
 APPROVAL_SCHEMA = "knowledge-approvals-1.0"
@@ -462,6 +468,98 @@ def _completed_execution(
     return report
 
 
+def _protect_execution_inputs(
+    args: Any,
+    plan: dict[str, Any],
+    approvals_path: Path,
+    quality_path: Path,
+) -> Path:
+    staging = args.staging.expanduser().resolve()
+    plan_path = staging / "plan.json"
+    snapshot_path = args.snapshot.expanduser().resolve()
+    state_path = args.state.expanduser().resolve()
+    graph_dir = args.graph_dir.expanduser().resolve()
+    snapshot = _load_snapshot(snapshot_path)
+    protected = {plan_path, snapshot_path, approvals_path, quality_path}
+    derived_raw = []
+    for row in plan.get("results", []):
+        if isinstance(row, dict) and isinstance(row.get("execution"), dict):
+            raw = _resolve_raw(row["execution"].get("raw"), plan_path)
+            if raw:
+                protected.add(raw)
+            derived_raw.append(
+                staging / "execution-corpus" / f"source-[{row.get('document_id')}].md"
+            )
+    exports = snapshot.get("exports") or {}
+    for document_id, document in snapshot["documents"].items():
+        reference = document.get("raw") or (exports.get(document_id) or {}).get("raw")
+        raw = _resolve_raw(reference, snapshot_path)
+        if raw:
+            protected.add(raw)
+    state = _read_json(state_path)
+    for record in (state.get("documents") or {}).values():
+        if not isinstance(record, dict):
+            continue
+        for section in ("graph", "corpus"):
+            value = record.get(section)
+            if isinstance(value, dict):
+                raw = _resolve_raw(value.get("raw"), state_path)
+                if raw:
+                    protected.add(raw)
+    graph_staging = staging / "graph-update"
+    outputs = [
+        state_path,
+        state_lock_path(state_path),
+        staging / "execution-result.json",
+        staging / "execution-manifest.json",
+        staging / "execution-corpus",
+        *derived_raw,
+        graph_staging,
+        *(
+            graph_staging / name
+            for name in (
+                "base-state.json",
+                "candidate-ready.json",
+                "candidate-result.json",
+                "candidate-validation.json",
+                "result.json",
+                "extraction.json",
+                "extraction-failed.json",
+                "extraction-usage.json",
+                "tokens.json",
+            )
+        ),
+        graph_staging / "candidate",
+        *(
+            graph_staging / "candidate" / name
+            for name in (
+                "graph.json",
+                "manifest.json",
+                ".graphify_analysis.json",
+                ".graphify_labels.json",
+                ".graphify_labels.json.sig",
+                "GRAPH_REPORT.md",
+            )
+        ),
+        graph_staging / "graph-backup",
+        graph_dir,
+        *(
+            graph_dir / name
+            for name in (
+                "graph.json",
+                "manifest.json",
+                ".graphify_analysis.json",
+                ".graphify_labels.json",
+                ".graphify_labels.json.sig",
+                "GRAPH_REPORT.md",
+            )
+        ),
+    ]
+    validate_outputs(outputs, protected - {state_path})
+    validate_outputs([state_path], set(outputs) - {state_path})
+    return state_path
+
+
 def _execute(args: Any) -> dict[str, Any]:
     staging = args.staging.expanduser().resolve()
     plan_path = staging / "plan.json"
@@ -472,6 +570,19 @@ def _execute(args: Any) -> dict[str, Any]:
     quality_path = args.quality_cases.expanduser().resolve()
     approvals = _bound_document(approvals_path, plan_path, APPROVAL_SCHEMA)
     quality = _bound_document(quality_path, plan_path, QUALITY_SCHEMA)
+    state_path = _protect_execution_inputs(args, plan, approvals_path, quality_path)
+    state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with state_lock(state_path):
+        return _execute_locked(args, plan, approvals, quality)
+
+
+def _execute_locked(
+    args: Any,
+    plan: dict[str, Any],
+    approvals: dict[str, Any],
+    quality: dict[str, Any],
+) -> dict[str, Any]:
+    staging = args.staging.expanduser().resolve()
     completed = _completed_execution(args, plan, approvals, quality)
     if completed is not None:
         return completed
@@ -544,6 +655,8 @@ def _execute(args: Any) -> dict[str, Any]:
             row["document_id"] for row, _, _ in _approved_rows(args, plan, approvals)
         } != {row["document_id"] for row, _, _ in selected}:
             raise ExecutionError("approved inputs changed before publication")
+        if state_path.read_bytes() != state_before:
+            raise ExecutionError("knowledge state changed concurrently")
         published = _run_graphify(args, "--publish-validated", corpus, manifest_path)
         if published.get("status") != "completed":
             raise ExecutionError("Graphify publication did not complete")

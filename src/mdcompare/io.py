@@ -135,9 +135,22 @@ def _same_file(first: Path, second: Path) -> bool:
         return False
 
 
+def _same_or_nested(first: Path, second: Path) -> bool:
+    if _same_file(first, second):
+        return True
+    try:
+        resolved_first = first.resolve()
+        resolved_second = second.resolve()
+    except (ValueError, RuntimeError) as exc:
+        raise InputError("INPUT_PATH_INVALID") from exc
+    return resolved_first.is_relative_to(
+        resolved_second
+    ) or resolved_second.is_relative_to(resolved_first)
+
+
 def validate_outputs(outputs: list[Path], inputs: set[Path]) -> None:
     for index, output in enumerate(outputs):
-        if any(_same_file(output, source) for source in inputs) or any(
+        if any(_same_or_nested(output, source) for source in inputs) or any(
             _same_file(output, other) for other in outputs[:index]
         ):
             raise InputError("REPORT_INPUT_COLLISION")

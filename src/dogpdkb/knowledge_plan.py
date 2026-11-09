@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,24 @@ SNAPSHOT_SCHEMA = "knowledge-capture-1.0"
 
 class PlanError(ValueError):
     """Inputs cannot produce an auditable knowledge plan."""
+
+
+def state_lock_path(state_path: Path) -> Path:
+    """Keep the coordination inode separate from atomically replaced state."""
+    return state_path.with_name(f".{state_path.name}.lock")
+
+
+@contextmanager
+def state_lock(state_path: Path):
+    """Serialize cooperative knowledge-state readers and writers."""
+    descriptor = os.open(
+        state_lock_path(state_path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def _document_id(value: Any) -> int:
@@ -230,7 +250,8 @@ def _freeze_raw(
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     destination.parent.chmod(0o700)
     validate_outputs(
-        [destination, staging / "plan.json", state_path], protected | {raw_path}
+        [destination, staging / "plan.json", state_path, state_lock_path(state_path)],
+        protected | {raw_path},
     )
     content = raw_path.read_bytes()
     if destination.exists():
@@ -265,7 +286,7 @@ def _write_plan(
     staging.chmod(0o700)
     state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     plan_path = staging / "plan.json"
-    validate_outputs([plan_path, state_path], inputs)
+    validate_outputs([plan_path, state_path, state_lock_path(state_path)], inputs)
     publish_reports(
         [
             (state_path, json.dumps(state, ensure_ascii=False, indent=1) + "\n"),
@@ -275,6 +296,28 @@ def _write_plan(
 
 
 def run_planner(args: Any) -> dict[str, Any]:
+    snapshot_path = args.snapshot.expanduser().resolve()
+    state_path = args.state.expanduser().resolve()
+    staging = args.staging.expanduser().resolve()
+    snapshot = _load_snapshot(snapshot_path)
+    protected = {snapshot_path}
+    if args.baseline:
+        protected.add(args.baseline.expanduser().resolve())
+    exports = snapshot.get("exports") or {}
+    for document_id, document in snapshot["documents"].items():
+        reference = document.get("raw") or (exports.get(document_id) or {}).get("raw")
+        raw_path = _resolve_raw(reference, snapshot_path)
+        if raw_path:
+            protected.add(raw_path)
+    validate_outputs(
+        [staging / "plan.json", state_path, state_lock_path(state_path)], protected
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with state_lock(state_path):
+        return _run_planner(args)
+
+
+def _run_planner(args: Any) -> dict[str, Any]:
     snapshot_path = args.snapshot.expanduser().resolve()
     state_path = args.state.expanduser().resolve()
     staging = args.staging.expanduser().resolve()
