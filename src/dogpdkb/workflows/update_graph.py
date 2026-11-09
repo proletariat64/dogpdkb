@@ -14,15 +14,19 @@ from pathlib import Path
 from typing import Any
 
 if __package__:
-    from .graph_sync import doc_id, merge_graph_records
+    from .graph_sync import doc_id, merge_graph_records, validate_extracted_records
 else:
     # Also support an isolated (-I) external graph interpreter.
     sys.path.append(str(Path(__file__).resolve().parent))
-    from graph_sync import doc_id, merge_graph_records
+    from graph_sync import doc_id, merge_graph_records, validate_extracted_records
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from mdocr.config import cli_path, config_arguments, configure, configured_book
+
+
+def _usage_count(value: Any) -> int | None:
+    return value if type(value) is int and value >= 0 else None
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -122,8 +126,8 @@ def extract_semantic(
             on_chunk_done=on_chunk_done,
         )
         tokens = {
-            "input_tokens": fresh.get("input_tokens", 0),
-            "output_tokens": fresh.get("output_tokens", 0),
+            "input_tokens": _usage_count(fresh.get("input_tokens")),
+            "output_tokens": _usage_count(fresh.get("output_tokens")),
         }
         if (
             fresh.get("failed_chunks")
@@ -138,20 +142,30 @@ def extract_semantic(
     if missing:
         raise RuntimeError(f"semantic cache is still missing {len(missing)} files")
     combined = {"nodes": nodes, "edges": edges, "hyperedges": hyperedges}
+    external_calls = _usage_count(fresh.get("external_calls")) if uncached else 0
+    token_values = list(tokens.values())
     usage = {
         "requested_documents": len(paths),
         "cache_hits": len(paths) - len(uncached),
         "external_extractions": len(uncached),
-        "external_calls": (fresh.get("external_calls") if uncached else 0),
+        "external_calls": external_calls,
         "external_calls_evidence": (
             "graphify_result"
-            if uncached and type(fresh.get("external_calls")) is int
+            if uncached and external_calls is not None
             else "not_applicable"
             if not uncached
             else "unknown"
         ),
         "tokens": tokens,
-        "token_evidence": "graphify_result" if uncached else "not_applicable",
+        "token_evidence": (
+            "not_applicable"
+            if not uncached
+            else "graphify_result"
+            if all(value is not None for value in token_values)
+            else "partial_graphify_result"
+            if any(value is not None for value in token_values)
+            else "unknown"
+        ),
     }
     write_json(staging / "extraction.json", combined)
     write_json(staging / "tokens.json", tokens)
@@ -317,6 +331,7 @@ def build_candidate(
             "tokens": tokens,
             "token_evidence": "legacy_adapter",
         }
+    validate_extracted_records(fresh, old)
     candidate, labels, audit = merge_graph_records(
         old,
         fresh,

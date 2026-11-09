@@ -1,7 +1,7 @@
 # 06: 修复最终双轴审查问题
 
 Type: task
-Status: claimed
+Status: resolved
 Blocked by: 01, 02, 03, 04, 05
 
 ## Context
@@ -24,3 +24,26 @@ Blocked by: 01, 02, 03, 04, 05
 ## Working rules
 
 读取TDD skill，逐slice先red再green。单独worktree基于集成tip；结束前合入最新集成tip、实际验证和提交；禁止reset/clean。修复后Answer逐项对应证据，审查文档分别保留Standards和Spec结果，不合并或隐去历史发现。
+
+## Answer
+
+实现分支：`fix/daily-knowledge-sync-review`，确认集成tip `5ffc866` 为起点祖先。没有reset/clean、真实模型、网络、OCR或生产操作。
+
+### 逐项red/green
+
+- STD-1/SPEC-10：3个新增CLI用例初始全失败，分别复现baseline页被改写、snapshot成为raw、失败页0755/0644；修复后3 passed；另补既有page硬链接反例，完整capture 18 passed。统一预检所有输入和派生输出，页/checkpoint私有写入。
+- STD-2：跨book同ID用例初始返回0并发布；复用严格state loader后提取前拒绝。
+- SPEC-3/4/5/9：4个用例初始分别得到15字符旧证据配不同冻结正文、旧raw变化仍发布、旧plan进入Graphify、成功重试仍HOLD；修复后全部通过，原始四脚本重放亦符合预期。
+- SPEC-1：两旧规则初始只有一个原因码且plan为1.0；2.0逐项issue/disposition后，缺一项拒绝、两项明确删除可执行，preserve必须绑定并通过实际质量case，旧泛ack拒绝。sync+execute聚焦35 passed。
+- SPEC-6/7：无效fresh edge和无关来源edge碰撞两个用例初始均返回0；前置提取/缓存校验及冲突拒绝后通过，另验证cached hyperedge和指向被替换旧节点的fresh引用。graph_sync/update_graph 25 passed。
+- SPEC-8：真实硬退出后resume初始返回1；journal恢复后返回0、报告重建且提取仍1次。普通state OSError恢复同时通过，完整execute 24 passed。
+- SPEC-2：缺token反例初始返回两个0和graphify_result；现为null/unknown。缺call证据同样unknown，正常实测值及无提取0保留；相关focused 4 passed。
+
+### 合同和UAT
+
+- plan/approval/quality升级为2.0；CLI指南、安装smoke及测试fixture已更新。新合法审批正例先执行成功，再验证恶意场景，未以旧schema拒绝冒充修复。
+- 新冻结UAT：`/tmp/daily-knowledge-sync-ticket06-uat-v2`。冻结输入与票05逐字节一致；采集7548→7550、2 new/4 updated、6导出，详情异常按原合同保持；正反例执行通过，2批准、4质量案例、2图谱成功，负例图/state不变。确定性替身未做真实提取；合成token不是账单。
+- 首次v1复跑因测试脚本让正负例共享负例缓存而未通过，未计为产品缺陷或通过；v2隔离缓存根后完成。历史实物未修改。
+- 审查历史及逐项定位：`docs/daily-knowledge-sync-review.md`。共享进度：`/tmp/daily-knowledge-sync-fix-progress.md`。
+
+最终`make check`：**928 passed**，doc-guard 65篇，Ruff及171文件格式检查通过，日志`/tmp/daily-knowledge-sync-ticket06-make-check-final.log`。离线build和隔离安装smoke通过，日志`/tmp/daily-knowledge-sync-ticket06-make-smoke-final.log`。最终10文件主动LSP为7 clean、3个warning文件、0 error；warning均为0700规则误报或既有有界数字转换，未宣称全clean。集成tip未前进且仍为当前分支祖先；实施分支提交后由集成merger合入。

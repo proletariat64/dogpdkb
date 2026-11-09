@@ -12,6 +12,7 @@ from typing import Any
 
 from dogpdkb.knowledge_plan import (
     _load_snapshot,
+    _load_state,
     _relative_raw,
     _resolve_raw,
     state_lock,
@@ -21,8 +22,8 @@ from dogpdkb.workflows.graph_sync import doc_id
 from mdcompare.io import publish_reports, validate_outputs
 
 EXECUTION_SCHEMA = "knowledge-execution-1.0"
-APPROVAL_SCHEMA = "knowledge-approvals-1.0"
-QUALITY_SCHEMA = "knowledge-quality-cases-1.0"
+APPROVAL_SCHEMA = "knowledge-approvals-2.0"
+QUALITY_SCHEMA = "knowledge-quality-cases-2.0"
 
 
 class ExecutionError(ValueError):
@@ -83,9 +84,7 @@ def _approved_rows(
     snapshot = _load_snapshot(snapshot_path)
     if snapshot["book"]["book_id"] != plan["book"]["book_id"]:
         raise ExecutionError("snapshot and plan refer to different books")
-    state = _read_json(args.state.expanduser().resolve())
-    if state.get("schema_version") != "knowledge-state-1.0":
-        raise ExecutionError("state has an unsupported schema")
+    state = _load_state(args.state.expanduser().resolve(), plan["book"])
     selected = []
     seen = set()
     plan_path = args.staging.expanduser().resolve() / "plan.json"
@@ -118,17 +117,43 @@ def _approved_rows(
         if not isinstance(issues, list) or not isinstance(dispositions, list):
             raise ExecutionError("review dispositions must cover every review issue")
         if any(
+            not isinstance(issue, dict)
+            or not isinstance(issue.get("issue_id"), str)
+            or not issue["issue_id"]
+            or not isinstance(issue.get("allowed_decisions"), list)
+            for issue in issues
+        ) or len({issue["issue_id"] for issue in issues}) != len(issues):
+            raise ExecutionError("plan contains invalid review issue identities")
+        issue_by_id = {issue["issue_id"]: issue for issue in issues}
+        if any(
             not isinstance(item, dict)
-            or item.get("decision") != "acknowledged"
-            or not isinstance(item.get("code"), str)
+            or not isinstance(item.get("issue_id"), str)
+            or not isinstance(item.get("decision"), str)
             for item in dispositions
         ):
-            raise ExecutionError(
-                "review dispositions must explicitly acknowledge issues"
-            )
-        codes = [item["code"] for item in dispositions]
-        if len(codes) != len(set(codes)) or set(codes) != set(issues):
+            raise ExecutionError("review dispositions must identify each decision")
+        disposition_ids = [item["issue_id"] for item in dispositions]
+        if len(disposition_ids) != len(set(disposition_ids)) or set(
+            disposition_ids
+        ) != set(issue_by_id):
             raise ExecutionError("review dispositions must exactly cover review issues")
+        for disposition in dispositions:
+            issue = issue_by_id[disposition["issue_id"]]
+            if disposition["decision"] not in issue["allowed_decisions"]:
+                raise ExecutionError(
+                    f"invalid decision for review issue: {issue['issue_id']}"
+                )
+            if disposition["decision"] == "preserve" and (
+                not isinstance(disposition.get("quality_case_ids"), list)
+                or not disposition["quality_case_ids"]
+                or any(
+                    not isinstance(case_id, str) or not case_id
+                    for case_id in disposition["quality_case_ids"]
+                )
+            ):
+                raise ExecutionError(
+                    "preserve disposition requires explicit quality case bindings"
+                )
         doc_id = str(row["document_id"])
         observed = snapshot["documents"].get(doc_id)
         if observed is None or observed.get("version") != execution["source_version"]:
@@ -157,8 +182,29 @@ def _approved_rows(
             and actual_graph.get("version") == execution["source_version"]
             and not state_record.get("pending")
         )
+        if not completed_graph and (
+            not isinstance(state_record, dict)
+            or state_record.get("observation") != row.get("observation")
+            or state_record.get("corpus") != row.get("corpus")
+            or state_record.get("pending") != row.get("pending")
+        ):
+            raise ExecutionError("plan is superseded by current observation or work")
         if actual_graph != row.get("graph") and not completed_graph:
             raise ExecutionError("graph source version changed after planning")
+        if not completed_graph and (row.get("graph") or {}).get("status") == "covered":
+            previous_raw = _resolve_raw(execution.get("previous_raw"), plan_path)
+            registered_old = _resolve_raw(
+                (row.get("graph") or {}).get("raw"),
+                args.state.expanduser().resolve(),
+            )
+            if (
+                previous_raw is None
+                or registered_old is None
+                or not previous_raw.is_file()
+                or not registered_old.is_file()
+                or previous_raw.read_bytes() != registered_old.read_bytes()
+            ):
+                raise ExecutionError("old comparison input changed after planning")
         selected.append((row, approval, frozen_raw))
     return selected
 
@@ -357,6 +403,19 @@ def _quality_case_definitions(
         raise ExecutionError(
             "every approved document requires at least one quality case"
         )
+    for row, approval, _frozen in selected:
+        available = {
+            case["case_id"]
+            for case in cases
+            if case["document_id"] == row["document_id"]
+        }
+        for disposition in approval["review_dispositions"]:
+            if disposition["decision"] != "preserve":
+                continue
+            if not set(disposition["quality_case_ids"]) <= available:
+                raise ExecutionError(
+                    "preserve disposition must bind a quality case for the same source"
+                )
     return cases
 
 
@@ -409,11 +468,25 @@ def _completed_execution(
     approvals: dict[str, Any],
     quality: dict[str, Any],
 ) -> dict[str, Any] | None:
-    report_path = args.staging.expanduser().resolve() / "execution-result.json"
-    if not report_path.is_file():
+    staging = args.staging.expanduser().resolve()
+    report_path = staging / "execution-result.json"
+    journal_path = staging / "graph-update" / "execution-journal.json"
+    recovering = not report_path.is_file()
+    if recovering and not journal_path.is_file():
         return None
     selected = _approved_rows(args, plan, approvals, allow_completed=True)
-    report = _read_json(report_path)
+    journal = _read_json(journal_path) if recovering else {}
+    if recovering:
+        if journal.get("schema_version") != "knowledge-execution-journal-1.0":
+            raise ExecutionError("execution journal has an unsupported schema")
+        current_state = _read_json(args.state.expanduser().resolve())
+        if current_state != journal.get("target_state"):
+            return None
+        report = journal.get("report")
+        if not isinstance(report, dict):
+            raise ExecutionError("execution journal has no retained report")
+    else:
+        report = _read_json(report_path)
     if (
         report.get("schema_version") != EXECUTION_SCHEMA
         or report.get("status") != "completed"
@@ -436,11 +509,7 @@ def _completed_execution(
             raise ExecutionError(
                 "retained execution result has a different source version"
             )
-        current = (
-            args.staging.expanduser().resolve()
-            / "execution-corpus"
-            / (f"source-[{row['document_id']}].md")
-        )
+        current = staging / "execution-corpus" / f"source-[{row['document_id']}].md"
         if not current.is_file() or current.read_bytes() != frozen.read_bytes():
             raise ExecutionError(
                 "retained execution corpus does not match approved raw"
@@ -452,7 +521,7 @@ def _completed_execution(
         raise ExecutionError("quality cases changed after execution")
     if selected:
         transaction = report.get("transaction") or {}
-        candidate = args.staging.expanduser().resolve() / "graph-update" / "candidate"
+        candidate = staging / "graph-update" / "candidate"
         if transaction.get("candidate") != str(candidate):
             raise ExecutionError(
                 "retained execution transaction is not bound to staging"
@@ -465,6 +534,46 @@ def _completed_execution(
             raise ExecutionError(
                 "published graph no longer matches the retained candidate"
             )
+    if recovering:
+        if journal.get("plan") != str(staging / "plan.json") or journal.get(
+            "candidate"
+        ) != str(staging / "graph-update" / "candidate"):
+            raise ExecutionError("execution journal is not bound to this plan")
+        publication = _read_json(staging / "graph-update" / "result.json")
+        if publication.get("status") != "completed" or publication.get(
+            "candidate"
+        ) != str(staging / "graph-update" / "candidate"):
+            raise ExecutionError("execution journal lacks publication evidence")
+        original_state = journal.get("original_state") or {}
+        for row, _approval, _frozen in selected:
+            original_record = (original_state.get("documents") or {}).get(
+                str(row["document_id"])
+            )
+            if (
+                not isinstance(original_record, dict)
+                or original_record.get("observation") != row.get("observation")
+                or original_record.get("corpus") != row.get("corpus")
+                or original_record.get("graph") != row.get("graph")
+                or original_record.get("pending") != row.get("pending")
+            ):
+                raise ExecutionError("execution journal original state does not match")
+        publish_reports(
+            [
+                (
+                    report_path,
+                    json.dumps(report, ensure_ascii=False, indent=1) + "\n",
+                ),
+                (
+                    journal_path,
+                    json.dumps(
+                        {**journal, "status": "recovered"},
+                        ensure_ascii=False,
+                        indent=1,
+                    )
+                    + "\n",
+                ),
+            ]
+        )
     return report
 
 
@@ -527,6 +636,7 @@ def _protect_execution_inputs(
                 "extraction-failed.json",
                 "extraction-usage.json",
                 "tokens.json",
+                "execution-journal.json",
             )
         ),
         graph_staging / "candidate",
@@ -542,6 +652,17 @@ def _protect_execution_inputs(
             )
         ),
         graph_staging / "graph-backup",
+        *(
+            graph_staging / "graph-backup" / name
+            for name in (
+                "graph.json",
+                "manifest.json",
+                ".graphify_analysis.json",
+                ".graphify_labels.json",
+                ".graphify_labels.json.sig",
+                "GRAPH_REPORT.md",
+            )
+        ),
         graph_dir,
         *(
             graph_dir / name
@@ -564,7 +685,7 @@ def _execute(args: Any) -> dict[str, Any]:
     staging = args.staging.expanduser().resolve()
     plan_path = staging / "plan.json"
     plan = _read_json(plan_path)
-    if plan.get("schema_version") != "knowledge-plan-1.0":
+    if plan.get("schema_version") != "knowledge-plan-2.0":
         raise ExecutionError("plan has an unsupported schema")
     approvals_path = args.approvals.expanduser().resolve()
     quality_path = args.quality_cases.expanduser().resolve()
@@ -651,21 +772,12 @@ def _execute_locked(
         candidate = Path(candidate_result["candidate"])
         graph = _validate_candidate_graph(candidate / "graph.json", selected)
         quality_report = _validate_quality_cases(quality, graph, selected)
+        if state_path.read_bytes() != state_before:
+            raise ExecutionError("knowledge state changed concurrently")
         if {
             row["document_id"] for row, _, _ in _approved_rows(args, plan, approvals)
         } != {row["document_id"] for row, _, _ in selected}:
             raise ExecutionError("approved inputs changed before publication")
-        if state_path.read_bytes() != state_before:
-            raise ExecutionError("knowledge state changed concurrently")
-        published = _run_graphify(args, "--publish-validated", corpus, manifest_path)
-        if published.get("status") != "completed":
-            raise ExecutionError("Graphify publication did not complete")
-        if (graph_dir / "graph.json").read_bytes() != (
-            candidate / "graph.json"
-        ).read_bytes():
-            raise ExecutionError("published graph differs from the retained candidate")
-        if state_path.read_bytes() != state_before:
-            raise ExecutionError("knowledge state changed concurrently")
         usage = candidate_result.get("usage") or {}
         usage_report = usage
         counts["external_calls"] = usage.get("external_calls")
@@ -676,6 +788,7 @@ def _execute_locked(
                 **usage["tokens"],
                 "evidence": usage.get("token_evidence", "unknown"),
             }
+        original_state = _read_json(state_path)
         state = _read_json(state_path)
         snapshot = _load_snapshot(args.snapshot.expanduser().resolve())
         for row, _approval, frozen in selected:
@@ -711,6 +824,7 @@ def _execute_locked(
         transaction = {
             "candidate": str(candidate),
             "backup": str(staging / "graph-update" / "graph-backup"),
+            "journal": str(staging / "graph-update" / "execution-journal.json"),
             "resume": "reuse_retained_candidate",
         }
         report = {
@@ -725,6 +839,44 @@ def _execute_locked(
             "quality_gate": quality_report,
             "transaction": transaction,
         }
+        journal = {
+            "schema_version": "knowledge-execution-journal-1.0",
+            "status": "prepared",
+            "plan": str(staging / "plan.json"),
+            "candidate": str(candidate),
+            "approvals": str(args.approvals.expanduser().resolve()),
+            "quality_cases": str(args.quality_cases.expanduser().resolve()),
+            "approved_inputs": [
+                {
+                    "book_id": row["book_id"],
+                    "document_id": row["document_id"],
+                    "source_version": row["execution"]["source_version"],
+                    "raw": row["execution"]["raw"],
+                    "previous_raw": row["execution"].get("previous_raw"),
+                }
+                for row, _approval, _frozen in selected
+            ],
+            "original_state": original_state,
+            "target_state": state,
+            "report": report,
+        }
+        publish_reports(
+            [
+                (
+                    staging / "graph-update" / "execution-journal.json",
+                    json.dumps(journal, ensure_ascii=False, indent=1) + "\n",
+                )
+            ]
+        )
+        published = _run_graphify(args, "--publish-validated", corpus, manifest_path)
+        if published.get("status") != "completed":
+            raise ExecutionError("Graphify publication did not complete")
+        if (graph_dir / "graph.json").read_bytes() != (
+            candidate / "graph.json"
+        ).read_bytes():
+            raise ExecutionError("published graph differs from the retained candidate")
+        if state_path.read_bytes() != state_before:
+            raise ExecutionError("knowledge state changed concurrently")
         publish_reports(
             [
                 (

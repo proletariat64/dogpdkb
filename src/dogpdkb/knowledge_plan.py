@@ -8,6 +8,7 @@ import os
 import tempfile
 from collections import Counter
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +17,9 @@ from mdcompare.knowledge import compare_knowledge_documents
 from mdcompare.manifest import load_manifest
 from mdcompare.model import CompareOptions, Document
 
-PLAN_SCHEMA = "knowledge-plan-1.0"
+PLAN_SCHEMA = "knowledge-plan-2.0"
 STATE_SCHEMA = "knowledge-state-1.0"
-APPROVAL_SCHEMA = "knowledge-approvals-1.0"
+APPROVAL_SCHEMA = "knowledge-approvals-2.0"
 SNAPSHOT_SCHEMA = "knowledge-capture-1.0"
 
 
@@ -245,15 +246,18 @@ def _freeze_raw(
     doc_id: int,
     protected: set[Path],
     state_path: Path,
+    *,
+    previous: bool = False,
 ) -> Path:
-    destination = staging / "inputs" / f"{book_id}-{doc_id}.md"
+    suffix = "-previous" if previous else ""
+    destination = staging / "inputs" / f"{book_id}-{doc_id}{suffix}.md"
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     destination.parent.chmod(0o700)
     validate_outputs(
         [destination, staging / "plan.json", state_path, state_lock_path(state_path)],
         protected | {raw_path},
     )
-    content = raw_path.read_bytes()
+    content = InputReader(CompareOptions.max_file_bytes).read_bytes(raw_path)
     if destination.exists():
         if destination.read_bytes() != content:
             raise PlanError("frozen planning input already exists with different bytes")
@@ -407,10 +411,40 @@ def _run_planner(args: Any) -> dict[str, Any]:
             or (graph.get("status") != "covered" and raw_path is not None)
         )
         comparison = None
-        reasons = list(previous_pending)
+        transient_reasons = {
+            "APPROVAL_REQUIRED",
+            "BODY_COMPARISON_REVIEW_REQUIRED",
+            "CAPTURE_ANOMALY",
+            "CAPTURE_EXPORT_FAILED",
+            "CAPTURE_RAW_UNAVAILABLE",
+            "NEW_DOCUMENT_NOT_IN_GRAPH",
+            "export_failed",
+            "detail_newer_than_listing",
+            "detail_older_than_listing",
+        }
+        persistent_pending = [
+            reason for reason in previous_pending if reason not in transient_reasons
+        ]
+        reasons = list(persistent_pending)
         old = _graph_document(doc_id, graph, book_id, state_path)
+        frozen = None
+        frozen_old = None
         if work and not capture_anomalies and raw_path is not None:
-            comparison = _compare(old, _document(document, book_id, raw_path))
+            frozen = _freeze_raw(
+                raw_path, staging, book_id, numeric_id, protected, state_path
+            )
+            if old is not None:
+                frozen_old = _freeze_raw(
+                    old.path,
+                    staging,
+                    book_id,
+                    numeric_id,
+                    protected,
+                    state_path,
+                    previous=True,
+                )
+                old = replace(old, path=frozen_old, base_dir=frozen_old.parent)
+            comparison = _compare(old, _document(document, book_id, frozen))
             compared += 1
             action = comparison["graphify_plan"]["action"]
             if old is None:
@@ -436,13 +470,7 @@ def _run_planner(args: Any) -> dict[str, Any]:
                 )
                 else "GRAPH_BASELINE_NOT_REGISTERED"
             )
-        resumable_candidate_reasons = {
-            "APPROVAL_REQUIRED",
-            "NEW_DOCUMENT_NOT_IN_GRAPH",
-        }
-        if any(
-            reason not in resumable_candidate_reasons for reason in previous_pending
-        ):
+        if persistent_pending:
             action = "HOLD_EXISTING"
         if metadata_tasks:
             reasons.append("METADATA_MAINTENANCE_REQUIRED")
@@ -474,30 +502,61 @@ def _run_planner(args: Any) -> dict[str, Any]:
         state["documents"][doc_id] = record
         execution = None
         if action == "BODY_DELTA_CANDIDATE":
-            if raw_path is None or comparison is None:
+            if frozen is None or comparison is None:
                 raise AssertionError("candidate requires a compared raw source")
-            frozen = _freeze_raw(
-                raw_path, staging, book_id, numeric_id, protected, state_path
-            )
             context_indexes = set(
                 comparison["graphify_plan"]["context_review_unit_indexes"]
                 + comparison["graphify_plan"]["presentation_review_unit_indexes"]
             )
-            review_issues = list(comparison["reason_codes"])
+            review_issues = [
+                {
+                    "issue_id": f"document:{code}",
+                    "code": code,
+                    "allowed_decisions": ["acknowledged"],
+                }
+                for code in sorted(set(comparison["reason_codes"]))
+            ]
             for index, unit in enumerate(comparison["units"]):
+                unit_issues = []
                 if unit["kind"] == "revise":
-                    review_issues.append("REVISION_REVIEW_REQUIRED")
+                    unit_issues.append(
+                        ("REVISION_REVIEW_REQUIRED", ["accept_revision", "preserve"])
+                    )
                 if (
                     unit["kind"] in {"old_only_review", "unresolved"}
                     or index in context_indexes
                 ):
-                    review_issues.append(unit["basis"])
+                    allowed = (
+                        ["approve_removal", "preserve"]
+                        if unit["kind"] == "old_only_review"
+                        else ["acknowledged", "preserve"]
+                    )
+                    unit_issues.append((unit["basis"], allowed))
+                for code, allowed in unit_issues:
+                    review_issues.append(
+                        {
+                            "issue_id": f"unit:{index}:{code}",
+                            "code": code,
+                            "unit_index": index,
+                            "unit_kind": unit["kind"],
+                            "old": unit.get("old"),
+                            "new": unit.get("new"),
+                            "allowed_decisions": allowed,
+                        }
+                    )
             execution = {
                 "source_scope": "whole_document",
                 "source_version": document["version"],
                 "raw": _relative_raw(frozen, staging / "plan.json"),
+                "previous_raw": (
+                    _relative_raw(frozen_old, staging / "plan.json")
+                    if frozen_old is not None
+                    else None
+                ),
                 "previous_graph_version": previous.get("graph", {}).get("version"),
-                "review_issues": sorted(set(review_issues)),
+                "review_issues": sorted(
+                    review_issues, key=lambda issue: issue["issue_id"]
+                ),
             }
         results.append(
             {

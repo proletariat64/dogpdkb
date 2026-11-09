@@ -951,3 +951,177 @@ def test_pending_absent_identity_is_retained_without_claiming_deletion(tmp_path:
     assert snapshot["pending"] == [
         {"id": 1, "reasons": ["absent_from_current_listing", "review_pending"]}
     ]
+
+
+def test_remote_pages_cannot_alias_or_contain_baseline_input(tmp_path: Path):
+    documents = [
+        {
+            "id": 1,
+            "title": "One",
+            "slug": "one",
+            "content_updated_at": "2026-11-09T00:00:00Z",
+        }
+    ]
+    config = write_remote_adapter(tmp_path, documents)
+    staging = tmp_path / "staging"
+    baseline = staging / "pages" / "page-123-0000000.json"
+    write_json(baseline, {"private": "baseline bytes"})
+    before = baseline.read_bytes()
+
+    result = discover(
+        "--config",
+        str(config),
+        "--snapshot",
+        str(tmp_path / "snapshot.json"),
+        "--baseline-snapshot",
+        str(baseline),
+        "--staging",
+        str(staging),
+        "-s",
+        "https://example.invalid/book",
+    )
+
+    assert result.returncode != 0
+    assert "REPORT_INPUT_COLLISION" in result.stderr
+    assert baseline.read_bytes() == before
+
+
+def test_existing_page_hardlink_to_baseline_is_rejected_before_remote_write(
+    tmp_path: Path,
+):
+    documents = [
+        {
+            "id": 1,
+            "title": "One",
+            "slug": "one",
+            "content_updated_at": "2026-11-09T00:00:00Z",
+        }
+    ]
+    config = write_remote_adapter(tmp_path, documents)
+    baseline = tmp_path / "baseline.json"
+    baseline_listing = tmp_path / "baseline-listing.json"
+    write_json(baseline_listing, listing(documents))
+    assert (
+        discover(
+            "--config",
+            str(config),
+            "--snapshot",
+            str(baseline),
+            "--listing",
+            str(baseline_listing),
+            "-s",
+            "https://example.invalid/book",
+        ).returncode
+        == 0
+    )
+    staging = tmp_path / "staging"
+    page = staging / "pages" / "page-123-0000000.json"
+    page.parent.mkdir(parents=True)
+    os.link(baseline, page)
+    before = baseline.read_bytes()
+
+    result = discover(
+        "--config",
+        str(config),
+        "--snapshot",
+        str(tmp_path / "next.json"),
+        "--baseline-snapshot",
+        str(baseline),
+        "--staging",
+        str(staging),
+        "-s",
+        "https://example.invalid/book",
+    )
+
+    assert result.returncode != 0
+    assert "REPORT_INPUT_COLLISION" in result.stderr
+    assert baseline.read_bytes() == before
+
+
+def test_snapshot_cannot_collide_with_selected_raw_output(tmp_path: Path):
+    old = "2026-11-07T00:00:00Z"
+    new = "2026-11-09T00:00:00Z"
+    baseline = tmp_path / "baseline.json"
+    baseline_listing = tmp_path / "baseline-listing.json"
+    write_json(
+        baseline_listing,
+        listing([{"id": 1, "title": "One", "content_updated_at": old}]),
+    )
+    assert (
+        discover(
+            "--snapshot",
+            str(baseline),
+            "--listing",
+            str(baseline_listing),
+            "-s",
+            "https://example.invalid/book",
+        ).returncode
+        == 0
+    )
+    current_listing = tmp_path / "current-listing.json"
+    write_json(
+        current_listing,
+        listing([{"id": 1, "title": "One", "content_updated_at": new}]),
+    )
+    details = tmp_path / "details"
+    detail = details / "1.json"
+    write_json(detail, {"id": 1, "body": "new body", "content_updated_at": new})
+    before = detail.read_bytes()
+    staging = tmp_path / "staging"
+    snapshot = staging / "raw" / "1-20261109T000000Z.md"
+
+    result = discover(
+        "--snapshot",
+        str(snapshot),
+        "--baseline-snapshot",
+        str(baseline),
+        "--staging",
+        str(staging),
+        "--listing",
+        str(current_listing),
+        "--details-dir",
+        str(details),
+        "-s",
+        "https://example.invalid/book",
+    )
+
+    assert result.returncode != 0
+    assert "REPORT_INPUT_COLLISION" in result.stderr
+    assert not snapshot.exists()
+    assert detail.read_bytes() == before
+
+
+def test_failed_remote_capture_still_creates_private_pages(tmp_path: Path):
+    config = write_remote_adapter(
+        tmp_path,
+        [
+            {
+                "id": 1,
+                "title": "SYNTHETIC PRIVATE TITLE",
+                "slug": "one",
+                "content_updated_at": "",
+            }
+        ],
+    )
+    staging = tmp_path / "staging"
+    previous_umask = os.umask(0o022)
+    try:
+        result = discover(
+            "--config",
+            str(config),
+            "--snapshot",
+            str(tmp_path / "snapshot.json"),
+            "--staging",
+            str(staging),
+            "-s",
+            "https://example.invalid/book",
+        )
+    finally:
+        os.umask(previous_umask)
+
+    page = staging / "pages" / "page-123-0000000.json"
+    assert result.returncode != 0
+    assert page.is_file()
+    assert staging.stat().st_mode & 0o777 == 0o700
+    assert page.parent.stat().st_mode & 0o777 == 0o700
+    assert page.stat().st_mode & 0o777 == 0o600
