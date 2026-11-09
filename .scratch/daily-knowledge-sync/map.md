@@ -22,9 +22,12 @@
 - 02 已在独立分支实现并复验：`dogpdkb discover --snapshot` 输出 `knowledge-capture-1.0`，支持完整观察、增量分类、选中 raw、pending 与私有续跑；初次观察不全库导出，完整基线不可覆盖。03 直接按 [02 Answer](issues/02-observation-capture.md#answer) 消费 documents/changes/exports/pending 和相对 raw 引用。合入 01 后聚焦验证 195 passed。合并提交 `656ee3384096068374f3336cfcd64abaec37315c`；集成验证：`test_knowledge_capture.py`、`test_sync.py`、`test_mcp_recovery.py`、`test_mdcompare_knowledge_cli.py` 共 110 passed；3 个变更 Python 文件 Ruff check 通过。
 - 03 已合入：`sync --knowledge` 默认只规划，独立记录观察、语料和图谱状态，候选需显式批准；04 执行及审批合同、状态与恢复细节见 [03 Answer](issues/03-plan-state.md#answer)。实现提交 `590781c6e5615091bd75ea2a3389839890ea083e`，合并提交 `9c1ea491dae1f982a2afafd6e9b2da68282c9882`。集成验证：`test_knowledge_sync.py`、`test_knowledge_capture.py`、`test_pipeline.py`、`test_platform.py`、`test_mdcompare_knowledge_cli.py`、`test_mdcompare_knowledge_units.py` 共 195 passed；4 个变更 Python 文件 Ruff check 和 format --check 通过。04 的 03 集成门禁已通过；未执行生产操作。
 
-- 01–03 集成后完整 `make check`：896 passed，Ruff检查及165文件格式检查通过，61篇文档门禁通过。04仍在独立工作树开发；这不是整份规格最终验收。
+- 01–03 集成后完整 `make check`：896 passed，Ruff检查及165文件格式检查通过，61篇文档门禁通过。这是 04 合入前的结果，不是整份规格最终验收。
+- 04 已合入，合同与执行边界见 [04 Answer](issues/04-approved-execution.md#answer)；实现提交 `6a6b158`，分支指针 `2a8dba8c1d3d488421dad922b84b042666698b46`，合并提交 `d3101be5fea3963ecceb6d30238cb0f100cad82b`。集成验证：`test_knowledge_execute.py`、`test_knowledge_sync.py`、`test_knowledge_capture.py`、`test_update_graph.py`、`test_pipeline.py` 共 **69 passed**；4 个变更 Python 文件 Ruff check 和 format --check 通过。质量门禁仅覆盖显式绑定的有界案例，不证明全部知识无损；元数据改名/搬动无法安全维护时 HOLD，不以重提取规避。以下并发与输入保护缺陷需修复；合入和测试通过不代表可安全执行，05 等待修复结果。
 
 ## Fog
 
 - 保留旧compare契约；没有明确生成来源时保护字面代码，不用OCR内容推断来源。
 - 实际真实Graphify编译需另行授权；替身测试和历史十篇实验不得冒称新流程已通过真实生产验收。
+- 04 合并检查使用隔离临时目录和 Graphify 替身复现：最终审批核验后、发布前若并发修改选中文档的 graph state，程序先发布图再发现状态漂移，续跑因计划版本冲突被拒；需在发布与状态更新边界处理并发并增加回归。
+- 04 合并检查另复现：将审批输入放在 `<staging>/execution-manifest.json` 时，执行覆盖审批文件后仍报告成功，重跑失败；需保护全部执行输入免遭输出碰撞并增加回归。
