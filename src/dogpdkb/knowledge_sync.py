@@ -25,12 +25,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--approvals", type=Path)
     parser.add_argument("--quality-cases", type=Path)
+    parser.add_argument("--graph-dir", type=Path)
+    parser.add_argument("--graphify-python", type=Path)
     args = parser.parse_args(argv)
     if not args.execute and (args.approvals or args.quality_cases):
         parser.error("--approvals and --quality-cases require --execute")
     if args.execute:
-        if not args.approvals or not args.quality_cases:
-            parser.error("--execute requires --approvals and --quality-cases")
+        if not args.approvals or not args.quality_cases or not args.graph_dir:
+            parser.error(
+                "--execute requires --approvals, --quality-cases and --graph-dir"
+            )
         try:
             module = importlib.import_module("dogpdkb.knowledge_execute")
         except ImportError:

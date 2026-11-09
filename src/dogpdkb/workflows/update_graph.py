@@ -78,7 +78,7 @@ def sync_scope(
 
 def extract_semantic(
     corpus: Path, graph_dir: Path, staging: Path, files: list[str]
-) -> tuple[dict[str, Any], dict[str, int]]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     # Graphify belongs to the configured graph interpreter, not the platform wheel.
     check_semantic_cache = import_module("graphify.cache").check_semantic_cache
     llm = import_module("graphify.llm")
@@ -89,8 +89,9 @@ def extract_semantic(
 
     paths = [str(corpus / name) for name in files]
     prompt = _extraction_system(deep=False)
+    cache_root = graph_dir.parent
     _, _, _, uncached = check_semantic_cache(
-        paths, root=corpus, cache_root=graph_dir, prompt=prompt
+        paths, root=corpus, cache_root=cache_root, prompt=prompt
     )
     fresh = {"nodes": [], "edges": [], "hyperedges": []}
     tokens = {"input_tokens": 0, "output_tokens": 0}
@@ -115,7 +116,7 @@ def extract_semantic(
             [Path(path) for path in uncached],
             backend=backend,
             root=corpus,
-            cache_root=graph_dir,
+            cache_root=cache_root,
             token_budget=50_000,
             max_concurrency=2,
             on_chunk_done=on_chunk_done,
@@ -132,21 +133,37 @@ def extract_semantic(
             write_json(staging / "extraction-failed.json", fresh)
             raise RuntimeError("Graphify extraction is incomplete; resume to retry")
     nodes, edges, hyperedges, missing = check_semantic_cache(
-        paths, root=corpus, cache_root=graph_dir, prompt=prompt
+        paths, root=corpus, cache_root=cache_root, prompt=prompt
     )
     if missing:
         raise RuntimeError(f"semantic cache is still missing {len(missing)} files")
     combined = {"nodes": nodes, "edges": edges, "hyperedges": hyperedges}
+    usage = {
+        "requested_documents": len(paths),
+        "cache_hits": len(paths) - len(uncached),
+        "external_extractions": len(uncached),
+        "external_calls": (fresh.get("external_calls") if uncached else 0),
+        "external_calls_evidence": (
+            "graphify_result"
+            if uncached and type(fresh.get("external_calls")) is int
+            else "not_applicable"
+            if not uncached
+            else "unknown"
+        ),
+        "tokens": tokens,
+        "token_evidence": "graphify_result" if uncached else "not_applicable",
+    }
     write_json(staging / "extraction.json", combined)
     write_json(staging / "tokens.json", tokens)
-    return combined, tokens
+    write_json(staging / "extraction-usage.json", usage)
+    return combined, usage
 
 
 def analysis_artifacts(
     candidate: dict[str, Any],
     labels: dict[str, str],
     corpus: Path,
-    tokens: dict[str, int],
+    tokens: dict[str, Any],
 ) -> dict[str, Any]:
     import networkx as nx
 
@@ -280,7 +297,26 @@ def build_candidate(
         fresh, tokens = extract_semantic(corpus, graph_dir, staging, semantic_files)
     else:
         fresh = {"nodes": [], "edges": [], "hyperedges": []}
-        tokens = {"input_tokens": 0, "output_tokens": 0}
+        tokens = {
+            "requested_documents": 0,
+            "cache_hits": 0,
+            "external_extractions": 0,
+            "external_calls": 0,
+            "external_calls_evidence": "not_applicable",
+            "tokens": {"input_tokens": 0, "output_tokens": 0},
+            "token_evidence": "not_applicable",
+        }
+    if "tokens" not in tokens:
+        # Preserve the existing extraction boundary for older Graphify adapters.
+        tokens = {
+            "requested_documents": len(semantic_files),
+            "cache_hits": None,
+            "external_extractions": None,
+            "external_calls": None,
+            "external_calls_evidence": "unknown",
+            "tokens": tokens,
+            "token_evidence": "legacy_adapter",
+        }
     candidate, labels, audit = merge_graph_records(
         old,
         fresh,
@@ -314,12 +350,15 @@ def build_candidate(
         manifest.pop(name, None)
         manifest.pop(str((corpus / name).resolve()), None)
     write_json(manifest_path, manifest)
-    for name, payload in analysis_artifacts(candidate, labels, corpus, tokens).items():
+    for name, payload in analysis_artifacts(
+        candidate, labels, corpus, tokens["tokens"]
+    ).items():
         if name.endswith((".json", ".sig")):
             write_json(candidate_dir / name, payload)
         else:
             (candidate_dir / name).write_text(str(payload), encoding="utf-8")
-    audit["tokens"] = tokens
+    audit["tokens"] = tokens["tokens"]
+    audit["usage"] = tokens
     audit["status"] = "candidate_validated"
     write_json(staging / "candidate-validation.json", audit)
     return candidate_dir, audit
@@ -432,6 +471,17 @@ def main() -> None:
     parser.add_argument("--manifest", type=cli_path, required=True)
     parser.add_argument("--staging", type=cli_path, required=True)
     parser.add_argument("--graph-dir", type=cli_path)
+    phase = parser.add_mutually_exclusive_group()
+    phase.add_argument(
+        "--candidate-only",
+        action="store_true",
+        help="build and retain an isolated candidate without publishing it",
+    )
+    phase.add_argument(
+        "--publish-validated",
+        action="store_true",
+        help="publish only a previously retained candidate",
+    )
     parser.add_argument(
         "--rebase",
         action="store_true",
@@ -464,6 +514,8 @@ def main() -> None:
         return
     if not (graph_dir / "graph.json").is_file():
         raise SystemExit(f"existing graph not found: {graph_dir / 'graph.json'}")
+    if args.publish_validated and not (staging / "candidate-ready.json").is_file():
+        raise SystemExit("validated candidate is missing; build it before publishing")
     if args.rebase:
         with publication_lock(graph_dir):
             for name in ("graph-backup", "candidate"):
@@ -514,6 +566,8 @@ def main() -> None:
             )
         audit = ready["audit"]
     else:
+        if args.publish_validated:
+            raise RuntimeError("validated candidate is missing")
         candidate, audit = build_candidate(
             corpus,
             graph_dir,
@@ -534,6 +588,17 @@ def main() -> None:
                 ),
             },
         )
+    if args.candidate_only:
+        result = {
+            **audit,
+            "status": "candidate_ready",
+            "candidate": str(candidate),
+            "backup": str(staging / "graph-backup"),
+            "full_rebuild": False,
+        }
+        write_json(staging / "candidate-result.json", result)
+        print(json.dumps(result, ensure_ascii=False))
+        return
     assert_deletions_absent(corpus, deleted_files)
     publish_candidate(candidate, graph_dir, staging)
     result = {
