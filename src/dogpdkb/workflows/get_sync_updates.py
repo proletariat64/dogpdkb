@@ -36,6 +36,7 @@ import re
 import selectors
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -534,7 +535,8 @@ def fetch_doc_list(
     offsets = list(range(0, items_count or PAGE_SIZE, PAGE_SIZE))
     pages: list[list[dict[str, Any]] | None] = [None] * len(offsets)
     if cache_dir is not None:
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        cache_dir.chmod(0o700)
 
     def fetch_page(offset: int) -> list[dict[str, Any]]:
         cache = (
@@ -549,15 +551,23 @@ def fetch_doc_list(
         if not isinstance(data, list):
             raise SkylarkError(f"unexpected doc_list payload at offset {offset}")
         if cache is not None:
-            temporary = cache.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(
-                    {"book_id": book_id, "offset": offset, "items": data},
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{cache.name}.", suffix=".tmp", dir=cache_dir
             )
-            temporary.replace(cache)
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    json.dump(
+                        {"book_id": book_id, "offset": offset, "items": data},
+                        stream,
+                        ensure_ascii=False,
+                    )
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.chmod(temporary, 0o600)
+                temporary.replace(cache)
+            finally:
+                temporary.unlink(missing_ok=True)
         return data
 
     cancelled = Event()

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from mdcompare.io import InputError, validate_outputs
 
 SCHEMA_VERSION = "knowledge-capture-1.0"
 
@@ -129,6 +132,68 @@ def _load_local_listing(
     )
 
 
+def _raw_inputs(snapshot_path: Path) -> set[Path]:
+    """Resolve every raw input referenced by a baseline before any output write."""
+    if not snapshot_path.is_file():
+        return set()
+    payload = _read_json(snapshot_path)
+    result: set[Path] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            if value.get("stage") == "raw_export" and isinstance(
+                value.get("path"), str
+            ):
+                raw = Path(value["path"])
+                result.add(
+                    raw.resolve()
+                    if raw.is_absolute()
+                    else (snapshot_path.parent / raw).resolve()
+                )
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(payload)
+    return result
+
+
+def _validate_capture_paths(args: Any, snapshot_path: Path, staging: Path) -> set[Path]:
+    inputs = {
+        Path(value).expanduser().resolve()
+        for value in (
+            args.baseline_snapshot,
+            args.pending_state,
+            args.listing,
+            args.details_dir,
+        )
+        if value
+    }
+    if args.baseline_snapshot:
+        inputs |= _raw_inputs(Path(args.baseline_snapshot).expanduser().resolve())
+    outputs = [
+        snapshot_path,
+        staging / "pages",
+        staging / "capture-checkpoint.json",
+        staging / "raw",
+    ]
+    try:
+        for index, output in enumerate(outputs):
+            validate_outputs(
+                [output], inputs | set(outputs[:index] + outputs[index + 1 :])
+            )
+        for path in (staging / "pages").glob("*"):
+            if path.is_file() or path.is_symlink():
+                validate_outputs([path], inputs)
+    except InputError as error:
+        raise CaptureError(error.reason_code) from error
+    staging.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(staging, 0o700)
+    return inputs
+
+
 def _load_remote_listing(
     source_url: str, staging: Path
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
@@ -181,12 +246,16 @@ def _load_remote_listing(
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
     try:
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=1) + "\n",
-            encoding="utf-8",
-        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=1)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
     finally:
@@ -313,19 +382,38 @@ def _save_raw(
     detail: dict[str, Any],
     staging: Path,
     snapshot_path: Path,
+    protected: set[Path],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     version = _version(detail)
     raw_dir = staging / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     raw_path = raw_dir / _raw_name(document, version)
+    try:
+        validate_outputs(
+            [raw_path],
+            protected
+            | {
+                snapshot_path,
+                staging / "pages",
+                staging / "capture-checkpoint.json",
+            },
+        )
+    except InputError as error:
+        raise CaptureError(error.reason_code) from error
     if raw_path.exists() and raw_path.read_text(encoding="utf-8") != detail["body"]:
         raise CaptureError(
             f"raw export already exists with different content: {raw_path.name}"
         )
     if not raw_path.exists():
-        temporary = raw_path.with_name(f".{raw_path.name}.{os.getpid()}.tmp")
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{raw_path.name}.", suffix=".tmp", dir=raw_dir
+        )
+        temporary = Path(temporary_name)
         try:
-            temporary.write_text(detail["body"], encoding="utf-8")
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(detail["body"])
+                stream.flush()
+                os.fsync(stream.fileno())
             os.chmod(temporary, 0o600)
             os.replace(temporary, raw_path)
         finally:
@@ -378,6 +466,7 @@ def run_capture(args: Any) -> int:
         if args.staging
         else snapshot_path.parent / "staging"
     )
+    protected_inputs = _validate_capture_paths(args, snapshot_path, staging)
     started_at = _utc_now()
     if args.listing:
         book, documents, listing = _load_local_listing(
@@ -474,8 +563,6 @@ def run_capture(args: Any) -> int:
     details_dir = (
         Path(args.details_dir).expanduser().resolve() if args.details_dir else None
     )
-    staging.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(staging, 0o700)
     checkpoint = _load_checkpoint(staging, book)
     by_id = {document["id"]: document for document in documents}
     for doc_id in selected:
@@ -532,7 +619,11 @@ def run_capture(args: Any) -> int:
                 else:
                     body, detail = _export_remote(document)
                 detail_version, raw = _save_raw(
-                    document, {**detail, "body": body}, staging, snapshot_path
+                    document,
+                    {**detail, "body": body},
+                    staging,
+                    snapshot_path,
+                    protected_inputs,
                 )
                 raw["adapter"] = (
                     "local_detail" if args.listing else "skylark_doc_detail"
