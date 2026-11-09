@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -1016,3 +1018,564 @@ def test_successful_capture_retry_recomputes_transient_failure(tmp_path: Path):
     assert row["pending"] == ["APPROVAL_REQUIRED"]
     assert "export_failed" not in row["pending"]
     assert "CAPTURE_EXPORT_FAILED" not in row["pending"]
+
+
+def test_unregistered_graph_source_becomes_a_review_candidate_when_raw_arrives(
+    tmp_path: Path,
+):
+    version = "2026-11-09T00:00:00Z"
+    baseline, _ = write_raw_baseline(
+        tmp_path,
+        [{"id": 1, "title": "Existing", "version": version, "body": "# Existing\n"}],
+    )
+    observed = snapshot(
+        [
+            {"id": 1, "title": "Existing", "version": version},
+            {"id": 2, "title": "New", "version": version},
+        ]
+    )
+    snapshot_path = tmp_path / "snapshot.json"
+    state_path = tmp_path / "state.json"
+    write_json(snapshot_path, observed)
+    initial = sync(
+        "--knowledge",
+        "--snapshot",
+        str(snapshot_path),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(tmp_path / "first-plan"),
+        "--baseline",
+        str(baseline),
+    )
+    assert initial.returncode == 0, initial.stderr
+    first = json.loads((tmp_path / "first-plan" / "plan.json").read_text())
+    assert first["results"][1]["pending"] == ["GRAPH_SOURCE_NOT_REGISTERED"]
+    assert first["results"][1]["action"] == "HOLD_EXISTING"
+    unchanged = sync(
+        "--knowledge",
+        "--snapshot",
+        str(snapshot_path),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(tmp_path / "unchanged-plan"),
+    )
+    assert unchanged.returncode == 0, unchanged.stderr
+    unchanged_row = json.loads((tmp_path / "unchanged-plan" / "plan.json").read_text())[
+        "results"
+    ][1]
+    assert unchanged_row["action"] == "HOLD_EXISTING"
+    assert unchanged_row["pending"] == ["GRAPH_SOURCE_NOT_REGISTERED"]
+
+    raw = tmp_path / "current.md"
+    raw.write_text("# New\n\nFee is 100 USD.\n")
+    observed["documents"]["2"]["raw"] = {"path": "current.md", "stage": "raw_export"}
+    write_json(snapshot_path, observed)
+    retry = sync(
+        "--knowledge",
+        "--snapshot",
+        str(snapshot_path),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(tmp_path / "second-plan"),
+    )
+
+    assert retry.returncode == 0, retry.stderr
+    second = json.loads((tmp_path / "second-plan" / "plan.json").read_text())
+    row = second["results"][1]
+    assert row["action"] == "BODY_DELTA_CANDIDATE"
+    assert row["pending"] == ["APPROVAL_REQUIRED", "NEW_DOCUMENT_NOT_IN_GRAPH"]
+    assert row["approval"]["required"] is True
+    assert row["execution"]["previous_raw"] is None
+    assert row["graph"]["status"] == "uncovered"
+    assert second["counts"]["approved"] == 0
+    state = json.loads(state_path.read_text())
+    assert state["documents"]["2"]["pending"] == row["pending"]
+
+    state["documents"]["2"]["pending"].append("OPERATOR_REVIEW_REQUIRED")
+    write_json(state_path, state)
+    manual = sync(
+        "--knowledge",
+        "--snapshot",
+        str(snapshot_path),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(tmp_path / "manual-plan"),
+    )
+    assert manual.returncode == 0, manual.stderr
+    manual_row = json.loads((tmp_path / "manual-plan" / "plan.json").read_text())[
+        "results"
+    ][1]
+    assert manual_row["action"] == "HOLD_EXISTING"
+    assert "OPERATOR_REVIEW_REQUIRED" in manual_row["pending"]
+    assert manual_row["graph"]["status"] == "uncovered"
+    assert manual_row["execution"] is None
+    assert manual_row["approval"]["required"] is False
+
+
+@pytest.mark.parametrize(
+    "failure", ["missing", "unreadable", "unreadable_parent", "over_budget"]
+)
+def test_unavailable_registered_graph_raw_holds_only_its_document_and_can_retry(
+    tmp_path: Path,
+    failure: str,
+):
+    old_version = "2026-11-07T00:00:00Z"
+    new_version = "2026-11-09T00:00:00Z"
+    baseline, old_raw = write_raw_baseline(
+        tmp_path,
+        [
+            {
+                "id": doc_id,
+                "title": title,
+                "version": old_version,
+                "body": f"# {title}\n\nRefund requires approval.\n",
+            }
+            for doc_id, title in ((1, "One"), (2, "Two"))
+        ],
+    )
+    if failure == "unreadable_parent":
+        private = tmp_path / "private-graph"
+        private.mkdir()
+        old_raw["1"] = old_raw["1"].rename(private / "1.md")
+        manifest = json.loads(baseline.read_text())
+        manifest["documents"][0]["path"] = "private-graph/1.md"
+        write_json(baseline, manifest)
+    initial_snapshot = tmp_path / "initial.json"
+    write_json(
+        initial_snapshot,
+        snapshot(
+            [
+                {"id": doc_id, "title": title, "version": old_version}
+                for doc_id, title in ((1, "One"), (2, "Two"))
+            ]
+        ),
+    )
+    state_path = tmp_path / "state.json"
+    initial = sync(
+        "--knowledge",
+        "--snapshot",
+        str(initial_snapshot),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(tmp_path / "initial-plan"),
+        "--baseline",
+        str(baseline),
+    )
+    assert initial.returncode == 0, initial.stderr
+    previous_graph = json.loads(state_path.read_text())["documents"]["1"]["graph"]
+    old_body = old_raw["1"].read_bytes()
+    if failure == "missing":
+        old_raw["1"].unlink()
+    elif failure == "unreadable":
+        old_raw["1"].chmod(0)
+        if os.access(old_raw["1"], os.R_OK):
+            pytest.skip("process can read mode-000 files")
+    elif failure == "unreadable_parent":
+        old_raw["1"].parent.chmod(0)
+        if os.access(old_raw["1"], os.R_OK):
+            pytest.skip("process can traverse mode-000 directories")
+    else:
+        with old_raw["1"].open("wb") as raw:
+            raw.truncate(16 * 1024 * 1024 + 1)
+
+    current = captured_update(
+        tmp_path,
+        [
+            {
+                "id": 1,
+                "title": "One",
+                "version": new_version,
+                "body": "# One\n\nRefund requires approval.\n\nFee is 100 USD.\n",
+            },
+            {
+                "id": 2,
+                "title": "Two",
+                "version": new_version,
+                "body": "# Two\n\nRefund requires approval.\n",
+            },
+        ],
+    )
+    current_path = tmp_path / "current.json"
+    write_json(current_path, current)
+    failed = sync(
+        "--knowledge",
+        "--snapshot",
+        str(current_path),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(tmp_path / "failed-plan"),
+    )
+
+    assert failed.returncode == 0, failed.stderr
+    plan = json.loads((tmp_path / "failed-plan" / "plan.json").read_text())
+    broken, healthy = plan["results"]
+    assert broken["action"] == "HOLD_EXISTING"
+    assert broken["comparison"] is None
+    assert broken["pending"] == ["GRAPH_RAW_UNAVAILABLE"]
+    assert broken["graph"] == previous_graph
+    assert broken["execution"] is None
+    assert broken["approval"]["required"] is False
+    assert healthy["action"] == "KEEP_EXISTING"
+    assert healthy["comparison"]["status"] == "REUSE"
+    assert healthy["graph"]["version"]["utc"] == new_version
+    assert plan["counts"]["compared"] == 1
+    assert (
+        json.loads(state_path.read_text())["documents"]["1"]["graph"] == previous_graph
+    )
+
+    old_raw["1"].parent.chmod(0o700)
+    if old_raw["1"].exists():
+        old_raw["1"].chmod(0o600)
+    old_raw["1"].write_bytes(old_body)
+    retry_plan = tmp_path / "retry-plan"
+    retry = sync(
+        "--knowledge",
+        "--snapshot",
+        str(current_path),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(retry_plan),
+    )
+    assert retry.returncode == 0, retry.stderr
+    row = json.loads((retry_plan / "plan.json").read_text())["results"][0]
+    assert row["action"] == "BODY_DELTA_CANDIDATE"
+    assert row["pending"] == ["APPROVAL_REQUIRED"]
+    assert row["approval"]["required"] is True
+    assert (
+        retry_plan / row["execution"]["previous_raw"]["path"]
+    ).read_bytes() == old_body
+    assert (retry_plan / row["execution"]["raw"]["path"]).read_bytes() == (
+        tmp_path / "current-raw" / "1.md"
+    ).read_bytes()
+    assert row["graph"] == previous_graph
+
+
+def test_explicit_baselines_recompute_pending_for_each_registered_source(
+    tmp_path: Path,
+):
+    version = "2026-11-09T00:00:00Z"
+    documents = [
+        {"id": doc_id, "title": title, "version": version}
+        for doc_id, title in ((1, "One"), (2, "Two"))
+    ]
+    snapshot_path = tmp_path / "snapshot.json"
+    state_path = tmp_path / "state.json"
+    write_json(snapshot_path, snapshot(documents))
+    arguments = [
+        "--knowledge",
+        "--snapshot",
+        str(snapshot_path),
+        "--state",
+        str(state_path),
+    ]
+    initial = sync(*arguments, "--staging", str(tmp_path / "initial-plan"))
+    assert initial.returncode == 0, initial.stderr
+    rows = json.loads((tmp_path / "initial-plan" / "plan.json").read_text())["results"]
+    assert [row["pending"] for row in rows] == [
+        ["GRAPH_BASELINE_NOT_REGISTERED"],
+        ["GRAPH_BASELINE_NOT_REGISTERED"],
+    ]
+
+    baseline, _ = write_raw_baseline(
+        tmp_path, [{**documents[0], "body": "# One\n\nA rule.\n"}]
+    )
+    first = sync(
+        *arguments,
+        "--staging",
+        str(tmp_path / "one-plan"),
+        "--baseline",
+        str(baseline),
+    )
+    assert first.returncode == 0, first.stderr
+    rows = json.loads((tmp_path / "one-plan" / "plan.json").read_text())["results"]
+    assert rows[0]["action"] == "KEEP_EXISTING"
+    assert rows[0]["pending"] == []
+    assert rows[1]["action"] == "HOLD_EXISTING"
+    assert rows[1]["pending"] == ["GRAPH_SOURCE_NOT_REGISTERED"]
+
+    baseline, _ = write_raw_baseline(
+        tmp_path, [{**documents[1], "body": "# Two\n\nAnother rule.\n"}]
+    )
+    second = sync(
+        *arguments,
+        "--staging",
+        str(tmp_path / "two-plan"),
+        "--baseline",
+        str(baseline),
+    )
+    assert second.returncode == 0, second.stderr
+    plan = json.loads((tmp_path / "two-plan" / "plan.json").read_text())
+    row = plan["results"][1]
+    assert row["action"] == "KEEP_EXISTING"
+    assert row["pending"] == []
+    assert row["graph"]["coverage"] == "registered_raw_baseline"
+    assert row["approval"]["required"] is False
+    assert plan["counts"]["approved"] == 0
+
+
+@pytest.mark.parametrize("failure", ["unreadable", "unreadable_parent", "over_budget"])
+def test_unreadable_captured_raw_holds_only_its_document_and_can_retry(
+    tmp_path: Path,
+    failure: str,
+):
+    old_version = "2026-11-07T00:00:00Z"
+    new_version = "2026-11-09T00:00:00Z"
+    baseline, old_raw = write_raw_baseline(
+        tmp_path,
+        [
+            {
+                "id": doc_id,
+                "title": title,
+                "version": old_version,
+                "body": f"# {title}\n\nRefund requires approval.\n",
+            }
+            for doc_id, title in ((1, "One"), (2, "Two"))
+        ],
+    )
+    current = captured_update(
+        tmp_path,
+        [
+            {
+                "id": 1,
+                "title": "One",
+                "version": new_version,
+                "body": "# One\n\nRefund requires approval.\n\nFee is 100 USD.\n",
+            },
+            {
+                "id": 2,
+                "title": "Two",
+                "version": new_version,
+                "body": "# Two\n\nRefund requires approval.\n",
+            },
+        ],
+    )
+    raw = tmp_path / "current-raw" / "1.md"
+    new_body = raw.read_bytes()
+    if failure == "unreadable":
+        raw.chmod(0)
+        if os.access(raw, os.R_OK):
+            pytest.skip("process can read mode-000 files")
+    elif failure == "unreadable_parent":
+        private = tmp_path / "private-current"
+        private.mkdir()
+        raw = raw.rename(private / "1.md")
+        current["exports"]["1"]["raw"]["path"] = "private-current/1.md"
+        private.chmod(0)
+        if os.access(raw, os.R_OK):
+            pytest.skip("process can traverse mode-000 directories")
+    else:
+        with raw.open("wb") as stream:
+            stream.truncate(16 * 1024 * 1024 + 1)
+    current_path = tmp_path / "current.json"
+    state_path = tmp_path / "state.json"
+    write_json(current_path, current)
+    failed = sync(
+        "--knowledge",
+        "--snapshot",
+        str(current_path),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(tmp_path / "failed-plan"),
+        "--baseline",
+        str(baseline),
+    )
+
+    assert failed.returncode == 0, failed.stderr
+    plan = json.loads((tmp_path / "failed-plan" / "plan.json").read_text())
+    broken, healthy = plan["results"]
+    assert broken["action"] == "HOLD_EXISTING"
+    assert broken["comparison"] is None
+    assert broken["pending"] == ["CAPTURE_RAW_UNAVAILABLE"]
+    assert broken["corpus"]["status"] == "pending"
+    assert broken["corpus"]["version"] is None
+    assert broken["graph"]["version"]["utc"] == old_version
+    assert broken["execution"] is None
+    assert healthy["action"] == "KEEP_EXISTING"
+    assert healthy["comparison"]["status"] == "REUSE"
+    assert healthy["graph"]["version"]["utc"] == new_version
+    assert plan["counts"]["compared"] == 1
+
+    raw.parent.chmod(0o700)
+    raw.chmod(0o600)
+    raw.write_bytes(new_body)
+    retry_plan = tmp_path / "retry-plan"
+    retry = sync(
+        "--knowledge",
+        "--snapshot",
+        str(current_path),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(retry_plan),
+    )
+    assert retry.returncode == 0, retry.stderr
+    row = json.loads((retry_plan / "plan.json").read_text())["results"][0]
+    assert row["action"] == "BODY_DELTA_CANDIDATE"
+    assert row["pending"] == ["APPROVAL_REQUIRED"]
+    assert row["approval"]["required"] is True
+    assert (retry_plan / row["execution"]["previous_raw"]["path"]).read_bytes() == (
+        old_raw["1"].read_bytes()
+    )
+    assert (retry_plan / row["execution"]["raw"]["path"]).read_bytes() == new_body
+    assert row["graph"]["version"]["utc"] == old_version
+
+
+@pytest.mark.parametrize(
+    "fault", ["old_source_collision", "frozen_target_mismatch", "output_directory"]
+)
+def test_planning_output_failures_remain_fatal(tmp_path: Path, fault: str):
+    old_version = "2026-11-07T00:00:00Z"
+    new_version = "2026-11-09T00:00:00Z"
+    baseline, raw = write_raw_baseline(
+        tmp_path,
+        [
+            {
+                "id": 1,
+                "title": "One",
+                "version": old_version,
+                "body": "# One\n\nRefund requires approval.\n",
+            }
+        ],
+    )
+    staging = tmp_path / "blocked-plan"
+    colliding_source = staging / "inputs" / "123-1-previous.md"
+    target = staging / "inputs" / "123-1.md"
+    if fault == "old_source_collision":
+        colliding_source.parent.mkdir(parents=True)
+        colliding_source.write_bytes(raw["1"].read_bytes())
+        manifest = json.loads(baseline.read_text())
+        manifest["documents"][0]["path"] = str(colliding_source)
+        write_json(baseline, manifest)
+    elif fault == "frozen_target_mismatch":
+        target.parent.mkdir(parents=True)
+        target.write_text("Existing frozen bytes must not be overwritten.\n")
+    else:
+        staging.mkdir()
+        (staging / "inputs").write_text("This file blocks the output directory.\n")
+
+    initial_path = tmp_path / "initial.json"
+    state_path = tmp_path / "state.json"
+    write_json(
+        initial_path, snapshot([{"id": 1, "title": "One", "version": old_version}])
+    )
+    initial = sync(
+        "--knowledge",
+        "--snapshot",
+        str(initial_path),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(tmp_path / "initial-plan"),
+        "--baseline",
+        str(baseline),
+    )
+    assert initial.returncode == 0, initial.stderr
+    state_before = state_path.read_bytes()
+    current = captured_update(
+        tmp_path,
+        [
+            {
+                "id": 1,
+                "title": "One",
+                "version": new_version,
+                "body": "# One\n\nNew rule.\n",
+            }
+        ],
+    )
+    current_path = tmp_path / "current.json"
+    write_json(current_path, current)
+    result = sync(
+        "--knowledge",
+        "--snapshot",
+        str(current_path),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(staging),
+    )
+
+    assert result.returncode != 0
+    assert not (staging / "plan.json").exists()
+    assert state_path.read_bytes() == state_before
+    if fault == "old_source_collision":
+        assert "REPORT_INPUT_COLLISION" in result.stderr
+        assert colliding_source.read_bytes() == raw["1"].read_bytes()
+    elif fault == "frozen_target_mismatch":
+        assert "frozen planning input already exists" in result.stderr
+        assert target.read_text() == "Existing frozen bytes must not be overwritten.\n"
+
+
+@pytest.mark.parametrize("field", ["raw", "metadata"])
+def test_invalid_registered_graph_schema_is_not_a_new_document(
+    tmp_path: Path, field: str
+):
+    old_version = "2026-11-07T00:00:00Z"
+    new_version = "2026-11-09T00:00:00Z"
+    baseline, _ = write_raw_baseline(
+        tmp_path,
+        [
+            {
+                "id": 1,
+                "title": "One",
+                "version": old_version,
+                "body": "# One\n\nA previous rule.\n",
+            }
+        ],
+    )
+    initial_path = tmp_path / "initial.json"
+    state_path = tmp_path / "state.json"
+    write_json(
+        initial_path, snapshot([{"id": 1, "title": "One", "version": old_version}])
+    )
+    initial = sync(
+        "--knowledge",
+        "--snapshot",
+        str(initial_path),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(tmp_path / "initial-plan"),
+        "--baseline",
+        str(baseline),
+    )
+    assert initial.returncode == 0, initial.stderr
+    state = json.loads(state_path.read_text())
+    state["documents"]["1"]["graph"][field] = None
+    write_json(state_path, state)
+    state_before = state_path.read_bytes()
+    current = captured_update(
+        tmp_path,
+        [
+            {
+                "id": 1,
+                "title": "One",
+                "version": new_version,
+                "body": "# One\n\nNew rule.\n",
+            }
+        ],
+    )
+    current_path = tmp_path / "current.json"
+    write_json(current_path, current)
+    staging = tmp_path / "invalid-plan"
+    result = sync(
+        "--knowledge",
+        "--snapshot",
+        str(current_path),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(staging),
+    )
+
+    assert result.returncode != 0
+    assert "registered graph source or metadata is invalid" in result.stderr
+    assert state_path.read_bytes() == state_before
+    assert not (staging / "plan.json").exists()
