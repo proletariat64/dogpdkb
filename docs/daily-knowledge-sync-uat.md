@@ -78,3 +78,9 @@ Graphify 边界使用确定性外部替身，输入是正式计划冻结的完�
 隔离 smoke 发现并修复一个真实发布缺口：`--graphify-python` 曾解析 venv 的 `bin/python` 符号链接，导致子进程落到基础解释器、丢失 Graphify 环境。现在保留调用路径，并新增真实 CLI 回归测试。
 
 仓库完整门禁和最终复验数值记录在 [票 05 Answer](../.scratch/daily-knowledge-sync/issues/05-acceptance-release.md#answer)；本次只读复核日志及 wheel/sdist 留存在 `/tmp/daily-knowledge-sync-ticket05-final.H9DDAjhR/`，隔离安装 venv 由 smoke 自动清理。本页所有通过结论均不包含真实 Graphify 重编译或生产知识正确性证明；固定案例是有界质量门槛，不证明全部知识无损。
+
+### 开发验收环境
+
+使用 Python 3.12 与 uv 运行 `make bootstrap` 创建本 worktree 的 dev venv，再运行 `make check`；执行测试的 Graphify 替身自带只覆盖测试所需接口的 `networkx` shim，无需额外手装 `networkx` 或启用系统/user site-packages。隔离 venv 的 CLI 用例也复用同一完整替身。离线复验使用本机仓库 bootstrap 从已有环境复用锁定版本；离线缓存不全时仍需先备齐这些锁定开发依赖，不能据此声称任意空缓存可离线安装。
+
+这个 shim 仅用于测试，不随产品安装，也不能代替真实 Graphify 环境；真实执行仍需在所配置的 Graphify 解释器中准备其兼容依赖（包括 NetworkX）。历史的首次 7 项失败和手装后的旧通过证据均保留在上述旧日志目录；干净 venv 的 red/green 复验证据位于 `/tmp/daily-knowledge-sync-ticket05-fixture.VNKBoo2Z/`。

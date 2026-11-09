@@ -1,7 +1,7 @@
 # 05: 完成正式UAT、安装与使用交付
 
 Type: task
-Status: claimed
+Status: resolved
 Blocked by: 04
 
 ## Context
@@ -24,7 +24,16 @@ Blocked by: 04
 
 ## Answer
 
-> 当前复核：原门禁在手动安装未声明的 `networkx` 后才通过，干净 dev bootstrap 尚未验收；本票暂回 claimed，修复并复验后方可重新 resolved。以下保留原报告和失败证据。
+> 当前复核：原门禁在手动安装未声明的 `networkx` 后才通过；已暂回 claimed，修复自包含替身并完成干净 dev 环境全门禁后重新 resolved。以下保留原报告和失败证据。
+
+### 干净 bootstrap 缺口复验
+
+- 从 `daily-knowledge-sync` 的 `6ef44b4` 以 `47cc597`（`--no-ff`）合入 `pi-agent-defc5784-d325-426`，保留 05 全部成果；以 `3b9b63a` 把本票暂回 claimed。
+- 未修改产品依赖或真实 Graphify。`tests/test_knowledge_execute.py` 的外部 Graphify 替身现在自行提供与 smoke 一致的最小 `networkx` shim；原符号链接黑盒测试向全新 Graphify venv 复制完整替身，防止依赖调用方或全局安装。
+- 以 `PYTHONNOUSERSITE=1 UV_OFFLINE=1 UV_PYTHON_DOWNLOADS=never PIP_NO_INDEX=1 make bootstrap` 创建全新 worktree dev venv；仓库 bootstrap 从本机 main venv 复用锁定版本，无下载。`pyvenv.cfg` 禁用 system site，`python -I` 禁用 user site，bootstrap 及测试前后均确认 dev venv 无 `networkx`。这只证明已有锁定依赖可离线复用，不保证空缓存可离线 bootstrap。
+- 先在该环境通过既有批准执行 CLI 测试复现 red，13 项为 **7 failed / 6 passed**；直接诊断为 `ModuleNotFoundError: No module named 'networkx'`。改为向隔离 venv 复制完整替身后，原有符号链接 CLI 测试也先 red；补 shim 后两条 red CLI 用例 **2 passed**，13 项执行测试 **13 passed**。
+- 最终 `git merge --no-ff daily-knowledge-sync` 显示 already up to date，集成 tip 为 `6ef44b4`。同一无 `networkx` 的隔离 dev venv 中，离线 `make check` **910 passed**，doc-guard **63** 篇、Ruff check 及 **169** 文件格式检查通过；离线 `make smoke` 构建 wheel/sdist 并完成安装 CLI 及质量正反例等测试。smoke 后 dev venv 仍无 `networkx`。无真实模型、生产同步或远端发布；本轮不重跑真实 UAT。
+- 新 red/green、bootstrap、check、smoke 日志及新包 SHA-256 在 `/tmp/daily-knowledge-sync-ticket05-fixture.VNKBoo2Z/`；原失败、历史 smoke 及私有 UAT 证据保持 `/tmp/daily-knowledge-sync-ticket05-final.H9DDAjhR/` 不变。
 
 ### 集成与交付合同
 
@@ -32,11 +41,11 @@ Blocked by: 04
 - 保留正式安装 smoke、wheel/sdist 模块 gate、`--graphify-python` 虚拟环境符号链接回归与[用户指南](../../../docs/daily-knowledge-sync.md)。正式契约是 `dogpdkb discover --snapshot` 采集、`sync --knowledge` 默认只规划、显式审批并通过有界质量门禁后才执行完整来源；独立 `mdcompare knowledge` 做离线比较。旧命令默认行为不变。
 - 本轮未重做已有实现或私有 UAT，也未新增源码修复；原有解释器修复及回归由 `4542859` 保存，开发期 red 命令未在本轮证据中，不能补写为已观察事实。
 
-### 最终门禁与离线环境
+### 历史门禁与离线环境（原始证据保留）
 
 - `UV_OFFLINE=1 UV_PYTHON_DOWNLOADS=never make check`：**910 passed**，文档门禁 **63** 篇、Ruff check 通过、**169** 文件格式检查通过。
 - `UV_OFFLINE=1 UV_PYTHON_DOWNLOADS=never make smoke`：通过，实际构建 `dogpdkb-0.1.6.tar.gz` 和 `dogpdkb-0.1.6-py3-none-any.whl`，在全新临时 venv 从 wheel 安装并运行真实 CLI，覆盖离线 snapshot、plan、审批、质量正反例及 managed 安装/升级/卸载；外部 Graphify 和安装下载运输使用替身。临时 venv 在 smoke 结束后自动清理，不是生产部署。
-- 离线环境的首次 `uv sync` 因缓存缺少锁定的 Ruff 轮子失败；使用仓库 `scripts/bootstrap.py --seed` 从本机已安装的锁定版本复用依赖，再离线 `make bootstrap`。首次 `make check` 出现 **7 failed / 903 passed**：这 7 项现有 Graphify 替身测试使用当前虚拟环境，候选阶段实际缺少 `networkx`；对保留的合成测试夹具直接复现 `ModuleNotFoundError`。从已有 UV 缓存离线安装 `networkx==3.6.1` 后，`UV_OFFLINE=1 .venv/bin/python -m pytest -q tests/test_knowledge_execute.py` 为 **13 passed**，随后的完整门禁如上。未下载包或放宽门禁；这不是源码 red/green 修复。默认 dev bootstrap 本身未声明该测试所需的 Graphify 环境依赖，冷环境需另行准备，后续可明确测试依赖。
+- 离线环境的首次 `uv sync` 因缓存缺少锁定的 Ruff 轮子失败；使用仓库 `scripts/bootstrap.py --seed` 从本机已安装的锁定版本复用依赖，再离线 `make bootstrap`。首次 `make check` 出现 **7 failed / 903 passed**：这 7 项现有 Graphify 替身测试使用当前虚拟环境，候选阶段实际缺少 `networkx`；对保留的合成测试夹具直接复现 `ModuleNotFoundError`。从已有 UV 缓存离线安装 `networkx==3.6.1` 后，`UV_OFFLINE=1 .venv/bin/python -m pytest -q tests/test_knowledge_execute.py` 为 **13 passed**，随后的完整门禁如上。未下载包或放宽门禁；这不是源码 red/green 修复。当时默认 dev bootstrap 未提供测试替身的 Graphify 环境依赖；“冷环境需另行准备”的原结论已由上面的自包含替身修复取代。
 - 构建包和本次私有验收日志（含失败、诊断、复验、包 SHA-256）保存在 `/tmp/daily-knowledge-sync-ticket05-final.H9DDAjhR/`。离线环境就绪前的 4 文件 LSP probe 为 inconclusive；bootstrap 后重新主动探测，同样 4 文件 **clean=4、findings=0**，不把第一次结果当 clean。
 
 ### 已有私有 UAT 的只读核验

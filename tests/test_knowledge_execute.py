@@ -159,6 +159,13 @@ def execute_arguments(
 def install_graphify_stub(tmp_path: Path) -> Path:
     package = tmp_path / "stub-packages" / "graphify"
     package.mkdir(parents=True)
+    # The external Graphify stub also supplies its minimal NetworkX boundary.
+    (package.parent / "networkx.py").write_text(
+        "class Graph:\n"
+        "    def add_node(self, *args, **kwargs): pass\n"
+        "    def add_edge(self, *args, **kwargs): pass\n"
+        "class DiGraph(Graph): pass\n"
+    )
     (package / "__init__.py").write_text("")
     (package / "cache.py").write_text(
         """import json, os
@@ -1079,13 +1086,7 @@ def test_graphify_python_symlink_preserves_virtual_environment(tmp_path: Path):
         / "site-packages"
     )
     stub = install_graphify_stub(tmp_path)
-    shutil.copytree(stub / "graphify", site / "graphify")
-    (site / "networkx.py").write_text(
-        "class Graph:\n"
-        "    def add_node(self, *args, **kwargs): pass\n"
-        "    def add_edge(self, *args, **kwargs): pass\n"
-        "class DiGraph(Graph): pass\n"
-    )
+    shutil.copytree(stub, site, dirs_exist_ok=True)
     arguments = execute_arguments(
         tmp_path, snapshot_path, state_path, staging, graph_dir
     )

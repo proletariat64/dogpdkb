@@ -93,11 +93,14 @@ dogpdkb sync --knowledge --execute \
 
 私有快照、raw、状态和报告使用受限权限，默认日志不包含正文证据。不得覆盖输入或用输出别名绕过保护。
 
-交付门禁：
+开发验收使用 Python 3.12 和 uv，先运行 `make bootstrap` 创建隔离 dev 环境。交付门禁：
 
 ```bash
+make bootstrap
 make check
 make smoke
 ```
+
+执行测试的确定性外部 Graphify 替身自带最小 NetworkX shim，无需在 dev venv 或系统环境中手工安装 NetworkX；该 shim 不随产品安装，也不是真实 Graphify。真实执行仍须在所配置的 Graphify 解释器中安装其依赖，包括 NetworkX。
 
 `make smoke` 从 wheel 在临时环境执行真实安装后的 CLI，覆盖快照、规划、审批、质量失败拒绝和成功执行，并使用确定的外部 Graphify 替身。它不运行真实模型、不访问生产图谱。实际部署、生产同步、付费提取及基线推进仍需单独授权。
