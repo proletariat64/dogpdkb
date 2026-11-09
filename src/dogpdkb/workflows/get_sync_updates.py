@@ -295,6 +295,7 @@ def _call_once(tool: str, args: dict[str, Any]) -> Any:
     pending = bytearray()
 
     def send(payload: dict[str, Any]) -> None:
+        assert stdin is not None  # pipes requested above
         try:
             stdin.write(json.dumps(payload) + "\n")
             stdin.flush()
@@ -307,6 +308,7 @@ def _call_once(tool: str, args: dict[str, Any]) -> Any:
             ) from error
 
     def wait_for(request_id: int) -> None:
+        assert stdout is not None  # pipes requested above
         while request_id not in responses:
             _check_cancelled()
             remaining = deadline - time.monotonic()
@@ -322,6 +324,7 @@ def _call_once(tool: str, args: dict[str, Any]) -> Any:
                     if _LISTING_CANCEL.get() is not None
                     else remaining
                 )
+                assert sel is not None
                 if not sel.select(timeout=poll_timeout):
                     continue
                 try:
@@ -798,7 +801,7 @@ def build_deletions(
     return deleted
 
 
-def main() -> None:
+def main() -> int | None:
     parser = argparse.ArgumentParser(
         description="List Yuque book additions, updates, moves and deletions."
     )
@@ -812,11 +815,29 @@ def main() -> None:
         type=cli_path,
         help="resume an interrupted listing from this directory",
     )
+    parser.add_argument("--snapshot", help="write a knowledge observation snapshot")
+    parser.add_argument("--baseline-snapshot", help="complete earlier observation")
+    parser.add_argument("--staging", help="private raw export and checkpoint directory")
+    parser.add_argument("--listing", help="complete local listing JSON adapter input")
+    parser.add_argument(
+        "--details-dir", help="local document detail JSON adapter input"
+    )
+    parser.add_argument("--pending-state", help="explicit prior pending-state input")
     args = parser.parse_args()
 
     config = configure(parser, args.config)
     source = configured_book(parser, config, args, args.skylark_url)
     args.skylark_url = source.url
+    if args.snapshot:
+        from dogpdkb.knowledge_capture import CaptureError, run_capture
+
+        try:
+            status = run_capture(args)
+            if status:
+                parser.exit(status)
+            return status
+        except CaptureError as error:
+            parser.exit(1, f"dogpdkb discover --snapshot: {error}\n")
     input_dir = cli_path(args.input) if args.input else source.corpus
     output_dir = cli_path(args.output) if args.output else config.state / source.key
     if not input_dir.is_dir():
@@ -841,7 +862,7 @@ def main() -> None:
     renamed, moved = build_structure_lists(docs, local, paths)
     deleted = build_deletions(docs, local, input_dir)
 
-    today = date.today()
+    today = datetime.now().astimezone().date()
     slug = book["slug"] or str(book["book_id"])
     stem = f"sync-updates-{slug}-{today:%Y%m%d}"
 
