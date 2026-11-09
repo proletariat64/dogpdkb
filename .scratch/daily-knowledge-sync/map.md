@@ -23,11 +23,12 @@
 - 03 已合入：`sync --knowledge` 默认只规划，独立记录观察、语料和图谱状态，候选需显式批准；04 执行及审批合同、状态与恢复细节见 [03 Answer](issues/03-plan-state.md#answer)。实现提交 `590781c6e5615091bd75ea2a3389839890ea083e`，合并提交 `9c1ea491dae1f982a2afafd6e9b2da68282c9882`。集成验证：`test_knowledge_sync.py`、`test_knowledge_capture.py`、`test_pipeline.py`、`test_platform.py`、`test_mdcompare_knowledge_cli.py`、`test_mdcompare_knowledge_units.py` 共 195 passed；4 个变更 Python 文件 Ruff check 和 format --check 通过。04 的 03 集成门禁已通过；未执行生产操作。
 
 - 01–03 集成后完整 `make check`：896 passed，Ruff检查及165文件格式检查通过，61篇文档门禁通过。这是 04 合入前的结果，不是整份规格最终验收。
-- 04 已合入，合同与执行边界见 [04 Answer](issues/04-approved-execution.md#answer)；实现提交 `6a6b158`，分支指针 `2a8dba8c1d3d488421dad922b84b042666698b46`，合并提交 `d3101be5fea3963ecceb6d30238cb0f100cad82b`。集成验证：`test_knowledge_execute.py`、`test_knowledge_sync.py`、`test_knowledge_capture.py`、`test_update_graph.py`、`test_pipeline.py` 共 **69 passed**；4 个变更 Python 文件 Ruff check 和 format --check 通过。质量门禁仅覆盖显式绑定的有界案例，不证明全部知识无损；元数据改名/搬动无法安全维护时 HOLD，不以重提取规避。以下并发与输入保护缺陷需修复；合入和测试通过不代表可安全执行，05 等待修复结果。
+- 04 已合入，合同与执行边界见 [04 Answer](issues/04-approved-execution.md#answer)；实现提交 `6a6b158`，分支指针 `2a8dba8c1d3d488421dad922b84b042666698b46`，合并提交 `d3101be5fea3963ecceb6d30238cb0f100cad82b`。集成验证：`test_knowledge_execute.py`、`test_knowledge_sync.py`、`test_knowledge_capture.py`、`test_update_graph.py`、`test_pipeline.py` 共 **69 passed**；4 个变更 Python 文件 Ruff check 和 format --check 通过。质量门禁仅覆盖显式绑定的有界案例，不证明全部知识无损；元数据改名/搬动无法安全维护时 HOLD，不以重提取规避。当时并发与输入保护缺陷阻塞 05；后续修复及验证见下。
+- [04 resolved](issues/04-approved-execution.md#安全修复与集成复验)：实际修复及回归提交 `9517bc75dd32399e9ca695edc875ee89f99ebcdb`，合并及测试提交 `aa1ff1242ebfd16142db190c9d75322b293f90d4`。执行、所有 sync、capture、update_graph、pipeline 和 mdcompare（含 strict CLI）聚焦 **456 passed**；指定别名、发布前 state 漂移、发布后 state 失败恢复及 strict CLI 回归 **8 passed**；仓库 Ruff check 通过。本轮 4 文件 LSP probe 为 inconclusive，不作为 clean 证据。05 的 04 依赖已解除，但 05 自身验收未运行。
 
 ## Fog
 
 - 保留旧compare契约；没有明确生成来源时保护字面代码，不用OCR内容推断来源。
 - 实际真实Graphify编译需另行授权；替身测试和历史十篇实验不得冒称新流程已通过真实生产验收。
-- 04 合并检查使用隔离临时目录和 Graphify 替身复现：最终审批核验后、发布前若并发修改选中文档的 graph state，程序先发布图再发现状态漂移，续跑因计划版本冲突被拒；需在发布与状态更新边界处理并发并增加回归。
-- 04 合并检查另复现：将审批输入放在 `<staging>/execution-manifest.json` 时，执行覆盖审批文件后仍报告成功，重跑失败；需保护全部执行输入免遭输出碰撞并增加回归。
+- **已关闭（历史复现）**：04 合并检查使用隔离临时目录和 Graphify 替身复现最终审批核验后、发布前 state 变化导致先发布后发现漂移，续跑因计划版本冲突被拒；现有协作锁及发布前检查，候选构建期间漂移回归已通过。非协作写入仍不受锁保证。
+- **已关闭（历史复现）**：将审批输入放在 `<staging>/execution-manifest.json` 曾导致执行覆盖审批文件后仍报告成功，重跑失败；现已增加输入/输出碰撞检查，并通过直接碰撞和别名回归。

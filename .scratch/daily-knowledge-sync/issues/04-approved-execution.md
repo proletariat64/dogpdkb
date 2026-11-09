@@ -1,7 +1,7 @@
 # 04: 实现审核后完整来源提取与安全发布
 
 Type: task
-Status: claimed
+Status: resolved
 Blocked by: 03
 
 ## Context
@@ -58,3 +58,13 @@ dogpdkb sync --knowledge --execute \
 - URL 保留：新增断言初始为 None 是 red；按旧图同 ID 继承后为 green。
 
 黑盒替身覆盖旧限制缺失不发布、部分失败缓存续跑、并发基线漂移、图发布后状态故障恢复、新文档加入既有图。最终全量 **905 passed**；执行/规划/采集/管线/图事务聚焦 **69 passed**；仓库 Ruff check、Ruff format --check 和变更文件 LSP error 检查通过。未运行真实网络、模型、OCR、生产发布或 05 安装/UAT。
+
+### 安全修复与集成复验
+
+- 实际修复及新增回归提交：`9517bc75dd32399e9ca695edc875ee89f99ebcdb`；集成测试代码所在的 `--no-ff` 合并提交：`aa1ff1242ebfd16142db190c9d75322b293f90d4`。该修复提交同时包含源码和测试；不使用不存在的 `dc612dd` 作为证据。
+- 规划和执行共享 state 协作锁，候选完成后、发布前再次检查 state 字节，发布后检查与恢复仍保留；锁仅协调遵守该锁的写入者，并非针对任意非协作写入的原子事务。
+- 执行输出先验证不能覆盖审批、质量、snapshot、plan、state 和关联 raw 等输入；回归覆盖审批输出碰撞、硬链接、符号链接及输出目录祖先碰撞，检查受保护输入不变。
+- 在合并提交 `aa1ff1242ebfd16142db190c9d75322b293f90d4` 上，`.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_knowledge_execute.py tests/test_*sync*.py tests/test_knowledge_capture.py tests/test_update_graph.py tests/test_pipeline.py tests/test_mdcompare_*.py`：**456 passed**。其中包含 strict `mdcompare compare` CLI 测试与输入别名回归。
+- 单独复验 **8 passed**：`test_knowledge_execute.py` 的 `test_execution_rejects_input_aliases_and_output_ancestors`、`test_execution_outputs_cannot_overwrite_approval_input`、`test_state_change_during_candidate_build_blocks_publication`、`test_graph_publish_then_state_failure_recovers_without_rebilling`；strict CLI 的 `test_mdcompare_cli.py::test_report_cannot_overwrite_document_or_manifest` 与 `test_mdcompare_stability.py::test_reports_cannot_overwrite_referenced_input_aliases`（3 参数）。
+- `.venv/bin/ruff check .` 通过；4 个变更 Python 文件的 `.venv/bin/ruff format --check` 通过。
+- 本轮对 4 个变更 Python 文件的 LSP probe 均为 inconclusive，不能据此声称 LSP clean。使用隔离临时目录及替身；未运行真实网络、模型、OCR、生产操作或 05 安装/UAT。04 已满足本次集成门禁，05 的其余验收仍须独立执行。
