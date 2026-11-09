@@ -154,7 +154,7 @@ def test_initial_observation_without_graph_baseline_stays_uncovered(
     assert result.returncode == 0, result.stderr
     plan = json.loads((staging / "plan.json").read_text())
     state = json.loads(state_path.read_text())
-    assert plan["schema_version"] == "knowledge-plan-1.0"
+    assert plan["schema_version"] == "knowledge-plan-2.0"
     assert plan["execution"]["automatic_extraction_allowed"] is False
     assert plan["counts"]["external_calls"] == 0
     assert plan["results"][0]["action"] == "HOLD_EXISTING"
@@ -324,7 +324,7 @@ def test_body_candidate_freezes_full_raw_but_is_not_execution_permission(
     assert frozen_raw.stat().st_mode & 0o777 == 0o600
     assert plan["execution"]["automatic_extraction_allowed"] is False
     assert plan["approval_contract"] == {
-        "schema_version": "knowledge-approvals-1.0",
+        "schema_version": "knowledge-approvals-2.0",
         "binding": ["book_id", "document_id", "source_version", "raw"],
         "source_scope": "whole_document",
         "review_dispositions_required": True,
@@ -650,7 +650,9 @@ def test_candidate_with_revision_exposes_mandatory_review_issues(tmp_path: Path)
     assert row["action"] == "BODY_DELTA_CANDIDATE"
     assert row["comparison"]["status"] == "REVIEW"
     assert row["execution"]["review_issues"]
-    assert "REVISION_REVIEW_REQUIRED" in row["execution"]["review_issues"]
+    assert "REVISION_REVIEW_REQUIRED" in {
+        issue["code"] for issue in row["execution"]["review_issues"]
+    }
 
 
 def test_missing_raw_file_is_not_a_corpus_success(tmp_path: Path):
@@ -949,3 +951,68 @@ def test_metadata_work_stays_separate_from_verified_body_reuse(tmp_path: Path):
     state = json.loads(state_path.read_text())
     assert state["documents"]["1"]["corpus"]["version"]["utc"] == new_version
     assert state["documents"]["1"]["graph"]["version"]["utc"] == old_version
+
+
+def test_successful_capture_retry_recomputes_transient_failure(tmp_path: Path):
+    baseline, _ = write_raw_baseline(
+        tmp_path,
+        [
+            {
+                "id": 1,
+                "title": "Limits",
+                "version": "2026-11-07T00:00:00Z",
+                "body": "# Limits\n\nRefund requires approval.\n",
+            }
+        ],
+    )
+    good = captured_update(
+        tmp_path,
+        [
+            {
+                "id": 1,
+                "title": "Limits",
+                "version": "2026-11-09T00:00:00Z",
+                "body": ("# Limits\n\nRefund requires approval.\n\nFee is 100 USD.\n"),
+            }
+        ],
+    )
+    failed = json.loads(json.dumps(good))
+    failed["status"] = "incomplete"
+    failed["anomalies"] = [{"id": 1, "code": "export_failed"}]
+    failed["exports"]["1"] = {"status": "failed"}
+    failed_path = tmp_path / "failed.json"
+    write_json(failed_path, failed)
+    state_path = tmp_path / "state.json"
+    first = sync(
+        "--knowledge",
+        "--snapshot",
+        str(failed_path),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(tmp_path / "failed-plan"),
+        "--baseline",
+        str(baseline),
+    )
+    assert first.returncode == 0, first.stderr
+
+    good["changes"]["updated"] = []
+    good["selected"] = []
+    good_path = tmp_path / "good.json"
+    write_json(good_path, good)
+    second = sync(
+        "--knowledge",
+        "--snapshot",
+        str(good_path),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(tmp_path / "good-plan"),
+    )
+
+    assert second.returncode == 0, second.stderr
+    row = json.loads((tmp_path / "good-plan" / "plan.json").read_text())["results"][0]
+    assert row["action"] == "BODY_DELTA_CANDIDATE"
+    assert row["pending"] == ["APPROVAL_REQUIRED"]
+    assert "export_failed" not in row["pending"]
+    assert "CAPTURE_EXPORT_FAILED" not in row["pending"]

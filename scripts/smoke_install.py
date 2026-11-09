@@ -680,7 +680,7 @@ def smoke(dist: Path) -> None:
         write_json(
             approvals,
             {
-                "schema_version": "knowledge-approvals-1.0",
+                "schema_version": "knowledge-approvals-2.0",
                 "plan": str(plan_path),
                 "approvals": [
                     {
@@ -690,8 +690,17 @@ def smoke(dist: Path) -> None:
                         "raw": execution["raw"],
                         "source_scope": "whole_document",
                         "review_dispositions": [
-                            {"code": code, "decision": "acknowledged"}
-                            for code in execution["review_issues"]
+                            {
+                                "issue_id": issue["issue_id"],
+                                "decision": (
+                                    "approve_removal"
+                                    if "approve_removal" in issue["allowed_decisions"]
+                                    else "accept_revision"
+                                    if "accept_revision" in issue["allowed_decisions"]
+                                    else "acknowledged"
+                                ),
+                            }
+                            for issue in execution["review_issues"]
                         ],
                     }
                 ],
@@ -700,7 +709,7 @@ def smoke(dist: Path) -> None:
 
         def quality_document(fragments: list[str]) -> dict[str, Any]:
             return {
-                "schema_version": "knowledge-quality-cases-1.0",
+                "schema_version": "knowledge-quality-cases-2.0",
                 "plan": str(plan_path),
                 "cases": [
                     {

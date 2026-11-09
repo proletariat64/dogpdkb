@@ -14,6 +14,7 @@
 - [03 规划与三类状态](issues/03-plan-state.md) — 01, 02
 - [04 审核执行与发布](issues/04-approved-execution.md) — 03
 - [05 UAT、安装与文档](issues/05-acceptance-release.md) — 04
+- [06 最终审查修复](issues/06-review-fixes.md) — 01, 02, 03, 04, 05
 
 ## Decisions-so-far
 
@@ -29,6 +30,8 @@
 - 05 冷环境历史证据：原 check 手工安装未声明的 `networkx`；测试 Graphify 替身现自带最小 shim，不手装 NetworkX，red **7 failed / 6 passed**、修复后执行测试 **13 passed**。干净 dev 环境完整 check **910 passed**、文档门禁 **63** 篇、Ruff 和 **169** 文件格式检查通过；离线 build/隔离安装 smoke 通过。共享冷日志：`/tmp/daily-knowledge-sync-ticket05-fixture.VNKBoo2Z/make-check.log`、`/tmp/daily-knowledge-sync-ticket05-fixture.VNKBoo2Z/make-smoke.log`（同目录保留 bootstrap、red/green、环境及包哈希）。本次未重建或重跑 smoke；历史 LSP 在环境就绪后复探 4 clean。
 - 集成分支合并后 `PYTHONNOUSERSITE=1 UV_OFFLINE=1 UV_PYTHON_DOWNLOADS=never PIP_NO_INDEX=1 make check` 实测 **910 passed**、文档门禁 **63** 篇、Ruff 和 **169** 文件格式检查通过，与冷环境报告一致；日志 `/tmp/daily-knowledge-sync-integration.l5YhvWpj/make-check.log`。
 - 私有 UAT summary 与保留实物只读比较：**7,548 → 7,550**、初次选中 0、**2 new / 4 updated / 6 捕获 / 0 失败**；4 篇旧 raw **1 字节相同 / 3 字节不同**，独立比较结果 **1 REUSE / 3 REVIEW**，2 个详情异常 HOLD。执行报告与 summary 均为 **2 获批 / 2 图谱成功 / 4 案例通过**，发布图等于候选、拒绝图等于备份；拒绝时 state 字节不变仅由原 summary 记录，缺执行前副本，不能独立复核。外部 Graphify 为确定性替身，固定案例有界，无真实模型或生产操作；本次比较日志 `/tmp/daily-knowledge-sync-integration.l5YhvWpj/uat-comparison.log`，历史日志 `/tmp/daily-knowledge-sync-ticket05-final.H9DDAjhR/`，原私有产物 `/tmp/daily-knowledge-sync-ticket05-uat-v1/`。
+
+- [06 resolved](issues/06-review-fixes.md#answer)：同一实现worktree完成12项focused red/green及四个原始复现，接口升级为plan/approval/quality 2.0；逐项定位见[审查记录](../../docs/daily-knowledge-sync-review.md)。新冻结UAT `/tmp/daily-knowledge-sync-ticket06-uat-v2` 正反例通过，仅确定性替身。最终`make check` **928 passed**、doc-guard 65篇、Ruff及171文件格式检查通过；离线build/隔离安装smoke通过。实施分支提交后由集成merger合入。
 
 ## Fog
 

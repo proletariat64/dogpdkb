@@ -61,13 +61,13 @@ dogpdkb sync --knowledge \
 - `BODY_DELTA_CANDIDATE`：保存完整冻结 raw、变化单元和旧侧证据，等待审批；不是提取许可。
 - `HOLD_EXISTING`：保留旧图和待办，不自动提取。旧侧缺失、上下文不确定、边界异常及版本异常均可能进入此路由。
 
-计划固定 `plan_only=true`、`automatic_extraction_allowed=false`、`full_document_fallback=false`。独立离线 `mdcompare knowledge` 仍可比较冻结 raw，但不修改 dogpdkb 状态或图谱。
+计划固定 `plan_only=true`、`automatic_extraction_allowed=false`、`full_document_fallback=false`。规划器先冻结新侧及已登记的旧侧 raw，再比较这两个冻结视图；候选执行同时绑定新旧字节，任一侧后续漂移都会使许可失效。独立离线 `mdcompare knowledge` 仍可比较冻结 raw，但不修改 dogpdkb 状态或图谱。
 
 ## 5. 审批和质量门禁
 
-审批使用 `knowledge-approvals-1.0`，绑定当前 `plan.json`。每项必须精确匹配知识库、文档 ID、完整 `source_version`、冻结 raw 和 `source_scope=whole_document`，并逐项明确 `acknowledged` 所有 `review_issues`。raw 或状态在审批后变化会使许可失效。
+审批使用 `knowledge-approvals-2.0`，绑定当前 `knowledge-plan-2.0` 的 `plan.json`。每项必须精确匹配知识库、文档 ID、完整 `source_version`、冻结 raw 和 `source_scope=whole_document`。`review_issues` 按文档或单元索引、来源行生成稳定 `issue_id`；审批必须用相同 ID 逐项处置，不能以原因码通用确认代替。修订使用 `accept_revision`，上下文问题使用 `acknowledged`；旧侧未再观察到的规则必须逐项选择 `approve_removal` 或 `preserve`。`preserve` 还须列出同一文档、同一来源版本的 `quality_case_ids`。旧版通用 ack 不自动升级，会被拒绝。
 
-质量文件使用 `knowledge-quality-cases-1.0`，同样绑定计划。每个获准文档至少一个案例；案例绑定相同来源版本，可对 `node` 或 `edge` 做同记录精确匹配及必要字段片段断言。应同时覆盖本次确认的新事实和必须保留的旧限制。外部文件中的 `pass` 字段没有授权作用。
+质量文件使用 `knowledge-quality-cases-2.0`，同样绑定计划。每个获准文档至少一个案例；案例绑定相同来源版本，可对 `node` 或 `edge` 做同记录精确匹配及必要字段片段断言。应同时覆盖本次确认的新事实和必须保留的旧限制。外部文件中的 `pass` 字段没有授权作用。
 
 门禁只证明显式案例通过，**不证明全部知识无损**，也不能用节点数增加代替。
 
@@ -83,13 +83,13 @@ dogpdkb sync --knowledge --execute \
 
 只执行已批准的候选，并把完整冻结 raw 交给既有整来源替换事务；diff、候选块和统计视图不能替代完整来源。新 ID 单独审核，不宣称全库知识新增。已有图基线必须存在；元数据任务无法安全维护时保持 HOLD，不靠重编译规避。
 
-候选图先写隔离目录，检查完整来源覆盖、节点 ID、边/超边引用、旧来源归属和固定质量案例，再允许发布。失败不改旧图或图谱成功版本。续跑复用已有缓存和候选；图已发布而状态写入失败时，通过事务记录和直接字节比较恢复，避免重复提取。协作锁只协调遵守该锁的写入者，不是任意外部写入的全局事务。
+候选图先写隔离目录，在有损合并前检查提取及缓存结果的节点身份、边/超边引用，再检查完整来源覆盖、旧来源归属、无关来源记录和固定质量案例；冲突无法安全保留时拒绝候选。失败不改旧图或图谱成功版本。续跑复用已有缓存和候选；发布前 journal 保存原/目标状态、候选及审批绑定。图或 state 已提交而报告因硬退出缺失时，直接核验 journal、候选、图谱和 state 字节后重建报告，不重复提取。协作锁只协调遵守该锁的写入者，不是任意外部写入的全局事务。
 
 `--graphify-python` 可以是虚拟环境的 `bin/python` 符号链接；执行器保留该路径以加载对应环境。
 
 ## 7. 报告、成本和交付边界
 
-`knowledge-plan-1.0`、`knowledge-state-1.0`、`knowledge-execution-1.0` 分开报告观察、语料、候选、批准、执行、缓存命中、外部调用和图谱成功数。token 只采用适配器实际返回的证据；没有账单时费用为 `unknown`，字符量或节点数不能换算成真实节费。
+`knowledge-plan-2.0`、`knowledge-state-1.0`、`knowledge-execution-1.0` 分开报告观察、语料、候选、批准、执行、缓存命中、外部调用和图谱成功数。当前观察、语料或 pending 已更新的 state 会使旧 plan 失效；已恢复的采集/比较瞬时错误会在成功重试时重新计算，未知或人工未处理问题仍保留。token 和调用数只采用适配器实际返回的非负整数证据；缺失或非法值为 `null`/`unknown`，只有实际返回或无提取时才能记录 0。没有账单时费用为 `unknown`，字符量或节点数不能换算成真实节费。
 
 私有快照、raw、状态和报告使用受限权限，默认日志不包含正文证据。不得覆盖输入或用输出别名绕过保护。
 

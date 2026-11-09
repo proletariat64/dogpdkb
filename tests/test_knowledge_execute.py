@@ -88,11 +88,27 @@ def candidate_plan(tmp_path: Path) -> tuple[dict[str, Any], Path, Path, Path, Pa
     )
 
 
+def review_dispositions(execution: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "issue_id": issue["issue_id"],
+            "decision": (
+                "approve_removal"
+                if "approve_removal" in issue["allowed_decisions"]
+                else "accept_revision"
+                if "accept_revision" in issue["allowed_decisions"]
+                else "acknowledged"
+            ),
+        }
+        for issue in execution["review_issues"]
+    ]
+
+
 def approval_document(plan: dict[str, Any]) -> dict[str, Any]:
     row = plan["results"][0]
     execution = row["execution"]
     return {
-        "schema_version": "knowledge-approvals-1.0",
+        "schema_version": "knowledge-approvals-2.0",
         "plan": "execution/plan.json",
         "approvals": [
             {
@@ -101,10 +117,7 @@ def approval_document(plan: dict[str, Any]) -> dict[str, Any]:
                 "source_version": execution["source_version"],
                 "raw": execution["raw"],
                 "source_scope": "whole_document",
-                "review_dispositions": [
-                    {"code": code, "decision": "acknowledged"}
-                    for code in execution["review_issues"]
-                ],
+                "review_dispositions": review_dispositions(execution),
             }
         ],
     }
@@ -113,7 +126,7 @@ def approval_document(plan: dict[str, Any]) -> dict[str, Any]:
 def quality_document(plan: dict[str, Any]) -> dict[str, Any]:
     row = plan["results"][0]
     return {
-        "schema_version": "knowledge-quality-cases-1.0",
+        "schema_version": "knowledge-quality-cases-2.0",
         "plan": "execution/plan.json",
         "cases": [
             {
@@ -293,7 +306,7 @@ def test_execute_without_approved_candidates_does_not_invoke_graphify(tmp_path: 
     write_json(
         approvals,
         {
-            "schema_version": "knowledge-approvals-1.0",
+            "schema_version": "knowledge-approvals-2.0",
             "plan": "execution/plan.json",
             "approvals": [],
         },
@@ -301,7 +314,7 @@ def test_execute_without_approved_candidates_does_not_invoke_graphify(tmp_path: 
     write_json(
         quality,
         {
-            "schema_version": "knowledge-quality-cases-1.0",
+            "schema_version": "knowledge-quality-cases-2.0",
             "plan": "execution/plan.json",
             "cases": [],
         },
@@ -338,6 +351,36 @@ def test_execute_without_approved_candidates_does_not_invoke_graphify(tmp_path: 
     assert plan["results"][0]["action"] == "BODY_DELTA_CANDIDATE"
 
 
+def test_execution_rejects_state_from_another_book_with_same_document_id(
+    tmp_path: Path,
+):
+    plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
+    graph_dir.mkdir()
+    write_json(graph_dir / "graph.json", {"nodes": [], "links": []})
+    write_json(tmp_path / "approvals.json", approval_document(plan))
+    write_json(tmp_path / "quality.json", quality_document(plan))
+    state = json.loads(state_path.read_text())
+    state["book"]["book_id"] = 456
+    write_json(state_path, state)
+    stub = install_graphify_stub(tmp_path)
+    log = tmp_path / "graphify-calls.jsonl"
+
+    result = sync(
+        *execute_arguments(tmp_path, snapshot_path, state_path, staging, graph_dir),
+        env={
+            "PYTHONPATH": os.pathsep.join([str(stub), str(ROOT / "src")]),
+            "GRAPHIFY_STUB_LOG": str(log),
+        },
+    )
+
+    assert result.returncode != 0
+    assert "different book" in result.stderr
+    assert not log.exists()
+    assert json.loads(state_path.read_text())["documents"]["1"]["pending"] == [
+        "APPROVAL_REQUIRED"
+    ]
+
+
 def test_external_pass_document_is_not_quality_evidence(tmp_path: Path):
     plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
     graph_dir.mkdir()
@@ -346,7 +389,7 @@ def test_external_pass_document_is_not_quality_evidence(tmp_path: Path):
     write_json(
         tmp_path / "quality.json",
         {
-            "schema_version": "knowledge-quality-cases-1.0",
+            "schema_version": "knowledge-quality-cases-2.0",
             "plan": "execution/plan.json",
             "pass": True,
             "cases": [],
@@ -525,6 +568,217 @@ def test_missing_old_limit_blocks_publish_and_candidate_resume_is_cached(
     assert json.loads(state_path.read_text())["documents"]["1"]["pending"] == []
 
 
+def test_invalid_fresh_edge_is_rejected_before_lossy_merge(tmp_path: Path):
+    plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
+    graph_dir.mkdir()
+    original = {
+        "directed": True,
+        "nodes": [
+            {
+                "id": "old-approval",
+                "label": "Refund approval",
+                "rationale": "Refund requires approval.",
+                "source_file": "old-[1].md",
+            }
+        ],
+        "links": [],
+        "hyperedges": [],
+    }
+    write_json(graph_dir / "graph.json", original)
+    write_json(tmp_path / "approvals.json", approval_document(plan))
+    write_json(tmp_path / "quality.json", quality_document(plan))
+    stub = install_graphify_stub(tmp_path)
+    llm = stub / "graphify" / "llm.py"
+    source = llm.read_text()
+    assert '"target": "refund-approval"' in source
+    llm.write_text(
+        source.replace('"target": "refund-approval"', '"target": "missing-node"')
+    )
+
+    result = sync(
+        *execute_arguments(tmp_path, snapshot_path, state_path, staging, graph_dir),
+        env={"PYTHONPATH": os.pathsep.join([str(stub), str(ROOT / "src")])},
+    )
+
+    assert result.returncode != 0
+    assert "candidate-only failed" in result.stderr
+    assert json.loads((graph_dir / "graph.json").read_text()) == original
+    assert not (staging / "execution-result.json").exists()
+    assert not (staging / "graph-update" / "candidate-ready.json").exists()
+    assert json.loads(state_path.read_text())["documents"]["1"]["pending"] == [
+        "APPROVAL_REQUIRED"
+    ]
+
+
+def test_fresh_reference_to_replaced_old_node_is_not_silently_dropped(
+    tmp_path: Path,
+):
+    plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
+    graph_dir.mkdir()
+    original = {
+        "directed": True,
+        "nodes": [
+            {
+                "id": "old-only",
+                "label": "Old only",
+                "rationale": "Old rule absent from fresh extraction.",
+                "source_file": "old-[1].md",
+            }
+        ],
+        "links": [],
+        "hyperedges": [],
+    }
+    write_json(graph_dir / "graph.json", original)
+    write_json(tmp_path / "approvals.json", approval_document(plan))
+    write_json(tmp_path / "quality.json", quality_document(plan))
+    stub = install_graphify_stub(tmp_path)
+    llm = stub / "graphify" / "llm.py"
+    source = llm.read_text()
+    assert '"target": "refund-approval"' in source
+    llm.write_text(
+        source.replace('"target": "refund-approval"', '"target": "old-only"')
+    )
+
+    result = sync(
+        *execute_arguments(tmp_path, snapshot_path, state_path, staging, graph_dir),
+        env={"PYTHONPATH": os.pathsep.join([str(stub), str(ROOT / "src")])},
+    )
+
+    assert result.returncode != 0
+    assert "candidate-only failed" in result.stderr
+    assert json.loads((graph_dir / "graph.json").read_text()) == original
+    assert not (staging / "graph-update" / "candidate-ready.json").exists()
+
+
+def test_invalid_cached_hyperedge_is_rejected_before_lossy_merge(tmp_path: Path):
+    plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
+    graph_dir.mkdir()
+    original = {"directed": True, "nodes": [], "links": [], "hyperedges": []}
+    write_json(graph_dir / "graph.json", original)
+    write_json(tmp_path / "approvals.json", approval_document(plan))
+    write_json(tmp_path / "quality.json", quality_document(plan))
+    stub = install_graphify_stub(tmp_path)
+    llm = stub / "graphify" / "llm.py"
+    source = llm.read_text()
+    old = '"edges": current_edges, "hyperedges": []'
+    assert old in source
+    llm.write_text(
+        source.replace(
+            old,
+            '"edges": current_edges, '
+            '"hyperedges": [{"members": ["refund-limit", "missing-node"], "source_file": source}]',
+        )
+    )
+
+    result = sync(
+        *execute_arguments(tmp_path, snapshot_path, state_path, staging, graph_dir),
+        env={"PYTHONPATH": os.pathsep.join([str(stub), str(ROOT / "src")])},
+    )
+
+    assert result.returncode != 0
+    assert "candidate-only failed" in result.stderr
+    assert json.loads((graph_dir / "graph.json").read_text()) == original
+    assert not (staging / "graph-update" / "candidate-ready.json").exists()
+
+
+def test_unrelated_source_edge_collision_is_safely_rejected(tmp_path: Path):
+    plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
+    graph_dir.mkdir()
+    original = {
+        "directed": True,
+        "nodes": [
+            {
+                "id": "old-approval",
+                "label": "Refund approval",
+                "rationale": "Refund requires approval.",
+                "source_file": "old-[1].md",
+            },
+            {
+                "id": "old-limit",
+                "label": "Refund limit",
+                "rationale": "Old limit",
+                "source_file": "old-[1].md",
+            },
+        ],
+        "links": [
+            {
+                "source": "old-limit",
+                "target": "old-approval",
+                "relation": "prohibits",
+                "rationale": "unapproved source fact",
+                "source_file": "outside-[2].md",
+            }
+        ],
+        "hyperedges": [],
+    }
+    write_json(graph_dir / "graph.json", original)
+    write_json(tmp_path / "approvals.json", approval_document(plan))
+    write_json(tmp_path / "quality.json", quality_document(plan))
+    stub = install_graphify_stub(tmp_path)
+
+    result = sync(
+        *execute_arguments(tmp_path, snapshot_path, state_path, staging, graph_dir),
+        env={"PYTHONPATH": os.pathsep.join([str(stub), str(ROOT / "src")])},
+    )
+
+    assert result.returncode != 0
+    assert "candidate-only failed" in result.stderr
+    assert json.loads((graph_dir / "graph.json").read_text()) == original
+    assert not (staging / "execution-result.json").exists()
+    assert json.loads(state_path.read_text())["documents"]["1"]["pending"] == [
+        "APPROVAL_REQUIRED"
+    ]
+
+
+def test_missing_adapter_usage_is_unknown_not_measured_zero(tmp_path: Path):
+    plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
+    graph_dir.mkdir()
+    write_json(
+        graph_dir / "graph.json",
+        {
+            "directed": True,
+            "nodes": [
+                {
+                    "id": "old-approval",
+                    "label": "Refund approval",
+                    "rationale": "Refund requires approval.",
+                    "source_file": "old-[1].md",
+                }
+            ],
+            "links": [],
+            "hyperedges": [],
+        },
+    )
+    write_json(tmp_path / "approvals.json", approval_document(plan))
+    write_json(tmp_path / "quality.json", quality_document(plan))
+    stub = install_graphify_stub(tmp_path)
+    llm = stub / "graphify" / "llm.py"
+    source = llm.read_text()
+    assert ', "input_tokens": 123, "output_tokens": 45' in source
+    assert ', "external_calls": len(files)' in source
+    llm.write_text(
+        source.replace(', "input_tokens": 123, "output_tokens": 45', "").replace(
+            ', "external_calls": len(files)', ""
+        )
+    )
+
+    result = sync(
+        *execute_arguments(tmp_path, snapshot_path, state_path, staging, graph_dir),
+        env={"PYTHONPATH": os.pathsep.join([str(stub), str(ROOT / "src")])},
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads((staging / "execution-result.json").read_text())
+    assert report["tokens"] == {
+        "input_tokens": None,
+        "output_tokens": None,
+        "evidence": "unknown",
+    }
+    assert report["counts"]["external_calls"] is None
+    assert report["usage"]["token_evidence"] == "unknown"
+    assert report["usage"]["external_calls_evidence"] == "unknown"
+
+
 def test_concurrent_graph_baseline_change_rejects_publish(tmp_path: Path):
     plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
     graph_dir.mkdir()
@@ -682,6 +936,81 @@ def test_graph_publish_then_state_failure_recovers_without_rebilling(tmp_path: P
     assert (staging / "execution-result.json").is_file()
 
 
+def test_hard_exit_after_state_commit_recovers_report_without_reextracting(
+    tmp_path: Path,
+):
+    plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
+    graph_dir.mkdir()
+    write_json(
+        graph_dir / "graph.json",
+        {
+            "directed": True,
+            "nodes": [
+                {
+                    "id": "old-approval",
+                    "label": "Refund approval",
+                    "rationale": "Refund requires approval.",
+                    "source_file": "old-[1].md",
+                }
+            ],
+            "links": [],
+            "hyperedges": [],
+        },
+    )
+    write_json(tmp_path / "approvals.json", approval_document(plan))
+    write_json(tmp_path / "quality.json", quality_document(plan))
+    stub = install_graphify_stub(tmp_path)
+    shim = tmp_path / "hard-exit-shim"
+    shim.mkdir()
+    (shim / "sitecustomize.py").write_text(
+        """import os
+from pathlib import Path
+original = os.replace
+def exit_after_state(source, destination, *args, **kwargs):
+    result = original(source, destination, *args, **kwargs)
+    if (
+        os.environ.get("INJECT_HARD_EXIT") == "1"
+        and Path(destination) == Path(os.environ["STATE_PATH"])
+        and Path(os.environ["GRAPH_RESULT"]).exists()
+    ):
+        os._exit(77)
+    return result
+os.replace = exit_after_state
+"""
+    )
+    log = tmp_path / "graphify-calls.jsonl"
+    env = {
+        "PYTHONPATH": os.pathsep.join([str(shim), str(stub), str(ROOT / "src")]),
+        "GRAPHIFY_STUB_LOG": str(log),
+        "INJECT_HARD_EXIT": "1",
+        "STATE_PATH": str(state_path),
+        "GRAPH_RESULT": str(staging / "graph-update" / "result.json"),
+    }
+    arguments = execute_arguments(
+        tmp_path, snapshot_path, state_path, staging, graph_dir
+    )
+
+    crashed = sync(*arguments, env=env)
+
+    assert crashed.returncode == 77
+    assert not (staging / "execution-result.json").exists()
+    published = (graph_dir / "graph.json").read_bytes()
+    assert b"refund-limit" in published
+    assert (
+        json.loads(state_path.read_text())["documents"]["1"]["graph"]["version"]["utc"]
+        == "2026-11-09T00:00:00Z"
+    )
+    env["INJECT_HARD_EXIT"] = "0"
+
+    resumed = sync(*arguments, env=env)
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert (staging / "execution-result.json").is_file()
+    assert (graph_dir / "graph.json").read_bytes() == published
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert sum(row["event"] == "extract" for row in calls) == 1
+
+
 def test_new_document_can_be_added_to_existing_graph_without_full_rebuild(
     tmp_path: Path,
 ):
@@ -742,7 +1071,7 @@ def test_new_document_can_be_added_to_existing_graph_without_full_rebuild(
     write_json(
         tmp_path / "approvals.json",
         {
-            "schema_version": "knowledge-approvals-1.0",
+            "schema_version": "knowledge-approvals-2.0",
             "plan": "execution/plan.json",
             "approvals": [
                 {
@@ -751,10 +1080,7 @@ def test_new_document_can_be_added_to_existing_graph_without_full_rebuild(
                     "source_version": execution["source_version"],
                     "raw": execution["raw"],
                     "source_scope": "whole_document",
-                    "review_dispositions": [
-                        {"code": code, "decision": "acknowledged"}
-                        for code in execution["review_issues"]
-                    ],
+                    "review_dispositions": review_dispositions(execution),
                 }
             ],
         },
@@ -762,7 +1088,7 @@ def test_new_document_can_be_added_to_existing_graph_without_full_rebuild(
     write_json(
         tmp_path / "quality.json",
         {
-            "schema_version": "knowledge-quality-cases-1.0",
+            "schema_version": "knowledge-quality-cases-2.0",
             "plan": "execution/plan.json",
             "cases": [
                 {
@@ -864,10 +1190,7 @@ def test_partial_extraction_failure_preserves_graph_and_resumes_from_cache(
                 "source_version": execution["source_version"],
                 "raw": execution["raw"],
                 "source_scope": "whole_document",
-                "review_dispositions": [
-                    {"code": code, "decision": "acknowledged"}
-                    for code in execution["review_issues"]
-                ],
+                "review_dispositions": review_dispositions(execution),
             }
         )
         cases.append(
@@ -884,7 +1207,7 @@ def test_partial_extraction_failure_preserves_graph_and_resumes_from_cache(
     write_json(
         tmp_path / "approvals.json",
         {
-            "schema_version": "knowledge-approvals-1.0",
+            "schema_version": "knowledge-approvals-2.0",
             "plan": "execution/plan.json",
             "approvals": approvals,
         },
@@ -892,7 +1215,7 @@ def test_partial_extraction_failure_preserves_graph_and_resumes_from_cache(
     write_json(
         tmp_path / "quality.json",
         {
-            "schema_version": "knowledge-quality-cases-1.0",
+            "schema_version": "knowledge-quality-cases-2.0",
             "plan": "execution/plan.json",
             "cases": cases,
         },
@@ -954,6 +1277,371 @@ def test_partial_extraction_failure_preserves_graph_and_resumes_from_cache(
     ]
     state = json.loads(state_path.read_text())
     assert all(state["documents"][str(doc_id)]["pending"] == [] for doc_id in (1, 2))
+
+
+def old_rule_plan(tmp_path: Path) -> tuple[dict[str, Any], Path, Path, Path, Path]:
+    baseline, _ = write_raw_baseline(
+        tmp_path,
+        [
+            {
+                "id": 1,
+                "title": "Limits",
+                "version": "2026-11-07T00:00:00Z",
+                "body": (
+                    "# Limits\n\nRefund requires approval.\n\n"
+                    "Never give unverified applicants login access.\n\n"
+                    "Only Finance can authorize chargebacks.\n"
+                ),
+            }
+        ],
+    )
+    observed = captured_update(
+        tmp_path,
+        [
+            {
+                "id": 1,
+                "title": "Limits",
+                "version": "2026-11-09T00:00:00Z",
+                "body": (
+                    "# Limits\n\nRefund requires approval.\n\n"
+                    "Refund requires manager approval when amount exceeds 100 USD.\n"
+                ),
+            }
+        ],
+    )
+    snapshot_path = tmp_path / "snapshot.json"
+    write_json(snapshot_path, observed)
+    state_path = tmp_path / "state.json"
+    staging = tmp_path / "execution"
+    planned = sync(
+        "--knowledge",
+        "--snapshot",
+        str(snapshot_path),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(staging),
+        "--baseline",
+        str(baseline),
+    )
+    assert planned.returncode == 0, planned.stderr
+    return (
+        json.loads((staging / "plan.json").read_text()),
+        snapshot_path,
+        state_path,
+        staging,
+        tmp_path / "graphify-out",
+    )
+
+
+def test_each_old_rule_requires_an_individual_explicit_disposition(tmp_path: Path):
+    plan, snapshot_path, state_path, staging, graph_dir = old_rule_plan(tmp_path)
+    assert plan["schema_version"] == "knowledge-plan-2.0"
+    execution = plan["results"][0]["execution"]
+    old_issues = [
+        issue
+        for issue in execution["review_issues"]
+        if issue["code"] == "OLD_BODY_NOT_OBSERVED"
+    ]
+    assert len(old_issues) == 2
+    assert {issue["old"]["start_line"] for issue in old_issues} == {5, 7}
+    assert len({issue["issue_id"] for issue in old_issues}) == 2
+    graph_dir.mkdir()
+    write_json(
+        graph_dir / "graph.json",
+        {
+            "directed": True,
+            "nodes": [
+                {
+                    "id": "old-login",
+                    "label": "Old login limit",
+                    "rationale": "Never give unverified applicants login access.",
+                    "source_file": "old-[1].md",
+                },
+                {
+                    "id": "old-finance",
+                    "label": "Old finance limit",
+                    "rationale": "Only Finance can authorize chargebacks.",
+                    "source_file": "old-[1].md",
+                },
+            ],
+            "links": [],
+            "hyperedges": [],
+        },
+    )
+    approval = approval_document(plan)
+    dispositions = approval["approvals"][0]["review_dispositions"]
+    old_dispositions = [
+        item
+        for item in dispositions
+        if item["issue_id"] in {issue["issue_id"] for issue in old_issues}
+    ]
+    assert len(old_dispositions) == 2
+    assert all(item["decision"] == "approve_removal" for item in old_dispositions)
+    write_json(tmp_path / "quality.json", quality_document(plan))
+    stub = install_graphify_stub(tmp_path)
+    log = tmp_path / "graphify-calls.jsonl"
+    arguments = execute_arguments(
+        tmp_path, snapshot_path, state_path, staging, graph_dir
+    )
+    env = {
+        "PYTHONPATH": os.pathsep.join([str(stub), str(ROOT / "src")]),
+        "GRAPHIFY_STUB_LOG": str(log),
+    }
+    removed = next(
+        item for item in dispositions if item["issue_id"] == old_issues[0]["issue_id"]
+    )
+    dispositions.remove(removed)
+    write_json(tmp_path / "approvals.json", approval)
+
+    failed = sync(*arguments, env=env)
+
+    assert failed.returncode != 0
+    assert "exactly cover review issues" in failed.stderr
+    assert not log.exists()
+    dispositions.append(removed)
+    write_json(tmp_path / "approvals.json", approval)
+
+    succeeded = sync(*arguments, env=env)
+
+    assert succeeded.returncode == 0, succeeded.stderr
+    labels = {
+        node["label"]
+        for node in json.loads((graph_dir / "graph.json").read_text())["nodes"]
+    }
+    assert "Old login limit" not in labels
+    assert "Old finance limit" not in labels
+
+
+def test_preserved_old_rule_requires_and_validates_its_quality_case(tmp_path: Path):
+    plan, snapshot_path, state_path, staging, graph_dir = old_rule_plan(tmp_path)
+    graph_dir.mkdir()
+    write_json(graph_dir / "graph.json", {"nodes": [], "links": [], "hyperedges": []})
+    execution = plan["results"][0]["execution"]
+    issue = next(
+        item
+        for item in execution["review_issues"]
+        if item["code"] == "OLD_BODY_NOT_OBSERVED" and item["old"]["start_line"] == 5
+    )
+    approval = approval_document(plan)
+    disposition = next(
+        item
+        for item in approval["approvals"][0]["review_dispositions"]
+        if item["issue_id"] == issue["issue_id"]
+    )
+    disposition["decision"] = "preserve"
+    write_json(tmp_path / "approvals.json", approval)
+    quality = quality_document(plan)
+    quality["cases"].append(
+        {
+            "case_id": "old-login",
+            "book_id": 123,
+            "document_id": 1,
+            "source_version": execution["source_version"],
+            "record": "node",
+            "where": {"label": "Old login limit"},
+            "required": {"rationale": ["unverified applicants", "login access"]},
+        }
+    )
+    write_json(tmp_path / "quality.json", quality)
+    stub = install_graphify_stub(tmp_path)
+    llm = stub / "graphify" / "llm.py"
+    source = llm.read_text()
+    marker = "        current_edges = "
+    assert marker in source
+    llm.write_text(
+        source.replace(
+            marker,
+            '        current_nodes.append({"id": "old-login", "label": "Old login limit", "rationale": "Never give unverified applicants login access.", "source_file": source})\n'
+            + marker,
+        )
+    )
+    arguments = execute_arguments(
+        tmp_path, snapshot_path, state_path, staging, graph_dir
+    )
+    env = {"PYTHONPATH": os.pathsep.join([str(stub), str(ROOT / "src")])}
+
+    missing_binding = sync(*arguments, env=env)
+
+    assert missing_binding.returncode != 0
+    assert "requires explicit quality case bindings" in missing_binding.stderr
+    disposition["quality_case_ids"] = ["old-login"]
+    write_json(tmp_path / "approvals.json", approval)
+
+    succeeded = sync(*arguments, env=env)
+
+    assert succeeded.returncode == 0, succeeded.stderr
+    labels = {
+        node["label"]
+        for node in json.loads((graph_dir / "graph.json").read_text())["nodes"]
+    }
+    assert "Old login limit" in labels
+    assert "Old finance limit" not in labels
+
+
+def test_legacy_generic_review_ack_is_safely_rejected(tmp_path: Path):
+    plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
+    graph_dir.mkdir()
+    write_json(graph_dir / "graph.json", {"nodes": [], "links": []})
+    legacy = approval_document(plan)
+    legacy["schema_version"] = "knowledge-approvals-1.0"
+    legacy["approvals"][0]["review_dispositions"] = [
+        {"code": "OLD_BODY_NOT_OBSERVED", "decision": "acknowledged"}
+    ]
+    write_json(tmp_path / "approvals.json", legacy)
+    write_json(tmp_path / "quality.json", quality_document(plan))
+
+    result = sync(
+        *execute_arguments(tmp_path, snapshot_path, state_path, staging, graph_dir)
+    )
+
+    assert result.returncode != 0
+    assert "unsupported schema" in result.stderr
+    assert not (staging / "graph-update").exists()
+
+
+def test_planner_compares_the_same_frozen_new_bytes_it_approves(tmp_path: Path):
+    baseline, _ = write_raw_baseline(
+        tmp_path,
+        [
+            {
+                "id": 1,
+                "title": "Limits",
+                "version": "2026-11-07T00:00:00Z",
+                "body": "# Limits\n\nRefund requires approval.\n",
+            }
+        ],
+    )
+    observed = captured_update(
+        tmp_path,
+        [
+            {
+                "id": 1,
+                "title": "Limits",
+                "version": "2026-11-09T00:00:00Z",
+                "body": "# Limits\n\nRefund requires approval.\n\nFee is 100 USD.\n",
+            }
+        ],
+    )
+    snapshot_path = tmp_path / "snapshot.json"
+    write_json(snapshot_path, observed)
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "sitecustomize.py").write_text(
+        """import os
+from pathlib import Path
+original = Path.read_bytes
+triggered = False
+def mutate_before_read(self):
+    global triggered
+    if not triggered and str(self) == os.environ.get("MUTATE_INPUT"):
+        triggered = True
+        self.write_text("# Limits\\n\\nThis is a DIFFERENT source, fee is ZERO.\\n")
+    return original(self)
+Path.read_bytes = mutate_before_read
+"""
+    )
+    current_raw = tmp_path / "current-raw" / "1.md"
+    staging = tmp_path / "execution"
+
+    result = sync(
+        "--knowledge",
+        "--snapshot",
+        str(snapshot_path),
+        "--state",
+        str(tmp_path / "state.json"),
+        "--staging",
+        str(staging),
+        "--baseline",
+        str(baseline),
+        env={
+            "PYTHONPATH": os.pathsep.join([str(shim), str(ROOT / "src")]),
+            "MUTATE_INPUT": str(current_raw),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    row = json.loads((staging / "plan.json").read_text())["results"][0]
+    frozen = staging / row["execution"]["raw"]["path"]
+    changed = "This is a DIFFERENT source, fee is ZERO."
+    expected = changed if changed in frozen.read_text() else "Fee is 100 USD."
+    assert row["comparison"]["graphify_plan"]["candidate_body_chars"] == len(expected)
+
+
+def test_old_comparison_raw_change_after_approval_is_rejected(tmp_path: Path):
+    plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
+    graph_dir.mkdir()
+    write_json(graph_dir / "graph.json", {"nodes": [], "links": []})
+    write_json(tmp_path / "approvals.json", approval_document(plan))
+    write_json(tmp_path / "quality.json", quality_document(plan))
+    (tmp_path / "baseline-raw" / "1.md").write_text(
+        "# Limits\n\nA DIFFERENT OLD LIMIT REQUIRES BOARD APPROVAL.\n"
+    )
+    stub = install_graphify_stub(tmp_path)
+    log = tmp_path / "graphify-calls.jsonl"
+
+    result = sync(
+        *execute_arguments(tmp_path, snapshot_path, state_path, staging, graph_dir),
+        env={
+            "PYTHONPATH": os.pathsep.join([str(stub), str(ROOT / "src")]),
+            "GRAPHIFY_STUB_LOG": str(log),
+        },
+    )
+
+    assert result.returncode != 0
+    assert "old comparison input changed" in result.stderr
+    assert not log.exists()
+
+
+def test_superseded_plan_cannot_publish_or_clear_newer_pending(tmp_path: Path):
+    plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
+    graph_dir.mkdir()
+    original = {"nodes": [], "links": [], "hyperedges": []}
+    write_json(graph_dir / "graph.json", original)
+    write_json(tmp_path / "approvals.json", approval_document(plan))
+    write_json(tmp_path / "quality.json", quality_document(plan))
+    newer_root = tmp_path / "newer"
+    newer_root.mkdir()
+    newer = captured_update(
+        newer_root,
+        [
+            {
+                "id": 1,
+                "title": "Limits",
+                "version": "2026-11-10T00:00:00Z",
+                "body": (
+                    "# Limits\n\nRefund requires approval.\n\n"
+                    "Refund now requires director approval for 200 USD.\n"
+                ),
+            }
+        ],
+    )
+    newer_snapshot = newer_root / "snapshot.json"
+    write_json(newer_snapshot, newer)
+    newer_staging = newer_root / "planning"
+    planned = sync(
+        "--knowledge",
+        "--snapshot",
+        str(newer_snapshot),
+        "--state",
+        str(state_path),
+        "--staging",
+        str(newer_staging),
+    )
+    assert planned.returncode == 0, planned.stderr
+    before = (graph_dir / "graph.json").read_bytes()
+
+    result = sync(
+        *execute_arguments(tmp_path, snapshot_path, state_path, staging, graph_dir)
+    )
+
+    assert result.returncode != 0
+    assert "superseded" in result.stderr
+    record = json.loads(state_path.read_text())["documents"]["1"]
+    assert record["observation"]["version"]["utc"] == "2026-11-10T00:00:00Z"
+    assert record["graph"]["version"]["utc"] == "2026-11-07T00:00:00Z"
+    assert record["pending"] == ["APPROVAL_REQUIRED"]
+    assert (graph_dir / "graph.json").read_bytes() == before
 
 
 def test_raw_change_after_approval_is_rejected_before_extraction(tmp_path: Path):
