@@ -44,9 +44,9 @@ def source_path(manifest_path: Path, document: dict) -> Path:
     return path if path.is_absolute() else manifest_path.parent / path
 
 
-def character_counts(path: Path) -> dict[str, int]:
+def character_counts(path: Path, body_scope=None) -> dict[str, int]:
     text = path.read_text()
-    units = extract_units(text)
+    units = extract_units(text, body_scope)
     return {
         "raw_chars": len(text),
         "cleaned_body_chars": sum(len(unit.text) for unit in units),
@@ -167,14 +167,20 @@ def run(report_path: Path, baseline_path: Path, incoming_path: Path) -> dict:
     }
     for row in selected:
         identity = (row["knowledge_base"], row["document_id"])
-        updated = character_counts(source_path(incoming_path, incoming[identity]))
+        updated = character_counts(
+            source_path(incoming_path, incoming[identity]),
+            incoming[identity].get("body_scope"),
+        )
         values["updated_raw"].append(updated["raw_chars"])
         values["updated_cleaned_body"].append(updated["cleaned_body_chars"])
         values["updated_cleaned_non_heading"].append(
             updated["cleaned_non_heading_chars"]
         )
         if identity in baseline:
-            original = character_counts(source_path(baseline_path, baseline[identity]))
+            original = character_counts(
+                source_path(baseline_path, baseline[identity]),
+                baseline[identity].get("body_scope"),
+            )
             values["original_raw"].append(original["raw_chars"])
             values["original_cleaned_body"].append(original["cleaned_body_chars"])
             values["original_cleaned_non_heading"].append(

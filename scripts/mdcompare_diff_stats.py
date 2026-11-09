@@ -11,7 +11,7 @@ from pathlib import Path
 
 from mdcompare_candidate_stats import manifest, read_json, source_path
 
-from mdcompare.knowledge_units import _body_view, _prose_key
+from mdcompare.knowledge_units import BodyScopeError, _body_view, _prose_key
 
 BINS = (
     (0, 0, "0"),
@@ -29,28 +29,16 @@ BINS = (
 MAX_LINE_BLOCK_CHARS = 20_000
 
 
-def body(path: Path, *, transform=None) -> str:
-    # Statistics-only view: remove explicit generated blocks even when an
-    # exporter placed them inside a Markdown code fence. Do not infer provenance
-    # of unmarked text. This is deliberately not the product comparison view.
-    text = path.read_text()
-    text = re.sub(
-        r"<!--\s*mdocr:ocr-begin\b.*?-->.*?(?:<!--\s*mdocr:ocr-end\s*-->|\Z)",
-        lambda match: re.sub(r"[^\n]", " ", match.group()),
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    # Disable code-protection solely for this body-size estimate so image
-    # references and marked generated text are excluded in all structures.
+def body(path: Path, *, transform=None, body_scope=None) -> str:
+    # Establish exactly the product body scope before display-only cleanup.
+    # Generated regions inside literal code require verified source declarations.
+    text, _ = _body_view(path.read_text(), body_scope)
+    # These additional changes are only a textual-size estimate, never reuse
+    # authorization. Product comparison retains fences and indentation.
     text = "\n".join(
         "" if re.match(r"^\s*(?:`{3,}|~{3,})", line) else line.lstrip()
         for line in text.splitlines()
     ).replace("`", "")
-    text, _ = _body_view(text)
-    # An unclosed legacy marker has no reliable end; never guess a boundary or
-    # report its contents as comparable body. Leave that pair unscorable.
-    if re.search(r"这是一张图片[，,]\s*ocr\s*内容为", text, re.IGNORECASE):
-        raise ValueError("UNTERMINATED_EXCLUDED_REGION")
     if transform is not None:
         text = transform(text)
     # Normalize whitelisted cosmetic HTML and quantities per line. Unknown
@@ -111,16 +99,20 @@ def main() -> None:
             rows.append({"document_id": row["document_id"], "paired": False})
             continue
         try:
-            before = body(source_path(args.baseline, old[identity]))
-            after = body(source_path(args.incoming, new[identity]))
-        except ValueError as exc:
-            if str(exc) != "UNTERMINATED_EXCLUDED_REGION":
-                raise
+            before = body(
+                source_path(args.baseline, old[identity]),
+                body_scope=old[identity].get("body_scope"),
+            )
+            after = body(
+                source_path(args.incoming, new[identity]),
+                body_scope=new[identity].get("body_scope"),
+            )
+        except BodyScopeError as exc:
             rows.append(
                 {
                     "document_id": row["document_id"],
                     "paired": True,
-                    "unscorable": str(exc),
+                    "unscorable": exc.reason_code,
                 }
             )
             continue

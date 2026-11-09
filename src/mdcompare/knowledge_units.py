@@ -41,6 +41,68 @@ _QUANTITY = re.compile(
 _TAG = r"<%s\b(?:[^>\"']|\"[^\"]*\"|'[^']*')*>"
 _OCR_BEGIN = re.compile(r"<!--\s*mdocr:ocr-begin\b.*?-->", re.IGNORECASE | re.DOTALL)
 _OCR_END = re.compile(r"<!--\s*mdocr:ocr-end\s*-->", re.IGNORECASE)
+_LEGACY_OCR_BEGIN = re.compile(
+    r"<!--\s*这是一张图片[，,]\s*ocr\s*内容为[：:]", re.IGNORECASE
+)
+_LEGACY_OCR_COMMENT = re.compile(
+    r"<!--\s*这是一张图片[，,]\s*ocr\s*内容为[：:].*?-->",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+class BodyScopeError(ValueError):
+    """The observable body scope cannot be established safely."""
+
+    def __init__(self, reason_code: str):
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
+
+def _declared_generated_spans(
+    text: str, body_scope: dict | None
+) -> list[tuple[int, int]]:
+    """Resolve only source-declared generated regions, with exact line evidence."""
+    if not body_scope:
+        return []
+    if (
+        not isinstance(body_scope, dict)
+        or body_scope.get("version") != "generated-regions-v1"
+    ):
+        raise BodyScopeError("BODY_SCOPE_DECLARATION_INVALID")
+    regions = body_scope.get("regions")
+    if not isinstance(regions, list):
+        raise BodyScopeError("BODY_SCOPE_DECLARATION_INVALID")
+    spans = []
+    for region in regions:
+        if not isinstance(region, dict) or region.get("kind") != "mdocr_ocr":
+            raise BodyScopeError("BODY_SCOPE_DECLARATION_INVALID")
+        start_line, end_line = region.get("start_line"), region.get("end_line")
+        if (
+            type(start_line) is not int
+            or type(end_line) is not int
+            or start_line < 1
+            or end_line < start_line
+            or end_line > len(text.splitlines())
+        ):
+            raise BodyScopeError("BODY_SCOPE_LOCATION_MISMATCH")
+        begins = [
+            match
+            for match in _OCR_BEGIN.finditer(text)
+            if text.count("\n", 0, match.start()) + 1 == start_line
+        ]
+        ends = [
+            match
+            for match in _OCR_END.finditer(text)
+            if text.count("\n", 0, match.start()) + 1 == end_line
+        ]
+        if len(begins) != 1 or len(ends) != 1 or begins[0].end() > ends[0].start():
+            raise BodyScopeError("BODY_SCOPE_LOCATION_MISMATCH")
+        spans.append((begins[0].start(), ends[0].end()))
+    if any(left[1] > right[0] for left, right in zip(sorted(spans), sorted(spans)[1:])):
+        raise BodyScopeError("BODY_SCOPE_LOCATION_MISMATCH")
+    return spans
+
+
 _WORKFLOW = re.compile(
     r"流程|步骤|顺序|\b(?:workflow|procedure|steps|sequence)\b", re.IGNORECASE
 )
@@ -343,27 +405,47 @@ def _closing(text: str, start: int, opener: str, closer: str) -> int | None:
     return None
 
 
-def _body_view(text: str) -> tuple[str, set[int]]:
+def _body_view(text: str, body_scope: dict | None = None) -> tuple[str, set[int]]:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     original_lines = text.splitlines()
     line_ends = [index for index, char in enumerate(text) if char == "\n"]
     code = _code_ranges(text)
-    spans: list[tuple[int, int]] = []
-    for begin in _OCR_BEGIN.finditer(text):
-        if not _outside_code(begin.start(), code):
-            continue
-        end = _OCR_END.search(text, begin.end())
-        # An explicit but unterminated excluded region extends to EOF. It does
-        # not create an image/OCR task or gate the remaining extracted body.
-        spans.append((begin.start(), len(text) if end is None else end.end()))
+    spans = _declared_generated_spans(text, body_scope)
+    markers = [
+        (match.start(), "begin", match)
+        for match in _OCR_BEGIN.finditer(text)
+        if _outside_code(match.start(), code)
+    ]
+    markers += [
+        (match.start(), "end", match)
+        for match in _OCR_END.finditer(text)
+        if _outside_code(match.start(), code)
+    ]
+    open_begin = None
+    for _, marker_kind, match in sorted(markers, key=lambda item: item[0]):
+        if marker_kind == "begin":
+            if open_begin is not None:
+                raise BodyScopeError("BODY_SCOPE_BOUNDARY_INVALID")
+            open_begin = match
+        elif open_begin is None:
+            raise BodyScopeError("BODY_SCOPE_BOUNDARY_INVALID")
+        else:
+            spans.append((open_begin.start(), match.end()))
+            open_begin = None
+    if open_begin is not None:
+        # Do not silently discard an unknown tail or compare only a prefix.
+        raise BodyScopeError("BODY_SCOPE_BOUNDARY_UNCLOSED")
     # These are explicit historical generation delimiters, not OCR judgments.
-    for match in re.finditer(
-        r"<!--\s*这是一张图片[，,]\s*ocr\s*内容为[：:].*?-->",
-        text,
-        re.IGNORECASE | re.DOTALL,
-    ):
-        if _outside_code(match.start(), code):
-            spans.append(match.span())
+    legacy_comments = [
+        match
+        for match in _LEGACY_OCR_COMMENT.finditer(text)
+        if _outside_code(match.start(), code)
+    ]
+    spans.extend(match.span() for match in legacy_comments)
+    complete_starts = {match.start() for match in legacy_comments}
+    for begin in _LEGACY_OCR_BEGIN.finditer(text):
+        if _outside_code(begin.start(), code) and begin.start() not in complete_starts:
+            raise BodyScopeError("BODY_SCOPE_BOUNDARY_UNCLOSED")
     legacy_begin = list(re.finditer(r"(?m)^\s*>\s*\*\*图片转写[：:]\*\*[^\n]*", text))
     for index, begin in enumerate(legacy_begin):
         if not _outside_code(begin.start(), code):
@@ -379,9 +461,8 @@ def _body_view(text: str) -> tuple[str, set[int]]:
         if end and begin.end() + end.end() <= next_begin:
             spans.append((begin.start(), begin.end() + end.end()))
         else:
-            # An unpaired generated label is excluded alone; do not guess where
-            # its unmarked following text stops or remove a business section.
-            spans.append(begin.span())
+            # Do not guess where the generated region ends or reuse its tail.
+            raise BodyScopeError("BODY_SCOPE_BOUNDARY_UNCLOSED")
     for match in re.finditer(r"\[PaddleOCR image region: untranscribed\]", text):
         if _outside_code(match.start(), code):
             spans.append(match.span())
@@ -574,13 +655,13 @@ def _key(kind: str, text: str) -> str:
     return _prose_key(text)
 
 
-def extract_units(text: str) -> list[Unit]:
+def extract_units(text: str, body_scope: dict | None = None) -> list[Unit]:
     """Extract body units with original one-based line locations.
 
     Ordered lists and tables stay whole to preserve step order and value bindings.
     Unordered sibling facts can align independently; nesting supplies context.
     """
-    body, ignored_lines = _body_view(text)
+    body, ignored_lines = _body_view(text, body_scope)
     lines = body.splitlines()
     units = []
     headings: list[tuple[int, str]] = []

@@ -50,6 +50,41 @@ cannot discover which unmarked historical passages originated in OCR. Results
 describe the available body and retain that source limitation; they do not certify
 reconstruction of the historical raw document.
 
+Outside literal code, a complete `mdocr:ocr-begin`/`mdocr:ocr-end` region is
+excluded directly. Marker-shaped text inside fenced, indented or inline code is
+ordinary literal content by default: syntax alone cannot prove that it was
+generated. An exporter that knows such a region is generated must bind an explicit
+versioned declaration to that immutable document snapshot:
+
+```json
+{
+  "body_scope": {
+    "version": "generated-regions-v1",
+    "regions": [
+      {"kind": "mdocr_ocr", "start_line": 4, "end_line": 6}
+    ]
+  }
+}
+```
+
+The declaration is a top-level document field in the existing manifest. Lines are
+one-based and inclusive. Each declared start line must contain exactly one OCR
+begin marker, each end line exactly one OCR end marker, and their positions must
+form a non-overlapping forward region. Otherwise that document is `UNKNOWN`, with
+`BODY_SCOPE_DECLARATION_INVALID` or `BODY_SCOPE_LOCATION_MISMATCH`; no generated
+text is guessed from its spelling. An unclosed explicit region, legacy generated
+comment or unpaired transcription label is also `UNKNOWN` with
+`BODY_SCOPE_BOUNDARY_UNCLOSED`, rather than silently dropping the tail and
+approving the remaining prefix. An unpaired transcription label follows the same
+rule. Unmarked passages remain observable body and are
+never removed by inferred provenance.
+
+The current `body-units-v4` comparison and the reusable character-statistics
+scripts establish this same source scope before any statistics-only display
+cleanup. Those scripts may subsequently normalize code presentation for size
+estimates, but that does not authorize unit reuse. Strict `compare` does not
+consume `body_scope`; its file/resource/OCR evidence contract is unchanged.
+
 ## Knowledge units and decisions
 
 The comparison uses structure and local context rather than one whole-document

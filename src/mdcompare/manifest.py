@@ -90,6 +90,7 @@ def load_manifest(
                 path.parent,
                 ocr if isinstance(ocr, dict) else None,
                 provenance if isinstance(provenance, dict) else {},
+                row.get("body_scope", {}),
             )
         )
     return sorted(documents, key=lambda d: d.identity)
