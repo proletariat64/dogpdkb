@@ -1,7 +1,7 @@
 # 04: 实现审核后完整来源提取与安全发布
 
 Type: task
-Status: resolved
+Status: claimed
 Blocked by: 03
 
 ## Context
