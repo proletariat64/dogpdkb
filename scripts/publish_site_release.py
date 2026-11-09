@@ -15,12 +15,12 @@ from urllib.request import urlopen
 
 PROJECT = "pd.pt/dogpdkb"
 RELEASE_URL = f"https://code.alipay.com/{PROJECT}/releases"
-SITE = "/home/admin/webserver/site/kb"
-SITE_URL = "http://poolab-iys595a7znqgza1e.inc.alipay.net/kb/release.json"
+SITE = "/home/admin/webserver/site/releases"
+SITE_URL = "http://poolab-iys595a7znqgza1e.inc.alipay.net/releases/dogpdkb.json"
 STAGING = "/home/admin/workspace/.dogpdkb-release-site"
 TAG_PATTERN = r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 
-# This program runs on the host. Only release.json is replaced; existing HTML,
+# This program runs on the host. Only dogpdkb.json is replaced; existing HTML,
 # catalogs and server configuration remain untouched. The lock also serializes
 # competing publishers so an older release cannot win a concurrent update.
 REMOTE_UPDATE = r"""
@@ -40,7 +40,9 @@ temporary = None
 try:
     payload = source.read_bytes()
     expected = json.loads(payload)
-    with (destination.parent / ".release.lock").open("a") as lock:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(destination.parent, 0o755)
+    with (destination.parent / ".dogpdkb.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         previous = destination.read_bytes() if destination.exists() else None
         previous_mode = destination.stat().st_mode & 0o7777 if previous is not None else 0o644
@@ -174,11 +176,14 @@ def metadata(tag: str, release: object, installer: bytes) -> dict:
             raise SitePublishError("Installer does not match the selected Release")
     return {
         "schema_version": 1,
+        "product": "dogpdkb",
         "version": version,
         "tag": tag,
         "channel": "stable",
+        "provider": "antcode",
         "installer_url": f"{base}/install.sh",
         "release_url": RELEASE_URL,
+        "auth": "none",
         "published_at": published,
     }
 
@@ -233,7 +238,7 @@ def publish(tag: str) -> None:
                     f":{staged_file}",
                 ]
             )
-            remote_python(REMOTE_UPDATE, staged_file, f"{SITE}/release.json", SITE_URL)
+            remote_python(REMOTE_UPDATE, staged_file, f"{SITE}/dogpdkb.json", SITE_URL)
     finally:
         # Only the unique staging directory owned by this invocation is removed.
         try:

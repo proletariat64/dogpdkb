@@ -43,11 +43,14 @@ def installer():
 def test_metadata_shape(release, installer):
     assert tool.metadata("v1.2.3", release, installer) == {
         "schema_version": 1,
+        "product": "dogpdkb",
         "version": "1.2.3",
         "tag": "v1.2.3",
         "channel": "stable",
+        "provider": "antcode",
         "installer_url": f"{tool.RELEASE_URL}/download/v1.2.3/install.sh",
         "release_url": tool.RELEASE_URL,
+        "auth": "none",
         "published_at": "2026-11-06T00:00:00Z",
     }
 
@@ -203,9 +206,11 @@ def execute_remote(tmp_path):
 def test_remote_atomic_publish_and_readback(tmp_path, monkeypatch, release, installer):
     data = tool.metadata("v1.2.3", release, installer)
     destination, stage = run_remote(tmp_path, monkeypatch, data)
+    destination.parent.chmod(0o750)
     execute_remote(tmp_path)
     assert json.loads(destination.read_bytes()) == data
     assert destination.stat().st_mode & 0o777 == 0o644
+    assert destination.parent.stat().st_mode & 0o777 == 0o755
     assert not stage.exists()
 
 

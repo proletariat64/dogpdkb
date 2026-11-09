@@ -24,14 +24,14 @@ have separate ownership. No Nginx reload is needed for this static-file update.
 
 ## Release ownership
 
-The UI reads `release.json` with `cache: no-store`, independently of the corpus.
+The UI reads `/releases/dogpdkb.json` with `cache: no-store`, independently of the corpus.
 `make release` first finalizes its AntCode Release, then calls
 `make publish-site-release TAG=vX.Y.Z`. The helper:
 
 1. Validates exact tag, stable/published/anonymous/unblocked state and attachments.
 2. Fetches the anonymous HTTPS installer and validates its version, wheel and URL.
 3. Sends only small metadata via `poolab` to a unique staging directory.
-4. Holds a lock and atomically replaces `/kb/release.json`; refuses stable downgrades.
+4. Holds a lock and atomically replaces `/releases/dogpdkb.json`; refuses stable downgrades.
 5. Confirms file and HTTP readback, rolling back to prior bytes on verification
    failure, then cleans its own staging directory.
 
@@ -40,8 +40,9 @@ keeps the existing version and retries publication plus homepage update. For a
 site-only repair, use `make publish-site-release TAG=vX.Y.Z`. Neither path edits
 HTML, knowledge data, Nginx, installed programs or services.
 
-Metadata fields: `schema_version` (1), `version`, `tag`, `channel` (`stable`),
-`installer_url`, `release_url`, `published_at`. The UI constructs the shell command
+Metadata fields: `schema_version` (1), `product` (`dogpdkb`), `version`, `tag`,
+`channel` (`stable`), `provider` (`antcode`), `auth` (`none`), `installer_url`,
+`release_url`, `published_at`. The UI constructs the shell command
 itself; it never accepts an arbitrary command from JSON. It validates the precise
 AntCode HTTPS URL and canonical version/tag before enabling copying.
 

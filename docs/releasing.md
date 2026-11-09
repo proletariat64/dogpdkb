@@ -33,7 +33,7 @@ credentials. The command:
    dependencies, then `make check` and `make smoke` before creating a tag.
 5. Creates an annotated `v<project.version>` tag and pushes only that tag to GitHub.
 6. Publishes anonymous installation attachments through the local AntCode CLI.
-7. Verifies the published installer and updates the homepage's `release.json`
+7. Verifies the published installer and updates the homepage's `dogpdkb.json`
    through `poolab`.
 
 Dry run reports the current version and planned checks without fetching,
@@ -162,7 +162,7 @@ make publish-site-release TAG=v0.1.1
 
 The homepage helper accepts only published, anonymous, unblocked stable Releases
 whose installer identifies that exact version and URL. It atomically replaces
-only `/home/admin/webserver/site/kb/release.json`, verifies readback and HTTP view,
+only `/home/admin/webserver/site/releases/dogpdkb.json`, verifies readback and HTTP view,
 and refuses to move an existing stable homepage to an older version. Failed
 post-write verification restores previous metadata while holding the same lock,
 or removes the new file on first publication. It never edits the knowledge
