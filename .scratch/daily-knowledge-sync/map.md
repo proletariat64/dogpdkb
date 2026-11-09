@@ -20,6 +20,7 @@
 - 五票覆盖已批准规格；审批执行开发被本次implement-spec授权，但真实生产/付费动作仍未授权。
 - 01 已合入：正文使用 `body-units-v4`；代码内生成区须有 `generated-regions-v1` 声明并验证位置，未声明的代码标记保留为字面内容；无效声明或无法配对的边界返回 UNKNOWN/HOLD。保留 `knowledge-1.0` 既有字段/退出码及旧 compare 行为。详情与上下文见 [01 Answer](issues/01-body-view.md#answer)；实现提交 `0e94797d796d007e5cde56a5d00fa27ebd63b4d9`，合并提交 `7c6f33b1649648e74c995cfbb4cb4cfb3aa137ee`。集成验证：指定知识比较测试 146 passed，8 个变更 Python 文件 Ruff check 通过。
 - 02 已在独立分支实现并复验：`dogpdkb discover --snapshot` 输出 `knowledge-capture-1.0`，支持完整观察、增量分类、选中 raw、pending 与私有续跑；初次观察不全库导出，完整基线不可覆盖。03 直接按 [02 Answer](issues/02-observation-capture.md#answer) 消费 documents/changes/exports/pending 和相对 raw 引用。合入 01 后聚焦验证 195 passed。合并提交 `656ee3384096068374f3336cfcd64abaec37315c`；集成验证：`test_knowledge_capture.py`、`test_sync.py`、`test_mcp_recovery.py`、`test_mdcompare_knowledge_cli.py` 共 110 passed；3 个变更 Python 文件 Ruff check 通过。
+- 03 已合入：`sync --knowledge` 默认只规划，独立记录观察、语料和图谱状态，候选需显式批准；04 执行及审批合同、状态与恢复细节见 [03 Answer](issues/03-plan-state.md#answer)。实现提交 `590781c6e5615091bd75ea2a3389839890ea083e`，合并提交 `9c1ea491dae1f982a2afafd6e9b2da68282c9882`。集成验证：`test_knowledge_sync.py`、`test_knowledge_capture.py`、`test_pipeline.py`、`test_platform.py`、`test_mdcompare_knowledge_cli.py`、`test_mdcompare_knowledge_units.py` 共 195 passed；4 个变更 Python 文件 Ruff check 和 format --check 通过。04 的 03 集成门禁已通过；未执行生产操作。
 
 ## Fog
 
