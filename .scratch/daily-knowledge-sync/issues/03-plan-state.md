@@ -1,7 +1,7 @@
 # 03: 接通只读知识规划与三类版本状态
 
 Type: task
-Status: ready-for-agent
+Status: claimed
 Blocked by: 01, 02
 
 ## Context
