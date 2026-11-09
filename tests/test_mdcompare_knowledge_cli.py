@@ -108,6 +108,43 @@ def test_images_and_ocr_do_not_generate_tasks_or_gate_historical_body(tmp_path):
     assert "完全不同的识别结果" not in serialized
 
 
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        (
+            '正文相同\n<div class="old"><span><img src="missing-a.png"></span></div>',
+            '正文相同\n<div><span class="new">![图片](missing-b.png)</span></div>',
+        ),
+        (
+            "正文相同\n<div><span>[![图片](missing-a.png)](/old)</span></div>",
+            '正文相同\n<div class="new">![图片](missing-b.png)</div>',
+        ),
+        (
+            '正文相同\n<a href="/old"><img src="missing-a.png"></a>',
+            '正文相同\n<a href="/new"><img src="missing-b.png"></a>',
+        ),
+        (
+            '[接口][api]\n\n<div><img src="missing-a.png"></div>\n\n[api]: /pay',
+            (
+                '[接口][api]\n\n<div class="new"><img src="missing-b.png"></div>'
+                "\n\n[api]: /pay"
+            ),
+        ),
+    ],
+)
+def test_excluded_image_wrappers_remain_reusable(tmp_path, before, after):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    old.write_text(before)
+    new.write_text(after)
+    result, report = invoke(tmp_path, [document(old)], [document(new)])
+    assert result.returncode == 0, result.stderr
+    row = report["results"][0]
+    assert row["status"] == "REUSE"
+    assert row["graphify_plan"]["action"] == "KEEP_EXISTING"
+    assert not report["errors"]
+
+
 def test_verified_generated_region_inside_code_fence_is_outside_body(tmp_path):
     old = tmp_path / "old.md"
     new = tmp_path / "new.md"
@@ -175,6 +212,70 @@ def test_undeclared_marker_text_in_code_remains_literal(tmp_path):
     assert row["status"] == "REVIEW"
     assert row["graphify_plan"]["action"] == "BODY_DELTA_CANDIDATE"
     assert row["graphify_plan"]["candidate_body_chars"] > 0
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        (
+            "```js\nconst x = '<p id=\"a\"></p>';\n```",
+            "```js\nconst x = '<p id=\"b\"></p>';\n```",
+        ),
+        (
+            "    const x = '<p id=\"a\"></p>';",
+            "    const x = '<p id=\"b\"></p>';",
+        ),
+        ('Use `<p id="a"></p>` literally.', 'Use `<p id="b"></p>` literally.'),
+        (
+            '规则：审批。\n<div data-subject="A"></div>',
+            '规则：审批。\n<div data-subject="B"></div>',
+        ),
+        (
+            '规则：审批。\n<div data-subject="![a](a.png)"></div>',
+            '规则：审批。\n<div data-subject="![b](b.png)"></div>',
+        ),
+        (
+            '规则：审批。\n<div data-subject="A"><img src="missing-a.png"></div>',
+            '规则：审批。\n<div data-subject="B"><img src="missing-b.png"></div>',
+        ),
+        (
+            '规则：审批。\n<div style="display:none"><img src="missing-a.png"></div>',
+            '规则：审批。\n<div><img src="missing-b.png"></div>',
+        ),
+        ('规则：审批。\n<a href="/a"></a>', '规则：审批。\n<a href="/b"></a>'),
+        (
+            '规则：审批。\n<a href="/image" data-subject="A"><img src="a.png"></a>',
+            '规则：审批。\n<a href="/image" data-subject="B"><img src="b.png"></a>',
+        ),
+        ("```js\nconst x = '[](/a)';\n```", "```js\nconst x = '[](/b)';\n```"),
+        ("规则：审批。\n[](/a)", "规则：审批。\n[](/b)"),
+    ],
+)
+def test_image_cleanup_does_not_hide_code_or_semantic_markup_changes(
+    tmp_path, before, after
+):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    old.write_text(before)
+    new.write_text(after)
+    result, report = invoke(tmp_path, [document(old)], [document(new)])
+    assert result.returncode == 2, result.stderr
+    row = report["results"][0]
+    assert row["status"] == "REVIEW"
+    assert row["graphify_plan"]["action"] == "BODY_DELTA_CANDIDATE"
+    assert row["graphify_plan"]["candidate_body_chars"] > 0
+
+
+def test_image_syntax_in_attribute_does_not_authorize_wrapper_removal(tmp_path):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    old.write_text(
+        '付款必须经过审批后才能处理。\n<figure class="![x](missing.png)"></figure>'
+    )
+    new.write_text("付款必须经过审批后才能处理。")
+    result, report = invoke(tmp_path, [document(old)], [document(new)])
+    assert result.returncode == 2, result.stderr
+    assert report["results"][0]["status"] == "REVIEW"
 
 
 def test_generated_region_declaration_must_match_source_location(tmp_path):
@@ -449,6 +550,51 @@ def test_meaningful_financial_table_url_order_and_code_changes_remain_candidates
     assert row["status"] == "REVIEW"
     assert row["graphify_plan"]["action"] == "BODY_DELTA_CANDIDATE"
     assert row["graphify_plan"]["candidate_body_chars"] > 0
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ('<div style="display:none">允许付款</div>', "<div>允许付款</div>"),
+        ('<p style="display:none">允许付款</p>', "<p>允许付款</p>"),
+        ('允许<br style="display:none"/>付款', "允许<br/>付款"),
+        ("<p hidden>允许付款</p>", "<p>允许付款</p>"),
+        (
+            '<div data-subject="A">允许付款</div>',
+            '<div data-subject="B">允许付款</div>',
+        ),
+        ('允许<br aria-hidden="true"/>付款', "允许<br/>付款"),
+        ('<div style="position:absolute">允许付款</div>', "<div>允许付款</div>"),
+    ],
+)
+def test_html_table_cell_semantic_attributes_require_review(tmp_path, before, after):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    table = "<table><tr><th>规则</th></tr><tr><td>{}</td></tr></table>"
+    old.write_text(table.format(before))
+    new.write_text(table.format(after))
+    result, report = invoke(tmp_path, [document(old)], [document(new)])
+    assert result.returncode == 2, result.stderr
+    row = report["results"][0]
+    assert row["status"] == "REVIEW"
+    assert row["graphify_plan"]["action"] == "BODY_DELTA_CANDIDATE"
+    assert row["graphify_plan"]["candidate_body_chars"] > 0
+
+
+def test_html_table_cell_safe_presentation_still_reuses_knowledge(tmp_path):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    old.write_text(
+        '<table><tr><th>规则</th></tr><tr><td><div style="font-size:14px">'
+        '付款</div><br style="color:red"/><p class="note" '
+        'style="font-family:serif">审批</p></td></tr></table>'
+    )
+    new.write_text("<table><tr><th>规则</th></tr><tr><td>付款 审批</td></tr></table>")
+    result, report = invoke(tmp_path, [document(old)], [document(new)])
+    assert result.returncode == 0, result.stderr
+    row = report["results"][0]
+    assert row["status"] == "REUSE"
+    assert row["graphify_plan"]["action"] == "KEEP_EXISTING"
 
 
 def test_graphify_plan_counts_only_new_body_units_not_reused_or_headings(tmp_path):

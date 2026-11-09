@@ -257,6 +257,7 @@ class _SimpleTable(HTMLParser):
             if tag in {"font", "span", "u"} and _cosmetic_attrs(attrs):
                 return
             if tag in {"br", "p", "div"}:
+                self.failed |= not _cosmetic_attrs(attrs)
                 self.cell.append(" ")
             elif tag in {"b", "strong"}:
                 self.cell.append("**")
@@ -463,6 +464,7 @@ def _body_view(text: str, body_scope: dict | None = None) -> tuple[str, set[int]
         else:
             # Do not guess where the generated region ends or reuse its tail.
             raise BodyScopeError("BODY_SCOPE_BOUNDARY_UNCLOSED")
+    image_spans_start = len(spans)
     for match in re.finditer(r"\[PaddleOCR image region: untranscribed\]", text):
         if _outside_code(match.start(), code):
             spans.append(match.span())
@@ -483,6 +485,13 @@ def _body_view(text: str, body_scope: dict | None = None) -> tuple[str, set[int]
         if _outside_code(match.start(), code):
             spans.append(match.span())
 
+    # Markdown-looking text inside an HTML tag is an attribute, not an image.
+    html_tags = [
+        match.span()
+        for match in re.finditer(
+            r"</?[A-Za-z][A-Za-z0-9:-]*\b(?:[^>\"']|\"[^\"]*\"|'[^']*')*>", text
+        )
+    ]
     image_labels = set()
     for match in re.finditer(r"!\[", text):
         start = match.start()
@@ -491,7 +500,7 @@ def _body_view(text: str, body_scope: dict | None = None) -> tuple[str, set[int]
             before -= 1
         if (start - before) % 2:
             continue
-        if not _outside_code(start, code):
+        if not _outside_code(start, code) or not _outside_code(start, html_tags):
             continue
         close = _closing(text, start + 1, "[", "]")
         if close is None:
@@ -511,6 +520,7 @@ def _body_view(text: str, body_scope: dict | None = None) -> tuple[str, set[int]
             image_labels.add(label)
         spans.append((start, end))
 
+    image_spans = spans[image_spans_start:]
     for start, end in sorted(spans, reverse=True):
         text = text[:start] + _blank(text[start:end]) + text[end:]
     excluded_lines = set()
@@ -518,8 +528,58 @@ def _body_view(text: str, body_scope: dict | None = None) -> tuple[str, set[int]
         excluded_lines.update(
             range(bisect_right(line_ends, start), bisect_right(line_ends, end) + 1)
         )
-    # A link around an image contains no body label after the image is removed.
-    text = re.sub(r"\[\s*\]\([^\n)]*\)", lambda m: _blank(m[0]), text)
+
+    def contains_excluded_image(match):
+        return not any(
+            start < match.end() and match.start() < end for start, end in code
+        ) and any(
+            match.start("content") <= start and end <= match.end("content")
+            for start, end in image_spans
+        )
+
+    # Only links made empty by image removal are absent from body knowledge.
+    text = re.sub(
+        r"\[(?P<content>\s*)\]\([^\n)]*\)",
+        lambda match: _blank(match[0]) if contains_excluded_image(match) else match[0],
+        text,
+    )
+    empty_wrapper = re.compile(
+        r"<(?P<tag>div|span|p|a|figure|center)\b(?P<attrs>(?:[^>\"']|\"[^\"]*\"|'[^']*')*)>(?P<content>\s*)</(?P=tag)\s*>",
+        re.IGNORECASE,
+    )
+
+    def blank_image_wrapper(match):
+        if not contains_excluded_image(match):
+            return match[0]
+        attrs = []
+        cursor = 0
+        for attribute in _ATTRIBUTE.finditer(match["attrs"]):
+            if match["attrs"][cursor : attribute.start()].strip():
+                return match[0]
+            name = attribute[1].casefold()
+            value = next((v for v in attribute.groups()[1:] if v is not None), None)
+            if not (
+                value is not None
+                and (
+                    (name == "href" and match["tag"].casefold() == "a")
+                    or (
+                        name == "align"
+                        and value.casefold() in {"left", "right", "center", "justify"}
+                    )
+                )
+            ):
+                attrs.append((name, value))
+            cursor = attribute.end()
+        if match["attrs"][cursor:].strip() or not _cosmetic_attrs(attrs):
+            return match[0]
+        return _blank(match[0])
+
+    # Work before variable-length reference binding so image and code offsets hold.
+    while True:
+        cleaned = empty_wrapper.sub(blank_image_wrapper, text)
+        if cleaned == text:
+            break
+        text = cleaned
     # Remove image-only reference declarations. A shared ordinary link keeps its target.
     ordinary_labels = {
         (match[2] or match[1]).strip().casefold()
@@ -554,16 +614,6 @@ def _body_view(text: str, body_scope: dict | None = None) -> tuple[str, set[int]
             replacements.append((match.start(), match.end(), f"[{match[1]}]({target})"))
     for start, end, replacement in reversed(replacements):
         text = text[:start] + replacement + text[end:]
-    # Presentation-only wrappers around removed images contain no body knowledge.
-    empty_wrapper = re.compile(
-        r"<(?P<tag>div|span|p|a|figure|center)\b(?:[^>\"']|\"[^\"]*\"|'[^']*')*>\s*</(?P=tag)\s*>",
-        re.IGNORECASE,
-    )
-    while True:
-        cleaned = empty_wrapper.sub(lambda match: _blank(match[0]), text)
-        if cleaned == text:
-            break
-        text = cleaned
     ignored = {
         index
         for index, line in enumerate(text.splitlines())
