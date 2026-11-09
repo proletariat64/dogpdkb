@@ -1,7 +1,7 @@
 # 05: 完成正式UAT、安装与使用交付
 
 Type: task
-Status: ready-for-agent
+Status: claimed
 Blocked by: 04
 
 ## Context
