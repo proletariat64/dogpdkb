@@ -51,8 +51,11 @@ new version's curl installer to gain these commands. See
 OCR reuse evidence before processing. It emits versioned JSON, bounded optional
 differences and conservative UNKNOWN decisions; it does not run a sync or OCR.
 See the [mdcompare guide](docs/mdcompare.md), [evidence contracts](docs/mdcompare-contract.md)
-and [real-file UAT record](docs/mdcompare-uat.md). It is included in the wheel;
-production pipeline integration and managed installer command links are unchanged.
+and [real-file UAT record](docs/mdcompare-uat.md). It is included in the wheel.
+For the opt-in daily raw snapshot, review and approved whole-document workflow, see
+[daily knowledge sync](docs/daily-knowledge-sync.md) and its
+[isolated UAT](docs/daily-knowledge-sync-uat.md). Existing commands remain unchanged
+unless `--snapshot` or `sync --knowledge` is explicitly selected.
 
 ## mdocr — Markdown image prepare/OCR CLI
 
