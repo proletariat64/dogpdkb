@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -1057,3 +1058,42 @@ def test_execution_outputs_cannot_overwrite_approval_input(tmp_path: Path):
     assert {path: path.read_bytes() for path in protected} == before
     assert not (staging / "execution-result.json").exists()
     assert not (staging / "graph-update").exists()
+
+
+def test_graphify_python_symlink_preserves_virtual_environment(tmp_path: Path):
+    plan, snapshot_path, state_path, staging, graph_dir = candidate_plan(tmp_path)
+    graph_dir.mkdir()
+    write_json(graph_dir / "graph.json", {"nodes": [], "links": []})
+    write_json(tmp_path / "approvals.json", approval_document(plan))
+    write_json(tmp_path / "quality.json", quality_document(plan))
+    graph_env = tmp_path / "graph-venv"
+    subprocess.run(
+        [sys.executable, "-m", "venv", str(graph_env)],
+        check=True,
+        capture_output=True,
+    )
+    site = (
+        graph_env
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    stub = install_graphify_stub(tmp_path)
+    shutil.copytree(stub / "graphify", site / "graphify")
+    (site / "networkx.py").write_text(
+        "class Graph:\n"
+        "    def add_node(self, *args, **kwargs): pass\n"
+        "    def add_edge(self, *args, **kwargs): pass\n"
+        "class DiGraph(Graph): pass\n"
+    )
+    arguments = execute_arguments(
+        tmp_path, snapshot_path, state_path, staging, graph_dir
+    )
+    arguments[arguments.index("--graphify-python") + 1] = str(graph_env / "bin/python")
+
+    result = sync(*arguments)
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads((staging / "execution-result.json").read_text())
+    assert report["counts"]["graph_successes"] == 1
+    assert report["quality_gate"]["status"] == "passed"
