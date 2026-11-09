@@ -394,6 +394,10 @@ def run_pipeline(
 
 
 def main() -> None:
+    if "--knowledge" in sys.argv[1:]:
+        from dogpdkb.knowledge_sync import main as knowledge_main
+
+        raise SystemExit(knowledge_main(sys.argv[1:]))
     parser = argparse.ArgumentParser(description=__doc__)
     config_arguments(parser, book=True)
     parser.add_argument("-i", "--input", type=cli_path)
