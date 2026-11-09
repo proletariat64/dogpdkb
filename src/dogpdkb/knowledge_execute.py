@@ -191,7 +191,7 @@ def _run_graphify(
     graph_dir = args.graph_dir.expanduser().resolve()
     graph_staging = args.staging.expanduser().resolve() / "graph-update"
     interpreter = (
-        args.graphify_python.expanduser().resolve()
+        args.graphify_python.expanduser().absolute()
         if args.graphify_python
         else Path(sys.executable)
     )
