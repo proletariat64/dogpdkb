@@ -1,7 +1,7 @@
 # 02: 正式化完整观察快照与增量导出
 
 Type: task
-Status: ready-for-agent
+Status: claimed
 Blocked by: none
 
 ## Context

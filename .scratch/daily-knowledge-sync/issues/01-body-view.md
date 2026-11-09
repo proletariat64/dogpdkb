@@ -1,7 +1,7 @@
 # 01: 统一正式正文范围
 
 Type: task
-Status: ready-for-agent
+Status: claimed
 Blocked by: none
 
 ## Context
