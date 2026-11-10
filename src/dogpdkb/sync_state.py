@@ -123,9 +123,13 @@ def initialize_state(
     if state.get("active_run"):
         raise StateError("unfinished sync plan exists; resume it before initialization")
     book = state["books"].setdefault(book_key, {"documents": {}})
-    if book.get("url") and book["url"] != url:
+    if book.get("url") and url and book["url"].rstrip("/") != url.rstrip("/"):
         raise StateError("book key belongs to a different source URL")
-    book.update(key=book_key, url=url, name=name)
+    book["key"] = book_key
+    if url:
+        book["url"] = url
+    if name:
+        book["name"] = name
     book.setdefault("book_id", None)
     sources = _source_names(graph_dir)
     source_ids = {m.group(2) for source in sources if (m := LOCAL_NAME.search(source))}

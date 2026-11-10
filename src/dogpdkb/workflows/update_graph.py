@@ -61,6 +61,10 @@ def sync_scope(
     manifest: dict[str, Any], corpus: Path, staging: Path
 ) -> tuple[list[str], list[str], list[str], dict[str, str]]:
     exported = manifest.get("exported") or []
+    if any(row.get("anomalies") for row in exported) or any(
+        failure.get("stage") == "version" for failure in manifest.get("failures", [])
+    ):
+        raise ValueError("sync manifest contains unresolved source version anomalies")
     current_files = [row["file"] for row in exported]
     if len(set(current_files)) != len(current_files):
         raise ValueError("sync manifest contains duplicate output files")
@@ -669,7 +673,9 @@ def main() -> None:
         if tracker:
             for row in manifest.get("exported", []):
                 identity = str(row["id"])
-                version = tracker.version(row.get("content_updated_at"))
+                version = row.get("source_version") or tracker.version(
+                    row.get("content_updated_at")
+                )
                 tracker.step(
                     identity, "graph", "completed", version=version, file=row["file"]
                 )
@@ -700,7 +706,16 @@ def main() -> None:
             for row in manifest.get("deleted", []):
                 identity = str(row["id"])
                 tracker.step(identity, "graph", "completed", deleted=True)
-                tracker.update(identity, graph={"status": "deleted", "version": None})
+                pending = tracker.book["documents"][identity].get("pending", [])
+                tracker.update(
+                    identity,
+                    graph={"status": "deleted", "version": None},
+                    pending=[
+                        reason
+                        for reason in pending
+                        if reason != "GRAPH_DELETION_REQUIRED"
+                    ],
+                )
             tracker.phase("graph", "completed", result=str(staging / "result.json"))
             if not os.environ.get("DOGPDKB_RUN_STAGING"):
                 tracker.finish()

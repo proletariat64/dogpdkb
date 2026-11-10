@@ -39,6 +39,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--graph-dir", type=Path)
     parser.add_argument("--graphify-python", type=Path)
     args = parser.parse_args(argv)
+    if not args.execute and (args.approvals or args.quality_cases):
+        parser.error("--approvals and --quality-cases require --execute")
+    if args.execute and (
+        not args.approvals or not args.quality_cases or not args.graph_dir
+    ):
+        parser.error("--execute requires --approvals, --quality-cases and --graph-dir")
+    if args.execute:
+        try:
+            execution_module = importlib.import_module("dogpdkb.knowledge_execute")
+        except ImportError:
+            parser.exit(1, "knowledge sync: approved execution is not installed\n")
     if args.config or args.book or args.input or args.state is None:
         config = configure(parser, args.config)
         source = configured_book(parser, config, args)
@@ -54,16 +65,18 @@ def main(argv: list[str] | None = None) -> int:
                     name=source.name,
                 )
             observed = _load_snapshot(args.snapshot.expanduser().resolve())
-            Progress(
+            progress = Progress(
                 corpus,
                 source.key,
                 url=source.url,
                 name=source.name,
                 book_id=observed["book"]["book_id"],
-            ).claim(
+            )
+            progress.claim(
                 args.staging,
                 phase="execute" if args.execute else "compare",
                 parent=args.snapshot,
+                persist=False,
             )
             if (
                 args.state
@@ -99,8 +112,16 @@ def main(argv: list[str] | None = None) -> int:
 
                     for doc_id, row in legacy["documents"].items():
                         current = entry["documents"].get(doc_id) or {}
-                        if current.get("graph") and current["graph"] != row.get(
-                            "graph"
+                        if (
+                            current.get("observed")
+                            or current.get("observation")
+                            or current.get("pending")
+                            or current.get("steps")
+                            or (current.get("corpus") or {}).get("raw")
+                            or (
+                                (current.get("graph") or {})
+                                and current["graph"] != row.get("graph")
+                            )
                         ):
                             raise StateError(
                                 "legacy import would replace an existing knowledge state"
@@ -129,24 +150,16 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     raise StateError("cannot import unsupported legacy state")
             args.state = target
+            if not args.execute:
+                progress.claim(args.staging, phase="compare", parent=args.snapshot)
         except (OSError, ValueError) as error:
             parser.exit(1, f"knowledge sync: {error}\n")
     elif args.state.exists():
         marker = json.loads(args.state.read_text())
         if marker.get("schema_version") == "knowledge-state-migrated-1.0":
             args.state = Path(marker["target"])
-    if not args.execute and (args.approvals or args.quality_cases):
-        parser.error("--approvals and --quality-cases require --execute")
     if args.execute:
-        if not args.approvals or not args.quality_cases or not args.graph_dir:
-            parser.error(
-                "--execute requires --approvals, --quality-cases and --graph-dir"
-            )
-        try:
-            module = importlib.import_module("dogpdkb.knowledge_execute")
-        except ImportError:
-            parser.exit(1, "knowledge sync: approved execution is not installed\n")
-        return module.run_execution(args)
+        return execution_module.run_execution(args)
     try:
         run_planner(args)
     except (OSError, PlanError, ValueError) as error:

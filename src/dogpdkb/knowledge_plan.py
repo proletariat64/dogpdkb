@@ -122,6 +122,8 @@ def _load_state(path: Path, book: dict[str, Any]) -> dict[str, Any]:
         return {"schema_version": STATE_SCHEMA, "book": book, "documents": {}}
     state = _read_json(path)
     if state.get("version") == 2:
+        if path.name != ".sync-state.json":
+            raise PlanError("v2 state requires the canonical .sync-state.json path")
         return canonical_view(state, book)
     if (
         state.get("schema_version") != STATE_SCHEMA

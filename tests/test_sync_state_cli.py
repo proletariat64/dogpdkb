@@ -195,3 +195,20 @@ def test_initialization_reports_unmatched_root_markdown_without_fake_ids(tmp_pat
     assert book["unmatched_files"] == [unmatched.name]
     assert list(book["documents"]) == ["42"]
     assert unmatched.read_bytes() == before
+
+
+def test_reinitialization_accepts_url_slash_and_preserves_existing_name(tmp_path):
+    corpus, graph = corpus_config(tmp_path)
+    (graph / "graph.json").write_text('{"nodes": [], "links": []}')
+    books = tmp_path / "books.json"
+    rows = json.loads(books.read_text())
+    rows[0]["name"] = "Funds"
+    books.write_text(json.dumps(rows))
+    assert run_init(tmp_path).returncode == 0
+    rows[0]["url"] += "/"
+    rows[0].pop("name")
+    books.write_text(json.dumps(rows))
+    result = run_init(tmp_path)
+    assert result.returncode == 0, result.stderr
+    book = json.loads((corpus / ".sync-state.json").read_text())["books"]["fund"]
+    assert book["name"] == "Funds"

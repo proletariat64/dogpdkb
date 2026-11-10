@@ -19,7 +19,23 @@ def graph_job(tmp_path, monkeypatch):
     original = {"nodes": [], "links": [], "captured_at": "original"}
     update_graph.write_json(graph / "graph.json", original)
     manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({"exported": [{"id": 1, "file": "a-[1].md"}]}))
+    manifest.write_text(
+        json.dumps(
+            {
+                "exported": [
+                    {
+                        "id": 1,
+                        "file": "a-[1].md",
+                        "source_version": {
+                            "field": "updated_at",
+                            "value": "2026-11-10T10:00:00+08:00",
+                            "utc": "2026-11-10T10:00:00+08:00",
+                        },
+                    }
+                ]
+            }
+        )
+    )
     staging = tmp_path / "graph-update"
     monkeypatch.setattr(
         sys,
@@ -81,11 +97,53 @@ def test_resume_after_successful_publish_reuses_candidate(graph_job):
     assert not (staging / "graph-backup/new-artifact.json").exists()
     canonical = json.loads((corpus / ".sync-state.json").read_text())
     assert canonical["books"]["adhoc"]["documents"]["1"]["graph"]["status"] == "covered"
+    assert (
+        canonical["books"]["adhoc"]["documents"]["1"]["graph"]["version"]["field"]
+        == "updated_at"
+    )
     frozen = Path(canonical["books"]["adhoc"]["documents"]["1"]["graph"]["raw"]["path"])
     assert frozen == staging / "source-snapshots/a-[1].md"
     (corpus / "a-[1].md").write_text("later corpus version")
     assert frozen.read_text() == "source"
     assert canonical["active_run"] is None
+
+
+def test_manifest_version_anomaly_blocks_direct_graph_update(graph_job):
+    _corpus, graph, staging, builds, _original = graph_job
+    manifest = staging.parent / "manifest.json"
+    payload = json.loads(manifest.read_text())
+    payload["exported"][0]["anomalies"] = ["detail_newer_than_listing"]
+    manifest.write_text(json.dumps(payload))
+    before = (graph / "graph.json").read_bytes()
+    with pytest.raises(ValueError, match="version anomalies"):
+        update_graph.main()
+    assert (graph / "graph.json").read_bytes() == before
+    assert builds == [1]
+
+
+def test_applied_graph_deletion_clears_only_its_pending_reason(graph_job, monkeypatch):
+    corpus, _graph, staging, _builds, _original = graph_job
+    update_graph.main()
+    path = corpus / ".sync-state.json"
+    state = json.loads(path.read_text())
+    state["books"]["adhoc"]["documents"]["1"]["pending"] = [
+        "GRAPH_DELETION_REQUIRED",
+        "review_pending",
+    ]
+    path.write_text(json.dumps(state))
+    (corpus / "a-[1].md").unlink()
+    manifest = staging.parent / "delete-manifest.json"
+    manifest.write_text(
+        json.dumps({"exported": [], "deleted": [{"id": 1, "local_file": "a-[1].md"}]})
+    )
+    args = list(sys.argv)
+    args[args.index("--manifest") + 1] = str(manifest)
+    args[args.index("--staging") + 1] = str(staging.parent / "delete-stage")
+    monkeypatch.setattr(sys, "argv", args)
+    update_graph.main()
+    record = json.loads(path.read_text())["books"]["adhoc"]["documents"]["1"]
+    assert record["graph"]["status"] == "deleted"
+    assert record["pending"] == ["review_pending"]
 
 
 def test_resume_still_rejects_external_graph_changes(graph_job):
