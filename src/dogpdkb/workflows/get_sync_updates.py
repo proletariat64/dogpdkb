@@ -772,6 +772,13 @@ def build_lists(
     return new, updated
 
 
+def listing_version(document: dict[str, Any]) -> dict[str, Any] | None:
+    for field in ("content_updated_at", "updated_at"):
+        if document.get(field):
+            return timestamp_record(str(document[field]), field)
+    return None
+
+
 def safe_segment(text: str) -> str:
     cleaned = re.sub(r'[/\\:*?"<>|]+', "-", str(text or "untitled").strip())
     cleaned = re.sub(r"\s+", "-", cleaned)
@@ -834,6 +841,7 @@ def build_structure_lists(
             "created_at": doc.get("created_at"),
             "content_updated_at": doc.get("content_updated_at")
             or doc.get("updated_at"),
+            "listing_version": listing_version(doc),
             "local_date": local_date.isoformat(),
             "local_file": local_file,
             "file": target,
@@ -954,9 +962,16 @@ def main() -> int | None:
                 ],
             )
 
-    docs = fetch_doc_list(
-        book["book_id"], book["items_count"], args.page_cache, on_page=observed_page
-    )
+    try:
+        docs = fetch_doc_list(
+            book["book_id"], book["items_count"], args.page_cache, on_page=observed_page
+        )
+    except ValueError:
+        if progress:
+            progress.phase(
+                "listing", "failed", reason="invalid remote document timestamp"
+            )
+        parser.exit(1, "dogpdkb discover: invalid remote document timestamp\n")
     if progress:
         progress.phase("listing", "completed", document_count=len(docs))
 
@@ -1079,6 +1094,8 @@ def main() -> int | None:
                     "format": fmt(doc),
                     "created_at": doc.get("created_at"),
                     "content_updated_at": doc.get("content_updated_at"),
+                    "updated_at": doc.get("updated_at"),
+                    "listing_version": listing_version(doc),
                     "url": url(doc),
                 }
                 for _, doc in new
@@ -1090,6 +1107,7 @@ def main() -> int | None:
                     "format": fmt(doc),
                     "local_date": local_date.isoformat(),
                     "content_updated_at": remote.isoformat(),
+                    "listing_version": listing_version(doc),
                     "url": url(doc),
                 }
                 for remote, local_date, doc in updated

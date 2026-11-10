@@ -57,6 +57,73 @@ def initialized(tmp_path: Path):
     return corpus, config
 
 
+@pytest.mark.parametrize("previously_observed", [False, True])
+def test_remote_observation_does_not_backfill_historical_missing_documents(
+    tmp_path: Path, previously_observed: bool
+):
+    from tests.test_knowledge_capture import write_remote_adapter
+
+    corpus, config = initialized(tmp_path)
+    original_config = config.read_text()
+    documents = [
+        {
+            "id": 1,
+            "title": "One",
+            "slug": "one",
+            "content_updated_at": "2026-11-10T10:00:00+08:00",
+        },
+        {
+            "id": 2,
+            "title": "Historical omitted",
+            "slug": "two",
+            "content_updated_at": "2020-01-01T10:00:00+08:00",
+        },
+        {
+            "id": 3,
+            "title": "Recent new",
+            "slug": "three",
+            "content_updated_at": "2026-11-10T11:00:00+08:00",
+        },
+    ]
+    write_remote_adapter(tmp_path, documents)
+    config.write_text(
+        original_config.replace(
+            'proxy_bin="utoo-proxy"', f'proxy_bin="{tmp_path / "fake-proxy.py"}"'
+        )
+    )
+    state_path = corpus / ".sync-state.json"
+    if previously_observed:
+        state = json.loads(state_path.read_text())
+        state["books"]["fund"]["documents"]["2"] = {
+            "baseline": None,
+            "observed": {"version": {"utc": "2020-01-01T10:00:00+08:00"}},
+            "observation": None,
+            "corpus": {"status": "not_captured", "raw": None},
+            "graph": {"status": "uncovered"},
+            "steps": {},
+            "pending": [],
+        }
+        write(state_path, state)
+    snapshot = tmp_path / "current.json"
+    result = cli(
+        "discover",
+        "--config",
+        str(config),
+        "--book",
+        "fund",
+        "--snapshot",
+        str(snapshot),
+        "--staging",
+        str(tmp_path / "capture"),
+    )
+    assert result.returncode == 0, result.stderr
+    capture = json.loads(snapshot.read_text())
+    assert capture["selected"] == [1, 3]
+    assert capture["changes"]["new"] == [3]
+    assert capture["changes"]["updated"] == [1]
+    assert "2" not in capture["exports"]
+
+
 def test_initialized_baseline_downloads_same_day_and_persists_before_plan(
     tmp_path: Path,
 ):
@@ -124,6 +191,43 @@ def test_initialized_baseline_downloads_same_day_and_persists_before_plan(
     assert planned.returncode == 0, planned.stderr
     row = json.loads((tmp_path / "planning/plan.json").read_text())["results"][0]
     assert "COMPARISON_PENDING" not in row["pending"]
+
+
+@pytest.mark.parametrize("timestamp", [None, "2026-11-10", "invalid"])
+def test_ordinary_listing_rejects_unknown_time_without_success_plan(
+    tmp_path: Path, timestamp
+):
+    from tests.test_knowledge_capture import write_remote_adapter
+
+    corpus, config = initialized(tmp_path)
+    original = config.read_text()
+    write_remote_adapter(
+        tmp_path,
+        [{"id": 1, "title": "One", "slug": "one", "content_updated_at": timestamp}],
+    )
+    config.write_text(
+        original.replace(
+            'proxy_bin="utoo-proxy"', f'proxy_bin="{tmp_path / "fake-proxy.py"}"'
+        )
+    )
+    output = tmp_path / "listing-output"
+    result = cli(
+        "discover",
+        "--config",
+        str(config),
+        "--book",
+        "fund",
+        "--json",
+        "-o",
+        str(output),
+    )
+    assert result.returncode != 0
+    assert "timestamp" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not list(output.glob("sync-updates-*.json"))
+    record = json.loads((corpus / ".sync-state.json").read_text())["books"]["fund"]
+    assert record["steps"]["listing"]["status"] == "failed"
+    assert record["documents"]["1"]["baseline"]["content_updated_at"] is None
 
 
 @pytest.mark.parametrize("covered", [True, False])
@@ -356,6 +460,167 @@ def test_approved_legacy_state_import_publishes_only_canonical_state(tmp_path: P
         json.loads(legacy.read_text())["schema_version"]
         == "knowledge-state-migrated-1.0"
     )
+
+
+@pytest.mark.parametrize("recover_report", [False, True])
+def test_canonical_execution_retry_preserves_completed_state(
+    tmp_path: Path, recover_report: bool
+):
+    from tests.test_knowledge_execute import execute_arguments, sync
+
+    test_approved_legacy_state_import_publishes_only_canonical_state(tmp_path)
+    state_path = tmp_path / "corpus/fund/.sync-state.json"
+    graph_path = tmp_path / "graphify-out/graph.json"
+    staging = tmp_path / "canonical-execution"
+    report = staging / "execution-result.json"
+    before = state_path.read_bytes(), graph_path.read_bytes(), report.read_bytes()
+    if recover_report:
+        report.unlink()
+    result = sync(
+        *execute_arguments(
+            tmp_path,
+            tmp_path / "snapshot.json",
+            tmp_path / "state.json",
+            staging,
+            graph_path.parent,
+        ),
+        "--config",
+        str(tmp_path / "config.toml"),
+        "--book",
+        "fund",
+        env={
+            "PYTHONPATH": os.pathsep.join(
+                [str(tmp_path / "stub-packages"), str(ROOT / "src")]
+            )
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert state_path.read_bytes() == before[0]
+    assert graph_path.read_bytes() == before[1]
+    assert json.loads(report.read_text()) == json.loads(before[2])
+    assert json.loads(state_path.read_text())["active_run"] is None
+
+
+def test_explicit_migrated_state_cannot_execute_over_another_active_plan(
+    tmp_path: Path,
+):
+    from tests.test_knowledge_execute import execute_arguments, sync
+
+    test_approved_legacy_state_import_publishes_only_canonical_state(tmp_path)
+    state_path = tmp_path / "corpus/fund/.sync-state.json"
+    state = json.loads(state_path.read_text())
+    state["active_run"] = {
+        "staging": str(tmp_path / "other.json"),
+        "book_key": "fund",
+        "phase": "capture",
+    }
+    write(state_path, state)
+    before = state_path.read_bytes()
+    graph = tmp_path / "graphify-out/graph.json"
+    graph_before = graph.read_bytes()
+    result = sync(
+        *execute_arguments(
+            tmp_path,
+            tmp_path / "snapshot.json",
+            tmp_path / "state.json",
+            tmp_path / "canonical-execution",
+            graph.parent,
+        ),
+        env={
+            "PYTHONPATH": os.pathsep.join(
+                [str(tmp_path / "stub-packages"), str(ROOT / "src")]
+            )
+        },
+    )
+    assert result.returncode != 0
+    assert "unfinished" in result.stderr
+    assert state_path.read_bytes() == before
+    assert graph.read_bytes() == graph_before
+
+
+def test_invalid_execute_arguments_do_not_import_legacy_state(tmp_path: Path):
+    from tests.test_knowledge_execute import candidate_plan
+
+    _plan, snapshot, legacy, _staging, _graph = candidate_plan(tmp_path)
+    corpus, config = initialized(tmp_path)
+    before = (corpus / ".sync-state.json").read_bytes(), legacy.read_bytes()
+    result = cli(
+        "sync",
+        "--knowledge",
+        "--execute",
+        "--config",
+        str(config),
+        "--book",
+        "fund",
+        "--snapshot",
+        str(snapshot),
+        "--state",
+        str(legacy),
+        "--staging",
+        str(tmp_path / "invalid"),
+    )
+    assert result.returncode != 0
+    assert "--execute requires" in result.stderr
+    assert (corpus / ".sync-state.json").read_bytes() == before[0]
+    assert legacy.read_bytes() == before[1]
+
+
+def test_legacy_import_cannot_replace_newer_canonical_capture(tmp_path: Path):
+    from tests.test_knowledge_execute import candidate_plan
+
+    _plan, snapshot, legacy, _staging, _graph = candidate_plan(tmp_path)
+    corpus, config = initialized(tmp_path)
+    state_path = corpus / ".sync-state.json"
+    state = json.loads(state_path.read_text())
+    record = state["books"]["fund"]["documents"]["1"]
+    record["corpus"] = {
+        "status": "captured",
+        "raw": {"path": str(tmp_path / "newest.md"), "stage": "raw_export"},
+        "version": {"utc": "2026-11-11T10:00:00+08:00"},
+    }
+    record["pending"] = ["COMPARISON_PENDING"]
+    write(state_path, state)
+    before = state_path.read_bytes(), legacy.read_bytes()
+    result = cli(
+        "sync",
+        "--knowledge",
+        "--config",
+        str(config),
+        "--book",
+        "fund",
+        "--snapshot",
+        str(snapshot),
+        "--state",
+        str(legacy),
+        "--staging",
+        str(tmp_path / "import"),
+    )
+    assert result.returncode != 0
+    assert "existing knowledge state" in result.stderr
+    assert state_path.read_bytes() == before[0]
+    assert legacy.read_bytes() == before[1]
+
+
+def test_quoted_home_paths_use_the_same_capture_and_plan_identity(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    test_initialized_baseline_downloads_same_day_and_persists_before_plan(tmp_path)
+    result = cli(
+        "sync",
+        "--knowledge",
+        "--config",
+        str(tmp_path / "config.toml"),
+        "--book",
+        "fund",
+        "--snapshot",
+        "~/current.json",
+        "--staging",
+        "~/planning",
+    )
+    assert result.returncode != 0
+    assert "unfinished" not in result.stderr
+    assert "plan output already exists" in result.stderr
 
 
 def test_conflicting_snapshot_cannot_change_state_or_download(tmp_path: Path):

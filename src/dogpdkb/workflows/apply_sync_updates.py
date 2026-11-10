@@ -39,7 +39,7 @@ from typing import Any
 
 from dogpdkb.instance_lock import locked_main, subprocess_lock_options
 from dogpdkb.sync_progress import progress_for_config
-from dogpdkb.sync_time import UTC8, parse_timestamp
+from dogpdkb.sync_time import UTC8, parse_timestamp, timestamp_record
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from get_sync_updates import (
@@ -55,6 +55,13 @@ from sync_formats import export_table, rewrite_image_urls
 from mdocr.config import cli_path, config_arguments, configure, configured_book
 
 LOCAL_NAME_RE = re.compile(r"-(\d{4}-\d{2}-\d{2})-\[(\d+)\]\.md$")
+VERSION_ANOMALIES = {
+    "detail_version_missing",
+    "listing_version_missing",
+    "detail_newer_than_listing",
+    "detail_older_than_listing",
+    "detail_version_field_changed",
+}
 
 
 def parse_date(value: str) -> date:
@@ -287,6 +294,16 @@ def export_doc(
     if not isinstance(data, dict) or not isinstance(data.get("body"), str):
         raise SkylarkError(f"doc {doc_id}: invalid detail payload")
     return rewrite_image_urls(data["body"]), data
+
+
+def document_version(document: dict[str, Any]) -> dict[str, Any] | None:
+    listed = document.get("listing_version")
+    if listed and listed.get("field") in {"content_updated_at", "updated_at"}:
+        return timestamp_record(listed["value"], listed["field"])
+    for field in ("content_updated_at", "updated_at"):
+        if document.get(field):
+            return timestamp_record(str(document[field]), field)
+    return None
 
 
 def run_mdocr(files: list[Path], out_dir: Path) -> int:
@@ -531,6 +548,8 @@ def main() -> None:
         prior = completed.get(str(doc_id)) or {}
         if (
             prior.get("status") == "exported"
+            and prior.get("source_version")
+            and not prior.get("anomalies")
             and (raw_dir / prior.get("file", "")).is_file()
         ):
             restored = {
@@ -538,6 +557,8 @@ def main() -> None:
                 "title": prior["title"],
                 "remote_content_updated_at": prior["remote_content_updated_at"],
                 "stamp": prior["stamp"],
+                "source_version": prior["source_version"],
+                "listing_version": prior.get("listing_version"),
             }
             exported.append((raw_dir / prior["file"], restored))
             tracker.step(
@@ -545,7 +566,9 @@ def main() -> None:
                 "download",
                 "completed",
                 file=prior["file"],
-                version=tracker.version(prior.get("remote_content_updated_at")),
+                version=prior["source_version"],
+                listing_version=prior.get("listing_version"),
+                anomalies=[],
                 raw=tracker.reference(raw_dir / prior["file"]),
             )
             existing_corpus = tracker.book["documents"][str(doc_id)].get("corpus", {})
@@ -557,9 +580,7 @@ def main() -> None:
                     str(doc_id),
                     corpus={
                         "status": "captured",
-                        "version": tracker.version(
-                            prior.get("remote_content_updated_at")
-                        ),
+                        "version": prior["source_version"],
                         "raw": tracker.reference(raw_dir / prior["file"]),
                     },
                 )
@@ -607,9 +628,25 @@ def main() -> None:
                 file=sys.stderr,
             )
             continue
-        remote_stamp = str(
-            detail.get("content_updated_at") or doc.get("content_updated_at") or ""
-        )
+        listing_version = document_version(doc)
+        source_version = document_version(detail)
+        anomalies = []
+        if source_version is None:
+            anomalies.append("detail_version_missing")
+        elif listing_version is None:
+            anomalies.append("listing_version_missing")
+        else:
+            detail_instant = parse_timestamp(source_version["utc"])
+            listed_instant = parse_timestamp(listing_version["utc"])
+            if detail_instant != listed_instant:
+                anomalies.append(
+                    "detail_newer_than_listing"
+                    if detail_instant > listed_instant
+                    else "detail_older_than_listing"
+                )
+            if source_version["field"] != listing_version["field"]:
+                anomalies.append("detail_version_field_changed")
+        remote_stamp = source_version["value"] if source_version else ""
         stamp = (
             parse_timestamp(remote_stamp).date().isoformat()
             if remote_stamp
@@ -620,6 +657,9 @@ def main() -> None:
             **doc,
             "title": title,
             "remote_content_updated_at": remote_stamp,
+            "source_version": source_version,
+            "listing_version": listing_version,
+            "anomalies": anomalies,
             "stamp": stamp,
         }
         trail = paths.get(doc_id, [])
@@ -643,30 +683,41 @@ def main() -> None:
             "file": target.name,
             "title": title,
             "remote_content_updated_at": remote_stamp,
+            "source_version": source_version,
+            "listing_version": listing_version,
+            "anomalies": anomalies,
             "stamp": stamp,
         }
+        if anomalies:
+            errors.append(
+                {"id": doc_id, "stage": "version", "reason": ", ".join(anomalies)}
+            )
         save_progress(errors)
         tracker.step(
             str(doc_id),
             "download",
             "completed",
             file=target.name,
-            version=tracker.version(remote_stamp),
+            version=source_version,
+            listing_version=listing_version,
+            anomalies=anomalies,
             raw=tracker.reference(target),
         )
         tracker.update(
             str(doc_id),
             corpus={
                 "status": "captured",
-                "version": tracker.version(remote_stamp),
+                "version": source_version,
                 "raw": tracker.reference(target),
             },
             pending=sorted(
                 (
                     set(tracker.book["documents"][str(doc_id)].get("pending", []))
                     - {"CAPTURE_EXPORT_FAILED"}
+                    - VERSION_ANOMALIES
                 )
                 | {"GRAPH_UPDATE_REQUIRED"}
+                | set(anomalies)
             ),
         )
         print(
@@ -687,6 +738,9 @@ def main() -> None:
                 "title": doc["title"],
                 "url": doc.get("url"),
                 "content_updated_at": doc["remote_content_updated_at"],
+                "source_version": doc.get("source_version"),
+                "listing_version": doc.get("listing_version"),
+                "anomalies": doc.get("anomalies", []),
             }
             for p, doc in exported
         ],
@@ -698,6 +752,14 @@ def main() -> None:
         _write_failure_manifest(manifest_path, manifest)
     else:
         _write_json(manifest_path, manifest)
+    if any(error.get("stage") == "version" for error in errors):
+        tracker.phase("download", "failed", reason="listing/detail version anomalies")
+        print(
+            "[version] downloaded sources have unresolved version anomalies; publication blocked",
+            file=sys.stderr,
+        )
+        print_retry()
+        raise SystemExit(1)
     if export_cancellation is not None:
         print(
             f"[export] cancelled doc_id={doc_id}; completed={len(exported)} "
@@ -770,7 +832,7 @@ def main() -> None:
     try:
 
         def published(destination, doc):
-            version = tracker.version(doc.get("remote_content_updated_at"))
+            version = doc.get("source_version")
             raw = raw_dir / destination.name
             tracker.step(
                 str(doc["id"]),

@@ -596,7 +596,17 @@ def run_capture(args: Any) -> int:
             doc_id = str(document["id"])
             previous = canonical_documents.get(doc_id)
             current = records[doc_id]["version"]
-            if previous is None:
+            existing_source = previous and (
+                previous.get("baseline")
+                or (previous.get("corpus") or {}).get("raw")
+                or (previous.get("graph") or {}).get("raw")
+                or (
+                    previous.get("steps", {}).get("download", {}).get("status")
+                    == "completed"
+                    and previous["steps"]["download"].get("raw")
+                )
+            )
+            if not existing_source:
                 if _instant(current).date().isoformat() >= cutoff:
                     changes["new"].append(document["id"])
                 continue

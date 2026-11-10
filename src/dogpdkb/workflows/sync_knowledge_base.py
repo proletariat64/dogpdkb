@@ -122,11 +122,35 @@ def recovery_command(options: PipelineOptions) -> str:
     return shlex.join(command)
 
 
+def _resume_state(options: PipelineOptions) -> dict | None:
+    if not options.input_dir.is_dir():
+        raise ValueError(f"input dir not found: {options.input_dir}")
+    state_path = options.staging.resolve() / "pipeline-state.json"
+    if options.rebase_graph and (
+        not options.resume
+        or options.skip_graph
+        or options.dry_run
+        or not state_path.is_file()
+    ):
+        raise ValueError(
+            "--rebase-graph requires --resume of an existing run with graph enabled"
+        )
+    if not state_path.exists():
+        return None
+    if not options.resume:
+        raise ValueError("staging already exists; use --resume or a new directory")
+    state = read_json(state_path)
+    if state.get("config") != _config(options):
+        raise ValueError("staging configuration changed; use a new staging directory")
+    if options.rebase_graph and state["stages"].get("corpus") != "completed":
+        raise ValueError("--rebase-graph requires a completed corpus stage")
+    return state
+
+
 def run_pipeline(
     options: PipelineOptions, runner: Callable[[list[str]], None] = run_command
 ) -> dict:
-    if not options.input_dir.is_dir():
-        raise ValueError(f"input dir not found: {options.input_dir}")
+    state = _resume_state(options)
     tracker = Progress(
         options.input_dir,
         options.book_key or "adhoc",
@@ -142,7 +166,7 @@ def run_pipeline(
     previous = {key: os.environ.get(key) for key in names}
     os.environ.update(names)
     try:
-        result = _run_pipeline(options, runner, tracker)
+        result = _run_pipeline(options, runner, tracker, state)
         tracker.finish()
         return result
     except BaseException as error:
@@ -157,7 +181,10 @@ def run_pipeline(
 
 
 def _run_pipeline(
-    options: PipelineOptions, runner: Callable[[list[str]], None], tracker: Progress
+    options: PipelineOptions,
+    runner: Callable[[list[str]], None],
+    tracker: Progress,
+    state: dict | None,
 ) -> dict:
     input_dir = options.input_dir.resolve()
     staging = options.staging.resolve()
@@ -165,28 +192,10 @@ def _run_pipeline(
         raise ValueError(f"input dir not found: {input_dir}")
     staging.mkdir(parents=True, exist_ok=True)
     state_path = staging / "pipeline-state.json"
-    if options.rebase_graph and (
-        not options.resume
-        or options.skip_graph
-        or options.dry_run
-        or not state_path.is_file()
-    ):
-        raise ValueError(
-            "--rebase-graph requires --resume of an existing run with graph enabled"
-        )
-    config = _config(options)
-    if state_path.exists():
-        if not options.resume:
-            raise ValueError("staging already exists; use --resume or a new directory")
-        state = read_json(state_path)
-        if state.get("config") != config:
-            raise ValueError(
-                "staging configuration changed; use a new staging directory"
-            )
-    else:
+    if state is None:
         state = {
             "version": 1,
-            "config": config,
+            "config": _config(options),
             "cutoff": options.cutoff,
             "stages": {},
             "outputs": {},
@@ -195,8 +204,6 @@ def _run_pipeline(
         write_json(state_path, state)
 
     if options.rebase_graph:
-        if state["stages"].get("corpus") != "completed":
-            raise ValueError("--rebase-graph requires a completed corpus stage")
         for stage in ("graph", "web"):
             state["stages"].pop(stage, None)
             state["outputs"].pop(stage, None)

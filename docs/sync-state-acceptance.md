@@ -45,4 +45,29 @@ Private evidence in that directory: `final-initialization.stdout`, `final-initia
 
 ## Remaining delivery boundary
 
-No production corpus, graph or co.bot state was migrated or updated. No live remote listing, full production mdcompare run, real Graphify model execution, paid extraction or production Web publication was performed. Final integration code review and OCR review are recorded separately by the integrating agent; these checks do not claim those reviews are complete.
+No production corpus, graph or co.bot state was migrated or updated. No live remote listing, full production mdcompare run, real Graphify model execution, paid extraction or production Web publication was performed. Final standards/specification review and the separate OCR CLI review are distinguished below.
+
+## Integration review fixes and final gates
+
+The initial standards/specification reviews identified four issues, each reproduced through the existing CLI seams before correction:
+
+1. Remote page observations created state rows that were mistaken for existing local sources, downloading intentionally omitted historical documents. Existing-source selection now requires actual baseline/corpus/download/graph source evidence; observed-only rows, including rows from previous attempts, still obey the historical cutoff.
+2. Configured retries claimed the run before checking a completed execution or committed journal. Read-only ownership validation now precedes completion recovery; only unfinished execution persists a new claim. Repeated execution and missing-report recovery preserve committed state/graph bytes and finish with no active run.
+3. Explicit legacy-state redirect execution did not validate canonical ownership and could clear another active plan. All canonical execution routes now validate the same snapshot, book and plan ownership before writing.
+4. Legacy apply could register listing time as detail time and ignore detail `updated_at`. The actual detail field/value is retained separately from listing version, carried through corpus and graph metadata, and missing/mismatched versions remain pending. Such manifests cannot publish corpus or graph changes. Discovery plans retain actual listing version metadata alongside compatibility fields.
+
+Confirmed preliminary OCR findings added five narrow corrections:
+
+- Required execution arguments and module availability are checked before initialization/import or plan claims.
+- Legacy imports refuse to overwrite canonical observations, captured sources, pending work or step evidence.
+- Quoted home paths are expanded consistently when binding capture/plan identities.
+- Legacy pipeline resume/configuration validation runs before claiming a new active plan; rejection preserves any pre-existing run identity.
+- Ordinary listing timestamp failures are explicit, retained as failed listing progress, and do not produce a successful zero-change plan. Missing, date-only and malformed values are not silently skipped or manufactured into exact instants.
+
+Both standards/specification follow-up reviews found no remaining actionable issue in the corrected scope: standards ran 16 focused cases; specification ran 10 focused cases plus a missing-execution-module simulation. These are separate review results, not production acceptance.
+
+Final post-fix `make check` passed document guards, Ruff checks/format and **1,021 tests in 125.10 seconds**. Final `make smoke` passed wheel/sdist and isolated installed workflows with a separate task-owned `XDG_STATE_HOME`. The earlier 1,004-test/66-test evidence above remains historical and is superseded for the final source revision by these gates. An intermediate four-fix revision also passed 1,013 tests and installed smoke; it is not the final-code gate.
+
+Final gate logs: `/tmp/dogpdkb-sync-state-review-fix-final-check.log` and `/tmp/dogpdkb-sync-state-review-fix-final-smoke.log`. Red/green regressions are retained in `tests/test_sync_progress_cli.py`, `tests/test_apply_recovery.py`, `tests/test_pipeline.py` and `tests/test_update_graph.py`.
+
+The OCR CLI review is still running at the time of this entry; only its confirmed preliminary findings above have been fixed. No final OCR pass is claimed. The existing real-corpus initialization proof remains limited to task-owned copies, and no production migration, remote sync, paid Graphify execution or Web publication was performed.

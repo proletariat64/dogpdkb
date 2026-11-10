@@ -66,10 +66,17 @@ class Progress:
                 self.book[field] = value
         self.book.setdefault("key", self.key)
 
-    def claim(self, staging: Path, *, phase: str, parent: Path | None = None):
+    def claim(
+        self,
+        staging: Path,
+        *,
+        phase: str,
+        parent: Path | None = None,
+        persist: bool = True,
+    ):
         self._reload()
         inherited = parent or os.environ.get("DOGPDKB_RUN_STAGING")
-        identity = str(Path(inherited or staging).resolve())
+        identity = str(Path(inherited or staging).expanduser().resolve())
         active = self.root.get("active_run")
         if active and (
             active.get("staging") != identity or active.get("book_key") != self.key
@@ -80,7 +87,8 @@ class Progress:
         if (
             phase in {"compare", "execute"}
             and active
-            and active.get("plan_staging") not in (None, str(Path(staging).resolve()))
+            and active.get("plan_staging")
+            not in (None, str(Path(staging).expanduser().resolve()))
         ):
             raise StateError(
                 "unfinished knowledge plan exists; resume its original staging directory"
@@ -94,8 +102,11 @@ class Progress:
             "updated_at": now_iso(),
         }
         if phase in {"compare", "execute"}:
-            self.root["active_run"]["plan_staging"] = str(Path(staging).resolve())
-        save_state(self.corpus, self.root)
+            self.root["active_run"]["plan_staging"] = str(
+                Path(staging).expanduser().resolve()
+            )
+        if persist:
+            save_state(self.corpus, self.root)
 
     def step(self, doc_id, step: str, status: str, **details: Any):
         self._reload()

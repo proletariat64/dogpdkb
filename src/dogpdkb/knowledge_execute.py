@@ -717,9 +717,20 @@ def _execute_locked(
     quality: dict[str, Any],
 ) -> dict[str, Any]:
     staging = args.staging.expanduser().resolve()
+    state = _load_state(args.state.expanduser().resolve(), plan["book"])
+    progress = None
+    if isinstance(state, BookState):
+        from dogpdkb.sync_progress import Progress
+
+        progress = Progress(args.state.expanduser().resolve().parent, state.key)
+        # Validate ownership without changing the committed state used by journal
+        # recovery. A completed retry must remain an entirely read-only operation.
+        progress.claim(staging, phase="execute", parent=args.snapshot, persist=False)
     completed = _completed_execution(args, plan, approvals, quality)
     if completed is not None:
         return completed
+    if progress:
+        progress.claim(staging, phase="execute", parent=args.snapshot)
     selected = _approved_rows(args, plan, approvals)
     counts = _empty_counts()
     counts["approved"] = len(selected)
