@@ -1,5 +1,7 @@
 # 日常知识增量同步指南
 
+设计更新：现有知识库初始化、单实例约束、逐步骤写入 `.sync-state.json` 和精确时间比较见 [sync 状态设计](sync-state-design.md)。该设计尚未实现；本文下述 raw 登记和独立 state 文件要求描述现有实现，实施新设计时需要同步迁移。
+
 本文说明 `dogpdkb discover --snapshot` 与 `dogpdkb sync --knowledge` 的显式正文更新流程。该流程默认只采集和规划；候选文档不会自动调用 Graphify。不带 `--knowledge` 的既有同步、OCR 和发布入口保持原行为。
 
 ## 1. 三种版本不要混用
