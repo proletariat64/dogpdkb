@@ -946,11 +946,23 @@ def test_date_only_remote_version_cannot_be_saved_as_exact_instant(tmp_path: Pat
 
 
 @pytest.mark.parametrize(
-    "changed_input",
-    [None, "source", "frozen", "incoming", "title", "version", "reference"],
+    ("changed_input", "selected_first"),
+    [
+        (None, True),
+        ("source", True),
+        ("frozen", True),
+        ("incoming", True),
+        ("title", True),
+        ("version", True),
+        ("reference", True),
+        (None, False),
+        ("title", False),
+        ("version", False),
+        ("reference", False),
+    ],
 )
 def test_partial_plan_retries_keep_the_original_comparison_source(
-    tmp_path, changed_input
+    tmp_path, changed_input, selected_first
 ):
     corpus, config = initialized(tmp_path)
     old = corpus / "One-2026-11-10-[1].md"
@@ -985,8 +997,10 @@ def test_partial_plan_retries_keep_the_original_comparison_source(
                 "raw": {"stage": "raw_export", "path": str(second)},
             },
         },
-        "selected": [1, 2],
-        "changes": {"updated": [1], "new": [2]},
+        # An unselected document can retain raw from a baseline snapshot while
+        # its graph version still needs comparison on the first attempt.
+        "selected": [1, 2] if selected_first else [2],
+        "changes": {"updated": [1] if selected_first else [], "new": [2]},
     }
     write(snapshot, capture)
     staging = tmp_path / "planning"

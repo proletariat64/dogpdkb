@@ -486,7 +486,7 @@ def _run_planner(args: Any) -> dict[str, Any]:
             "version": document["version"],
             "source_raw": _relative_raw(raw_path, state_path) if raw_path else None,
             "metadata": _document(document, book_id, raw_path).metadata
-            if work and not capture_anomalies and raw_path is not None
+            if not capture_anomalies and raw_path is not None
             else None,
         }
         if (
