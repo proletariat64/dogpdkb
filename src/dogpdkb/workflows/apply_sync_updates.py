@@ -36,6 +36,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from dogpdkb.instance_lock import locked_main, subprocess_lock_options
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from get_sync_updates import (
     SkylarkError,
@@ -286,7 +288,9 @@ def run_mdocr(files: list[Path], out_dir: Path) -> int:
         "-f",
         *[str(f) for f in files],
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, check=False, **subprocess_lock_options()
+    )
     sys.stderr.write(proc.stderr)
     return proc.returncode
 
@@ -355,6 +359,7 @@ def run_ocr_with_resume(files: list[Path], out_dir: Path, state_dir: Path) -> No
         temporary.replace(checkpoint)
 
 
+@locked_main
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(__doc__ or "apply sync-updates delta").split("\n")[0]

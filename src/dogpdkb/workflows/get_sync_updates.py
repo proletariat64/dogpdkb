@@ -46,6 +46,7 @@ from pathlib import Path
 from threading import Event
 from typing import Any
 
+from dogpdkb.instance_lock import locked_main, subprocess_lock_options
 from mdocr.config import (
     cli_path,
     config_arguments,
@@ -280,6 +281,7 @@ def _call_once(tool: str, args: dict[str, Any]) -> Any:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            **subprocess_lock_options(),
             text=True,
             bufsize=1,
         )
@@ -811,6 +813,7 @@ def build_deletions(
     return deleted
 
 
+@locked_main
 def main() -> int | None:
     parser = argparse.ArgumentParser(
         description="List Yuque book additions, updates, moves and deletions."

@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from dogpdkb.instance_lock import subprocess_lock_options
 from dogpdkb.knowledge_plan import (
     _load_snapshot,
     _load_state,
@@ -261,6 +262,7 @@ def _run_graphify(
             phase,
         ],
         env=environment,
+        **subprocess_lock_options(),
         text=True,
         capture_output=True,
         check=False,
