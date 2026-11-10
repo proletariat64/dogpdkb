@@ -783,6 +783,8 @@ def _execute_locked(
         if candidate_result.get("status") != "candidate_ready":
             raise ExecutionError("Graphify did not retain a validated candidate")
         candidate = Path(candidate_result["candidate"])
+        if state_path.read_bytes() != state_before:
+            raise ExecutionError("knowledge state changed concurrently")
         candidate_state = _load_state(state_path, plan["book"])
         if isinstance(candidate_state, BookState):
             for row, _approval, _frozen in selected:
