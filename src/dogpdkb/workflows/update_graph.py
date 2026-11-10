@@ -13,6 +13,8 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
+from dogpdkb.instance_lock import locked_main
+
 if __package__:
     from .graph_sync import doc_id, merge_graph_records, validate_extracted_records
 else:
@@ -479,6 +481,7 @@ def _publish_candidate(candidate: Path, graph_dir: Path, staging: Path) -> None:
         raise
 
 
+@locked_main
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     config_arguments(parser, book=True)

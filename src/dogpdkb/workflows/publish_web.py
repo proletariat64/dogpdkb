@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from dogpdkb.instance_lock import locked_main
+
 NAME_RE = re.compile(r"-(\d{4}-\d{2}-\d{2})-\[(\d+)\]\.md$")
 from mdocr.config import (
     SyncConfig,
@@ -319,6 +321,7 @@ def publish_snapshots(output: Path, catalog: dict, layered: dict) -> None:
         raise
 
 
+@locked_main
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     config_arguments(parser, book=True)
