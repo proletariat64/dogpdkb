@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 
 from dogpdkb.instance_lock import locked_main, subprocess_lock_options
+from dogpdkb.sync_progress import Progress
+from dogpdkb.sync_time import UTC8
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
@@ -123,6 +125,40 @@ def recovery_command(options: PipelineOptions) -> str:
 def run_pipeline(
     options: PipelineOptions, runner: Callable[[list[str]], None] = run_command
 ) -> dict:
+    if not options.input_dir.is_dir():
+        raise ValueError(f"input dir not found: {options.input_dir}")
+    tracker = Progress(
+        options.input_dir,
+        options.book_key or "adhoc",
+        url=options.source_url,
+        name=options.book_name,
+    )
+    tracker.claim(options.staging, phase="sync")
+    names = {
+        "DOGPDKB_RUN_STAGING": str(options.staging.resolve()),
+        "DOGPDKB_RUN_CORPUS": str(options.input_dir.resolve()),
+        "DOGPDKB_RUN_BOOK": tracker.key,
+    }
+    previous = {key: os.environ.get(key) for key in names}
+    os.environ.update(names)
+    try:
+        result = _run_pipeline(options, runner, tracker)
+        tracker.finish()
+        return result
+    except BaseException as error:
+        tracker.phase("sync", "failed", reason=safe_diagnostic(error) or "cancelled")
+        raise
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _run_pipeline(
+    options: PipelineOptions, runner: Callable[[list[str]], None], tracker: Progress
+) -> dict:
     input_dir = options.input_dir.resolve()
     staging = options.staging.resolve()
     if not input_dir.is_dir():
@@ -171,6 +207,7 @@ def run_pipeline(
             reason = f"subprocess exited {error.returncode}"
         else:
             reason = safe_diagnostic(error) or "cancelled"
+        tracker.phase(name, "failed", reason=reason)
         state["stages"][name] = "retry_required"
         state["status"] = "failed"
         state["error"] = reason
@@ -227,6 +264,7 @@ def run_pipeline(
         return command
 
     def execute(name: str, command: list[str], output: Path) -> None:
+        tracker.phase(name, "running")
         reuse = state["stages"].get(name) == "completed"
         state["current_stage"] = name
         state["status"] = "running"
@@ -249,6 +287,7 @@ def run_pipeline(
         except BaseException as error:
             record_failure(name, error)
             raise
+        tracker.phase(name, "completed", output=str(output))
         state["stages"][name] = "completed"
         state["outputs"][name] = str(output)
         state["error"] = None
@@ -270,6 +309,7 @@ def run_pipeline(
             "--page-cache",
             str(staging / "plan-pages"),
         ]
+        tracker.phase("plan", "running")
         state["current_stage"] = "plan"
         write_json(state_path, state)
         try:
@@ -281,6 +321,7 @@ def run_pipeline(
         except BaseException as error:
             record_failure("plan", error)
             raise
+        tracker.phase("plan", "completed", output=str(plan_output))
         state["stages"]["plan"] = "completed"
         state["outputs"]["plan"] = str(plan_output)
         write_json(state_path, state)
@@ -436,9 +477,7 @@ def main() -> None:
         input_dir=input_dir,
         source_url=source.url,
         staging=args.staging
-        or config.staging
-        / source.key
-        / f"sync-{datetime.now().astimezone():%Y%m%d-%H%M%S}",
+        or config.staging / source.key / f"sync-{datetime.now(UTC8):%Y%m%d-%H%M%S}",
         cutoff=args.cutoff,
         dry_run=args.dry_run,
         resume=args.resume,

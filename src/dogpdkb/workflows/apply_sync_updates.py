@@ -32,21 +32,22 @@ import shlex
 import shutil
 import subprocess
 import sys
-from datetime import date
+from collections.abc import Callable
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 from dogpdkb.instance_lock import locked_main, subprocess_lock_options
+from dogpdkb.sync_progress import progress_for_config
+from dogpdkb.sync_time import UTC8, parse_timestamp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from get_sync_updates import (
     SkylarkError,
     call_tool,
     corpus_filename,
-    load_sync_state,
     resolve_book,
     safe_diagnostic,
-    save_sync_state,
     toc_paths,
 )
 from sync_formats import export_table, rewrite_image_urls
@@ -62,7 +63,7 @@ def parse_date(value: str) -> date:
 
 def corpus_max_date(input_dir: Path) -> date:
     best: date | None = None
-    for path in input_dir.rglob("*.md"):
+    for path in input_dir.glob("*.md"):
         match = LOCAL_NAME_RE.search(path.name)
         if match:
             stamp = parse_date(match.group(1))
@@ -85,12 +86,18 @@ def select_delta(sync: dict[str, Any], cutoff: date) -> list[dict[str, Any]]:
     """Select recent additions and all updates to documents already tracked locally."""
     delta: list[dict[str, Any]] = []
     for doc in sync.get("new", []):
-        stamp = (doc.get("content_updated_at") or doc.get("created_at") or "")[:10]
+        remote = doc.get("content_updated_at") or doc.get("created_at")
+        stamp = parse_timestamp(remote).date().isoformat() if remote else ""
         if stamp >= cutoff.isoformat():
             delta.append({**doc, "kind": "new", "stamp": stamp})
     for kind in ("updated", "renamed", "moved"):
         for doc in sync.get(kind, []):
-            stamp = (doc.get("content_updated_at") or doc["local_date"])[:10]
+            remote = doc.get("content_updated_at")
+            stamp = (
+                parse_timestamp(remote).date().isoformat()
+                if remote
+                else doc["local_date"]
+            )
             delta.append({**doc, "kind": kind, "stamp": stamp})
     seen = set()
     unique = []
@@ -175,12 +182,16 @@ def plan_deletions(
 
 
 def remove_documents(
-    planned: list[tuple[Path, dict[str, Any]]], backup_dir: Path
+    planned: list[tuple[Path, dict[str, Any]]],
+    backup_dir: Path,
+    on_complete: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, int]:
     result = {"deleted": 0, "already_absent": 0}
     for path, record in planned:
         if not path.exists():
             result["already_absent"] += 1
+            if on_complete:
+                on_complete(record)
             continue
         _assert_deletion_source_unchanged(path, record)
         backup_dir.mkdir(parents=True, exist_ok=True)
@@ -191,6 +202,8 @@ def remove_documents(
             _atomic_copy(path, backup)
         path.unlink()
         result["deleted"] += 1
+        if on_complete:
+            on_complete(record)
     return result
 
 
@@ -210,8 +223,9 @@ def publish_documents(
     ocr_dir: Path,
     input_dir: Path,
     backup_dir: Path,
+    on_complete: Callable[[Path, dict[str, Any]], None] | None = None,
 ) -> dict[str, int]:
-    planned: list[tuple[Path, Path, list[Path]]] = []
+    planned: list[tuple[Path, Path, list[Path], dict[str, Any]]] = []
     for raw_path, doc in exported:
         final_source = ocr_dir / raw_path.name
         if not final_source.is_file():
@@ -228,7 +242,7 @@ def publish_documents(
             match = LOCAL_NAME_RE.search(candidate.name)
             if match and int(match.group(2)) == int(doc["id"]):
                 old.append(candidate)
-        planned.append((final_source, destination, old))
+        planned.append((final_source, destination, old, doc))
 
     assets = []
     assets_dir = ocr_dir / "assets"
@@ -242,7 +256,7 @@ def publish_documents(
             assets.append((source, destination))
 
     backup_dir.mkdir(parents=True, exist_ok=True)
-    old_documents = {old for _, _, old_paths in planned for old in old_paths}
+    old_documents = {old for _, _, old_paths, _ in planned for old in old_paths}
     for old in sorted(old_documents):
         backup = backup_dir / old.name
         if not backup.exists():
@@ -253,12 +267,14 @@ def publish_documents(
             _atomic_copy(source, destination)
 
     replaced = 0
-    for final_source, destination, old_paths in planned:
+    for final_source, destination, old_paths, doc in planned:
         _atomic_copy(final_source, destination)
         for old in old_paths:
             replaced += 1
             if old != destination:
                 old.unlink()
+        if on_complete:
+            on_complete(destination, doc)
     return {"added": len(planned), "replaced": replaced, "assets": len(assets)}
 
 
@@ -320,7 +336,12 @@ def _write_failure_manifest(path: Path, manifest: dict[str, Any]) -> None:
         )
 
 
-def run_ocr_with_resume(files: list[Path], out_dir: Path, state_dir: Path) -> None:
+def run_ocr_with_resume(
+    files: list[Path],
+    out_dir: Path,
+    state_dir: Path,
+    on_complete: Callable[[Path], None] | None = None,
+) -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = state_dir / "ocr-complete.json"
     completed: set[str] = set()
@@ -334,6 +355,8 @@ def run_ocr_with_resume(files: list[Path], out_dir: Path, state_dir: Path) -> No
     for path in files:
         output = out_dir / path.name
         if path.name in completed and output.is_file():
+            if on_complete:
+                on_complete(path)
             continue
         # Missing output invalidates the old completion before OCR can write a
         # partial replacement and fail or be interrupted.
@@ -357,6 +380,8 @@ def run_ocr_with_resume(files: list[Path], out_dir: Path, state_dir: Path) -> No
             encoding="utf-8",
         )
         temporary.replace(checkpoint)
+        if on_complete:
+            on_complete(path)
 
 
 @locked_main
@@ -412,7 +437,8 @@ def main() -> None:
     print(f"sync json: {sync_path}")
     print(f"cutoff: {cutoff} · delta docs: {len(delta)} · deletions: {len(deletions)}")
     staging = (
-        args.staging or config.staging / source.key / f"sync-{date.today():%Y%m%d}"
+        args.staging
+        or config.staging / source.key / f"sync-{datetime.now(UTC8):%Y%m%d}"
     )
     retry_command = [
         sys.executable,
@@ -435,6 +461,15 @@ def main() -> None:
 
     def print_retry() -> None:
         print(f"Retry: {shlex.join(retry_command)}", file=sys.stderr)
+
+    try:
+        tracker = progress_for_config(config, source, input_dir)
+        assert tracker is not None
+        tracker.claim(staging, phase="corpus")
+    except (OSError, ValueError) as error:
+        print(f"[state] failed: {safe_diagnostic(error)}", file=sys.stderr)
+        print_retry()
+        raise SystemExit(1) from error
 
     raw_dir = staging / "raw"
     ocr_dir = staging / "md"
@@ -505,6 +540,29 @@ def main() -> None:
                 "stamp": prior["stamp"],
             }
             exported.append((raw_dir / prior["file"], restored))
+            tracker.step(
+                str(doc_id),
+                "download",
+                "completed",
+                file=prior["file"],
+                version=tracker.version(prior.get("remote_content_updated_at")),
+                raw=tracker.reference(raw_dir / prior["file"]),
+            )
+            existing_corpus = tracker.book["documents"][str(doc_id)].get("corpus", {})
+            if (
+                existing_corpus.get("status") != "published"
+                or existing_corpus.get("file") != prior["file"]
+            ):
+                tracker.update(
+                    str(doc_id),
+                    corpus={
+                        "status": "captured",
+                        "version": tracker.version(
+                            prior.get("remote_content_updated_at")
+                        ),
+                        "raw": tracker.reference(raw_dir / prior["file"]),
+                    },
+                )
             print(
                 f"  [{i}/{len(delta)}] reuse {doc_id} {prior['title']}", file=sys.stderr
             )
@@ -527,6 +585,14 @@ def main() -> None:
             skipped.append((doc_id, reason))
             errors.append({"id": doc_id, "reason": reason})
             save_progress(errors)
+            tracker.step(str(doc_id), "download", "failed", reason=reason)
+            tracker.update(
+                str(doc_id),
+                pending=sorted(
+                    set(tracker.book["documents"][str(doc_id)].get("pending", []))
+                    | {"CAPTURE_EXPORT_FAILED"}
+                ),
+            )
             print(
                 f"  [{i}/{len(delta)}] FAIL {doc_id}: {reason}",
                 file=sys.stderr,
@@ -544,7 +610,11 @@ def main() -> None:
         remote_stamp = str(
             detail.get("content_updated_at") or doc.get("content_updated_at") or ""
         )
-        stamp = parse_date((remote_stamp or doc["stamp"])[:10]).isoformat()
+        stamp = (
+            parse_timestamp(remote_stamp).date().isoformat()
+            if remote_stamp
+            else doc["stamp"]
+        )
         title = str(detail.get("title") or doc.get("title") or f"doc-{doc_id}")
         doc = {
             **doc,
@@ -553,7 +623,13 @@ def main() -> None:
             "stamp": stamp,
         }
         trail = paths.get(doc_id, [])
-        naming_doc = {**doc, "title": title, "content_updated_at": remote_stamp}
+        naming_doc = {
+            **doc,
+            "title": title,
+            "content_updated_at": parse_timestamp(remote_stamp).isoformat()
+            if remote_stamp
+            else "",
+        }
         target = raw_dir / corpus_filename(naming_doc, trail, parse_date(doc["stamp"]))
         # A regenerated raw file invalidates OCR even when its filename is unchanged.
         # Invalidate first so interruption cannot leave a completed stale OCR result.
@@ -570,6 +646,29 @@ def main() -> None:
             "stamp": stamp,
         }
         save_progress(errors)
+        tracker.step(
+            str(doc_id),
+            "download",
+            "completed",
+            file=target.name,
+            version=tracker.version(remote_stamp),
+            raw=tracker.reference(target),
+        )
+        tracker.update(
+            str(doc_id),
+            corpus={
+                "status": "captured",
+                "version": tracker.version(remote_stamp),
+                "raw": tracker.reference(target),
+            },
+            pending=sorted(
+                (
+                    set(tracker.book["documents"][str(doc_id)].get("pending", []))
+                    - {"CAPTURE_EXPORT_FAILED"}
+                )
+                | {"GRAPH_UPDATE_REQUIRED"}
+            ),
+        )
         print(
             f"  [{i}/{len(delta)}] ok {doc_id} {title} ({len(body)} chars)",
             file=sys.stderr,
@@ -613,11 +712,35 @@ def main() -> None:
         file=sys.stderr,
     )
     try:
-        run_ocr_with_resume([p for p, _ in exported], ocr_dir, staging / "checkpoints")
+        by_file = {path.name: doc for path, doc in exported}
+
+        def ocr_completed(path):
+            tracker.step(
+                str(by_file[path.name]["id"]),
+                "ocr",
+                "completed",
+                file=path.name,
+                output=str(ocr_dir / path.name),
+            )
+
+        run_ocr_with_resume(
+            [p for p, _ in exported],
+            ocr_dir,
+            staging / "checkpoints",
+            on_complete=ocr_completed,
+        )
     except (OSError, RuntimeError, KeyboardInterrupt) as error:
         failure = {"stage": "ocr", "reason": safe_diagnostic(error) or "cancelled"}
         if isinstance(error, OCRFailure):
             failure["file"] = error.file
+        tracker.phase("ocr", "failed", reason=failure["reason"])
+        if failure.get("file") in by_file:
+            tracker.step(
+                str(by_file[failure["file"]]["id"]),
+                "ocr",
+                "failed",
+                reason=failure["reason"],
+            )
         manifest["status"] = "failed"
         manifest["failures"].append(failure)
         _write_failure_manifest(manifest_path, manifest)
@@ -630,6 +753,7 @@ def main() -> None:
             raise
         raise SystemExit(1) from error
     if errors:
+        tracker.phase("download", "failed", failures=len(errors))
         print(
             f"[export] completed={len(exported)} failed={len(errors)}; "
             f"staging kept at {staging}; valid export/OCR checkpoints will be reused",
@@ -644,19 +768,46 @@ def main() -> None:
         return
 
     try:
-        state = load_sync_state(input_dir)
-        result = publish_documents(exported, ocr_dir, input_dir, staging / "backup")
-        result.update(remove_documents(deletions, staging / "backup"))
-        for path, doc in exported:
-            if doc["remote_content_updated_at"]:
-                state[str(doc["id"])] = {
-                    "file": path.name,
-                    "content_updated_at": doc["remote_content_updated_at"],
-                }
-        for _, record in deletions:
-            state.pop(str(record["id"]), None)
-        save_sync_state(input_dir, state)
+
+        def published(destination, doc):
+            version = tracker.version(doc.get("remote_content_updated_at"))
+            raw = raw_dir / destination.name
+            tracker.step(
+                str(doc["id"]),
+                "corpus",
+                "completed",
+                file=destination.name,
+                version=version,
+            )
+            tracker.update(
+                str(doc["id"]),
+                corpus={
+                    "status": "published",
+                    "version": version,
+                    "raw": tracker.reference(raw),
+                    "file": destination.name,
+                },
+            )
+
+        def removed(record):
+            tracker.step(str(record["id"]), "corpus", "completed", deleted=True)
+            tracker.update(
+                str(record["id"]),
+                corpus={"status": "deleted", "version": None},
+                pending=sorted(
+                    set(tracker.book["documents"][str(record["id"])].get("pending", []))
+                    | {"GRAPH_DELETION_REQUIRED"}
+                ),
+            )
+
+        result = publish_documents(
+            exported, ocr_dir, input_dir, staging / "backup", on_complete=published
+        )
+        result.update(
+            remove_documents(deletions, staging / "backup", on_complete=removed)
+        )
     except (OSError, RuntimeError, KeyboardInterrupt, SystemExit) as error:
+        tracker.phase("corpus", "failed", reason=safe_diagnostic(error) or "cancelled")
         manifest["status"] = "failed"
         manifest["failures"].append(
             {"stage": "publish", "reason": safe_diagnostic(error) or "cancelled"}
@@ -674,6 +825,9 @@ def main() -> None:
     manifest["status"] = "completed"
     manifest["published"] = result
     _write_json(manifest_path, manifest)
+    tracker.phase("corpus", "completed", manifest=str(manifest_path))
+    if not os.environ.get("DOGPDKB_RUN_STAGING"):
+        tracker.finish()
     print(
         f"merged into {input_dir}: {result['added']} added, "
         f"{result['replaced']} stale copies replaced, "
