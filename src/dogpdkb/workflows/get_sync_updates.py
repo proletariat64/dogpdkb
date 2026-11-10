@@ -47,6 +47,11 @@ from threading import Event
 from typing import Any
 
 from dogpdkb.instance_lock import locked_main, subprocess_lock_options
+from dogpdkb.sync_progress import progress_for_config
+from dogpdkb.sync_state import StateError
+from dogpdkb.sync_state import load_state as canonical_load
+from dogpdkb.sync_state import save_state as canonical_save
+from dogpdkb.sync_time import UTC8, parse_timestamp, timestamp_record
 from mdocr.config import (
     cli_path,
     config_arguments,
@@ -102,7 +107,7 @@ def _parse_ts(value: Any) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parse_timestamp(str(value))
     except ValueError:
         return None
 
@@ -526,7 +531,7 @@ def resolve_book(url: str) -> dict[str, Any]:
 
 
 def fetch_doc_list(
-    book_id: int, items_count: int, cache_dir: Path | None = None
+    book_id: int, items_count: int, cache_dir: Path | None = None, *, on_page=None
 ) -> list[dict[str, Any]]:
     """Fetch a fresh listing; persisted pages are diagnostic checkpoints only.
 
@@ -570,6 +575,8 @@ def fetch_doc_list(
                 temporary.replace(cache)
             finally:
                 temporary.unlink(missing_ok=True)
+        if on_page is not None:
+            on_page(offset, data)
         return data
 
     cancelled = Event()
@@ -627,7 +634,9 @@ def fetch_doc_list(
     return sorted(docs.values(), key=lambda d: d["id"])
 
 
-def load_sync_state(input_dir: Path) -> dict[str, dict[str, str]]:
+def load_sync_state(
+    input_dir: Path, book_key: str | None = None
+) -> dict[str, dict[str, str]]:
     path = input_dir / ".sync-state.json"
     if not path.exists():
         return {}
@@ -635,13 +644,60 @@ def load_sync_state(input_dir: Path) -> dict[str, dict[str, str]]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f"cannot read sync state {path}: {exc}") from exc
+    if payload.get("version") == 2:
+        books = payload.get("books") or {}
+        if book_key not in books:
+            if len(books) != 1:
+                raise SystemExit("select one book for canonical sync state")
+            book_key = next(iter(books))
+        result = dict(books[book_key].get("legacy_documents") or {})
+        for doc_id, record in books[book_key]["documents"].items():
+            baseline = record.get("baseline") or {}
+            corpus = record.get("corpus") or {}
+            if corpus.get("status") == "deleted":
+                result.pop(doc_id, None)
+            elif corpus.get("status") == "published":
+                reference = corpus.get("raw") or {}
+                result[doc_id] = {
+                    "file": Path(reference.get("path", "")).name,
+                    "content_updated_at": (corpus.get("version") or {}).get("utc", ""),
+                }
+            elif baseline:
+                result[doc_id] = {
+                    "file": baseline["file"],
+                    "content_updated_at": baseline.get("content_updated_at") or "",
+                }
+        return result
     if payload.get("version") != 1 or not isinstance(payload.get("documents"), dict):
         raise SystemExit(f"unsupported sync state format in {path}")
     return payload["documents"]
 
 
-def save_sync_state(input_dir: Path, records: dict[str, dict[str, str]]) -> None:
+def save_sync_state(
+    input_dir: Path, records: dict[str, dict[str, str]], book_key: str | None = None
+) -> None:
     path = input_dir / ".sync-state.json"
+    if path.exists() and json.loads(path.read_text()).get("version") == 2:
+        root = canonical_load(input_dir, book_key)
+        books = root["books"]
+        if book_key not in books:
+            if len(books) != 1:
+                raise SystemExit("select one book for canonical sync state")
+            book_key = next(iter(books))
+        documents = books[book_key]["documents"]
+        for doc_id, row in records.items():
+            record = documents.setdefault(
+                doc_id, {"baseline": None, "steps": {}, "pending": []}
+            )
+            record["corpus"] = {
+                "status": "published",
+                "version": timestamp_record(row["content_updated_at"])
+                if row.get("content_updated_at")
+                else None,
+                "raw": {"path": row["file"], "stage": "historical_cleaned"},
+            }
+        canonical_save(input_dir, root)
+        return
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(
         json.dumps(
@@ -655,14 +711,18 @@ def save_sync_state(input_dir: Path, records: dict[str, dict[str, str]]) -> None
     temporary.replace(path)
 
 
-def scan_local(input_dir: Path) -> dict[int, tuple[date, str, datetime | None]]:
-    state = load_sync_state(input_dir)
+def scan_local(
+    input_dir: Path, book_key: str | None = None
+) -> dict[int, tuple[date, str, datetime | None]]:
+    state = load_sync_state(input_dir, book_key)
     local: dict[int, tuple[date, str, datetime | None]] = {}
-    for path in input_dir.rglob("*.md"):
+    for path in input_dir.glob("*.md"):
         match = LOCAL_NAME_RE.search(path.name)
         if not match:
             continue
         doc_id = match.group(2)
+        if int(doc_id) in local:
+            raise SystemExit(f"duplicate document ID {doc_id} in local corpus")
         record = state.get(doc_id) or {}
         remote = None
         if record.get("file") == path.name:
@@ -677,7 +737,7 @@ def scan_local(input_dir: Path) -> dict[int, tuple[date, str, datetime | None]]:
 
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
+        return value.replace(tzinfo=UTC8)
     return value.astimezone(timezone.utc)
 
 
@@ -842,6 +902,9 @@ def main() -> int | None:
     source = configured_book(parser, config, args, args.skylark_url)
     args.skylark_url = source.url
     if args.snapshot:
+        args.sync_source = source
+        args.sync_config = config
+        args.sync_corpus = cli_path(args.input) if args.input else source.corpus
         from dogpdkb.knowledge_capture import CaptureError, run_capture
 
         try:
@@ -849,7 +912,7 @@ def main() -> int | None:
             if status:
                 parser.exit(status)
             return status
-        except CaptureError as error:
+        except (CaptureError, StateError) as error:
             parser.exit(1, f"dogpdkb discover --snapshot: {error}\n")
     input_dir = cli_path(args.input) if args.input else source.corpus
     output_dir = cli_path(args.output) if args.output else config.state / source.key
@@ -866,16 +929,62 @@ def main() -> int | None:
     )
 
     print("Fetching full doc list ...", file=sys.stderr)
-    docs = fetch_doc_list(book["book_id"], book["items_count"], args.page_cache)
+    progress = progress_for_config(config, source, input_dir)
+    if progress:
+        progress.metadata["book_id"] = book["book_id"]
+        active = progress.root.get("active_run")
+        if active and not os.environ.get("DOGPDKB_RUN_STAGING"):
+            raise SystemExit("unfinished sync plan exists; resume it before discovery")
+
+    def observed_page(offset, rows):
+        if progress:
+            progress.observe_page(
+                offset,
+                [
+                    {
+                        "id": row["id"],
+                        "version": timestamp_record(
+                            str(row.get("content_updated_at") or row.get("updated_at")),
+                            "content_updated_at"
+                            if row.get("content_updated_at")
+                            else "updated_at",
+                        ),
+                    }
+                    for row in rows
+                ],
+            )
+
+    docs = fetch_doc_list(
+        book["book_id"], book["items_count"], args.page_cache, on_page=observed_page
+    )
+    if progress:
+        progress.phase("listing", "completed", document_count=len(docs))
 
     print("Scanning local corpus and fetching TOC ...", file=sys.stderr)
-    local = scan_local(input_dir)
+    local = scan_local(input_dir, progress.key if progress else source.key)
     paths = toc_paths(book["book_id"]) if local else {}
     new, updated = build_lists(docs, local)
+    if progress:
+        by_id = {row["id"]: row for row in docs}
+        selected = {row["id"] for _, _, row in updated}
+        for value, record in progress.book["documents"].items():
+            doc_id = int(value)
+            if (
+                record.get("pending")
+                and doc_id in by_id
+                and doc_id in local
+                and doc_id not in selected
+            ):
+                remote = _parse_ts(
+                    by_id[doc_id].get("content_updated_at")
+                    or by_id[doc_id].get("updated_at")
+                )
+                if remote:
+                    updated.append((remote, local[doc_id][0], by_id[doc_id]))
     renamed, moved = build_structure_lists(docs, local, paths)
     deleted = build_deletions(docs, local, input_dir)
 
-    today = datetime.now().astimezone().date()
+    today = datetime.now(UTC8).date()
     slug = book["slug"] or str(book["book_id"])
     stem = f"sync-updates-{slug}-{today:%Y%m%d}"
 
