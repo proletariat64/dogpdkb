@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -151,6 +152,11 @@ def inspect_artifacts(wheel: Path, sdist: Path) -> None:
         "dogpdkb/cli.py",
         "dogpdkb/doctor.py",
         "dogpdkb/lifecycle.py",
+        "dogpdkb/instance_lock.py",
+        "dogpdkb/sync_state.py",
+        "dogpdkb/sync_time.py",
+        "dogpdkb/sync_progress.py",
+        "dogpdkb/knowledge_state.py",
         "mdocr/cli.py",
         "dogpdkb/resources/dogpdkb.toml",
         "dogpdkb/resources/books.json",
@@ -199,6 +205,114 @@ def inspect_artifacts(wheel: Path, sdist: Path) -> None:
             raise RuntimeError(
                 "distribution contains local configuration or corpus artifacts"
             )
+
+
+def smoke_canonical_sync(work: Path, command: Path, run, env: dict) -> None:
+    """Exercise initialized historical state and precise same-day comparison offline."""
+    root = work / "canonical-sync"
+    corpus = root / "corpus/fund"
+    graph = corpus / "graphify-out/graph.json"
+    name = "Limits-2026-11-10-[1].md"
+    corpus.mkdir(parents=True)
+    body = "# Limits\n\nRefund requires approval.\n"
+    (corpus / name).write_text(body, encoding="utf-8")
+    (corpus / "Local-Notes.md").write_text("Local notes without remote identity.\n")
+    write_json(graph, {"nodes": [{"id": "old", "source_file": name}], "links": []})
+    write_json(
+        root / "books.json",
+        [{"key": "fund", "url": "https://example.invalid/team/book"}],
+    )
+    config = root / "config.toml"
+    config.write_text(
+        '[source]\nbooks_file="books.json"\n[paths]\ncorpus="corpus"\n[skylark]\nmcp_url="http://127.0.0.1:9/mcp"\n'
+    )
+    initialize = [str(command), "init-state", "--config", str(config), "--book", "fund"]
+    lock = Path(env["XDG_STATE_HOME"]) / "dogpdkb/sync.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        run(initialize, expected=1)
+        assert not (corpus / ".sync-state.json").exists()
+    initialized = parse_json(run(initialize))
+    assert initialized["counts"]["documents"] == 1
+    assert initialized["counts"]["files"] == 2
+    assert initialized["counts"]["unmatched_files"] == 1
+    version = "2026-11-09T18:30:00Z"
+    document = {
+        "id": 1,
+        "title": "Limits",
+        "slug": "limits",
+        "content_updated_at": version,
+    }
+    listing = root / "listing.json"
+    write_json(
+        listing,
+        {
+            "book": {"book_id": 123, "slug": "book", "name": "Funds", "items_count": 1},
+            "listing": {
+                "complete": True,
+                "document_count": 1,
+                "pages": [{"offset": 0, "limit": 50, "item_count": 1}],
+            },
+            "documents": [document],
+        },
+    )
+    details = root / "details"
+    write_json(details / "1.json", {**document, "body": body})
+    snapshot = root / "snapshot.json"
+    run(
+        [
+            str(command),
+            "discover",
+            "--config",
+            str(config),
+            "--book",
+            "fund",
+            "--snapshot",
+            str(snapshot),
+            "--staging",
+            str(root / "capture"),
+            "--listing",
+            str(listing),
+            "--details-dir",
+            str(details),
+        ]
+    )
+    observed = parse_json(snapshot.read_text())
+    assert observed["selected"] == [1]
+    assert observed["observation"]["timezone"] == "UTC+8"
+    state = parse_json((corpus / ".sync-state.json").read_text())
+    row = state["books"]["fund"]["documents"]["1"]
+    assert row["baseline"]["content_updated_at"] is None
+    downloaded = row["steps"]["download"]
+    assert downloaded["status"] == "completed"
+    assert downloaded["version"]["utc"] == "2026-11-10T02:30:00+08:00"
+    planning = root / "planning"
+    before_graph = graph.read_bytes()
+    run(
+        [
+            str(command),
+            "sync",
+            "--knowledge",
+            "--config",
+            str(config),
+            "--book",
+            "fund",
+            "--snapshot",
+            str(snapshot),
+            "--staging",
+            str(planning),
+        ]
+    )
+    plan = parse_json((planning / "plan.json").read_text())
+    assert plan["results"][0]["action"] == "KEEP_EXISTING"
+    state = parse_json((corpus / ".sync-state.json").read_text())
+    row = state["books"]["fund"]["documents"]["1"]
+    assert row["steps"]["compare"]["status"] == "completed"
+    assert row["graph"]["version"]["utc"] == "2026-11-10T02:30:00+08:00"
+    assert state["books"]["fund"]["unmatched_files"] == ["Local-Notes.md"]
+    assert graph.read_bytes() == before_graph
+    assert (corpus / name).read_text() == body
 
 
 def smoke_managed_install(work: Path, wheel: Path, version: str, env: dict) -> None:
@@ -315,6 +429,7 @@ def smoke(dist: Path) -> None:
         work = Path(temporary)
         environment = work / "env"
         python = environment / "bin/python"
+        env["XDG_STATE_HOME"] = str(work / "user-state")
         command = environment / "bin/dogpdkb"
         mdocr = environment / "bin/mdocr"
         mdcompare = environment / "bin/mdcompare"
@@ -401,6 +516,7 @@ def smoke(dist: Path) -> None:
             "update-graph",
             "publish-web",
             "doctor",
+            "init-state",
             "update",
             "uninstall",
         ):
@@ -823,9 +939,10 @@ def smoke(dist: Path) -> None:
         run([str(mdocr), "prepare", "-f", "image.md", "-o", "prepared"])
         assert (work / "prepared/image.md").is_file()
         assert list((work / "prepared/assets").rglob("*.jpg"))
+        smoke_canonical_sync(work, command, run, env)
         smoke_managed_install(work, wheel, version, env)
     print(
-        "smoke: PASS (wheel/sdist, CLI, mdcompare, knowledge snapshot/plan/approval/quality, "
+        "smoke: PASS (wheel/sdist, CLI, mdcompare, knowledge snapshot/plan/approval/quality, canonical state/UTC+8/lock, "
         "doctor, Web, images, managed upgrade/uninstall)"
     )
 

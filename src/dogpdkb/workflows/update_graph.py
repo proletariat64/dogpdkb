@@ -13,10 +13,6 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
-from dogpdkb.instance_lock import locked_main
-from dogpdkb.sync_progress import Progress, progress_for_config
-from dogpdkb.sync_time import UTC8
-
 if __package__:
     from .graph_sync import doc_id, merge_graph_records, validate_extracted_records
 else:
@@ -26,6 +22,9 @@ else:
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
+from dogpdkb.instance_lock import locked_main
+from dogpdkb.sync_progress import Progress, progress_for_config
+from dogpdkb.sync_time import UTC8
 from mdocr.config import cli_path, config_arguments, configure, configured_book
 
 
