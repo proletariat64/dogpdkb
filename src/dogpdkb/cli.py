@@ -67,6 +67,13 @@ def main(argv: list[str] | None = None) -> int:
         "init-config", help="create portable example configuration"
     )
     initialize.add_argument("-o", "--output", type=Path, default=Path.cwd())
+    initialize_state = commands.add_parser(
+        "init-state", help="register an existing corpus and graph without extraction"
+    )
+    initialize_state.add_argument("--config", type=Path)
+    initialize_state.add_argument("--book")
+    initialize_state.add_argument("-i", "--input", type=Path)
+    initialize_state.add_argument("--graph-dir", type=Path)
     upgrade = commands.add_parser(
         "update", help="install a specified Release; retain configuration and data"
     )
@@ -78,6 +85,28 @@ def main(argv: list[str] | None = None) -> int:
         "--yes", action="store_true", help="confirm noninteractive removal"
     )
     args = parser.parse_args(arguments)
+    if args.command == "init-state":
+        import json
+
+        from dogpdkb.sync_state import initialize_state
+        from mdocr.config import load_config, select_book
+
+        try:
+            config = load_config(args.config)
+            book = select_book(config, args.book)
+            corpus = (args.input or book.corpus).expanduser().resolve()
+            graph = (
+                (args.graph_dir or config.graph_dir or corpus / "graphify-out")
+                .expanduser()
+                .resolve()
+            )
+            result = initialize_state(
+                corpus, graph, book.key, url=book.url, name=book.name
+            )
+        except (OSError, ValueError) as error:
+            parser.exit(1, f"dogpdkb init-state: {error}\n")
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
     if args.command in ("update", "uninstall"):
         from dogpdkb import lifecycle
 
