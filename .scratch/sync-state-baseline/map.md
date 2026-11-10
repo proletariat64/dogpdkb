@@ -12,4 +12,4 @@ Status: implemented
 
 ## Validation and review
 
-The final review-fix source passed `make check` with 1,021 tests and isolated installed `make smoke`. Initial standards/specification findings and their CLI regression evidence are recorded in [acceptance](../../docs/sync-state-acceptance.md); both review axes passed follow-up checks. OCR CLI review remains pending and is not included in those pass claims. No production state or graph was migrated or updated.
+The final review-fix source passed `make check` with 1,027 tests and isolated installed `make smoke`. Initial standards/specification findings and their CLI regression evidence are recorded in [acceptance](../../docs/sync-state-acceptance.md); both review axes passed follow-up checks. External OCR remains explicitly partial: 14 source files completed externally and one remaining file was reviewed by the host using OCR delegate scope/rules. All 20 first-run comments are dispositioned in acceptance; this is not a claim of an all-35-file external review pass. No production state or graph was migrated or updated.

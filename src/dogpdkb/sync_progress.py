@@ -84,6 +84,10 @@ class Progress:
             raise StateError(
                 "unfinished sync plan exists; resume it before starting another plan"
             )
+        if phase == "capture" and active and active.get("plan_staging"):
+            raise StateError(
+                "capture is bound to an existing knowledge plan; continue that plan"
+            )
         if (
             phase in {"compare", "execute"}
             and active

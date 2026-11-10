@@ -479,19 +479,8 @@ def main() -> None:
     def print_retry() -> None:
         print(f"Retry: {shlex.join(retry_command)}", file=sys.stderr)
 
-    try:
-        tracker = progress_for_config(config, source, input_dir)
-        assert tracker is not None
-        tracker.claim(staging, phase="corpus")
-    except (OSError, ValueError) as error:
-        print(f"[state] failed: {safe_diagnostic(error)}", file=sys.stderr)
-        print_retry()
-        raise SystemExit(1) from error
-
     raw_dir = staging / "raw"
     ocr_dir = staging / "md"
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    ocr_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = staging / "export-progress.json"
     source_identity = {
         "path": str(sync_path.resolve()),
@@ -516,6 +505,18 @@ def main() -> None:
         if "configuration" in progress and progress["configuration"] != configuration:
             raise SystemExit("staging configuration changed; use a new staging dir")
         completed = progress.get("documents") or {}
+
+    try:
+        tracker = progress_for_config(config, source, input_dir)
+        assert tracker is not None
+        tracker.claim(staging, phase="corpus")
+    except (OSError, ValueError) as error:
+        print(f"[state] failed: {safe_diagnostic(error)}", file=sys.stderr)
+        print_retry()
+        raise SystemExit(1) from error
+
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    ocr_dir.mkdir(parents=True, exist_ok=True)
 
     def save_progress(errors: list[dict[str, Any]]) -> None:
         temporary = checkpoint.with_suffix(".json.tmp")

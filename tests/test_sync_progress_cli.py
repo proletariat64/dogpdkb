@@ -538,6 +538,70 @@ def test_explicit_migrated_state_cannot_execute_over_another_active_plan(
     assert graph.read_bytes() == graph_before
 
 
+def test_incomplete_capture_cannot_replace_inputs_after_a_plan_is_bound(tmp_path: Path):
+    from tests.test_knowledge_capture import listing
+
+    corpus, config = initialized(tmp_path)
+    documents = [
+        {"id": 1, "title": "One", "content_updated_at": "2026-11-10T10:00:00+08:00"},
+        {"id": 2, "title": "Two", "content_updated_at": "2026-11-10T10:00:00+08:00"},
+    ]
+    listing_path = tmp_path / "list.json"
+    write(listing_path, listing(documents))
+    details = tmp_path / "details"
+    write(details / "1.json", {**documents[0], "body": "# One\n\nOld rule.\n"})
+    snapshot = tmp_path / "partial.json"
+    capture = tmp_path / "capture"
+    arguments = (
+        "discover",
+        "--config",
+        str(config),
+        "--book",
+        "fund",
+        "--snapshot",
+        str(snapshot),
+        "--staging",
+        str(capture),
+        "--listing",
+        str(listing_path),
+        "--details-dir",
+        str(details),
+    )
+    result = cli(*arguments)
+    assert result.returncode == 1
+    assert json.loads(snapshot.read_text())["status"] == "incomplete"
+    plan = cli(
+        "sync",
+        "--knowledge",
+        "--config",
+        str(config),
+        "--book",
+        "fund",
+        "--snapshot",
+        str(snapshot),
+        "--staging",
+        str(tmp_path / "plan"),
+    )
+    assert plan.returncode == 0, plan.stderr
+    state_path = corpus / ".sync-state.json"
+    before = state_path.read_bytes(), snapshot.read_bytes()
+    raw_before = {
+        str(path): path.read_bytes() for path in (capture / "raw").glob("*.md")
+    }
+    documents[0]["content_updated_at"] = "2026-11-11T10:00:00+08:00"
+    write(listing_path, listing(documents))
+    for row in documents:
+        write(details / f"{row['id']}.json", {**row, "body": "Changed body"})
+    result = cli(*arguments)
+    assert result.returncode != 0
+    assert "plan" in result.stderr
+    assert state_path.read_bytes() == before[0]
+    assert snapshot.read_bytes() == before[1]
+    assert {
+        str(path): path.read_bytes() for path in (capture / "raw").glob("*.md")
+    } == raw_before
+
+
 def test_invalid_execute_arguments_do_not_import_legacy_state(tmp_path: Path):
     from tests.test_knowledge_execute import candidate_plan
 
@@ -563,6 +627,36 @@ def test_invalid_execute_arguments_do_not_import_legacy_state(tmp_path: Path):
     assert "--execute requires" in result.stderr
     assert (corpus / ".sync-state.json").read_bytes() == before[0]
     assert legacy.read_bytes() == before[1]
+
+
+def test_noncanonical_v2_state_path_is_rejected_without_dual_writes(tmp_path: Path):
+    from tests.test_knowledge_execute import candidate_plan
+
+    _plan, snapshot, _legacy, _staging, _graph = candidate_plan(tmp_path)
+    corpus, _config = initialized(tmp_path)
+    canonical = corpus / ".sync-state.json"
+    root = json.loads(canonical.read_text())
+    root["books"]["fund"]["book_id"] = 123
+    write(canonical, root)
+    backup = corpus / "backup.json"
+    backup.write_bytes(canonical.read_bytes())
+    before = canonical.read_bytes(), backup.read_bytes()
+    staging = tmp_path / "noncanonical-plan"
+    result = cli(
+        "sync",
+        "--knowledge",
+        "--snapshot",
+        str(snapshot),
+        "--state",
+        str(backup),
+        "--staging",
+        str(staging),
+    )
+    assert result.returncode != 0
+    assert "canonical" in result.stderr
+    assert canonical.read_bytes() == before[0]
+    assert backup.read_bytes() == before[1]
+    assert not (staging / "plan.json").exists()
 
 
 def test_legacy_import_cannot_replace_newer_canonical_capture(tmp_path: Path):

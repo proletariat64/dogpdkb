@@ -706,7 +706,16 @@ def main() -> None:
             for row in manifest.get("deleted", []):
                 identity = str(row["id"])
                 tracker.step(identity, "graph", "completed", deleted=True)
-                tracker.update(identity, graph={"status": "deleted", "version": None})
+                pending = tracker.book["documents"][identity].get("pending", [])
+                tracker.update(
+                    identity,
+                    graph={"status": "deleted", "version": None},
+                    pending=[
+                        reason
+                        for reason in pending
+                        if reason != "GRAPH_DELETION_REQUIRED"
+                    ],
+                )
             tracker.phase("graph", "completed", result=str(staging / "result.json"))
             if not os.environ.get("DOGPDKB_RUN_STAGING"):
                 tracker.finish()

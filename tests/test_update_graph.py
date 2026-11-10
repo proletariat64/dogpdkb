@@ -121,6 +121,31 @@ def test_manifest_version_anomaly_blocks_direct_graph_update(graph_job):
     assert builds == [1]
 
 
+def test_applied_graph_deletion_clears_only_its_pending_reason(graph_job, monkeypatch):
+    corpus, _graph, staging, _builds, _original = graph_job
+    update_graph.main()
+    path = corpus / ".sync-state.json"
+    state = json.loads(path.read_text())
+    state["books"]["adhoc"]["documents"]["1"]["pending"] = [
+        "GRAPH_DELETION_REQUIRED",
+        "review_pending",
+    ]
+    path.write_text(json.dumps(state))
+    (corpus / "a-[1].md").unlink()
+    manifest = staging.parent / "delete-manifest.json"
+    manifest.write_text(
+        json.dumps({"exported": [], "deleted": [{"id": 1, "local_file": "a-[1].md"}]})
+    )
+    args = list(sys.argv)
+    args[args.index("--manifest") + 1] = str(manifest)
+    args[args.index("--staging") + 1] = str(staging.parent / "delete-stage")
+    monkeypatch.setattr(sys, "argv", args)
+    update_graph.main()
+    record = json.loads(path.read_text())["books"]["adhoc"]["documents"]["1"]
+    assert record["graph"]["status"] == "deleted"
+    assert record["pending"] == ["review_pending"]
+
+
 def test_resume_still_rejects_external_graph_changes(graph_job):
     _corpus, graph, _staging, _builds, _original = graph_job
     (graph / "graph.json").write_text('{"nodes": ["external"]}')

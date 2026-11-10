@@ -116,6 +116,8 @@ def test_updater_rejects_other_plans_but_keeps_read_only_cli_available(tmp_path)
             env, "init-state", "--config", "/another-config.toml", "--book", "other"
         )
         assert "UPDATE_ALREADY_RUNNING" in initialized.stderr
+        update = run(env, "update", "--version", "not-a-valid-version")
+        assert "UPDATE_ALREADY_RUNNING" in update.stderr
         compared = subprocess.run(
             [sys.executable, "-m", "mdcompare", "--version"],
             env=env,

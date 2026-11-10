@@ -71,3 +71,42 @@ Final post-fix `make check` passed document guards, Ruff checks/format and **1,0
 Final gate logs: `/tmp/dogpdkb-sync-state-review-fix-final-check.log` and `/tmp/dogpdkb-sync-state-review-fix-final-smoke.log`. Red/green regressions are retained in `tests/test_sync_progress_cli.py`, `tests/test_apply_recovery.py`, `tests/test_pipeline.py` and `tests/test_update_graph.py`.
 
 The OCR CLI review is still running at the time of this entry; only its confirmed preliminary findings above have been fixed. No final OCR pass is claimed. The existing real-corpus initialization proof remains limited to task-owned copies, and no production migration, remote sync, paid Graphify execution or Web publication was performed.
+
+## Final OCR disposition and source closure
+
+This entry supersedes the earlier pending-OCR statements. No external review process remains running. The original review targeted the branch change scope of 35 files but was manually interrupted after 38 minutes 15 seconds; 13 of the 15 source files had completed source checkpoints. A resume with a different scope was rejected by the OCR CLI. A separate bounded five-minute review of the two remaining source files completed `sync_time.py` with one low-severity note, while `sync_progress.py` timed out. The host then used the installed OCR delegate workflow's deterministic preview/rules and reviewed the full `sync_progress.py` diff and its consumers: one file reviewed, zero skipped.
+
+Coverage therefore consists of **14 externally completed source reviews plus one host-delegated source review**. Neither external run is reported as an overall exit-0 review of all 35 changed files. The first external session is interrupted/partial, the bounded continuation is partial, and the delegated file review is a distinct proof layer. Reported external tokens are not Graphify extraction usage or production cost evidence.
+
+The sanitized first-run source comments are retained in `/tmp/dogpdkb-sync-state-ocr-source-comments.json`, the bounded review result in `/tmp/dogpdkb-sync-state-ocr-remaining.json`, and the deterministic delegate scope plus host findings in `/tmp/dogpdkb-sync-state-ocr-delegate-progress.json`. The following IDs follow the order of the 20 sanitized first-run comments.
+
+| ID | Source area | Disposition and evidence |
+| --- | --- | --- |
+| 1 | apply checkpoint ownership | Fixed. Source/config checkpoint validation now precedes claiming or creating staging output. Rejection preserves both an absent and a pre-existing active plan. |
+| 2 | listing timestamp exceptions | Fixed with explicit failed listing progress and a nonzero CLI result. Missing/date-only/invalid values are not skipped or reported as a successful zero-change plan. |
+| 3 | listing state error presentation | Deferred low-severity CLI presentation improvement. No synchronization correctness change was required for this note. |
+| 4 | legacy state reader UTF-8/error presentation | Deferred low-severity reader hardening. No source content or production state was changed to address it. |
+| 5 | pipeline claim before validation | Fixed. Resume/configuration/rebase validation is read-only and precedes run ownership mutation. |
+| 6 | observed-only IDs become updates | Fixed. Actual baseline/corpus/source evidence determines existing identity; historical filtering and new-document classification survive page observations and prior attempts. |
+| 7 | downloaded corpus marked applied | Not accepted as an applied-version defect. `captured` and `published` have distinct consumers; `get_sync_updates.load_sync_state` only advances from published corpus or established baseline, while graph coverage remains separate. |
+| 8 | completed execution leaves active run | Fixed. Completion/journal recovery is validated before persisting a new claim, and retries preserve committed state and graph bytes. |
+| 9 | arbitrary filename for v2 state | Fixed. The knowledge state loader rejects v2 files not named `.sync-state.json`, before per-document or final writes. Legacy named state files remain supported. |
+| 10 | invalid execute and quoted-home claims | Fixed. Required arguments/module checks precede import or initialization side effects; run identities expand quoted home paths consistently. |
+| 11 | legacy import replaces current capture | Fixed. Canonical observation, captured-source, pending and step evidence block destructive legacy import. |
+| 12 | explicit legacy read error presentation | Deferred low-severity CLI presentation improvement. |
+| 13 | update version option bypasses lock | Fixed. Only the standalone display form `--version` bypasses the decorator; `update --version ...` is locked. The regression holds a real updater lock and passes an invalid upgrade version, with no installation or network operation. |
+| 14 | observed/observation naming | Deferred compatibility cleanup. Listing observations and the snapshot observation consumed by knowledge planning remain explicit; no field was silently renamed. |
+| 15 | unused load_view helper | Deferred low-severity cleanup. |
+| 16 | reinitialization metadata | Fixed through the real CLI. Equivalent trailing-slash URLs are accepted, and an omitted/empty configured name preserves existing metadata. |
+| 17 | duplicate record_step helper | Deferred low-severity cleanup. |
+| 18 | candidate-only retains active run | Not changed. A retained candidate is an intermediate result before graph publication; the design requires the same run to continue with its staged candidate, rather than admitting a different updating plan. `graph_candidate` completion does not advance graph coverage. |
+| 19 | completed deletion remains pending | Fixed. Successful graph deletion removes only `GRAPH_DELETION_REQUIRED`, retaining unrelated review/pending reasons. |
+| 20 | metadata forces strict comparison action | Not accepted as the reported knowledge-route failure. The cited `mdcompare.decisions.choose_action` belongs to strict `compare`; `knowledge_plan._compare` calls `compare_knowledge_documents`, which does not consume strict `metadata.status` or that action selector. Title/context rules remain active. |
+
+The additional low-severity `sync_time.py` separator-format suggestion was deferred, along with the six low-severity first-run comments; the accepted timestamp syntax was not broadened during correctness fixes.
+
+Host review also reproduced a phase-boundary defect: an incomplete capture could produce a plan, then a repeated discovery could overwrite the same snapshot/raw and invalidate that plan. Complete snapshots were already rejected at capture entry. The narrow fix rejects `phase=capture` when its matching active run already has `plan_staging`, before listing acquisition or raw/snapshot writes. The real CLI regression first observed a successful overwrite, then passed by proving the original state, snapshot and raw bytes unchanged. This does not add abandonment, automatic replanning or a new workflow engine.
+
+Final post-OCR `make check` passed document guards, lint/format and **1,027 tests in 134.91 seconds**. The affected focused subset passed **84 tests in 20.85 seconds**. Final installed `make smoke` passed from the built wheel/sdist with a separate task-owned updater state directory. These runs cover the final source revision after all accepted OCR findings and the reproduced capture/plan boundary fix; the previous 1,021-test evidence is for commit `6be0957` and does not replace these final gates.
+
+Final logs: `/tmp/dogpdkb-sync-state-review-fix-ocr-final-check.log`, `/tmp/dogpdkb-sync-state-review-fix-ocr-focused.log`, and `/tmp/dogpdkb-sync-state-review-fix-ocr-final-smoke.log`. Documentation guard and diff whitespace checks were repeated after adding the final dispositions. No production actions are included in this closure.

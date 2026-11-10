@@ -360,6 +360,22 @@ def test_partial_corpus_publication_records_only_completed_documents(run, monkey
     assert (corpus / "Old-2-2026-01-01-[2].md").read_text() == "old 2"
 
 
+@pytest.mark.parametrize("unfinished", [False, True])
+def test_rejected_checkpoint_does_not_create_or_change_active_plan(run, unfinished):
+    invoke, corpus, _staging, _failures, _exports, _ocr, plan = run
+    invoke("--no-merge")
+    state_path = corpus / ".sync-state.json"
+    if not unfinished:
+        root = json.loads(state_path.read_text())
+        root["active_run"] = None
+        state_path.write_text(json.dumps(root))
+    before = state_path.read_bytes()
+    plan.write_text(plan.read_text() + " ")
+    with pytest.raises(SystemExit, match="different sync plan"):
+        invoke("--no-merge")
+    assert state_path.read_bytes() == before
+
+
 @pytest.mark.parametrize("cancel", [False, True])
 def test_failed_missing_ocr_regeneration_never_trusts_partial_output(
     run, monkeypatch, cancel
