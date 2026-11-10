@@ -56,7 +56,12 @@ def main(argv: list[str] | None = None) -> int:
         corpus = args.input or source.corpus
         target = state_path(corpus)
         try:
-            if not target.exists():
+            existing = load_state(corpus, source.key)
+            selected_book = existing["books"].get(source.key) or {}
+            if not target.exists() or (
+                "legacy_documents" in selected_book
+                and not selected_book.get("initialized_at")
+            ):
                 initialize_state(
                     corpus,
                     args.graph_dir or config.graph_dir or corpus / "graphify-out",

@@ -943,3 +943,181 @@ def test_date_only_remote_version_cannot_be_saved_as_exact_instant(tmp_path: Pat
     assert record["baseline"]["content_updated_at"] is None
     assert record["observed"] is None
     assert record["steps"].get("download") is None
+
+
+@pytest.mark.parametrize(
+    "changed_input",
+    [None, "source", "frozen", "incoming", "title", "version", "reference"],
+)
+def test_partial_plan_retries_keep_the_original_comparison_source(
+    tmp_path, changed_input
+):
+    corpus, config = initialized(tmp_path)
+    old = corpus / "One-2026-11-10-[1].md"
+    old_bytes = old.read_bytes()
+    raw = tmp_path / "new.md"
+    raw.write_bytes(old_bytes + b"\n")
+    second = tmp_path / "second.md"
+    second.write_text("# Two\n\nNew rule.\n")
+    version = {
+        "field": "content_updated_at",
+        "value": "2026-11-10T10:00:00+08:00",
+        "utc": "2026-11-10T10:00:00+08:00",
+    }
+    snapshot = tmp_path / "snapshot.json"
+    capture = {
+        "schema_version": "knowledge-capture-1.0",
+        "status": "captured",
+        "book": {"book_id": 123, "key": "fund", "name": "UAT"},
+        "observation": {"ended_at": "2026-11-10T11:00:00+08:00"},
+        "listing": {"complete": True, "document_count": 2, "document_ids": [1, 2]},
+        "documents": {
+            "1": {
+                "id": 1,
+                "title": "One",
+                "version": version,
+                "raw": {"stage": "raw_export", "path": str(raw)},
+            },
+            "2": {
+                "id": 2,
+                "title": None,
+                "version": version,
+                "raw": {"stage": "raw_export", "path": str(second)},
+            },
+        },
+        "selected": [1, 2],
+        "changes": {"updated": [1], "new": [2]},
+    }
+    write(snapshot, capture)
+    staging = tmp_path / "planning"
+    args = (
+        "sync",
+        "--knowledge",
+        "--config",
+        str(config),
+        "--book",
+        "fund",
+        "--snapshot",
+        str(snapshot),
+        "--staging",
+        str(staging),
+    )
+    result = cli(*args)
+    assert result.returncode != 0
+    assert "title is invalid" in result.stderr
+    assert not (staging / "plan.json").exists()
+    state_path = corpus / ".sync-state.json"
+    record = json.loads(state_path.read_text())["books"]["fund"]["documents"]["1"]
+    assert record["steps"]["compare"]["action"] == "KEEP_EXISTING"
+    comparison_path = Path(record["steps"]["compare"]["output"])
+    comparison_before = comparison_path.read_bytes()
+    frozen_old = Path(record["steps"]["compare"]["previous_raw"])
+    assert frozen_old.read_bytes() == old_bytes
+    if changed_input in {"source", "frozen", "incoming"}:
+        {"source": old, "frozen": frozen_old, "incoming": raw}[
+            changed_input
+        ].write_text("Changed evidence")
+    elif changed_input == "title":
+        capture["documents"]["1"]["title"] = "Changed subject"
+    elif changed_input == "version":
+        capture["documents"]["1"]["version"] = {
+            **version,
+            "utc": "2026-11-10T12:00:00+08:00",
+        }
+    elif changed_input == "reference":
+        replacement = tmp_path / "replacement.md"
+        replacement.write_bytes(raw.read_bytes())
+        capture["documents"]["1"]["raw"]["path"] = str(replacement)
+    capture["documents"]["2"]["title"] = "Two"
+    write(snapshot, capture)
+    result = cli(*args)
+    if changed_input:
+        assert result.returncode != 0
+        assert (
+            "input identity changed"
+            if changed_input in {"title", "version", "reference"}
+            else "different bytes"
+        ) in result.stderr
+        assert not (staging / "plan.json").exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        plan = json.loads((staging / "plan.json").read_text())
+        assert plan["results"][0]["action"] == "KEEP_EXISTING"
+        assert plan["counts"]["external_calls"] == 0
+        assert frozen_old.read_bytes() == old_bytes
+        assert comparison_path.read_bytes() == comparison_before
+        retained = json.loads(state_path.read_text())["books"]["fund"]["documents"][
+            "1"
+        ]["steps"]["compare"]
+        assert retained["previous_kind"] == "historical_enriched"
+        assert retained["previous_graph"]["raw"]["path"] == old.name
+        assert retained["previous_graph"]["version"] is None
+        assert retained["previous_graph"]["metadata"]["name"] == "One"
+
+
+def test_configured_knowledge_sync_initializes_v1_baselines_before_claim(tmp_path):
+    corpus, config = initialized(tmp_path)
+    state_path = corpus / ".sync-state.json"
+    original_time = "2026-11-09T18:30:00Z"
+    write(
+        state_path,
+        {
+            "version": 1,
+            "documents": {
+                "1": {
+                    "file": "One-2026-11-10-[1].md",
+                    "content_updated_at": original_time,
+                }
+            },
+        },
+    )
+    graph_path = corpus / "graphify-out/graph.json"
+    graph_before = graph_path.read_bytes()
+    raw = tmp_path / "current.md"
+    raw.write_text("# One\n\nOld rule.\n")
+    stamp = "2026-11-10T10:00:00+08:00"
+    version = {"field": "content_updated_at", "value": stamp, "utc": stamp}
+    snapshot = tmp_path / "snapshot.json"
+    write(
+        snapshot,
+        {
+            "schema_version": "knowledge-capture-1.0",
+            "status": "captured",
+            "book": {"book_id": 123, "key": "fund", "name": "UAT"},
+            "observation": {"ended_at": "2026-11-10T11:00:00+08:00"},
+            "listing": {"complete": True, "document_count": 1, "document_ids": [1]},
+            "documents": {
+                "1": {
+                    "id": 1,
+                    "title": "One",
+                    "version": version,
+                    "raw": {"stage": "raw_export", "path": str(raw)},
+                }
+            },
+            "selected": [1],
+            "changes": {"updated": [1]},
+        },
+    )
+    staging = tmp_path / "plan"
+    result = cli(
+        "sync",
+        "--knowledge",
+        "--config",
+        str(config),
+        "--book",
+        "fund",
+        "--snapshot",
+        str(snapshot),
+        "--staging",
+        str(staging),
+    )
+    assert result.returncode == 0, result.stderr
+    plan = json.loads((staging / "plan.json").read_text())
+    assert plan["results"][0]["action"] == "KEEP_EXISTING"
+    assert plan["counts"]["compared"] == 1
+    assert plan["counts"]["external_calls"] == 0
+    record = json.loads(state_path.read_text())["books"]["fund"]["documents"]["1"]
+    assert record["baseline"]["version"]["value"] == original_time
+    assert record["baseline"]["content_updated_at"] == "2026-11-10T02:30:00+08:00"
+    assert record["steps"]["compare"]["previous_kind"] == "historical_enriched"
+    assert graph_path.read_bytes() == graph_before

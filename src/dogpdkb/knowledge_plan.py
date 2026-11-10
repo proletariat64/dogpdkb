@@ -477,7 +477,29 @@ def _run_planner(args: Any) -> dict[str, Any]:
             reason for reason in previous_pending if reason not in transient_reasons
         ]
         reasons = list(persistent_pending)
-        old = _graph_document(doc_id, graph, book_id, state_path)
+        cached = previous.get("steps", {}).get("compare") or {}
+        comparison_path = staging / "comparisons" / f"{doc_id}.json"
+        # Reuse can advance graph.raw before a later document interrupts planning.
+        # Retry against the original source, still checking it against frozen bytes.
+        comparison_graph = graph
+        incoming_identity = {
+            "version": document["version"],
+            "source_raw": _relative_raw(raw_path, state_path) if raw_path else None,
+            "metadata": _document(document, book_id, raw_path).metadata
+            if work and not capture_anomalies and raw_path is not None
+            else None,
+        }
+        if (
+            cached.get("output") == str(comparison_path)
+            and cached.get("status") == "completed"
+            and "previous_graph" in cached
+        ):
+            if any(
+                cached.get(key) != value for key, value in incoming_identity.items()
+            ):
+                raise PlanError("retained comparison input identity changed")
+            comparison_graph = cached["previous_graph"]
+        old = _graph_document(doc_id, comparison_graph, book_id, state_path)
         frozen = None
         frozen_old = None
         source_failure = None
@@ -508,10 +530,9 @@ def _run_planner(args: Any) -> dict[str, Any]:
                 if frozen is None:
                     corpus = {**corpus, "status": "pending", "version": None}
         if frozen is not None and source_failure is None:
-            cached = previous.get("steps", {}).get("compare") or {}
-            comparison_path = staging / "comparisons" / f"{doc_id}.json"
             comparison_inputs = {
-                "version": document["version"],
+                **incoming_identity,
+                "previous_graph": comparison_graph,
                 "raw": str(frozen),
                 "previous_raw": str(frozen_old) if frozen_old else None,
                 "previous_kind": old.content_kind if old else None,

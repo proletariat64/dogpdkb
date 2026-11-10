@@ -5,6 +5,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 
 def run_init(tmp_path, *extra):
     env = os.environ.copy()
@@ -212,3 +214,105 @@ def test_reinitialization_accepts_url_slash_and_preserves_existing_name(tmp_path
     assert result.returncode == 0, result.stderr
     book = json.loads((corpus / ".sync-state.json").read_text())["books"]["fund"]
     assert book["name"] == "Funds"
+
+
+@pytest.mark.parametrize("original_survives", [False, True])
+def test_duplicate_resolution_preserves_registered_baseline_identity(
+    tmp_path, original_survives
+):
+    corpus, graph = corpus_config(tmp_path)
+    first = corpus / "One-2026-11-10-[42].md"
+    second = corpus / "Two-2026-11-10-[42].md"
+    first.write_text("# Original knowledge\n")
+    (graph / "graph.json").write_text(
+        json.dumps(
+            {
+                "nodes": [{"id": "original", "source_file": first.name}],
+                "links": [],
+            }
+        )
+    )
+    before = (graph / "graph.json").read_bytes()
+    assert run_init(tmp_path).returncode == 0
+    second.write_text("# Different knowledge\n")
+    assert run_init(tmp_path).returncode == 0
+    (second if original_survives else first).unlink()
+    result = run_init(tmp_path)
+    assert result.returncode == 0, result.stderr
+    record = json.loads((corpus / ".sync-state.json").read_text())["books"]["fund"][
+        "documents"
+    ]["42"]
+    assert record["baseline"]["file"] == first.name
+    assert record["baseline"]["source"]["path"] == first.name
+    if original_survives:
+        assert record["pending"] == []
+        assert "conflicting_files" not in record
+    else:
+        assert "BASELINE_SOURCE_CONFLICT" in record["pending"]
+        assert record["conflicting_files"] == [second.name]
+        assert json.loads(result.stdout)["counts"]["baseline_source_conflicts"] == 1
+    assert (graph / "graph.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("graph_current", [True, False])
+def test_reinitialization_accepts_a_published_corpus_and_graph_version(
+    tmp_path, graph_current
+):
+    corpus, graph = corpus_config(tmp_path)
+    first = corpus / "One-2026-11-10-[42].md"
+    first.write_text("# Original knowledge\n")
+    (graph / "graph.json").write_text(
+        json.dumps(
+            {
+                "nodes": [{"id": "original", "source_file": first.name}],
+                "links": [],
+            }
+        )
+    )
+    assert run_init(tmp_path).returncode == 0
+    second = corpus / "Two-2026-11-10-[42].md"
+    first.rename(second)
+    second.write_text("# Published knowledge\n")
+    state_path = corpus / ".sync-state.json"
+    state = json.loads(state_path.read_text())
+    record = state["books"]["fund"]["documents"]["42"]
+    version = {"utc": "2026-11-10T12:00:00+08:00"}
+    raw = {"stage": "raw_export", "path": "published-raw.md"}
+    (corpus / "published-raw.md").write_text("# Published knowledge\n")
+    record["corpus"] = {
+        "status": "published",
+        "file": second.name,
+        "raw": raw,
+        "version": version,
+    }
+    record["graph"] = {
+        "status": "covered",
+        "coverage": "approved_whole_document",
+        "raw": raw,
+        "version": version if graph_current else {"utc": "2026-11-10T10:00:00+08:00"},
+    }
+    record["steps"] = {
+        "corpus": {"status": "completed", "file": second.name, "version": version},
+        "graph_publish": {"status": "completed", "version": version},
+    }
+    state_path.write_text(json.dumps(state))
+    (graph / "graph.json").write_text(
+        json.dumps(
+            {
+                "nodes": [{"id": "published", "source_file": second.name}],
+                "links": [],
+            }
+        )
+    )
+    graph_before = (graph / "graph.json").read_bytes()
+    result = run_init(tmp_path)
+    assert result.returncode == 0, result.stderr
+    record = json.loads(state_path.read_text())["books"]["fund"]["documents"]["42"]
+    if graph_current:
+        assert record["pending"] == []
+        assert "conflicting_files" not in record
+    else:
+        assert record["pending"] == ["BASELINE_SOURCE_CONFLICT"]
+    assert record["baseline"]["file"] == first.name
+    assert record["corpus"]["file"] == second.name
+    assert (graph / "graph.json").read_bytes() == graph_before

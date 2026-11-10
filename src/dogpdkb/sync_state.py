@@ -161,9 +161,29 @@ def initialize_state(
             )
             continue
         path = candidates[0]
+        baseline = record.get("baseline") or {}
+        current_corpus = record.get("corpus") or {}
+        current_graph = record.get("graph") or {}
+        published_current = (
+            current_corpus.get("status") == "published"
+            and current_corpus.get("file") == path.name
+            and current_corpus.get("version") is not None
+            and current_graph.get("status") == "covered"
+            and current_graph.get("version") == current_corpus["version"]
+        )
+        if baseline and baseline.get("file") != path.name and not published_current:
+            counts["baseline_source_conflicts"] += 1
+            record["conflicting_files"] = [path.name]
+            record["pending"] = sorted(
+                (set(record["pending"]) - {"DUPLICATE_DOCUMENT_ID"})
+                | {"BASELINE_SOURCE_CONFLICT"}
+            )
+            continue
         record.pop("conflicting_files", None)
         record["pending"] = [
-            reason for reason in record["pending"] if reason != "DUPLICATE_DOCUMENT_ID"
+            reason
+            for reason in record["pending"]
+            if reason not in {"DUPLICATE_DOCUMENT_ID", "BASELINE_SOURCE_CONFLICT"}
         ]
         match = LOCAL_NAME.search(path.name)
         assert match
