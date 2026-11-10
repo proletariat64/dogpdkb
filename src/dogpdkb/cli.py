@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from dogpdkb.instance_lock import locked_main, subprocess_lock_options
+
 WORKFLOWS = {
     "sync": "sync_knowledge_base.py",
     "discover": "get_sync_updates.py",
@@ -39,11 +41,13 @@ def init_config(directory: Path) -> None:
         raise
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] in WORKFLOWS:
         script = Path(__file__).resolve().parent / "workflows" / WORKFLOWS[arguments[0]]
-        return subprocess.call([sys.executable, str(script), *arguments[1:]])
+        return subprocess.call(
+            [sys.executable, str(script), *arguments[1:]], **subprocess_lock_options()
+        )
     parser = argparse.ArgumentParser(description=__doc__, prog="dogpdkb")
     try:
         version = importlib.metadata.version("dogpdkb")
@@ -67,6 +71,13 @@ def main(argv: list[str] | None = None) -> int:
         "init-config", help="create portable example configuration"
     )
     initialize.add_argument("-o", "--output", type=Path, default=Path.cwd())
+    initialize_state = commands.add_parser(
+        "init-state", help="register an existing corpus and graph without extraction"
+    )
+    initialize_state.add_argument("--config", type=Path)
+    initialize_state.add_argument("--book")
+    initialize_state.add_argument("-i", "--input", type=Path)
+    initialize_state.add_argument("--graph-dir", type=Path)
     upgrade = commands.add_parser(
         "update", help="install a specified Release; retain configuration and data"
     )
@@ -78,6 +89,28 @@ def main(argv: list[str] | None = None) -> int:
         "--yes", action="store_true", help="confirm noninteractive removal"
     )
     args = parser.parse_args(arguments)
+    if args.command == "init-state":
+        import json
+
+        from dogpdkb.sync_state import initialize_state
+        from mdocr.config import load_config, select_book
+
+        try:
+            config = load_config(args.config)
+            book = select_book(config, args.book)
+            corpus = (args.input or book.corpus).expanduser().resolve()
+            graph = (
+                (args.graph_dir or config.graph_dir or corpus / "graphify-out")
+                .expanduser()
+                .resolve()
+            )
+            result = initialize_state(
+                corpus, graph, book.key, url=book.url, name=book.name
+            )
+        except (OSError, ValueError) as error:
+            parser.exit(1, f"dogpdkb init-state: {error}\n")
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
     if args.command in ("update", "uninstall"):
         from dogpdkb import lifecycle
 
@@ -106,3 +139,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     parser.print_help()
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] in {*WORKFLOWS, "init-state", "update", "uninstall"}:
+        return locked_main(_main)(arguments)
+    return _main(arguments)

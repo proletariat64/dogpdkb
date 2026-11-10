@@ -55,7 +55,10 @@ and [real-file UAT record](docs/mdcompare-uat.md). It is included in the wheel.
 For the opt-in daily raw snapshot, review and approved whole-document workflow, see
 [daily knowledge sync](docs/daily-knowledge-sync.md) and its
 [isolated UAT](docs/daily-knowledge-sync-uat.md). Existing commands remain unchanged
-unless `--snapshot` or `sync --knowledge` is explicitly selected.
+unless `--snapshot` or `sync --knowledge` is explicitly selected. Existing cleaned
+corpora can be registered with `dogpdkb init-state --config dogpdkb.toml --book <key>`;
+knowledge capture and planning then save each completed step in the corpus
+`.sync-state.json`. See [state, UTC+8 and single-updater behavior](docs/sync-state-design.md).
 
 ## mdocr — Markdown image prepare/OCR CLI
 

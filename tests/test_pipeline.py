@@ -73,6 +73,34 @@ def options(tmp_path: Path):
     )
 
 
+@pytest.mark.parametrize("unfinished", [False, True])
+def test_invalid_resume_configuration_preserves_canonical_run_identity(
+    tmp_path: Path, unfinished: bool
+):
+    config = options(tmp_path)
+    config.input_dir.mkdir()
+    (config.input_dir / "Doc-2026-01-01-[1].md").write_text("body")
+    pipeline.run_pipeline(config, runner=fake_runner(config.staging, []))
+    state_path = config.input_dir / ".sync-state.json"
+    state = json.loads(state_path.read_text())
+    if unfinished:
+        state["active_run"] = {
+            "staging": str(config.staging.resolve()),
+            "book_key": "adhoc",
+            "phase": "graph",
+            "updated_at": "2026-11-10T10:00:00+08:00",
+        }
+        state_path.write_text(json.dumps(state))
+    before = state_path.read_bytes()
+    config.resume = True
+    config.cutoff = "2026-01-02"
+    calls = []
+    with pytest.raises(ValueError, match="staging configuration changed"):
+        pipeline.run_pipeline(config, runner=fake_runner(config.staging, calls))
+    assert state_path.read_bytes() == before
+    assert calls == []
+
+
 def test_pipeline_resumes_after_graph_failure(tmp_path: Path):
     config = options(tmp_path)
     config.input_dir.mkdir()
@@ -272,6 +300,11 @@ def test_pipeline_resumes_real_apply_without_repeating_plan_or_successful_export
     assert calls == ["get_sync_updates.py", "apply_sync_updates.py"]
     state = json.loads((staging / "pipeline-state.json").read_text())
     assert state["stages"] == {"plan": "completed", "corpus": "retry_required"}
+    canonical = json.loads((corpus / ".sync-state.json").read_text())
+    assert canonical["active_run"]["staging"] == str(staging.resolve())
+    book = canonical["books"]["adhoc"]
+    assert book["documents"]["1"]["steps"]["download"]["status"] == "completed"
+    assert book["steps"]["corpus"]["status"] == "failed"
     output = capsys.readouterr().err
     assert "completed_exports=1 failed=1" in output
     assert "unit=2" in output
@@ -285,6 +318,7 @@ def test_pipeline_resumes_real_apply_without_repeating_plan_or_successful_export
     result = pipeline.run_pipeline(config, runner=run)
 
     assert result["status"] == "completed"
+    assert json.loads((corpus / ".sync-state.json").read_text())["active_run"] is None
     assert calls == ["apply_sync_updates.py", "update_graph.py", "publish_web.py"]
     assert exports == [2]
     assert ocr == ["Doc-2-2026-11-01-[2].md"]

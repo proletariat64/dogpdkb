@@ -94,8 +94,104 @@ def snapshot(corpus):
     return {
         str(path.relative_to(corpus)): path.read_bytes()
         for path in corpus.rglob("*")
-        if path.is_file()
+        if path.is_file() and path.name != ".sync-state.json"
     }
+
+
+def test_download_progress_survives_later_export_failure(run):
+    invoke, corpus, staging, failures, _exports, _ocr, _plan = run
+    failures.add(2)
+    with pytest.raises(SystemExit):
+        invoke()
+    state = json.loads((corpus / ".sync-state.json").read_text())
+    records = state["books"]["adhoc"]["documents"]
+    assert records["1"]["steps"]["download"]["status"] == "completed"
+    assert (
+        records["1"]["steps"]["download"]["version"]["utc"]
+        == "2026-11-01T12:00:00+08:00"
+    )
+    assert (staging / "raw" / records["1"]["steps"]["download"]["file"]).is_file()
+    assert records["2"]["steps"]["download"]["status"] == "failed"
+    assert "graph" not in records["1"]["steps"]
+    assert records["1"]["corpus"]["status"] == "captured"
+    assert "corpus" not in records["1"]["steps"]
+    assert not records["1"].get("graph")
+    assert state["active_run"] is not None
+
+
+def test_download_uses_utc8_filename_date_and_keeps_exact_version(run, monkeypatch):
+    invoke, corpus, staging, _failures, _exports, _ocr, _plan = run
+    monkeypatch.setattr(
+        apply_sync,
+        "export_doc",
+        lambda doc_id, doc_format=None: (
+            "body",
+            {"content_updated_at": "2026-11-01T18:30:00Z"},
+        ),
+    )
+    # A detail version newer than the listing is downloaded but held for review.
+    with pytest.raises(SystemExit):
+        invoke("--no-merge")
+    assert (staging / "raw" / "Doc-1-2026-11-02-[1].md").is_file()
+    state = json.loads((corpus / ".sync-state.json").read_text())
+    download = state["books"]["adhoc"]["documents"]["1"]["steps"]["download"]
+    assert download["version"]["utc"] == "2026-11-02T02:30:00+08:00"
+    assert download["version"]["value"] == "2026-11-01T18:30:00Z"
+
+
+@pytest.mark.parametrize("detail_stamp", ["2026-11-02T10:00:00+08:00", None])
+def test_detail_version_fallback_is_recorded_without_publishing_anomalies(
+    run, monkeypatch, detail_stamp
+):
+    invoke, corpus, staging, _failures, _exports, _ocr, _plan = run
+    before = snapshot(corpus)
+    detail = {"updated_at": detail_stamp} if detail_stamp else {}
+    monkeypatch.setattr(
+        apply_sync, "export_doc", lambda doc_id, doc_format=None: ("new body", detail)
+    )
+    with pytest.raises(SystemExit):
+        invoke()
+    assert snapshot(corpus) == before
+    root = json.loads((corpus / ".sync-state.json").read_text())
+    record = root["books"]["adhoc"]["documents"]["1"]
+    download = record["steps"]["download"]
+    assert download["listing_version"]["value"] == "2026-11-01T12:00:00+08:00"
+    if detail_stamp:
+        assert download["version"]["field"] == "updated_at"
+        assert download["version"]["value"] == detail_stamp
+    else:
+        assert download["version"] is None
+    assert download["anomalies"]
+    assert record["corpus"]["status"] == "captured"
+    assert "corpus" not in record["steps"]
+    assert not record.get("graph")
+    assert json.loads((staging / "manifest.json").read_text())["status"] == "failed"
+
+
+def test_matching_updated_at_detail_version_reaches_corpus_and_manifest(
+    run, monkeypatch
+):
+    invoke, corpus, staging, _failures, _exports, _ocr, plan = run
+    payload = json.loads(plan.read_text())
+    for row in payload["updated"]:
+        row["updated_at"] = row.pop("content_updated_at")
+    plan.write_text(json.dumps(payload))
+    monkeypatch.setattr(
+        apply_sync,
+        "export_doc",
+        lambda doc_id, doc_format=None: (
+            "new body",
+            {"updated_at": "2026-11-01T12:00:00+08:00"},
+        ),
+    )
+    invoke()
+    record = json.loads((corpus / ".sync-state.json").read_text())["books"]["adhoc"][
+        "documents"
+    ]["1"]
+    assert record["corpus"]["version"]["field"] == "updated_at"
+    manifest = json.loads((staging / "manifest.json").read_text())
+    assert manifest["exported"][0]["source_version"]["field"] == "updated_at"
+    assert manifest["exported"][0]["listing_version"]["field"] == "updated_at"
 
 
 @pytest.mark.parametrize("no_merge", [False, True])
@@ -240,6 +336,46 @@ def test_publication_failure_records_failed_manifest_without_sync_state_advance(
     assert manifest["failures"][0]["stage"] == "publish"
 
 
+def test_partial_corpus_publication_records_only_completed_documents(run, monkeypatch):
+    invoke, corpus, _staging, _failures, _exports, _ocr, _plan = run
+    copy = apply_sync._atomic_copy
+
+    def fail_second_document(source, destination):
+        if destination.parent == corpus and "[2].md" in destination.name:
+            raise OSError("second publication failed")
+        return copy(source, destination)
+
+    monkeypatch.setattr(apply_sync, "_atomic_copy", fail_second_document)
+    with pytest.raises(SystemExit):
+        invoke()
+    state = json.loads((corpus / ".sync-state.json").read_text())
+    records = state["books"]["adhoc"]["documents"]
+    assert records["1"]["steps"]["corpus"]["status"] == "completed"
+    assert records["1"]["corpus"]["status"] == "published"
+    assert records["2"]["corpus"]["status"] == "captured"
+    assert "corpus" not in records["2"]["steps"]
+    assert not records["1"].get("graph")
+    assert not records["2"].get("graph")
+    assert (corpus / "Doc-1-2026-11-01-[1].md").read_text() == "new 1"
+    assert (corpus / "Old-2-2026-01-01-[2].md").read_text() == "old 2"
+
+
+@pytest.mark.parametrize("unfinished", [False, True])
+def test_rejected_checkpoint_does_not_create_or_change_active_plan(run, unfinished):
+    invoke, corpus, _staging, _failures, _exports, _ocr, plan = run
+    invoke("--no-merge")
+    state_path = corpus / ".sync-state.json"
+    if not unfinished:
+        root = json.loads(state_path.read_text())
+        root["active_run"] = None
+        state_path.write_text(json.dumps(root))
+    before = state_path.read_bytes()
+    plan.write_text(plan.read_text() + " ")
+    with pytest.raises(SystemExit, match="different sync plan"):
+        invoke("--no-merge")
+    assert state_path.read_bytes() == before
+
+
 @pytest.mark.parametrize("cancel", [False, True])
 def test_failed_missing_ocr_regeneration_never_trusts_partial_output(
     run, monkeypatch, cancel
@@ -337,11 +473,10 @@ def test_invalid_sync_state_fails_before_publication_with_retry_diagnostics(
 
     assert error.value.code != 0
     assert snapshot(corpus) == before
-    manifest = json.loads((staging / "manifest.json").read_text())
-    assert manifest["status"] == "failed"
-    assert manifest["failures"][0]["stage"] == "publish"
+    assert not staging.exists()
+    assert (corpus / ".sync-state.json").read_text() == state
     output = capsys.readouterr().err
-    assert "[publish] failed" in output and "Retry:" in output
+    assert "[state] failed" in output and "Retry:" in output
 
 
 @pytest.mark.parametrize(
@@ -372,8 +507,14 @@ def test_failure_retry_output_survives_unwritable_diagnostic_manifest(
 
         monkeypatch.setattr(apply_sync, "run_mdocr", cancel)
     else:
-        (corpus / ".sync-state.json").write_text("invalid state")
-        before = snapshot(corpus)
+        copy = apply_sync._atomic_copy
+
+        def fail_publication(source, destination):
+            if destination.parent == corpus:
+                raise OSError("publication disk full")
+            return copy(source, destination)
+
+        monkeypatch.setattr(apply_sync, "_atomic_copy", fail_publication)
     replace = Path.replace
 
     def cannot_save_failure(path, target):

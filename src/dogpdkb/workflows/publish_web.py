@@ -12,6 +12,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from dogpdkb.instance_lock import locked_main
+from dogpdkb.sync_progress import progress_for_config
+from dogpdkb.sync_time import UTC8
+
 NAME_RE = re.compile(r"-(\d{4}-\d{2}-\d{2})-\[(\d+)\]\.md$")
 from mdocr.config import (
     SyncConfig,
@@ -94,7 +98,7 @@ def build_catalog(
             }
         )
     return {
-        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "generated_at": datetime.now(UTC8).isoformat(timespec="seconds"),
         "book": book,
         "stats": {
             "documents": len(documents),
@@ -226,7 +230,7 @@ def build_map(
             "documents": list(documents.values()),
         }
     return {
-        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "generated_at": datetime.now(UTC8).isoformat(timespec="seconds"),
         "stats": {
             "rawNodes": len(graph["nodes"]),
             "rawEdges": len(graph.get("links", [])),
@@ -319,6 +323,7 @@ def publish_snapshots(output: Path, catalog: dict, layered: dict) -> None:
         raise
 
 
+@locked_main
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     config_arguments(parser, book=True)
@@ -348,7 +353,22 @@ def main() -> None:
         config,
     )
     layered = build_map(graph, catalog, community_limit=config.community_limit)
-    publish_snapshots(args.output, catalog, layered)
+    tracker = progress_for_config(config, source, args.input)
+    if tracker:
+        tracker.claim(args.output, phase="web")
+        tracker.phase("web", "running")
+    try:
+        publish_snapshots(args.output, catalog, layered)
+    except BaseException as error:
+        if tracker:
+            tracker.phase("web", "failed", reason=type(error).__name__)
+        raise
+    if tracker:
+        tracker.phase(
+            "web", "completed", output=str(args.output), graph=str(graph_path)
+        )
+        if not os.environ.get("DOGPDKB_RUN_STAGING"):
+            tracker.finish()
     result = {
         "status": "completed",
         "documents": catalog["stats"]["documents"],

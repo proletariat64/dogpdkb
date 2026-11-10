@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from dogpdkb.sync_progress import Progress
+from dogpdkb.sync_state import state_path
+from dogpdkb.sync_time import now_iso, parse_timestamp, timestamp_record
 from mdcompare.io import InputError, validate_outputs
 
 SCHEMA_VERSION = "knowledge-capture-1.0"
@@ -19,7 +22,7 @@ class CaptureError(ValueError):
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return now_iso()
 
 
 def _version(document: dict[str, Any]) -> dict[str, Any]:
@@ -28,22 +31,16 @@ def _version(document: dict[str, Any]) -> dict[str, Any]:
     if not value:
         raise CaptureError(f"document {document['id']} has no usable update timestamp")
     try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return timestamp_record(str(value), field)
     except ValueError as error:
         raise CaptureError(
             f"document {document['id']} has an invalid update timestamp"
         ) from error
-    if parsed.tzinfo is None:
-        raise CaptureError(
-            f"document {document['id']} update timestamp has no timezone"
-        )
-    normalized = parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    return {"field": field, "value": str(value), "utc": normalized}
 
 
 def _instant(version: dict[str, Any]) -> datetime:
     try:
-        return datetime.fromisoformat(str(version["utc"]).replace("Z", "+00:00"))
+        return parse_timestamp(str(version["utc"]))
     except (KeyError, TypeError, ValueError) as error:
         raise CaptureError(
             "snapshot contains an invalid normalized timestamp"
@@ -195,7 +192,7 @@ def _validate_capture_paths(args: Any, snapshot_path: Path, staging: Path) -> se
 
 
 def _load_remote_listing(
-    source_url: str, staging: Path
+    source_url: str, staging: Path, progress: Progress | None = None
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     from dogpdkb.workflows.get_sync_updates import (
         PAGE_SIZE,
@@ -208,7 +205,21 @@ def _load_remote_listing(
     try:
         book = resolve_book(source_url)
         pages_dir = staging / "pages"
-        documents = fetch_doc_list(book["book_id"], book["items_count"], pages_dir)
+        if progress:
+            progress.metadata["book_id"] = book["book_id"]
+        documents = fetch_doc_list(
+            book["book_id"],
+            book["items_count"],
+            pages_dir,
+            on_page=(
+                lambda offset, rows: progress.observe_page(
+                    offset,
+                    [{"id": row["id"], "version": _version(row)} for row in rows],
+                )
+            )
+            if progress
+            else None,
+        )
         paths = toc_paths(book["book_id"])
     except SkylarkError as error:
         raise CaptureError(f"remote observation failed: {error}") from error
@@ -471,6 +482,12 @@ def run_capture(args: Any) -> int:
         else snapshot_path.parent / "staging"
     )
     protected_inputs = _validate_capture_paths(args, snapshot_path, staging)
+    progress = None
+    corpus = getattr(args, "sync_corpus", None)
+    source = getattr(args, "sync_source", None)
+    if corpus and source and state_path(Path(corpus)).is_file():
+        progress = Progress(Path(corpus), source.key, url=source.url, name=source.name)
+        progress.claim(staging, phase="capture", parent=snapshot_path)
     started_at = _utc_now()
     if args.listing:
         book, documents, listing = _load_local_listing(
@@ -479,7 +496,19 @@ def run_capture(args: Any) -> int:
     else:
         if args.details_dir:
             raise CaptureError("--details-dir requires the local --listing adapter")
-        book, documents, listing = _load_remote_listing(args.skylark_url, staging)
+        book, documents, listing = _load_remote_listing(
+            args.skylark_url, staging, progress
+        )
+    if progress:
+        progress = Progress(
+            progress.corpus,
+            progress.key,
+            url=source.url,
+            name=source.name,
+            book_id=book["book_id"],
+        )
+        progress.run = str(snapshot_path)
+        book = {**book, "key": source.key, "url": source.url}
     records = {
         str(document["id"]): {
             "id": document["id"],
@@ -500,6 +529,20 @@ def run_capture(args: Any) -> int:
         raise CaptureError("baseline snapshot cannot be overwritten")
     baseline = _load_baseline(baseline_path, book) if baseline_path else None
     baseline_documents = baseline["documents"] if baseline else {}
+    canonical_documents = progress.book["documents"] if progress else {}
+    if progress:
+        for page in listing["pages"]:
+            page_rows = documents[page["offset"] : page["offset"] + page["item_count"]]
+            progress.observe_page(
+                page["offset"],
+                [
+                    {"id": row["id"], "version": records[str(row["id"])]["version"]}
+                    for row in page_rows
+                ],
+            )
+        progress.phase(
+            "listing", "completed", pages=listing["pages"], document_count=len(records)
+        )
     if baseline and baseline_path is not None:
         for doc_id, previous in baseline_documents.items():
             current = records.get(doc_id)
@@ -540,13 +583,68 @@ def run_capture(args: Any) -> int:
                 changes["renamed"].append(document["id"])
             if (document.get("toc_path") or []) != (previous.get("toc_path") or []):
                 changes["moved"].append(document["id"])
+    if progress and baseline is None:
+        cutoff = max(
+            (
+                row.get("baseline", {}).get("filename_date", "")
+                for row in canonical_documents.values()
+                if row.get("baseline")
+            ),
+            default="",
+        )
+        for document in documents:
+            doc_id = str(document["id"])
+            previous = canonical_documents.get(doc_id)
+            current = records[doc_id]["version"]
+            existing_source = previous and (
+                previous.get("baseline")
+                or (previous.get("corpus") or {}).get("raw")
+                or (previous.get("graph") or {}).get("raw")
+                or (
+                    previous.get("steps", {}).get("download", {}).get("status")
+                    == "completed"
+                    and previous["steps"]["download"].get("raw")
+                )
+            )
+            if not existing_source:
+                if _instant(current).date().isoformat() >= cutoff:
+                    changes["new"].append(document["id"])
+                continue
+            initial = previous.get("baseline") or {}
+            downloaded = previous.get("steps", {}).get("download", {})
+            prior = (
+                downloaded.get("version")
+                or (previous.get("corpus") or {}).get("version")
+                or initial.get("version")
+            )
+            if prior:
+                if _instant(current) < _instant(prior):
+                    raise CaptureError(f"document {doc_id} has a timestamp regression")
+                if _instant(current) > _instant(prior):
+                    changes["updated"].append(document["id"])
+            elif _instant(current).date().isoformat() >= initial.get(
+                "filename_date", ""
+            ):
+                changes["updated"].append(document["id"])
     current_id_set = {document["id"] for document in documents}
     prior_pending = (
         _load_pending(Path(args.pending_state).expanduser().resolve(), book)
         if args.pending_state
         else {}
     )
-    known_ids = current_id_set | {int(value) for value in baseline_documents}
+    if progress:
+        prior_pending.update(
+            {
+                int(key): row.get("pending", [])
+                for key, row in canonical_documents.items()
+                if row.get("pending")
+            }
+        )
+    known_ids = (
+        current_id_set
+        | {int(value) for value in baseline_documents}
+        | {int(value) for value in canonical_documents}
+    )
     unknown_pending = set(prior_pending) - known_ids
     if unknown_pending:
         raise CaptureError(
@@ -605,7 +703,29 @@ def run_capture(args: Any) -> int:
             except CaptureError:
                 detail_matches_listing = False
         reused = False
+        saved_download = (
+            canonical_documents.get(str(doc_id), {})
+            .get("steps", {})
+            .get("download", {})
+        )
+        saved_ref = saved_download.get("raw") or {}
+        saved_path = Path(saved_ref.get("path", ""))
+        if not saved_path.is_absolute() and progress:
+            saved_path = progress.corpus / saved_path
+        saved_version = saved_download.get("version")
         if (
+            progress
+            and saved_version
+            and saved_path.is_file()
+            and _instant(saved_version) == _instant(records[str(doc_id)]["version"])
+        ):
+            detail_version = saved_version
+            raw = _raw_reference(
+                saved_path, snapshot_path, saved_download["recorded_at"]
+            )
+            raw["adapter"] = "canonical_download"
+            reused = True
+        elif (
             isinstance(checkpoint_row, dict)
             and checkpoint_row.get("listing_version") == records[str(doc_id)]["version"]
             and detail_matches_listing
@@ -652,6 +772,9 @@ def run_capture(args: Any) -> int:
                     "original": original,
                     "error": str(error),
                 }
+                if progress:
+                    progress.step(doc_id, "download", "failed", reason=str(error))
+                    progress.update(doc_id, pending=sorted(set(reasons)))
                 continue
             checkpoint[str(doc_id)] = {
                 "raw_file": Path(raw["path"]).name,
@@ -661,6 +784,30 @@ def run_capture(args: Any) -> int:
                 "adapter": raw["adapter"],
             }
             _save_checkpoint(staging, book, checkpoint)
+        if progress:
+            raw_path = Path(raw["path"])
+            if not raw_path.is_absolute():
+                raw_path = snapshot_path.parent / raw_path
+            progress.step(
+                doc_id,
+                "download",
+                "completed",
+                version=detail_version,
+                file=raw_path.name,
+                raw=progress.reference(raw_path),
+            )
+            progress.update(
+                doc_id,
+                corpus={
+                    "status": "captured",
+                    "version": detail_version,
+                    "raw": progress.reference(raw_path),
+                },
+                pending=sorted(
+                    set(canonical_documents.get(str(doc_id), {}).get("pending", []))
+                    | {"COMPARISON_PENDING"}
+                ),
+            )
         detail_instant = _instant(detail_version)
         listing_instant = _instant(records[str(doc_id)]["version"])
         if detail_instant != listing_instant:
@@ -701,14 +848,14 @@ def run_capture(args: Any) -> int:
             "incomplete"
             if anomalies
             else "initialized"
-            if baseline is None
+            if baseline is None and progress is None
             else "captured"
         ),
         "book": book,
         "observation": {
             "started_at": started_at,
             "ended_at": _utc_now(),
-            "timezone": "UTC",
+            "timezone": "UTC+8",
         },
         "listing": listing,
         "baseline": (

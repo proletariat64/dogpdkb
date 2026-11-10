@@ -12,6 +12,9 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from dogpdkb.knowledge_state import BookState, canonical_view, root_state, save_view
+from dogpdkb.sync_progress import Progress
+from dogpdkb.sync_time import now_iso, parse_timestamp
 from mdcompare.io import InputReader, publish_reports, validate_outputs
 from mdcompare.knowledge import compare_knowledge_documents
 from mdcompare.manifest import load_manifest
@@ -118,6 +121,10 @@ def _load_state(path: Path, book: dict[str, Any]) -> dict[str, Any]:
     if not path.exists():
         return {"schema_version": STATE_SCHEMA, "book": book, "documents": {}}
     state = _read_json(path)
+    if state.get("version") == 2:
+        if path.name != ".sync-state.json":
+            raise PlanError("v2 state requires the canonical .sync-state.json path")
+        return canonical_view(state, book)
     if (
         state.get("schema_version") != STATE_SCHEMA
         or (state.get("book") or {}).get("book_id") != book.get("book_id")
@@ -139,7 +146,10 @@ def _relative_raw(path: Path, owner: Path) -> dict[str, Any]:
 
 
 def _resolve_raw(reference: Any, owner: Path) -> Path | None:
-    if not isinstance(reference, dict) or reference.get("stage") != "raw_export":
+    if not isinstance(reference, dict) or reference.get("stage") not in {
+        "raw_export",
+        "historical_cleaned",
+    }:
         return None
     value = reference.get("path")
     if not isinstance(value, str) or not value:
@@ -225,7 +235,7 @@ def _graph_document(
     return Document(
         knowledge_base=str(book_id),
         document_id=doc_id,
-        content_kind="raw",
+        content_kind=graph.get("content_kind", "raw"),
         path=path,
         metadata=metadata,
         resources=[],
@@ -234,6 +244,23 @@ def _graph_document(
 
 
 def _compare(old: Document | None, new: Document) -> dict[str, Any]:
+    if old is not None and old.content_kind == "historical_enriched":
+        from dogpdkb.workflows.get_sync_updates import safe_segment
+
+        # Historical filenames encode titles and TOC segments with this exact rule.
+        # Keep the old metadata intact; compare incoming metadata in that same representation.
+        new = replace(
+            new,
+            metadata={
+                **new.metadata,
+                "name": safe_segment(new.metadata["name"]),
+                "logical_path": "/".join(
+                    safe_segment(part)
+                    for part in new.metadata["logical_path"].split("/")
+                    if part
+                ),
+            },
+        )
     reader = InputReader(CompareOptions.max_file_bytes)
     report = compare_knowledge_documents(
         [old] if old else [], [new], CompareOptions(), reader
@@ -300,7 +327,10 @@ def _write_plan(
     validate_outputs([plan_path, state_path, state_lock_path(state_path)], inputs)
     publish_reports(
         [
-            (state_path, json.dumps(state, ensure_ascii=False, indent=1) + "\n"),
+            (
+                state_path,
+                json.dumps(root_state(state), ensure_ascii=False, indent=1) + "\n",
+            ),
             (plan_path, json.dumps(plan, ensure_ascii=False, indent=1) + "\n"),
         ]
     )
@@ -339,6 +369,11 @@ def _run_planner(args: Any) -> dict[str, Any]:
     book_id = snapshot["book"]["book_id"]
     state = _load_state(state_path, snapshot["book"])
     protected = {snapshot_path}
+    progress = None
+    if isinstance(state, BookState):
+        progress = Progress(state_path.parent, state.key, book_id=book_id)
+        progress.claim(staging, phase="compare", parent=snapshot_path)
+        state = _load_state(state_path, snapshot["book"])
     if args.baseline:
         protected |= _register_baseline(
             args.baseline.expanduser().resolve(), state, state_path
@@ -412,7 +447,8 @@ def _run_planner(args: Any) -> dict[str, Any]:
         graph_version = graph.get("version")
         graph_needs_comparison = graph.get("status") == "covered" and (
             not isinstance(graph_version, dict)
-            or graph_version.get("utc") != document["version"].get("utc")
+            or parse_timestamp(graph_version["utc"])
+            != parse_timestamp(document["version"]["utc"])
         )
         work = (
             numeric_id in selected
@@ -424,6 +460,7 @@ def _run_planner(args: Any) -> dict[str, Any]:
         )
         comparison = None
         transient_reasons = {
+            "COMPARISON_PENDING",
             "APPROVAL_REQUIRED",
             "BODY_COMPARISON_REVIEW_REQUIRED",
             "CAPTURE_ANOMALY",
@@ -440,7 +477,29 @@ def _run_planner(args: Any) -> dict[str, Any]:
             reason for reason in previous_pending if reason not in transient_reasons
         ]
         reasons = list(persistent_pending)
-        old = _graph_document(doc_id, graph, book_id, state_path)
+        cached = previous.get("steps", {}).get("compare") or {}
+        comparison_path = staging / "comparisons" / f"{doc_id}.json"
+        # Reuse can advance graph.raw before a later document interrupts planning.
+        # Retry against the original source, still checking it against frozen bytes.
+        comparison_graph = graph
+        incoming_identity = {
+            "version": document["version"],
+            "source_raw": _relative_raw(raw_path, state_path) if raw_path else None,
+            "metadata": _document(document, book_id, raw_path).metadata
+            if not capture_anomalies and raw_path is not None
+            else None,
+        }
+        if (
+            cached.get("output") == str(comparison_path)
+            and cached.get("status") == "completed"
+            and "previous_graph" in cached
+        ):
+            if any(
+                cached.get(key) != value for key, value in incoming_identity.items()
+            ):
+                raise PlanError("retained comparison input identity changed")
+            comparison_graph = cached["previous_graph"]
+        old = _graph_document(doc_id, comparison_graph, book_id, state_path)
         frozen = None
         frozen_old = None
         source_failure = None
@@ -471,13 +530,52 @@ def _run_planner(args: Any) -> dict[str, Any]:
                 if frozen is None:
                     corpus = {**corpus, "status": "pending", "version": None}
         if frozen is not None and source_failure is None:
-            comparison = _compare(old, _document(document, book_id, frozen))
+            comparison_inputs = {
+                **incoming_identity,
+                "previous_graph": comparison_graph,
+                "raw": str(frozen),
+                "previous_raw": str(frozen_old) if frozen_old else None,
+                "previous_kind": old.content_kind if old else None,
+            }
+            if (
+                cached.get("output") == str(comparison_path)
+                and cached.get("status") == "completed"
+                and all(
+                    cached.get(key) == value for key, value in comparison_inputs.items()
+                )
+                and comparison_path.is_file()
+            ):
+                comparison = _read_json(comparison_path)
+                if comparison.get("document_id") != doc_id or comparison.get(
+                    "knowledge_base"
+                ) != str(book_id):
+                    raise PlanError("retained comparison belongs to another document")
+            else:
+                comparison = _compare(old, _document(document, book_id, frozen))
+                validate_outputs(
+                    [comparison_path],
+                    protected
+                    | {state_path, plan_path, frozen}
+                    | ({frozen_old} if frozen_old else set()),
+                )
+                comparison_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                publish_reports(
+                    [
+                        (
+                            comparison_path,
+                            json.dumps(comparison, ensure_ascii=False, indent=1) + "\n",
+                        )
+                    ]
+                )
             compared += 1
             action = comparison["graphify_plan"]["action"]
             if old is None:
                 reasons.append("NEW_DOCUMENT_NOT_IN_GRAPH")
                 if action == "KEEP_EXISTING":
                     action = "BODY_DELTA_CANDIDATE"
+            if old is not None and graph.get("status") != "covered":
+                action = "HOLD_EXISTING"
+                reasons.append("GRAPH_SOURCE_NOT_REGISTERED")
             if action == "BODY_DELTA_CANDIDATE":
                 reasons.append("APPROVAL_REQUIRED")
             elif action == "HOLD_EXISTING":
@@ -520,6 +618,7 @@ def _run_planner(args: Any) -> dict[str, Any]:
                 "metadata": _document(document, book_id, raw_path).metadata,
             }
         record = {
+            **previous,
             "observation": {
                 "version": document["version"],
                 "observed_at": snapshot["observation"]["ended_at"],
@@ -528,7 +627,18 @@ def _run_planner(args: Any) -> dict[str, Any]:
             "graph": graph,
             "pending": reasons,
         }
+        if comparison is not None or work:
+            record.setdefault("steps", {})["compare"] = {
+                "status": "completed" if comparison is not None else "held",
+                "recorded_at": now_iso(),
+                "version": document["version"],
+                "action": action,
+                **(comparison_inputs if comparison is not None else {}),
+                "output": str(comparison_path) if comparison is not None else None,
+            }
         state["documents"][doc_id] = record
+        if isinstance(state, BookState):
+            save_view(state_path, state)
         execution = None
         if action == "BODY_DELTA_CANDIDATE":
             if frozen is None or comparison is None:

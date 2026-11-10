@@ -1,10 +1,26 @@
 # 日常知识增量同步指南
 
+现有知识库初始化、单实例约束、逐步骤状态和 UTC+8 规则已接入当前源码，见 [sync 状态设计](sync-state-design.md) 与 [验收记录](sync-state-acceptance.md)。本文命令描述源码及隔离安装行为，不代表生产部署完成。
+
 本文说明 `dogpdkb discover --snapshot` 与 `dogpdkb sync --knowledge` 的显式正文更新流程。该流程默认只采集和规划；候选文档不会自动调用 Graphify。不带 `--knowledge` 的既有同步、OCR 和发布入口保持原行为。
 
-## 1. 三种版本不要混用
+## 1. 从已有知识库开始
 
-每篇文档分别记录三类状态：
+已有清洗 Markdown、`graphify-out/graph.json` 和 books 配置即可初始化：
+
+```bash
+dogpdkb init-state --config ./dogpdkb.toml --book fund-platform
+```
+
+默认使用所选 book 的语料和图谱路径；可显式指定 `--input` 和 `--graph-dir`。初始化写入语料目录的 `.sync-state.json` v2，只登记已有来源，不运行提取或重建图谱。原正文保存为 `historical_enriched` 基线，文件名日期只有日精度；精确历史时间未知就保持为空，不拿本次远端列表时间冒充旧版本。
+
+报告分别列出根目录 Markdown 文件总数、识别的唯一文档数、无标准 ID 文件数、重复 ID、来源匹配和未知项。无 ID 文件在 book 的 `unmatched_files` 中列出，不编造远端 ID。重复 ID 保留冲突；没有匹配图谱来源的文档保留待处理，不宣称已经覆盖。
+
+所有更新命令使用同用户的统一实例锁，跨配置、book 和 staging 串行；另一个进程直接返回 `UPDATE_ALREADY_RUNNING`。父进程结束但子步骤仍运行时锁继续保留。未完成计划恢复使用原 snapshot 和 planning staging，不能另建计划跳过原待办。只读 doctor、help 和独立 mdcompare 仍可用。
+
+## 三种版本不要混用
+
+每篇文档分别记录三类状态，并在每个实际步骤完成后写入 `.sync-state.json`：
 
 - **观察版本**：最近一次完整远端列表看到的版本，只证明“看过”。
 - **语料版本**：已成功保存的 raw 导出，只证明“已取得正文”。
@@ -12,24 +28,23 @@
 
 列表时间变新不等于正文变化，raw 下载成功不等于图谱更新。候选、拒绝、异常和失败都会留下 `pending`；下次远端时间没有继续变化时，待办仍保留。
 
-## 2. 初始化完整观察基线
+## 2. 采集第一次完整远端观察
 
 ```bash
-dogpdkb discover -s <book-url> \
-  --snapshot <private>/baseline.json --staging <private>/baseline-capture
+dogpdkb discover --config ./dogpdkb.toml --book fund-platform \
+  --snapshot <private>/current.json --staging <private>/current-capture
 ```
 
-初次没有 `--baseline-snapshot` 时，命令只保存完整列表，状态为 `initialized`。它不会把全库文档算作一天新增，也不会自动导出或提取全库。
+已有初始化语料时，程序用登记的本地版本选择需下载的文档；只有文件名日期的文档，同日及之后的远端日期需要下载后比较。它不会把全库文档算作一天新增。没有已初始化语料、也没有 `--baseline-snapshot` 的旧观察模式仍只保存完整列表，状态为 `initialized`，不导出全库。
 
-输出包含知识库和文档 ID、UTC 观察起止时间、分页覆盖、实际使用的时间字段及完整性。缺失时间、时间倒退、分页缺口或导出失败不会形成可信的“零变化”结论。列表中缺席只记为 `absent`，不据此确认删除。
+输出包含知识库和文档 ID、UTC+8 观察起止时间、分页覆盖、实际使用的时间字段及完整性。缺失时间、时间倒退、分页缺口或导出失败不会形成可信的“零变化”结论。列表中缺席只记为 `absent`，不据此确认删除。
 
 ## 3. 采集日常增量
 
 ```bash
-dogpdkb discover -s <book-url> \
-  --baseline-snapshot <private>/baseline.json \
-  --snapshot <private>/current.json --staging <private>/current-capture \
-  [--pending-state <private>/previous.json]
+dogpdkb discover --config ./dogpdkb.toml --book fund-platform \
+  --baseline-snapshot <private>/previous.json \
+  --snapshot <private>/current.json --staging <private>/current-capture
 ```
 
 `new`、`updated`、`renamed`、`moved` 分开报告；同一 ID 的重叠标签只导出一次。选中正文保存为私有 raw，后续审批绑定这个实际版本。列表和详情时间分别保留；两者不一致时该文档进入异常和待办，不伪造原子快照。
@@ -48,12 +63,15 @@ dogpdkb discover -s <book-url> --config <config.toml> \
 ## 4. 生成只读正文计划
 
 ```bash
-dogpdkb sync --knowledge \
-  --snapshot <private>/current.json --state <private>/state.json \
-  --staging <private>/planning [--baseline <raw-mdcompare-manifest.json>]
+dogpdkb sync --knowledge --config ./dogpdkb.toml --book fund-platform \
+  --snapshot <private>/current.json --staging <private>/planning
 ```
 
-可选 `--baseline` 是显式的 raw 图谱来源登记清单，每项必须有 `content_kind=raw` 和对应知识库/文档 ID。不要把历史富化文件当成 raw。首次没有图谱来源登记时，文档保持未覆盖和待核，不进行全库提取。
+使用 `--config`、`--book` 或 `--input` 时，规划和执行统一使用语料目录的 `.sync-state.json`。未初始化时可从现有语料和图谱自动登记；历史富化基线保持原来源限制，不要求补造旧 raw。下载完成立即记录精确详情时间和 raw 路径；每篇比较完成立即保存结果，不等整批结束。观察、下载或候选完成都不会提前标记图谱发布成功。
+
+可选 `--baseline` 仍接受明确的 raw 图谱登记清单，不得把历史富化文件伪装为 raw。旧调用若仅提供 `--state <legacy.json>`，且不提供配置/book/input，仍保持独立单文件模式。转入 canonical 模式时，可以同时提供配置和旧 `--state` 导入；成功后旧文件改为 `knowledge-state-migrated-1.0` 跳转标记，不能继续作为另一份可写成功状态。导入后重新生成计划及绑定的审批和质量文件，不能执行导入前旧计划。
+
+默认时区固定为 UTC+8：精确时间保存 `+08:00`，带偏移输入先正确转换，无偏移输入按 UTC+8 并记录默认来源。文件名、cutoff 和日常窗口按 UTC+8。兼容字段名 `utc` 仍保留，但字段值是带 `+08:00` 的规范时间；比较解析后的瞬时。只有文件名日期的旧基线，同日仍下载比较；已经取得精确时间后，同日后续更新按精确时间识别。
 
 主要路由：
 
@@ -61,7 +79,7 @@ dogpdkb sync --knowledge \
 - `BODY_DELTA_CANDIDATE`：保存完整冻结 raw、变化单元和旧侧证据，等待审批；不是提取许可。
 - `HOLD_EXISTING`：保留旧图和待办，不自动提取。旧侧缺失、上下文不确定、边界异常及版本异常均可能进入此路由。
 
-计划固定 `plan_only=true`、`automatic_extraction_allowed=false`、`full_document_fallback=false`。规划器先冻结新侧及已登记的旧侧 raw，再比较这两个冻结视图；候选执行同时绑定新旧字节，任一侧后续漂移都会使许可失效。独立离线 `mdcompare knowledge` 仍可比较冻结 raw，但不修改 dogpdkb 状态或图谱。
+计划固定 `plan_only=true`、`automatic_extraction_allowed=false`、`full_document_fallback=false`。规划器先冻结新侧 raw 及已登记的旧侧正文（raw 或历史清洗文件），再比较这两个冻结视图；候选执行同时绑定新旧字节，任一侧后续漂移都会使许可失效。独立离线 `mdcompare knowledge` 仍可比较冻结 raw，但不修改 dogpdkb 状态或图谱。
 
 ## 5. 审批和质量门禁
 
@@ -74,9 +92,9 @@ dogpdkb sync --knowledge \
 ## 6. 显式执行与恢复
 
 ```bash
-dogpdkb sync --knowledge --execute \
-  --snapshot <private>/current.json --state <private>/state.json \
-  --staging <private>/planning --approvals <private>/approvals.json \
+dogpdkb sync --knowledge --execute --config ./dogpdkb.toml --book fund-platform \
+  --snapshot <private>/current.json --staging <private>/planning \
+  --approvals <private>/approvals.json \
   --quality-cases <private>/quality.json --graph-dir <existing-graphify-out> \
   [--graphify-python <graph-venv/bin/python>]
 ```
@@ -89,7 +107,7 @@ dogpdkb sync --knowledge --execute \
 
 ## 7. 报告、成本和交付边界
 
-`knowledge-plan-2.0`、`knowledge-state-1.0`、`knowledge-execution-1.0` 分开报告观察、语料、候选、批准、执行、缓存命中、外部调用和图谱成功数。当前观察、语料或 pending 已更新的 state 会使旧 plan 失效；已恢复的采集/比较瞬时错误会在成功重试时重新计算，未知或人工未处理问题仍保留。token 和调用数只采用适配器实际返回的非负整数证据；缺失或非法值为 `null`/`unknown`，只有实际返回或无提取时才能记录 0。没有账单时费用为 `unknown`，字符量或节点数不能换算成真实节费。
+canonical `.sync-state.json` v2 保存逐步骤状态；`knowledge-state-1.0` 是兼容视图，旧独立调用才使用独立文件。`knowledge-plan-2.0`、`knowledge-execution-1.0` 分开报告观察、语料、候选、批准、执行、缓存命中、外部调用和图谱成功数。当前观察、语料或 pending 已更新的 state 会使旧 plan 失效；已恢复的采集/比较瞬时错误会在成功重试时重新计算，未知或人工未处理问题仍保留。token 和调用数只采用适配器实际返回的非负整数证据；缺失或非法值为 `null`/`unknown`，只有实际返回或无提取时才能记录 0。没有账单时费用为 `unknown`，字符量或节点数不能换算成真实节费。
 
 私有快照、raw、状态和报告使用受限权限，默认日志不包含正文证据。不得覆盖输入或用输出别名绕过保护。
 
