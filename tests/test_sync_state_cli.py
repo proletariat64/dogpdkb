@@ -176,3 +176,22 @@ def test_reinitialization_clears_a_resolved_duplicate_only(tmp_path):
     ]["42"]
     assert record["pending"] == []
     assert "conflicting_files" not in record
+
+
+def test_initialization_reports_unmatched_root_markdown_without_fake_ids(tmp_path):
+    corpus, graph = corpus_config(tmp_path)
+    (corpus / "Known-2026-11-10-[42].md").write_text("# Known\n")
+    unmatched = corpus / "Operator-Notes-2026-11-10.md"
+    unmatched.write_text("# Local operational notes\n")
+    (graph / "graph.json").write_text('{"nodes": [], "links": []}')
+    before = unmatched.read_bytes()
+    result = run_init(tmp_path)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["counts"]["files"] == 2
+    assert report["counts"]["documents"] == 1
+    assert report["counts"]["unmatched_files"] == 1
+    book = json.loads((corpus / ".sync-state.json").read_text())["books"]["fund"]
+    assert book["unmatched_files"] == [unmatched.name]
+    assert list(book["documents"]) == ["42"]
+    assert unmatched.read_bytes() == before

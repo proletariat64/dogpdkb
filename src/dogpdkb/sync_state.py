@@ -130,7 +130,9 @@ def initialize_state(
     sources = _source_names(graph_dir)
     source_ids = {m.group(2) for source in sources if (m := LOCAL_NAME.search(source))}
     paths: dict[str, list[Path]] = defaultdict(list)
-    for path in sorted(corpus.glob("*.md")):
+    files = sorted(corpus.glob("*.md"))
+    unmatched = []
+    for path in files:
         match = LOCAL_NAME.search(path.name)
         if match:
             try:
@@ -138,8 +140,11 @@ def initialize_state(
             except ValueError as error:
                 raise StateError(f"invalid filename date: {path.name}") from error
             paths[match.group(2)].append(path)
+        else:
+            unmatched.append(path.name)
+    book["unmatched_files"] = unmatched
     counts: Counter[str] = Counter(
-        documents=len(paths), files=sum(map(len, paths.values()))
+        documents=len(paths), files=len(files), unmatched_files=len(unmatched)
     )
     legacy = book.get("legacy_documents", {})
     for doc_id, candidates in paths.items():
