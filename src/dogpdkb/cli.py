@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from dogpdkb.instance_lock import locked_main, subprocess_lock_options
+
 WORKFLOWS = {
     "sync": "sync_knowledge_base.py",
     "discover": "get_sync_updates.py",
@@ -39,11 +41,13 @@ def init_config(directory: Path) -> None:
         raise
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] in WORKFLOWS:
         script = Path(__file__).resolve().parent / "workflows" / WORKFLOWS[arguments[0]]
-        return subprocess.call([sys.executable, str(script), *arguments[1:]])
+        return subprocess.call(
+            [sys.executable, str(script), *arguments[1:]], **subprocess_lock_options()
+        )
     parser = argparse.ArgumentParser(description=__doc__, prog="dogpdkb")
     try:
         version = importlib.metadata.version("dogpdkb")
@@ -135,3 +139,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     parser.print_help()
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] in {*WORKFLOWS, "init-state", "update", "uninstall"}:
+        return locked_main(_main)(arguments)
+    return _main(arguments)

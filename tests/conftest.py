@@ -106,8 +106,10 @@ def ref_of(markdown: str):
 
 
 @pytest.fixture(autouse=True)
-def isolated_env(monkeypatch):
+def isolated_env(monkeypatch, tmp_path):
     monkeypatch.delenv("PADDLEOCR_TOKEN", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "user-state"))
+    monkeypatch.delenv("DOGPDKB_UPDATE_LOCK_FD", raising=False)
 
 
 @pytest.fixture

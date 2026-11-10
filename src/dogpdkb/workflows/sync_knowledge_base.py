@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from dogpdkb.instance_lock import locked_main, subprocess_lock_options
+
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 
@@ -63,7 +65,7 @@ def write_json(path: Path, payload: dict) -> None:
 
 def run_command(command: list[str]) -> None:
     print("+", " ".join(command), flush=True)
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, **subprocess_lock_options())
 
 
 def _config(options: PipelineOptions) -> dict:
@@ -393,6 +395,7 @@ def run_pipeline(
     return result
 
 
+@locked_main
 def main() -> None:
     if "--knowledge" in sys.argv[1:]:
         from dogpdkb.knowledge_sync import main as knowledge_main
