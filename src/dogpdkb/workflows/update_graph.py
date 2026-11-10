@@ -8,12 +8,14 @@ import shutil
 import sys
 from collections import defaultdict
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from importlib import import_module
 from pathlib import Path
 from typing import Any
 
 from dogpdkb.instance_lock import locked_main
+from dogpdkb.sync_progress import Progress, progress_for_config
+from dogpdkb.sync_time import UTC8
 
 if __package__:
     from .graph_sync import doc_id, merge_graph_records, validate_extracted_records
@@ -341,7 +343,7 @@ def build_candidate(
         old_files=old_files,
         deleted_files=[*deleted_files, *sorted(empty_files)],
         source_urls=source_urls,
-        captured_at=datetime.now(timezone.utc).isoformat(),
+        captured_at=datetime.now(UTC8).isoformat(),
         labels=labels,
     )
     candidate_dir = staging / "candidate"
@@ -522,113 +524,193 @@ def main() -> None:
     ).resolve()
     staging = args.staging.resolve()
     staging.mkdir(parents=True, exist_ok=True)
-    manifest = load_json(args.manifest)
-    scope = sync_scope(manifest, corpus, args.manifest.parent)
-    current_files, old_files, deleted_files, source_urls = scope
-    if not current_files and not deleted_files:
-        result = {"status": "skipped", "reason": "no published corpus changes"}
-        write_json(staging / "result.json", result)
-        print(json.dumps(result))
-        return
-    if not (graph_dir / "graph.json").is_file():
-        raise SystemExit(f"existing graph not found: {graph_dir / 'graph.json'}")
-    if args.publish_validated and not (staging / "candidate-ready.json").is_file():
-        raise SystemExit("validated candidate is missing; build it before publishing")
-    if args.rebase:
-        with publication_lock(graph_dir):
-            for name in ("graph-backup", "candidate"):
-                if (staging / name).exists():
-                    try:
-                        shutil.rmtree(staging / name)
-                    except OSError as error:
-                        raise RuntimeError(
-                            f"cannot reset staged graph directory: {name}"
-                        ) from error
-            for name in (
-                "base-state.json",
-                "candidate-ready.json",
-                "candidate-validation.json",
-                "result.json",
-            ):
-                (staging / name).unlink(missing_ok=True)
-            base_dir = _prepare_base(graph_dir, staging)
-    else:
-        base_dir = prepare_base(graph_dir, staging)
-    # Freeze validated artifacts before publication, so a crash after publishing
-    # does not rebuild them with different timestamps or extraction token counts.
-    inputs = {
-        "corpus": str(corpus),
-        "graph_dir": str(graph_dir),
-        "manifest": manifest,
-        "scope": [current_files, old_files, deleted_files, source_urls],
-        "config": config.snapshot(),
-        "sources": {
-            name: {
-                "size": (corpus / name).stat().st_size,
-                "mtime_ns": (corpus / name).stat().st_mtime_ns,
-            }
-            for name in current_files
-        },
-    }
-    ready_path = staging / "candidate-ready.json"
-    candidate = staging / "candidate"
-    if ready_path.exists():
-        ready = load_json(ready_path)
-        if ready["inputs"] != inputs:
-            raise RuntimeError("candidate inputs changed; use a new staging directory")
-        if not ready["files"] or any(
-            not (candidate / name).is_file() for name in ready["files"]
-        ):
-            raise RuntimeError(
-                "validated candidate files missing; use a new staging directory"
+    tracker = progress_for_config(config, source, corpus)
+    if tracker is None and not (args.candidate_only or args.publish_validated):
+        tracker = Progress(corpus, "adhoc")
+    if tracker:
+        tracker.claim(staging, phase="graph")
+        tracker.phase("graph", "running")
+    try:
+        manifest = load_json(args.manifest)
+        scope = sync_scope(manifest, corpus, args.manifest.parent)
+        current_files, old_files, deleted_files, source_urls = scope
+        if not current_files and not deleted_files:
+            result = {"status": "skipped", "reason": "no published corpus changes"}
+            write_json(staging / "result.json", result)
+            if tracker:
+                tracker.phase("graph", "completed", result=result)
+                if not os.environ.get("DOGPDKB_RUN_STAGING"):
+                    tracker.finish()
+            print(json.dumps(result))
+            return
+        if not (graph_dir / "graph.json").is_file():
+            raise SystemExit(f"existing graph not found: {graph_dir / 'graph.json'}")
+        if args.publish_validated and not (staging / "candidate-ready.json").is_file():
+            raise SystemExit(
+                "validated candidate is missing; build it before publishing"
             )
-        audit = ready["audit"]
-    else:
-        if args.publish_validated:
-            raise RuntimeError("validated candidate is missing")
-        candidate, audit = build_candidate(
-            corpus,
-            graph_dir,
-            staging,
-            current_files,
-            old_files,
-            deleted_files,
-            source_urls,
-            base_dir=base_dir,
-        )
-        write_json(
-            ready_path,
-            {
-                "inputs": inputs,
-                "audit": audit,
-                "files": sorted(
-                    path.name for path in candidate.iterdir() if path.is_file()
-                ),
+        if args.rebase:
+            with publication_lock(graph_dir):
+                for name in ("graph-backup", "candidate"):
+                    if (staging / name).exists():
+                        try:
+                            shutil.rmtree(staging / name)
+                        except OSError as error:
+                            raise RuntimeError(
+                                f"cannot reset staged graph directory: {name}"
+                            ) from error
+                for name in (
+                    "base-state.json",
+                    "candidate-ready.json",
+                    "candidate-validation.json",
+                    "result.json",
+                ):
+                    (staging / name).unlink(missing_ok=True)
+                base_dir = _prepare_base(graph_dir, staging)
+        else:
+            base_dir = prepare_base(graph_dir, staging)
+        # Freeze validated artifacts before publication, so a crash after publishing
+        # does not rebuild them with different timestamps or extraction token counts.
+        inputs = {
+            "corpus": str(corpus),
+            "graph_dir": str(graph_dir),
+            "manifest": manifest,
+            "scope": [current_files, old_files, deleted_files, source_urls],
+            "config": config.snapshot(),
+            "sources": {
+                name: {
+                    "size": (corpus / name).stat().st_size,
+                    "mtime_ns": (corpus / name).stat().st_mtime_ns,
+                }
+                for name in current_files
             },
-        )
-    if args.candidate_only:
+        }
+        if tracker:
+            for name in current_files:
+                snapshot = staging / "source-snapshots" / name
+                source_path = corpus / name
+                if snapshot.exists():
+                    if snapshot.read_bytes() != source_path.read_bytes():
+                        raise RuntimeError(
+                            "candidate inputs changed; use a new staging directory"
+                        )
+                else:
+                    snapshot.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_copy(source_path, snapshot)
+        ready_path = staging / "candidate-ready.json"
+        candidate = staging / "candidate"
+        if ready_path.exists():
+            ready = load_json(ready_path)
+            if ready["inputs"] != inputs:
+                raise RuntimeError(
+                    "candidate inputs changed; use a new staging directory"
+                )
+            if not ready["files"] or any(
+                not (candidate / name).is_file() for name in ready["files"]
+            ):
+                raise RuntimeError(
+                    "validated candidate files missing; use a new staging directory"
+                )
+            audit = ready["audit"]
+        else:
+            if args.publish_validated:
+                raise RuntimeError("validated candidate is missing")
+            candidate, audit = build_candidate(
+                corpus,
+                graph_dir,
+                staging,
+                current_files,
+                old_files,
+                deleted_files,
+                source_urls,
+                base_dir=base_dir,
+            )
+            write_json(
+                ready_path,
+                {
+                    "inputs": inputs,
+                    "audit": audit,
+                    "files": sorted(
+                        path.name for path in candidate.iterdir() if path.is_file()
+                    ),
+                },
+            )
+        if tracker:
+            tracker.phase("graph_candidate", "completed", candidate=str(candidate))
+            for row in manifest.get("exported", []):
+                tracker.step(
+                    str(row["id"]),
+                    "graph_candidate",
+                    "completed",
+                    candidate=str(candidate),
+                    file=row["file"],
+                )
+        if args.candidate_only:
+            result = {
+                **audit,
+                "status": "candidate_ready",
+                "candidate": str(candidate),
+                "backup": str(staging / "graph-backup"),
+                "full_rebuild": False,
+            }
+            write_json(staging / "candidate-result.json", result)
+            print(json.dumps(result, ensure_ascii=False))
+            return
+        assert_deletions_absent(corpus, deleted_files)
+        publish_candidate(candidate, graph_dir, staging)
         result = {
             **audit,
-            "status": "candidate_ready",
+            "status": "completed",
+            "graph": str(graph_dir / "graph.json"),
             "candidate": str(candidate),
             "backup": str(staging / "graph-backup"),
             "full_rebuild": False,
         }
-        write_json(staging / "candidate-result.json", result)
+        write_json(staging / "result.json", result)
+        if tracker:
+            for row in manifest.get("exported", []):
+                identity = str(row["id"])
+                version = tracker.version(row.get("content_updated_at"))
+                tracker.step(
+                    identity, "graph", "completed", version=version, file=row["file"]
+                )
+                pending = tracker.book["documents"][identity].get("pending", [])
+                tracker.update(
+                    identity,
+                    graph={
+                        "status": "covered",
+                        "coverage": "published_source",
+                        "version": version,
+                        "raw": tracker.reference(
+                            staging / "source-snapshots" / row["file"],
+                            "historical_cleaned",
+                        ),
+                        "content_kind": "historical_enriched",
+                        "metadata": {
+                            "name": row.get("title", row["file"]),
+                            "logical_path": "",
+                            "source_ref": f"{tracker.key}:{identity}",
+                        },
+                    },
+                    pending=[
+                        reason
+                        for reason in pending
+                        if reason != "GRAPH_UPDATE_REQUIRED"
+                    ],
+                )
+            for row in manifest.get("deleted", []):
+                identity = str(row["id"])
+                tracker.step(identity, "graph", "completed", deleted=True)
+                tracker.update(identity, graph={"status": "deleted", "version": None})
+            tracker.phase("graph", "completed", result=str(staging / "result.json"))
+            if not os.environ.get("DOGPDKB_RUN_STAGING"):
+                tracker.finish()
         print(json.dumps(result, ensure_ascii=False))
-        return
-    assert_deletions_absent(corpus, deleted_files)
-    publish_candidate(candidate, graph_dir, staging)
-    result = {
-        **audit,
-        "status": "completed",
-        "graph": str(graph_dir / "graph.json"),
-        "candidate": str(candidate),
-        "backup": str(staging / "graph-backup"),
-        "full_rebuild": False,
-    }
-    write_json(staging / "result.json", result)
-    print(json.dumps(result, ensure_ascii=False))
+
+    except BaseException as error:
+        if tracker:
+            tracker.phase("graph", "failed", reason=type(error).__name__)
+        raise
 
 
 if __name__ == "__main__":
