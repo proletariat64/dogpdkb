@@ -15,6 +15,8 @@ def parse_timestamp(value: str) -> datetime:
 
 
 def timestamp_record(value: str, field: str = "content_updated_at") -> dict[str, Any]:
+    if "T" not in value and " " not in value.strip():
+        raise ValueError("exact timestamp requires a time component")
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return {
         "field": field,

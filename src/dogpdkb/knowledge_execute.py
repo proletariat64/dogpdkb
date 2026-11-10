@@ -19,6 +19,8 @@ from dogpdkb.knowledge_plan import (
     state_lock,
     state_lock_path,
 )
+from dogpdkb.knowledge_state import BookState, canonical_view, root_state, save_view
+from dogpdkb.sync_time import now_iso
 from dogpdkb.workflows.graph_sync import doc_id
 from mdcompare.io import publish_reports, validate_outputs
 
@@ -247,6 +249,9 @@ def _run_graphify(
     script = Path(__file__).resolve().parent / "workflows" / "update_graph.py"
     environment = os.environ.copy()
     environment["GRAPHIFY_OUT"] = graph_dir.name
+    # The parent executor owns canonical progress; this corpus is an isolated input.
+    for name in ("DOGPDKB_RUN_CORPUS", "DOGPDKB_RUN_BOOK", "DOGPDKB_RUN_STAGING"):
+        environment.pop(name, None)
     completed = subprocess.run(
         [
             str(interpreter),
@@ -551,6 +556,8 @@ def _completed_execution(
         ) != str(staging / "graph-update" / "candidate"):
             raise ExecutionError("execution journal lacks publication evidence")
         original_state = journal.get("original_state") or {}
+        if original_state.get("version") == 2:
+            original_state = canonical_view(original_state, plan["book"])
         for row, _approval, _frozen in selected:
             original_record = (original_state.get("documents") or {}).get(
                 str(row["document_id"])
@@ -611,7 +618,7 @@ def _protect_execution_inputs(
         raw = _resolve_raw(reference, snapshot_path)
         if raw:
             protected.add(raw)
-    state = _read_json(state_path)
+    state = _load_state(state_path, plan["book"])
     for record in (state.get("documents") or {}).values():
         if not isinstance(record, dict):
             continue
@@ -776,6 +783,21 @@ def _execute_locked(
         if candidate_result.get("status") != "candidate_ready":
             raise ExecutionError("Graphify did not retain a validated candidate")
         candidate = Path(candidate_result["candidate"])
+        if state_path.read_bytes() != state_before:
+            raise ExecutionError("knowledge state changed concurrently")
+        candidate_state = _load_state(state_path, plan["book"])
+        if isinstance(candidate_state, BookState):
+            for row, _approval, _frozen in selected:
+                candidate_state["documents"][str(row["document_id"])].setdefault(
+                    "steps", {}
+                )["graph_candidate"] = {
+                    "status": "completed",
+                    "recorded_at": now_iso(),
+                    "candidate": str(candidate),
+                    "version": row["execution"]["source_version"],
+                }
+            save_view(state_path, candidate_state)
+            state_before = state_path.read_bytes()
         graph = _validate_candidate_graph(candidate / "graph.json", selected)
         quality_report = _validate_quality_cases(quality, graph, selected)
         if state_path.read_bytes() != state_before:
@@ -795,7 +817,7 @@ def _execute_locked(
                 "evidence": usage.get("token_evidence", "unknown"),
             }
         original_state = _read_json(state_path)
-        state = _read_json(state_path)
+        state = _load_state(state_path, plan["book"])
         snapshot = _load_snapshot(args.snapshot.expanduser().resolve())
         for row, _approval, frozen in selected:
             doc_id_value = str(row["document_id"])
@@ -814,6 +836,11 @@ def _execute_locked(
                     "source_ref": f"{row['book_id']}:{row['document_id']}",
                 },
             }
+            record.setdefault("steps", {})["graph_publish"] = {
+                "status": "completed",
+                "recorded_at": now_iso(),
+                "version": row["execution"]["source_version"],
+            }
             record["pending"] = []
             results.append(
                 {
@@ -827,6 +854,9 @@ def _execute_locked(
                     ],
                 }
             )
+        if isinstance(state, BookState):
+            state.root["active_run"] = None
+        state = root_state(state)
         transaction = {
             "candidate": str(candidate),
             "backup": str(staging / "graph-update" / "graph-backup"),
@@ -908,6 +938,10 @@ def _execute_locked(
         "quality_gate": quality_report,
         "transaction": transaction,
     }
+    current = _load_state(args.state.expanduser().resolve(), plan["book"])
+    if isinstance(current, BookState):
+        current.root["active_run"] = None
+        save_view(args.state.expanduser().resolve(), current)
     publish_reports(
         [
             (

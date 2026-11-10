@@ -67,7 +67,11 @@ def graph_job(tmp_path, monkeypatch):
 
 
 def test_resume_after_successful_publish_reuses_candidate(graph_job):
-    _corpus, graph, staging, builds, original = graph_job
+    corpus, graph, staging, builds, original = graph_job
+    canonical = json.loads((corpus / ".sync-state.json").read_text())
+    record = canonical["books"]["adhoc"]["documents"]["1"]
+    assert record["steps"]["graph_candidate"]["status"] == "completed"
+    assert not record.get("graph")
     published = (graph / "graph.json").read_bytes()
     update_graph.main()
     assert len(builds) == 1
@@ -75,6 +79,13 @@ def test_resume_after_successful_publish_reuses_candidate(graph_job):
     assert json.loads((staging / "result.json").read_text())["status"] == "completed"
     assert json.loads((staging / "graph-backup/graph.json").read_text()) == original
     assert not (staging / "graph-backup/new-artifact.json").exists()
+    canonical = json.loads((corpus / ".sync-state.json").read_text())
+    assert canonical["books"]["adhoc"]["documents"]["1"]["graph"]["status"] == "covered"
+    frozen = Path(canonical["books"]["adhoc"]["documents"]["1"]["graph"]["raw"]["path"])
+    assert frozen == staging / "source-snapshots/a-[1].md"
+    (corpus / "a-[1].md").write_text("later corpus version")
+    assert frozen.read_text() == "source"
+    assert canonical["active_run"] is None
 
 
 def test_resume_still_rejects_external_graph_changes(graph_job):
@@ -423,7 +434,25 @@ def test_rebased_deletion_rejects_restored_document(
     )
     restored = corpus / "restored-[1].md"
     timestamp = corpus / ".sync-state.json"
-    timestamp.write_text('{"1": {"content_updated_at": "2026-11-06"}}')
+    timestamp.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "active_run": None,
+                "books": {
+                    "adhoc": {
+                        "documents": {
+                            "1": {
+                                "baseline": {"content_updated_at": "2026-11-06"},
+                                "pending": [],
+                                "steps": {},
+                            }
+                        }
+                    }
+                },
+            }
+        )
+    )
     if cached_candidate:
 
         def build(*args, **kwargs):
@@ -456,4 +485,6 @@ def test_rebased_deletion_rejects_restored_document(
         "restored-[1].md": {"keep": True}
     }
     assert restored.read_text() == "restored content"
-    assert timestamp.read_text() == '{"1": {"content_updated_at": "2026-11-06"}}'
+    document = json.loads(timestamp.read_text())["books"]["adhoc"]["documents"]["1"]
+    assert document["baseline"]["content_updated_at"] == "2026-11-06"
+    assert "graph" not in document["steps"]

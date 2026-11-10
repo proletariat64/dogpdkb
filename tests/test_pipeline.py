@@ -272,6 +272,11 @@ def test_pipeline_resumes_real_apply_without_repeating_plan_or_successful_export
     assert calls == ["get_sync_updates.py", "apply_sync_updates.py"]
     state = json.loads((staging / "pipeline-state.json").read_text())
     assert state["stages"] == {"plan": "completed", "corpus": "retry_required"}
+    canonical = json.loads((corpus / ".sync-state.json").read_text())
+    assert canonical["active_run"]["staging"] == str(staging.resolve())
+    book = canonical["books"]["adhoc"]
+    assert book["documents"]["1"]["steps"]["download"]["status"] == "completed"
+    assert book["steps"]["corpus"]["status"] == "failed"
     output = capsys.readouterr().err
     assert "completed_exports=1 failed=1" in output
     assert "unit=2" in output
@@ -285,6 +290,7 @@ def test_pipeline_resumes_real_apply_without_repeating_plan_or_successful_export
     result = pipeline.run_pipeline(config, runner=run)
 
     assert result["status"] == "completed"
+    assert json.loads((corpus / ".sync-state.json").read_text())["active_run"] is None
     assert calls == ["apply_sync_updates.py", "update_graph.py", "publish_web.py"]
     assert exports == [2]
     assert ocr == ["Doc-2-2026-11-01-[2].md"]

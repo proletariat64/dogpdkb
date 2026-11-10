@@ -157,9 +157,9 @@ def test_initial_snapshot_observes_complete_listing_without_exporting(
     assert snapshot["schema_version"] == "knowledge-capture-1.0"
     assert snapshot["status"] == "initialized"
     assert snapshot["book"]["book_id"] == 123
-    assert snapshot["observation"]["timezone"] == "UTC"
-    assert snapshot["observation"]["started_at"].endswith("Z")
-    assert snapshot["observation"]["ended_at"].endswith("Z")
+    assert snapshot["observation"]["timezone"] == "UTC+8"
+    assert snapshot["observation"]["started_at"].endswith("+08:00")
+    assert snapshot["observation"]["ended_at"].endswith("+08:00")
     assert snapshot["listing"]["complete"] is True
     assert snapshot["listing"]["document_ids"] == [1, 2]
     assert snapshot["listing"]["pages"] == [{"offset": 0, "limit": 50, "item_count": 2}]
@@ -175,7 +175,8 @@ def test_initial_snapshot_observes_complete_listing_without_exporting(
     assert snapshot["documents"]["1"]["version"] == {
         "field": "content_updated_at",
         "value": "2026-11-07T01:00:00.000Z",
-        "utc": "2026-11-07T01:00:00Z",
+        "utc": "2026-11-07T09:00:00+08:00",
+        "default_timezone": False,
     }
     assert snapshot["documents"]["2"]["version"]["field"] == "updated_at"
     assert not list(staging.glob("raw/*.md"))
@@ -287,7 +288,9 @@ def test_incremental_snapshot_classifies_and_exports_each_selected_id_once(
     assert sorted(snapshot["exports"]) == ["2", "4"]
     assert len(list(staging.glob("raw/*.md"))) == 2
     assert snapshot["exports"]["2"]["status"] == "captured"
-    assert snapshot["exports"]["2"]["detail_version"]["utc"] == "2026-11-08T19:00:00Z"
+    assert (
+        snapshot["exports"]["2"]["detail_version"]["utc"] == "2026-11-09T03:00:00+08:00"
+    )
     assert snapshot["exports"]["2"]["original"]["status"] == "missing"
     assert snapshot["exports"]["4"]["original"]["status"] == "not_applicable"
     assert snapshot["documents"]["1"]["id"] == 1
@@ -1065,9 +1068,9 @@ def test_invalid_observation_cannot_claim_success(tmp_path: Path):
     cases = [
         ({"id": 1, "title": "Missing"}, True, "no usable update timestamp"),
         (
-            {"id": 1, "title": "Naive", "content_updated_at": "2026-11-09T00:00:00"},
+            {"id": 1, "title": "Invalid", "content_updated_at": "not-a-time"},
             True,
-            "no timezone",
+            "invalid update timestamp",
         ),
         (
             {

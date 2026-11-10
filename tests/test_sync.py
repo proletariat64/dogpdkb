@@ -570,7 +570,9 @@ def test_get_main_writes_structure_changes_and_complete_snapshot(
         },
     )
     monkeypatch.setattr(
-        get_sync, "fetch_doc_list", lambda book_id, count, cache_dir=None: docs
+        get_sync,
+        "fetch_doc_list",
+        lambda book_id, count, cache_dir=None, **kwargs: docs,
     )
     monkeypatch.setattr(
         get_sync, "toc_paths", lambda book_id: {1: ["parent"], 2: ["new-parent"]}
