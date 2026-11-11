@@ -47,6 +47,25 @@ def _instant(version: dict[str, Any]) -> datetime:
         ) from error
 
 
+def _suppressed_match(
+    doc_id: int, version: dict[str, Any], rows: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """The archived handoff for this document at this exact source version.
+
+    Version identity reuses the existing normalized instant (no new fingerprint);
+    a different remote version never matches an archived failure.
+    """
+    for row in rows:
+        if str(row.get("document_id")) != str(doc_id):
+            continue
+        try:
+            if _instant(row.get("source_version") or {}) == _instant(version):
+                return row
+        except CaptureError:
+            continue
+    return None
+
+
 def _read_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -734,14 +753,16 @@ def _export_local(
 
 
 def _export_remote(document: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    from dogpdkb.workflows.apply_sync_updates import export_doc
+    from dogpdkb.workflows import apply_sync_updates
     from dogpdkb.workflows.get_sync_updates import SkylarkError
 
     try:
-        return export_doc(
+        return apply_sync_updates.export_doc(
             document["id"], document.get("format") or document.get("type")
         )
-    except SkylarkError as error:
+    except (SkylarkError, apply_sync_updates.SkylarkError) as error:
+        # The legacy exporter re-exports get_sync_updates under a second module
+        # identity; both must archive as a per-document failure, never escape.
         raise CaptureError(
             f"document {document['id']} export failed: {error}"
         ) from error
@@ -944,6 +965,29 @@ def run_capture(args: Any) -> int:
         }
         | (set(prior_pending) & current_id_set)
     )
+    # Retry suppression (ticket 03): an archived failure handed off for this exact
+    # source version is not re-attempted by the daily batch. A new remote version
+    # never matches, so it participates normally; abandonment is version-scoped.
+    suppressed: list[dict[str, Any]] = []
+    suppression = getattr(args, "suppressed_anomalies", None) or []
+    if suppression:
+        kept = []
+        for doc_id in selected:
+            match = _suppressed_match(
+                doc_id, records[str(doc_id)]["version"], suppression
+            )
+            if match is None:
+                kept.append(doc_id)
+            else:
+                suppressed.append(
+                    {
+                        "id": doc_id,
+                        "anomaly_id": match["id"],
+                        "code": match["code"],
+                        "version_stamp": match.get("version_stamp"),
+                    }
+                )
+        selected = kept
     exports: dict[str, Any] = {}
     pending = []
     anomalies = []
@@ -1201,6 +1245,7 @@ def run_capture(args: Any) -> int:
         "exports": exports,
         "pending": pending,
         "anomalies": anomalies,
+        "suppressed": suppressed,
         "imports": import_summaries,
     }
     _write_json(snapshot_path, snapshot)
