@@ -22,8 +22,11 @@ def write_json(path: Path, payload: Any) -> None:
 def sync(*arguments: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "src")
+    # Ticket 08 converged `dogpdkb sync` onto the unified runner. These legacy
+    # planning regressions exercise the retained deprecated compatibility
+    # executor directly; their input-integrity assertions are unchanged.
     return subprocess.run(
-        [sys.executable, "-m", "dogpdkb", "sync", *arguments],
+        [sys.executable, "-m", "dogpdkb.knowledge_sync", *arguments],
         cwd=ROOT,
         env=env,
         text=True,

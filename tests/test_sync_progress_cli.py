@@ -17,8 +17,15 @@ def write(path: Path, data) -> None:
 
 
 def cli(*args: str):
+    # Ticket 08 converged `dogpdkb sync` onto the unified runner. The legacy
+    # knowledge-planning regressions here exercise the retained deprecated
+    # compatibility executor directly; their assertions are unchanged.
+    if args and args[0] == "sync":
+        command = [sys.executable, "-m", "dogpdkb.knowledge_sync", *args[1:]]
+    else:
+        command = [sys.executable, "-m", "dogpdkb", *args]
     return subprocess.run(
-        [sys.executable, "-m", "dogpdkb", *args],
+        command,
         cwd=ROOT,
         env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
         text=True,

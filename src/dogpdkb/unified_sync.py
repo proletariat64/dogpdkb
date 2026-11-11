@@ -42,7 +42,10 @@ from dogpdkb.sync_state import StateError
 from dogpdkb.workflows.get_sync_updates import safe_diagnostic
 from mdocr.config import Book, SyncConfig, config_arguments, configure, configured_book
 
-#: Flags that still belong to the superseded executors. Ticket 08 removes them.
+#: Flags that belonged to the superseded executors. Ticket 08 converged the
+#: sync entry onto the unified runner: these no longer select a second default
+#: executor. They are recognised only to emit a deprecation notice and forward
+#: the compatible subset (:func:`unified_arguments`) into the unified runner.
 LEGACY_FLAGS = frozenset(
     {
         "--knowledge",
@@ -90,10 +93,44 @@ def legacy_flags(arguments: list[str]) -> list[str]:
 def deprecation_notice(flags: list[str]) -> str:
     listed = ", ".join(sorted(set(flags)))
     return (
-        f"dogpdkb sync: deprecated legacy flags ({listed}); forwarding to the "
-        "legacy executor. The unified runner accepts --config, --book, "
-        "--stop-after and --resume <run>."
+        f"dogpdkb sync: deprecated legacy flags ({listed}); the legacy sync "
+        "executor is removed and this invocation is forwarded to the unified "
+        "runner. The unified runner accepts --config, --book, --stop-after and "
+        "--resume <run>; legacy-only flags are ignored."
     )
+
+
+#: The unified runner's own value-taking flags. A legacy invocation keeps only
+#: these (plus their values); every superseded executor flag is dropped.
+_UNIFIED_VALUE_FLAGS = frozenset({"--config", "--book", "--stop-after", "--resume"})
+
+
+def unified_arguments(arguments: list[str]) -> list[str]:
+    """Compatible subset of a legacy invocation, forwarded to the unified runner.
+
+    ``--config``, ``--book``, ``--stop-after`` and a valued ``--resume <run>``
+    are kept; superseded executor flags (and a valueless boolean ``--resume``)
+    are dropped. The unified runner is the single default executor, so a legacy
+    invocation runs the same five-stage batch rather than a second pipeline.
+    """
+    kept: list[str] = []
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        name, separator, _value = token.partition("=")
+        if name not in _UNIFIED_VALUE_FLAGS:
+            index += 1
+            continue
+        if separator:
+            kept.append(token)
+            index += 1
+        elif index + 1 < len(arguments) and not arguments[index + 1].startswith("-"):
+            kept.extend([token, arguments[index + 1]])
+            index += 2
+        else:
+            # A valueless flag (e.g. the legacy boolean --resume) is dropped.
+            index += 1
+    return kept
 
 
 def build_parser() -> argparse.ArgumentParser:

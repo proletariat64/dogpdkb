@@ -386,7 +386,7 @@ def test_emitted_resume_command_preserves_named_book_config_and_original_cutoff(
         ],
     )
     with pytest.raises(SystemExit) as error:
-        pipeline.main()
+        pipeline.legacy_main()
     assert error.value.code == 1
     output = capsys.readouterr().err
     command = shlex.split(
@@ -404,7 +404,7 @@ def test_emitted_resume_command_preserves_named_book_config_and_original_cutoff(
     calls.clear()
     monkeypatch.setattr(sys, "argv", command[1:])
 
-    pipeline.main()
+    pipeline.legacy_main()
 
     assert observed[1].book_name == "Selected book"
     assert observed[1].cutoff is None
@@ -544,12 +544,14 @@ def test_sync_cli_listing_exhaustion_reports_page_budget_and_retained_resume(tmp
         [str(shim), str(Path(__file__).resolve().parents[1] / "src")]
     )
 
+    # Ticket 08 converged `dogpdkb sync` onto the unified runner. This legacy
+    # listing-exhaustion recovery regression exercises the retained deprecated
+    # compatibility executor directly; its assertions are unchanged.
     result = subprocess.run(
         [
             sys.executable,
-            "-m",
-            "dogpdkb",
-            "sync",
+            "-c",
+            "from dogpdkb.workflows.sync_knowledge_base import legacy_main; legacy_main()",
             "--config",
             str(settings),
             "--skylark-url",

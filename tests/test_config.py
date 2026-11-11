@@ -153,7 +153,7 @@ def test_pipeline_cli_overrides_file_and_env(config_file, tmp_path, monkeypatch)
             "--dry-run",
         ],
     )
-    pipeline.main()
+    pipeline.legacy_main()
     options = captured[0]
     assert options.input_dir == tmp_path / "cli-corpus"
     assert options.web_dir == tmp_path / "cli-web"
@@ -290,7 +290,7 @@ def test_graphify_interpreter_retains_virtual_environment(
     monkeypatch.setattr(pipeline, "run_pipeline", captured.append)
     monkeypatch.setattr(sys, "argv", command)
 
-    pipeline.main()
+    pipeline.legacy_main()
 
     options = captured[0]
     assert options.graphify_python == interpreter
