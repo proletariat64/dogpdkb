@@ -156,3 +156,136 @@ def clone_run(source: Path, target: Path, **changes: Any) -> Path:
     state.update(changes)
     write_json(target / "run.json", state)
     return target
+
+
+def archive_clone(workspace: Workspace, run: Path) -> Path:
+    """Give a constructed run the durable result a real finish would archive."""
+    source = workspace.results / "runs" / f"{run.name}.json"
+    if not source.is_file():
+        existing = sorted((workspace.results / "runs").glob("*.json"))
+        assert existing, "expected a durable batch result to copy"
+        source = existing[0]
+    payload = read_json(source)
+    payload.update(run_id=run.name, run_dir=str(run))
+    target = workspace.results / "runs" / f"{run.name}.json"
+    write_json(target, payload)
+    return target
+
+
+def cleanup_record(workspace: Workspace) -> dict[str, Any]:
+    return read_json(workspace.results / "cleanup.json")
+
+
+def actions(workspace: Workspace) -> dict[str, str]:
+    return {row["run_id"]: row["action"] for row in cleanup_record(workspace)["runs"]}
+
+
+def test_cleanup_keeps_paused_and_unfinished_workspaces(workspace: Workspace):
+    paused = workspace.sync("--stop-after", "capture")
+    assert paused.returncode == 0, paused.stderr
+    original = workspace.only_run()
+    book = original.parent
+    older = clone_run(
+        original,
+        book / "run-20260101-000000",
+        status="completed",
+        ended_at="2026-01-01T00:00:10+08:00",
+    )
+    archive_clone(workspace, older)
+    held = clone_run(original, book / "run-20260101-000001", status="paused")
+    crashed = clone_run(
+        original, book / "run-20260101-000002", status="running", pid=999999
+    )
+
+    resumed = workspace.sync("--resume", original.name)
+    assert resumed.returncode == 0, resumed.stderr
+    assert json.loads(resumed.stdout.strip().splitlines()[-1])["status"] == "completed"
+
+    # The earlier finished workspace is gone; paused/interrupted ones stay.
+    assert not older.exists()
+    assert held.is_dir()
+    assert crashed.is_dir()
+    assert original.is_dir()
+    assert actions(workspace) == {
+        older.name: "removed",
+        held.name: "kept",
+        crashed.name: "kept",
+        original.name: "kept",
+    }
+    record = cleanup_record(workspace)
+    assert record["schema_version"] == "unified-wash-cleanup-1.0"
+    assert record["counts"]["removed"] == 1
+    assert record["trigger_run"] == original.name
+    # Durable history is never cleaned with wash.
+    assert (workspace.results / "runs" / f"{older.name}.json").is_file()
+    assert (workspace.results / "runs" / f"{original.name}.json").is_file()
+
+
+def test_cleanup_defers_a_workspace_whose_result_is_not_archived(
+    workspace: Workspace,
+):
+    assert workspace.sync("--stop-after", "capture").returncode == 0
+    original = workspace.only_run()
+    older = clone_run(
+        original,
+        original.parent / "run-20260101-000000",
+        status="completed",
+        ended_at="2026-01-01T00:00:10+08:00",
+    )
+    # No durable result for the constructed run: archiving must come first.
+
+    resumed = workspace.sync("--resume", original.name)
+    assert resumed.returncode == 0, resumed.stderr
+    assert older.is_dir()
+    row = next(
+        item
+        for item in cleanup_record(workspace)["runs"]
+        if item["run_id"] == older.name
+    )
+    assert row["action"] == "kept"
+    assert "not archived" in row["reason"]
+
+    # The next finished batch retries once the result is durable.
+    archive_clone(workspace, older)
+    assert workspace.sync().returncode == 0
+    assert not older.exists()
+    assert actions(workspace)[older.name] == "removed"
+
+
+def test_cleanup_failure_is_recorded_and_retried_without_failing_the_batch(
+    workspace: Workspace,
+):
+    assert workspace.sync("--stop-after", "capture").returncode == 0
+    original = workspace.only_run()
+    older = clone_run(
+        original,
+        original.parent / "run-20260101-000000",
+        status="completed",
+        ended_at="2026-01-01T00:00:10+08:00",
+    )
+    archive_clone(workspace, older)
+    locked = [older, *sorted(older.rglob("*"))]
+    for path in locked:
+        if path.is_dir():
+            path.chmod(0o500)
+    try:
+        resumed = workspace.sync("--resume", original.name)
+        assert resumed.returncode == 0, resumed.stderr
+        summary = json.loads(resumed.stdout.strip().splitlines()[-1])
+        assert summary["status"] == "completed"
+        assert older.is_dir()
+        record = cleanup_record(workspace)
+        assert record["counts"]["failed"] == 1
+        assert any(row["reason"] == "removal-failed" for row in record["failures"])
+        assert actions(workspace)[older.name] == "failed"
+        # A valid knowledge base is untouched by the failed cleanup.
+        assert (workspace.corpus / ".sync-state.json").is_file()
+        assert (workspace.results / "runs" / f"{original.name}.json").is_file()
+    finally:
+        for path in locked:
+            if path.is_dir():
+                path.chmod(0o700)
+
+    assert workspace.sync().returncode == 0
+    assert not older.exists()
+    assert actions(workspace)[older.name] == "removed"
