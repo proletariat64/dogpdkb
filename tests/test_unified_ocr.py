@@ -57,6 +57,12 @@ def _record(kind):
         stream.write(kind + "\\n")
 
 def _handle(method, url, **kwargs):
+    if url == "https://example.com/result.jsonl":
+        if MODE == "blank":
+            return Resp(text="")
+        payload = {{"result": {{"layoutParsingResults": [
+            {{"markdown": {{"text": "OCR output line"}}}}]}}}}
+        return Resp(text=json.dumps(payload))
     if "paddleocr.aistudio-app.com" in url:
         if method == "POST" and url.endswith("/jobs"):
             _record("POST")
@@ -70,12 +76,6 @@ def _handle(method, url, **kwargs):
                 return Resp(json_data={{"data": {{"state": "failed", "errorMsg": "boom"}}}})
             return Resp(json_data={{"data": {{"state": "done",
                 "resultUrl": {{"jsonUrl": "https://example.com/result.jsonl"}}}}}})
-        if url == "https://example.com/result.jsonl":
-            if MODE == "blank":
-                return Resp(text="")
-            payload = {{"result": {{"layoutParsingResults": [
-                {{"markdown": {{"text": "OCR output line"}}}}]}}}}
-            return Resp(text=json.dumps(payload))
         raise AssertionError(url)
     if url.startswith("https://cdn.example.invalid/"):
         _record("IMG " + url)
