@@ -289,3 +289,127 @@ def test_cleanup_failure_is_recorded_and_retried_without_failing_the_batch(
     assert workspace.sync().returncode == 0
     assert not older.exists()
     assert actions(workspace)[older.name] == "removed"
+
+
+def legacy_run(workspace: Workspace, name: str = "sync-20260101-000000") -> Path:
+    """A constructed work directory from the superseded pipeline implementation."""
+    run = workspace.staging / "fund" / name
+    (run / "raw").mkdir(parents=True)
+    raw = run / "raw" / "1-20260101T000000+0800.md"
+    raw.write_text("# Legacy original\n\nBody.\n", encoding="utf-8")
+    write_json(
+        run / "export-progress.json",
+        {
+            "configuration": {"source_url": "https://example.invalid/team/uat"},
+            "items": [
+                {
+                    "id": 1,
+                    "file": raw.name,
+                    "status": "exported",
+                    "raw": {"path": str(raw), "stage": "raw_export"},
+                }
+            ],
+        },
+    )
+    write_json(
+        run / "pipeline-state.json",
+        {"version": 1, "stages": {"corpus": "retry_required"}, "status": "running"},
+    )
+    return run
+
+
+def wash_cli(workspace: Workspace, *args: str):
+    return workspace.cli(
+        "wash", "--config", str(workspace.config), "--book", "fund", *args
+    )
+
+
+def point_state_at_legacy(workspace: Workspace, raw: Path) -> None:
+    """The canonical download-reuse reference still points into historical wash."""
+    path = workspace.corpus / ".sync-state.json"
+    state = read_json(path)
+    row = state["books"]["fund"]["documents"]["1"]
+    row.setdefault("steps", {})["download"] = {
+        "status": "completed",
+        "version": {
+            "field": "content_updated_at",
+            "value": "2026-01-01T00:00:00+08:00",
+            "utc": "2026-01-01T00:00:00+08:00",
+        },
+        "file": raw.name,
+        "raw": {"path": str(raw), "stage": "raw_export"},
+    }
+    write_json(path, state)
+
+
+def test_wash_inventory_reports_legacy_references_without_deleting(
+    workspace: Workspace,
+):
+    finished_batch(workspace)
+    legacy = legacy_run(workspace)
+    raw = legacy / "raw" / "1-20260101T000000+0800.md"
+    point_state_at_legacy(workspace, raw)
+    before = {
+        path: path.read_bytes() for path in sorted(legacy.rglob("*")) if path.is_file()
+    }
+    state_before = (workspace.corpus / ".sync-state.json").read_bytes()
+
+    listed = wash_cli(workspace, "--json")
+    assert listed.returncode == 0, listed.stderr
+    view = json.loads(listed.stdout)
+    assert view["schema_version"] == "unified-wash-inventory-1.0"
+    row = next(item for item in view["runs"] if item["run_id"] == legacy.name)
+    assert row["kind"] == "legacy"
+    assert row["resume_verified"] is False
+    assert "validation" in row["annotation"]
+    assert str(raw) in [ref["path"] for ref in row["references"]]
+    assert row["action"] == "migrate"
+
+    # Inventory is read-only: no deletion, no migration, no state rewrite.
+    assert {
+        path: path.read_bytes() for path in sorted(legacy.rglob("*")) if path.is_file()
+    } == before
+    assert (workspace.corpus / ".sync-state.json").read_bytes() == state_before
+    assert not (workspace.results / "wash-migration.json").exists()
+    assert not (workspace.results / "migrated").exists()
+
+
+def test_wash_migrate_persists_necessary_artifacts_and_rewrites_old_references(
+    workspace: Workspace,
+):
+    finished_batch(workspace)
+    legacy = legacy_run(workspace)
+    raw = legacy / "raw" / "1-20260101T000000+0800.md"
+    expected = raw.read_bytes()
+    point_state_at_legacy(workspace, raw)
+
+    migrated = wash_cli(workspace, "--migrate", "--json")
+    assert migrated.returncode == 0, migrated.stderr
+    manifest = json.loads(migrated.stdout)
+    assert manifest["schema_version"] == "unified-wash-migration-1.0"
+
+    # The necessary original is durable outside wash and byte-identical.
+    durable = workspace.results / "migrated" / legacy.name / "raw" / raw.name
+    assert durable.is_file()
+    assert durable.read_bytes() == expected
+    assert not durable.is_relative_to(workspace.staging)
+    # The old canonical reference now resolves to the durable copy.
+    state = read_json(workspace.corpus / ".sync-state.json")
+    reference = state["books"]["fund"]["documents"]["1"]["steps"]["download"]["raw"]
+    assert reference["path"] == str(durable)
+    # Nothing was bulk-deleted: the historical directory keeps its evidence.
+    assert raw.is_file()
+    assert (legacy / "pipeline-state.json").is_file()
+    annotation = read_json(legacy / "wash-migration.json")
+    assert annotation["resume_verified"] is False
+    assert "validation" in annotation["annotation"]
+    assert (workspace.results / "wash-migration.json").is_file()
+
+    # Repeating the migration is idempotent.
+    again = wash_cli(workspace, "--migrate", "--json")
+    assert again.returncode == 0, again.stderr
+    assert json.loads(again.stdout)["counts"]["migrated"] == 0
+    assert durable.read_bytes() == expected
+    assert read_json(workspace.corpus / ".sync-state.json")["books"]["fund"]["documents"][
+        "1"
+    ]["steps"]["download"]["raw"]["path"] == str(durable)
