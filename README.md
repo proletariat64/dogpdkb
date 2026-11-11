@@ -203,6 +203,16 @@ template. Set `[paths].web` explicitly for a deployed Web server; the portable
 default writes to local `web-output/<book-key>/`. Set `graphify_python` when
 Graphify lives in another environment; otherwise the current interpreter is used.
 
+The unattended `dogpdkb sync` OCR stage is best-effort. `[paths].ocr_cache`
+(default `ocr-cache`) holds long-term OCR success evidence — the original image,
+its prepared JPEG and the recognized artifact — outside the cleanable wash run
+directory, so repeated syncs reuse verified results instead of re-OCR.
+`[ocr].budget_seconds` (default `1800`) bounds the whole stage; on exhaustion the
+stage keeps completed results, archives unfinished images and proceeds to
+compile. Both keys are read through the shared configuration system and appear
+in the non-secret resume snapshot; no new environment variables are introduced
+(`PADDLEOCR_TOKEN` remains environment-only).
+
 Web publication writes both JSON files into a generation under `.snapshots/`,
 then atomically switches a shared `current` symlink. The public `catalog.json`
 and `map/map-data.json` paths remain unchanged and become relative symlinks;
