@@ -275,6 +275,32 @@ def _archive_result(state: RunState, config: SyncConfig, book_key: str) -> None:
         report_progress(f"result archiving failed: {safe_diagnostic(error)}")
 
 
+def _clean_wash(
+    state: RunState, config: SyncConfig, book_key: str, corpus: Path
+) -> None:
+    """Clean earlier finished work directories after the result is durable.
+
+    Runs only for a completed/partial batch, after archiving. A cleanup failure
+    is recorded in the durable cleanup record and retried at the next finished
+    batch; it never breaks a valid corpus or changes the batch exit code.
+    """
+    from dogpdkb.sync_wash import cleanup_wash
+
+    try:
+        record = cleanup_wash(config, book_key, corpus=corpus, trigger=state.layout)
+    except (OSError, ValueError) as error:
+        report_progress(f"wash cleanup failed: {safe_diagnostic(error)}")
+        return
+    counts = record["counts"]
+    report_progress(
+        "wash cleanup: "
+        f"removed={counts['removed']} kept={counts['kept']} "
+        f"failed={counts['failed']} migrated={counts['migrated']}"
+    )
+    for row in record["failures"]:
+        report_progress(f"wash cleanup deferred: {safe_diagnostic(row)}")
+
+
 def main(argv: list[str] | None = None) -> int:
     from dogpdkb.sync_progress import Progress
 
@@ -372,6 +398,10 @@ def main(argv: list[str] | None = None) -> int:
     if status in FINISHED_STATUSES:
         # A finished batch never leaves a claim that blocks the next cron run.
         progress.finish()
+    if status in ("completed", "partial"):
+        # Only a successfully ended batch cleans earlier finished workspaces,
+        # and only after its own result and necessary inputs are durable.
+        _clean_wash(state, config, book.key, corpus)
     report_progress(f"run {layout.run_id} {status}" + (f": {reason}" if reason else ""))
     print(json.dumps(state.summary(), ensure_ascii=False))
     return code
