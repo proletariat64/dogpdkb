@@ -67,6 +67,8 @@ def _handle(method, url, **kwargs):
     if url == "https://example.com/result.jsonl":
         if MODE == "blank":
             return Resp(text="")
+        if MODE == "garbage":
+            return Resp(text="this is not valid json")
         payload = {{"result": {{"layoutParsingResults": [
             {{"markdown": {{"text": "OCR output line"}}}}]}}}}
         return Resp(text=json.dumps(payload))
@@ -290,8 +292,9 @@ def test_same_url_with_changed_image_content_is_recognized_again(
     assert ocr_workspace.submissions() == 2
 
 
-def test_a_blank_result_never_overwrites_a_cached_success(
-    ocr_workspace: OcrWorkspace,
+@pytest.mark.parametrize("invalid_mode", ["blank", "garbage"])
+def test_an_invalid_result_never_overwrites_a_cached_success(
+    ocr_workspace: OcrWorkspace, invalid_mode: str
 ):
     ocr_workspace.sync()
     run1 = ocr_workspace.latest_run()
@@ -301,11 +304,11 @@ def test_a_blank_result_never_overwrites_a_cached_success(
     before = cached[0].read_text(encoding="utf-8")
     assert "OCR output line" in before
 
-    # A different image (cache miss) meets an unstable interface returning blank.
-    # It must fail without clobbering the valid cached success for the first image
-    # and without minting a success result of its own.
+    # A different image (cache miss) meets an unstable interface returning a
+    # blank or unparseable result. It must fail without clobbering the valid
+    # cached success for the first image and without minting a success of its own.
     ocr_workspace.write_image(20)
-    ocr_workspace.set_mode("blank")
+    ocr_workspace.set_mode(invalid_mode)
     ocr_workspace.sync()
     run2 = ocr_workspace.latest_run()
     counts2 = ocr_workspace.ocr_envelope(run2)["counts"]
