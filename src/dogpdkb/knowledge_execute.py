@@ -1073,8 +1073,24 @@ def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
         graphify_python=context.config.graphify_python,
     )
     metadata_by_id = _compile_metadata(context)
+    metadata_items = plan.get("metadata") or []
     if not items:
-        report = _compile_report(plan, [], [], {}, metadata_by_id, None)
+        # No body compile work, but the plan may still schedule metadata
+        # maintenance (rename/move/source-ref) for reused sources. Execute it
+        # rather than dropping it just because nothing entered the compile list.
+        metadata_results: list[dict[str, Any]] = []
+        if metadata_items and state_path.is_file():
+            state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with state_lock(state_path):
+                state = _load_state(state_path, plan["book"])
+                metadata_results = _apply_metadata_maintenance(
+                    state, metadata_items, metadata_by_id
+                )
+                if metadata_results:
+                    save_view(state_path, state)
+        report = _compile_report(
+            plan, [], [], {}, metadata_by_id, None, metadata_results
+        )
         publish_reports(
             [(report_path, json.dumps(report, ensure_ascii=False, indent=1) + "\n")]
         )
@@ -1114,6 +1130,7 @@ def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
             graph_dir,
             metadata_by_id,
             report_path,
+            metadata_items,
         )
 
 
@@ -1130,6 +1147,55 @@ def _compile_metadata(context: Any) -> dict[str, dict[str, Any]]:
     }
 
 
+def _apply_metadata_maintenance(
+    state: dict[str, Any],
+    metadata_items: list[dict[str, Any]],
+    metadata_by_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Execute the plan's rename / move / source-ref maintenance (item 5).
+
+    Applies the incoming metadata to each planned document's canonical graph
+    record and records the execution. This runs for every ``metadata[].tasks``
+    item the plan scheduled, including documents whose body was reused, so
+    maintenance is never dropped just because the body did not change. It is
+    independent of the body success version: a source whose extraction failed
+    keeps its old knowledge and version while its incoming name/path/source-ref
+    are still maintained.
+    """
+    results: list[dict[str, Any]] = []
+    for item in metadata_items:
+        identity = str(item["document_id"])
+        record = state["documents"].get(identity)
+        if not isinstance(record, dict):
+            continue
+        graph = record.get("graph")
+        if not isinstance(graph, dict) or not graph.get("status"):
+            continue
+        incoming = metadata_by_id.get(identity) or {
+            "name": f"source-[{identity}].md",
+            "logical_path": "",
+            "source_ref": f"{item['book_id']}:{identity}",
+        }
+        graph["metadata"] = incoming
+        tasks = item.get("tasks") or []
+        record.setdefault("steps", {})["metadata_maintenance"] = {
+            "status": "completed",
+            "recorded_at": now_iso(),
+            "version": item["source_version"],
+            "tasks": tasks,
+        }
+        results.append(
+            {
+                "book_id": item["book_id"],
+                "document_id": item["document_id"],
+                "source_version": item["source_version"],
+                "tasks": tasks,
+                "status": "executed",
+            }
+        )
+    return results
+
+
 def _execute_compile_locked(
     context: Any,
     args: Any,
@@ -1142,6 +1208,7 @@ def _execute_compile_locked(
     graph_dir: Path,
     metadata_by_id: dict[str, dict[str, Any]],
     report_path: Path,
+    metadata_items: list[dict[str, Any]],
 ) -> dict[str, Any]:
     candidate_result = _run_graphify(
         args, "--candidate-only", corpus, manifest_path, log=context.log, partial=True
@@ -1221,10 +1288,21 @@ def _execute_compile_locked(
                 "source_version": item["source_version"],
             }
         )
+    # Execute the plan's metadata maintenance for every scheduled document
+    # (including reused bodies), then persist state once.
+    metadata_results = _apply_metadata_maintenance(
+        state, metadata_items, metadata_by_id
+    )
     save_view(state_path, state)
     usage = candidate_result.get("usage") or {}
     report = _compile_report(
-        plan, results, sorted(failed_ids), usage, metadata_by_id, candidate_result
+        plan,
+        results,
+        sorted(failed_ids),
+        usage,
+        metadata_by_id,
+        candidate_result,
+        metadata_results,
     )
     publish_reports(
         [(report_path, json.dumps(report, ensure_ascii=False, indent=1) + "\n")]
@@ -1239,6 +1317,7 @@ def _compile_report(
     usage: dict[str, Any],
     metadata_by_id: dict[str, dict[str, Any]],
     candidate_result: dict[str, Any] | None,
+    metadata_results: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     items = plan.get("compile") or []
     by_id = {str(item["document_id"]): item for item in items}
@@ -1254,6 +1333,7 @@ def _compile_report(
         if identity in by_id
     ]
     tokens = usage.get("tokens") or {}
+    metadata_results = metadata_results or []
     return {
         "schema_version": COMPILE_SCHEMA,
         "status": "partial" if failed else "completed",
@@ -1262,11 +1342,13 @@ def _compile_report(
             "compile": len(items),
             "published": len(results),
             "failed": len(failed),
+            "metadata": len(metadata_results),
             "external_calls": usage.get("external_calls"),
             "cache_hits": usage.get("cache_hits", 0),
         },
         "results": results,
         "failed": failed,
+        "metadata": metadata_results,
         "tokens": {**tokens, "evidence": usage.get("token_evidence", "unknown")},
         "usage": usage,
         "transaction": (

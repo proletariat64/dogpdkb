@@ -68,7 +68,7 @@ def handle(context: StageContext) -> StageResult:
     counts = report["counts"]
     context.count(**{k: v for k, v in counts.items() if v is not None})
     status = report["status"]
-    if counts["compile"] == 0 and not anomalies:
+    if counts["compile"] == 0 and not counts.get("metadata") and not anomalies:
         status = "skipped"
     return StageResult(
         status=status,

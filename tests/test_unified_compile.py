@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +25,7 @@ COMPILE_SCHEMA = "unified-stage-1.0"
 # An OCR double registered at interpreter startup. It consumes the plan's OCR
 # work list and publishes the ``prepared-jpeg-ocr-v1`` evidence contract that the
 # compile stage reads; with no OCR work it skips. This is a test double only.
-OCR_DOUBLE = '''
+OCR_DOUBLE = """
 import os
 if os.environ.get("DOGPDKB_OCR_DOUBLE") == "1":
     from dogpdkb.sync_stages import register_handler, StageResult
@@ -51,14 +50,14 @@ if os.environ.get("DOGPDKB_OCR_DOUBLE") == "1":
         )
 
     register_handler("ocr", _ocr_double)
-'''
+"""
 
 
 # Inject a fault on the canonical state write *after* compile has really published
 # its graph, mirroring the legacy publication-recovery regression. The compile
 # graph result lives under the run's staging dir, which is only known once the run
 # exists, so the guard globs for it rather than naming a fixed path.
-COMPILE_STATE_FAILURE = '''
+COMPILE_STATE_FAILURE = """
 import glob
 import os
 from pathlib import Path
@@ -75,7 +74,7 @@ def guarded_replace(source, destination):
             raise OSError("injected state failure after compile publish")
     return _replace(source, destination)
 os.replace = guarded_replace
-'''
+"""
 
 
 class CompileWorkspace(Workspace):
@@ -178,7 +177,23 @@ def test_partial_publication_keeps_failed_source_knowledge_and_version(
     assert doc2["graph"]["version"]["utc"] == "2026-11-10T11:00:00+08:00"
 
 
-def _bump_remote_version(workspace: CompileWorkspace, doc_id: int, version: str) -> None:
+def _set_detail(workspace: CompileWorkspace, doc_id: int, **fields: Any) -> None:
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"][str(doc_id)].update(fields)
+    write_json(workspace.root / "remote.json", remote)
+
+
+def _set_title(workspace: CompileWorkspace, doc_id: int, title: str) -> None:
+    remote = read_json(workspace.root / "remote.json")
+    for row in remote["documents"]:
+        if row["id"] == doc_id:
+            row["title"] = title
+    write_json(workspace.root / "remote.json", remote)
+
+
+def _bump_remote_version(
+    workspace: CompileWorkspace, doc_id: int, version: str
+) -> None:
     remote = read_json(workspace.root / "remote.json")
     for row in remote["documents"]:
         if row["id"] == doc_id:
@@ -209,9 +224,7 @@ def test_same_version_compile_failure_is_not_retried_the_next_day(
     assert envelope["status"] == "skipped"
     # No second extraction attempt for the suppressed source.
     extracts = [
-        row["file"]
-        for row in workspace.graphify_calls()
-        if row["event"] == "extract"
+        row["file"] for row in workspace.graphify_calls() if row["event"] == "extract"
     ]
     assert "source-[1].md" not in extracts
 
@@ -281,7 +294,9 @@ def test_fault_between_publish_and_state_record_recovers_without_rebilling(
     # The graph was really published (the commit happened)...
     graph_path = workspace.corpus / "graphify-out" / "graph.json"
     published = graph_path.read_bytes()
-    assert "source-[2].md" in {node["source_file"] for node in workspace.graph()["nodes"]}
+    assert "source-[2].md" in {
+        node["source_file"] for node in workspace.graph()["nodes"]
+    }
     assert (run_dir / "compile" / "graph-update" / "result.json").is_file()
     # ...but the success version did NOT advance and no compile result was recorded.
     doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
@@ -328,3 +343,34 @@ def test_invalid_candidate_structure_does_not_advance_the_success_version(
     assert documents["2"]["graph"].get("version") is None
     run_dir = workspace.only_run()
     assert not (run_dir / "compile" / "compile-result.json").exists()
+
+
+def test_compile_executes_planned_metadata_maintenance_for_body_reuse(
+    workspace: CompileWorkspace,
+):
+    # Doc One's body matches its historical baseline, so it is reused rather than
+    # recompiled. Its incoming source_ref still differs from the unversioned
+    # baseline, so the plan schedules metadata maintenance. The compile stage is
+    # the executor: it must apply and record that maintenance even though Doc One
+    # is not in the compile list.
+    _set_detail(workspace, 1, body="# One\n\nOld rule.\n")
+
+    completed = workspace.sync()
+
+    assert completed.returncode == 0, completed.stderr
+    run_dir = workspace.only_run()
+    plan = read_json(run_dir / "plan" / "plan.json")
+    assert 1 in {row["document_id"] for row in plan["body_reuse"]}
+    assert 1 not in {row["document_id"] for row in plan["compile"]}
+    assert 1 in {row["document_id"] for row in plan["metadata"]}
+
+    report = read_json(run_dir / "compile" / "compile-result.json")
+    executed = {row["document_id"]: row for row in report["metadata"]}
+    assert 1 in executed
+    assert executed[1]["status"] == "executed"
+    assert any(task["field"] == "source_ref" for task in executed[1]["tasks"])
+
+    doc1 = workspace.state()["books"]["fund"]["documents"]["1"]
+    assert doc1["graph"]["metadata"]["name"] == "One"
+    assert doc1["graph"]["metadata"]["source_ref"] == "123:1"
+    assert doc1["steps"]["metadata_maintenance"]["status"] == "completed"
