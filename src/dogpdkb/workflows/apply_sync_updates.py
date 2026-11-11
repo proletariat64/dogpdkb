@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Apply a Yuque sync-updates delta: export, OCR (mdocr), merge into corpus.
+"""Apply a Yuque sync-updates delta: export and merge into the corpus.
 
 Reads a sync-updates JSON produced by get_sync_updates.py, selects recent
 additions plus all updates, renames and moves of tracked docs, then for each doc:
 
   1. exports the markdown body via the skylark MCP bridge
   2. rewrites SSO-gated image URLs to the public mirror
-  3. runs `mdocr ocr --download` so image text becomes queryable
-  4. merges the result into the corpus dir using the flatten-export
+  3. merges the result into the corpus dir using the flatten-export
      filename convention `<toc-path>__<title>-<YYYY-MM-DD>-[doc_id].md`
      (stale local copies of updated docs are removed first)
+
+OCR is no longer run here: it is a best-effort stage of the unified
+``dogpdkb sync`` runner, and publication proceeds with the available raw export
+when no OCR output exists. The ``run_ocr_with_resume`` utility remains for
+direct callers.
 
 Remote deletions are applied only from a complete snapshot of the same book;
 old and deleted files are backed up in the staging directory.
