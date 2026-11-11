@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
 
+from dogpdkb.sync_time import UTC8
 from scripts import apply_sync_updates as apply_sync
 from scripts import get_sync_updates as get_sync
 
@@ -593,7 +594,7 @@ def test_get_main_writes_structure_changes_and_complete_snapshot(
 
     get_sync.main()
 
-    result_path = output / f"sync-updates-uat-{date.today():%Y%m%d}.json"
+    result_path = output / f"sync-updates-uat-{datetime.now(UTC8):%Y%m%d}.json"
     payload = json.loads(result_path.read_text())
     assert payload["snapshot"] == {
         "complete": True,
