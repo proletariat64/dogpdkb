@@ -52,7 +52,7 @@ def graph_job(tmp_path, monkeypatch):
     )
     builds = []
 
-    def build(corpus, graph_dir, staging, *args, base_dir=None):
+    def build(corpus, graph_dir, staging, *args, base_dir=None, partial=False):
         builds.append(1)
         candidate = staging / "candidate"
         candidate.mkdir(exist_ok=True)
@@ -198,7 +198,7 @@ def test_rejects_base_changes_before_first_publication(
         else {"1": "external"}
     )
 
-    def build(_corpus, graph_dir, stage, *args, base_dir=None):
+    def build(_corpus, graph_dir, stage, *args, base_dir=None, partial=False):
         assert update_graph.load_json(base_dir / "graph.json") == original
         assert update_graph.load_json(base_dir / ".graphify_labels.json") == labels
         candidate = stage / "candidate"
@@ -341,7 +341,7 @@ def test_blank_document_removes_old_semantics_without_extraction(
     staging.mkdir()
     base_dir = update_graph.prepare_base(graph_dir, staging)
 
-    def unexpected_extract(*args):
+    def unexpected_extract(*args, **kwargs):
         pytest.fail("blank sources must not invoke semantic extraction")
 
     monkeypatch.setattr(update_graph, "extract_semantic", unexpected_extract)
@@ -413,7 +413,7 @@ def test_rebased_delta_removes_third_filename_for_same_document(
     monkeypatch.setattr(
         update_graph,
         "extract_semantic",
-        lambda *args: (
+        lambda *args, **kwargs: (
             {
                 "nodes": [
                     {"id": "new", "label": "New concept", "source_file": current}
