@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 import shutil
@@ -207,8 +208,150 @@ def inspect_artifacts(wheel: Path, sdist: Path) -> None:
             )
 
 
+#: A deterministic local Yuque boundary (JSON-RPC over stdin/stdout). It serves
+#: frozen documents/details so the installed unified sync runs fully offline.
+_REMOTE_PROXY = """import json
+import sys
+from pathlib import Path
+
+fixture = json.loads(Path(__file__).with_name("remote.json").read_text())
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request.get("id")
+    if request_id is None:
+        continue
+    if request.get("method") == "initialize":
+        result = {}
+    else:
+        name = request["params"]["name"]
+        args = request["params"]["arguments"]
+        if name == "skylark_resolve_url":
+            data = {"type": "book", "id": 123, "slug": "book", "name": "Funds"}
+        elif name == "skylark_book_detail":
+            data = {"name": "Funds", "items_count": len(fixture["documents"])}
+        elif name == "skylark_doc_list":
+            offset = args["offset"]
+            data = fixture["documents"][offset:offset + args["limit"]]
+        elif name == "skylark_book_toc":
+            data = [
+                {"type": "DOC", "doc_id": doc["id"], "title": doc["title"], "children": []}
+                for doc in fixture["documents"]
+            ]
+        elif name == "skylark_doc_detail":
+            data = fixture["details"][str(args["doc_id"])]
+        else:
+            raise AssertionError(name)
+        result = {"content": [{"text": json.dumps({"ok": True, "data": data})}]}
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+"""
+
+
+def write_unified_remote(
+    root: Path, documents: list[dict], bodies: dict[int, str]
+) -> None:
+    """Freeze a local Yuque adapter serving real-shaped documents offline."""
+    write_json(
+        root / "remote.json",
+        {
+            "documents": documents,
+            "details": {
+                str(doc["id"]): {
+                    "id": doc["id"],
+                    "body": bodies[doc["id"]],
+                    "content_updated_at": doc["content_updated_at"],
+                }
+                for doc in documents
+            },
+        },
+    )
+    proxy = root / "fake-proxy.py"
+    proxy.write_text(f"#!{sys.executable}\n" + _REMOTE_PROXY, encoding="utf-8")
+    proxy.chmod(0o755)
+
+
+def smoke_unified_sync(
+    work: Path, command: Path, run, env: dict, graph_env: Path
+) -> None:
+    """Exercise the installed unified five-stage sync entry offline (ticket 08).
+
+    This replaces the superseded human-approval / semantic-quality gate exercise:
+    the unified runner is the single default ``dogpdkb sync`` entry. A changed
+    source compiles through the deterministic Graphify stub in ``graph_env``; an
+    unchanged second batch converges by reuse with no repeat extraction. No real
+    Yuque / OCR / Graphify / network / paid call is made.
+    """
+    root = work / "unified-sync"
+    corpus = root / "corpus/fund"
+    graph_dir = corpus / "graphify-out"
+    corpus.mkdir(parents=True)
+    name = "Limits-2026-11-09-[1].md"
+    old_body = "# Limits\n\nRefund requires approval.\n"
+    new_body = (
+        old_body + "\nRefund requires manager approval when amount exceeds 100 USD.\n"
+    )
+    (corpus / name).write_text(old_body, encoding="utf-8")
+    write_json(
+        graph_dir / "graph.json",
+        {"nodes": [{"id": "old", "source_file": name}], "links": []},
+    )
+    write_json(
+        root / "books.json",
+        [{"key": "fund", "url": "https://example.invalid/team/book", "name": "Funds"}],
+    )
+    version = "2026-11-10T02:30:00+08:00"
+    document = {
+        "id": 1,
+        "title": "Limits",
+        "slug": "limits",
+        "content_updated_at": version,
+    }
+    write_unified_remote(root, [document], {1: new_body})
+    config = root / "config.toml"
+    config.write_text(
+        '[source]\nbooks_file="books.json"\n'
+        '[paths]\ncorpus="corpus"\nstaging="wash"\nstate="state"\nweb="web"\n'
+        f'graphify_python="{graph_env / "bin/python"}"\n'
+        '[skylark]\nmcp_url="http://127.0.0.1:9/mcp"\n'
+        f'proxy_bin="{root / "fake-proxy.py"}"\n'
+        "timeout_seconds=5\nmax_retries=0\nconcurrency=1\n",
+        encoding="utf-8",
+    )
+    run([str(command), "init-state", "--config", str(config), "--book", "fund"])
+    sync = [str(command), "sync", "--config", str(config), "--book", "fund"]
+    first = parse_json(run(sync).strip().splitlines()[-1])
+    assert first["status"] == "completed", first
+    assert first["stages"]["compile"] == "completed"
+    order = ("capture", "mdcompare", "plan", "ocr", "compile")
+    run1 = max((root / "wash/fund").glob("run-*"))
+    states = parse_json((run1 / "run.json").read_text())["stage_states"]
+    assert all(states[s]["status"] in {"completed", "skipped"} for s in order)
+    assert all(
+        states[a]["ended_at"] <= states[b]["started_at"]
+        for a, b in itertools.pairwise(order)
+    )
+    assert all((run1 / s / "result.json").is_file() for s in order)
+    graph = parse_json((graph_dir / "graph.json").read_text())
+    sources = {node["source_file"] for node in graph["nodes"]}
+    assert "source-[1].md" in sources and name not in sources
+    state = parse_json((corpus / ".sync-state.json").read_text())
+    row = state["books"]["fund"]["documents"]["1"]
+    assert row["graph"]["status"] == "covered"
+    assert row["graph"]["version"]["utc"] == version
+
+    # An unchanged remote converges by reuse: no re-download, no repeat compile.
+    second = parse_json(run(sync).strip().splitlines()[-1])
+    assert second["status"] == "completed", second
+    assert second["stages"]["compile"] == "skipped"
+    run2 = max((root / "wash/fund").glob("run-*"))
+    assert run2 != run1
+    capture2 = parse_json((run2 / "capture/result.json").read_text())["counts"]
+    assert capture2["reused"] == 1
+    assert parse_json((run2 / "plan/plan.json").read_text())["compile"] == []
+    assert parse_json((run2 / "compile/result.json").read_text())["status"] == "skipped"
+
+
 def smoke_canonical_sync(work: Path, command: Path, run, env: dict) -> None:
-    """Exercise initialized historical state and precise same-day comparison offline."""
+    """Exercise initialized historical state and precise same-day observation offline."""
     root = work / "canonical-sync"
     corpus = root / "corpus/fund"
     graph = corpus / "graphify-out/graph.json"
@@ -220,12 +363,13 @@ def smoke_canonical_sync(work: Path, command: Path, run, env: dict) -> None:
     write_json(graph, {"nodes": [{"id": "old", "source_file": name}], "links": []})
     write_json(
         root / "books.json",
-        [{"key": "fund", "url": "https://example.invalid/team/book"}],
+        [{"key": "fund", "url": "https://example.invalid/team/book", "name": "Funds"}],
     )
     config = root / "config.toml"
     config.write_text(
         '[source]\nbooks_file="books.json"\n[paths]\ncorpus="corpus"\n[skylark]\nmcp_url="http://127.0.0.1:9/mcp"\n'
     )
+    before_graph = graph.read_bytes()
     initialize = [str(command), "init-state", "--config", str(config), "--book", "fund"]
     lock = Path(env["XDG_STATE_HOME"]) / "dogpdkb/sync.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
@@ -287,29 +431,11 @@ def smoke_canonical_sync(work: Path, command: Path, run, env: dict) -> None:
     downloaded = row["steps"]["download"]
     assert downloaded["status"] == "completed"
     assert downloaded["version"]["utc"] == "2026-11-10T02:30:00+08:00"
-    planning = root / "planning"
-    before_graph = graph.read_bytes()
-    run(
-        [
-            str(command),
-            "sync",
-            "--knowledge",
-            "--config",
-            str(config),
-            "--book",
-            "fund",
-            "--snapshot",
-            str(snapshot),
-            "--staging",
-            str(planning),
-        ]
-    )
-    plan = parse_json((planning / "plan.json").read_text())
-    assert plan["results"][0]["action"] == "KEEP_EXISTING"
-    state = parse_json((corpus / ".sync-state.json").read_text())
-    row = state["books"]["fund"]["documents"]["1"]
-    assert row["steps"]["compare"]["status"] == "completed"
-    assert row["graph"]["version"]["utc"] == "2026-11-10T02:30:00+08:00"
+    # discover is an independent retained tool: it observes and exports raw
+    # without advancing the canonical graph or rewriting the corpus body. The
+    # unified five-stage same-day comparison/reuse is exercised separately by
+    # smoke_unified_sync; the unified sync is self-contained and does not consume
+    # a discover claim, so the two independent flows are not mixed on one state.
     assert state["books"]["fund"]["unmatched_files"] == ["Local-Notes.md"]
     assert graph.read_bytes() == before_graph
     assert (corpus / name).read_text() == body
@@ -638,7 +764,6 @@ def smoke(dist: Path) -> None:
         source_url = "https://example.invalid/team/book"
         old_version = "2026-11-07T00:00:00Z"
         new_version = "2026-11-09T00:00:00Z"
-        old_body = "# Limits\n\nRefund requires approval.\n"
         new_body = (
             "# Limits\n\nRefund requires approval.\n\n"
             "Refund requires manager approval when amount exceeds 100 USD.\n"
@@ -724,168 +849,12 @@ def smoke(dist: Path) -> None:
         assert current["changes"]["updated"] == [1]
         assert current["counts"]["captured"] == 1
 
-        old_raw = knowledge_root / "baseline-raw" / "old.md"
-        old_raw.parent.mkdir()
-        old_raw.write_text(old_body, encoding="utf-8")
-        baseline_manifest = knowledge_root / "baseline.json"
-        write_json(
-            baseline_manifest,
-            {
-                "schema_version": "1.0",
-                "documents": [
-                    {
-                        "knowledge_base": "123",
-                        "document_id": "1",
-                        "content_kind": "raw",
-                        "path": "baseline-raw/old.md",
-                        "metadata": {
-                            "name": "Limits",
-                            "logical_path": "Funds",
-                            "source_ref": "123:1",
-                            "sync_timestamp": old_version,
-                        },
-                    }
-                ],
-            },
-        )
-        knowledge_graph = knowledge_root / "graphify-out"
-        knowledge_graph.mkdir()
-        write_json(
-            knowledge_graph / "graph.json",
-            {
-                "nodes": [
-                    {
-                        "id": "old-refund",
-                        "label": "Old refund",
-                        "source_file": "old-[1].md",
-                        "source_url": "https://example.invalid/team/book/limits",
-                    }
-                ],
-                "links": [],
-            },
-        )
-        state = knowledge_root / "state.json"
-        planning = knowledge_root / "planning"
-        run(
-            [
-                str(command),
-                "sync",
-                "--knowledge",
-                "--snapshot",
-                str(current_snapshot),
-                "--state",
-                str(state),
-                "--staging",
-                str(planning),
-                "--baseline",
-                str(baseline_manifest),
-            ]
-        )
-        plan_path = planning / "plan.json"
-        plan = parse_json(plan_path.read_text())
-        row = plan["results"][0]
-        assert row["action"] == "BODY_DELTA_CANDIDATE"
-        assert plan["counts"]["external_calls"] == 0
-        frozen_raw = planning / row["execution"]["raw"]["path"]
-        assert frozen_raw.read_text() == new_body
-        assert old_raw.read_text() == old_body
-
-        execution = row["execution"]
-        approvals = knowledge_root / "approvals.json"
-        quality = knowledge_root / "quality.json"
-        write_json(
-            approvals,
-            {
-                "schema_version": "knowledge-approvals-2.0",
-                "plan": str(plan_path),
-                "approvals": [
-                    {
-                        "book_id": 123,
-                        "document_id": 1,
-                        "source_version": execution["source_version"],
-                        "raw": execution["raw"],
-                        "source_scope": "whole_document",
-                        "review_dispositions": [
-                            {
-                                "issue_id": issue["issue_id"],
-                                "decision": (
-                                    "approve_removal"
-                                    if "approve_removal" in issue["allowed_decisions"]
-                                    else "accept_revision"
-                                    if "accept_revision" in issue["allowed_decisions"]
-                                    else "acknowledged"
-                                ),
-                            }
-                            for issue in execution["review_issues"]
-                        ],
-                    }
-                ],
-            },
-        )
-
-        def quality_document(fragments: list[str]) -> dict[str, Any]:
-            return {
-                "schema_version": "knowledge-quality-cases-2.0",
-                "plan": str(plan_path),
-                "cases": [
-                    {
-                        "case_id": "new-limit",
-                        "book_id": 123,
-                        "document_id": 1,
-                        "source_version": execution["source_version"],
-                        "record": "node",
-                        "where": {"label": "Refund limit"},
-                        "required": {"rationale": fragments},
-                    },
-                    {
-                        "case_id": "old-restriction",
-                        "book_id": 123,
-                        "document_id": 1,
-                        "source_version": execution["source_version"],
-                        "record": "node",
-                        "where": {"label": "Refund approval"},
-                        "required": {"rationale": ["requires approval"]},
-                    },
-                ],
-            }
-
-        execute = [
-            str(command),
-            "sync",
-            "--knowledge",
-            "--execute",
-            "--snapshot",
-            str(current_snapshot),
-            "--state",
-            str(state),
-            "--staging",
-            str(planning),
-            "--approvals",
-            str(approvals),
-            "--quality-cases",
-            str(quality),
-            "--graph-dir",
-            str(knowledge_graph),
-            "--graphify-python",
-            str(graph_env / "bin/python"),
-        ]
-        original_graph = (knowledge_graph / "graph.json").read_bytes()
-        write_json(quality, quality_document(["manager approval", "500 USD"]))
-        run(execute, expected=1)
-        assert (knowledge_graph / "graph.json").read_bytes() == original_graph
-        retained_state = parse_json(state.read_text())
-        assert (
-            retained_state["documents"]["1"]["graph"]["version"]["utc"] == old_version
-        )
-        write_json(quality, quality_document(["manager approval", "100 USD"]))
-        run(execute)
-        execution_report = parse_json((planning / "execution-result.json").read_text())
-        assert execution_report["counts"]["approved"] == 1
-        assert execution_report["counts"]["graph_successes"] == 1
-        assert execution_report["quality_gate"]["passed_cases"] == 2
-        assert execution_report["cost"]["status"] == "unknown"
-        assert (knowledge_graph / "graph.json").read_bytes() != original_graph
-        assert frozen_raw.read_text() == new_body
+        # The unified runner is the single default sync entry (ticket 08). The
+        # superseded human-approval / semantic-quality daily gate is replaced by
+        # an offline five-stage batch: a changed source compiles through the
+        # deterministic Graphify stub, an unchanged second batch converges by
+        # reuse with no repeat extraction.
+        smoke_unified_sync(work, command, run, env, graph_env)
         report = parse_json(run([str(command), "doctor", "--package", "--json"]))
         assert report["ok"]
         run([str(command), "init-config"], expected=1)
@@ -942,7 +911,7 @@ def smoke(dist: Path) -> None:
         smoke_canonical_sync(work, command, run, env)
         smoke_managed_install(work, wheel, version, env)
     print(
-        "smoke: PASS (wheel/sdist, CLI, mdcompare, knowledge snapshot/plan/approval/quality, canonical state/UTC+8/lock, "
+        "smoke: PASS (wheel/sdist, CLI, mdcompare, knowledge snapshot/discover, unified five-stage sync/reuse, canonical state/UTC+8/lock, "
         "doctor, Web, images, managed upgrade/uninstall)"
     )
 
