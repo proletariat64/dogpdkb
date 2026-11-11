@@ -249,6 +249,10 @@ def extract_corpus_parallel(files, backend, root, cache_root, **kwargs):
             {"id": "refund-limit", "label": "Refund limit", "rationale": "Refund requires manager approval when amount exceeds 100 USD.", "source_file": source},
         ]
         current_edges = [{"source": "refund-limit", "target": "refund-approval", "relation": "requires", "rationale": "manager approval above 100 USD", "source_file": source}]
+        if os.environ.get("GRAPHIFY_STUB_DANGLING") == path.stem:
+            # Emit a structurally invalid candidate (edge to a missing node) so the
+            # artifact structure check must reject it before any publication.
+            current_edges.append({"source": "refund-limit", "target": "missing-node", "relation": "requires", "rationale": "dangling", "source_file": source})
         value = {"body": body, "nodes": current_nodes, "edges": current_edges, "hyperedges": []}
         entry = _entry(path, cache_root)
         entry.parent.mkdir(parents=True, exist_ok=True)
@@ -256,8 +260,9 @@ def extract_corpus_parallel(files, backend, root, cache_root, **kwargs):
         nodes.extend(current_nodes)
         edges.extend(current_edges)
         _log({"event": "extract", "file": source, "cache_root": str(cache_root)})
-    result = {"nodes": nodes, "edges": edges, "hyperedges": [], "input_tokens": 123, "output_tokens": 45, "external_calls": len(files) - len(partial_files)}
+    result = {"nodes": nodes, "edges": edges, "hyperedges": [], "input_tokens": 123, "output_tokens": 45, "external_calls": len(files)}
     if partial_files:
+        result["external_calls"] = len(files) - len(partial_files)
         result["_partial_files"] = partial_files
         result["uncovered_files"] = [str(path) for path in files if path.name in partial_files]
     return result

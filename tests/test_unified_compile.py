@@ -54,6 +54,30 @@ if os.environ.get("DOGPDKB_OCR_DOUBLE") == "1":
 '''
 
 
+# Inject a fault on the canonical state write *after* compile has really published
+# its graph, mirroring the legacy publication-recovery regression. The compile
+# graph result lives under the run's staging dir, which is only known once the run
+# exists, so the guard globs for it rather than naming a fixed path.
+COMPILE_STATE_FAILURE = '''
+import glob
+import os
+from pathlib import Path
+_replace = os.replace
+def guarded_replace(source, destination):
+    if (
+        os.environ.get("DOGPDKB_COMPILE_STATE_FAIL") == "1"
+        and Path(destination).name == ".sync-state.json"
+    ):
+        book_staging = os.environ.get("DOGPDKB_BOOK_STAGING")
+        if book_staging and glob.glob(
+            os.path.join(book_staging, "run-*", "compile", "graph-update", "result.json")
+        ):
+            raise OSError("injected state failure after compile publish")
+    return _replace(source, destination)
+os.replace = guarded_replace
+'''
+
+
 class CompileWorkspace(Workspace):
     """The unified runner wired to the Graphify stub and an OCR double."""
 
@@ -234,3 +258,73 @@ def test_graphify_output_streams_to_the_stage_log_not_the_console(
         assert "body 1" not in text
         assert "body 2" not in text
         assert "Old rule." not in text
+
+
+def test_fault_between_publish_and_state_record_recovers_without_rebilling(
+    workspace: CompileWorkspace,
+):
+    # Only one sitecustomize loads, so fold the failure guard into the OCR double's
+    # shim rather than shadowing it with a second one.
+    shim_file = workspace.shim / "sitecustomize.py"
+    shim_file.write_text(
+        shim_file.read_text(encoding="utf-8") + "\n" + COMPILE_STATE_FAILURE,
+        encoding="utf-8",
+    )
+    workspace.env["DOGPDKB_COMPILE_STATE_FAIL"] = "1"
+    workspace.env["DOGPDKB_BOOK_STAGING"] = str(workspace.staging / "fund")
+
+    failed = workspace.sync()
+
+    assert failed.returncode != 0
+    assert "injected state failure" in failed.stderr
+    run_dir = workspace.only_run()
+    # The graph was really published (the commit happened)...
+    graph_path = workspace.corpus / "graphify-out" / "graph.json"
+    published = graph_path.read_bytes()
+    assert "source-[2].md" in {node["source_file"] for node in workspace.graph()["nodes"]}
+    assert (run_dir / "compile" / "graph-update" / "result.json").is_file()
+    # ...but the success version did NOT advance and no compile result was recorded.
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    assert doc2["graph"].get("version") is None
+    assert not (run_dir / "compile" / "compile-result.json").exists()
+    first_calls = workspace.graphify_calls()
+    assert sum(row["event"] == "extract" for row in first_calls) == 2
+
+    workspace.env["DOGPDKB_COMPILE_STATE_FAIL"] = "0"
+    resumed = workspace.sync("--resume", run_dir.name)
+
+    assert resumed.returncode == 0, resumed.stderr
+    # Recovery reuses the retained candidate: no re-extraction, no re-billing.
+    assert workspace.graphify_calls() == first_calls
+    # Publication is idempotent: the graph is byte-identical to the first commit.
+    assert graph_path.read_bytes() == published
+    # The success version advances only now, after the real successful write.
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    assert doc2["graph"]["status"] == "covered"
+    assert doc2["graph"]["version"]["utc"] == "2026-11-10T11:00:00+08:00"
+    assert (run_dir / "compile" / "compile-result.json").is_file()
+    assert workspace.runs() == [run_dir]
+
+
+def test_invalid_candidate_structure_does_not_advance_the_success_version(
+    workspace: CompileWorkspace,
+):
+    graph_path = workspace.corpus / "graphify-out" / "graph.json"
+    before = graph_path.read_bytes()
+    # A structurally invalid candidate (dangling edge) must be rejected by the
+    # artifact check before publication, so neither the graph nor the success
+    # version moves.
+    workspace.env["GRAPHIFY_STUB_DANGLING"] = "source-[2]"
+
+    failed = workspace.sync()
+
+    assert failed.returncode != 0
+    assert graph_path.read_bytes() == before
+    sources = {node["source_file"] for node in workspace.graph()["nodes"]}
+    assert "source-[1].md" not in sources
+    assert "source-[2].md" not in sources
+    documents = workspace.state()["books"]["fund"]["documents"]
+    assert documents["1"]["graph"].get("version") is None
+    assert documents["2"]["graph"].get("version") is None
+    run_dir = workspace.only_run()
+    assert not (run_dir / "compile" / "compile-result.json").exists()
