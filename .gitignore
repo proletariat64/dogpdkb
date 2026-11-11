@@ -13,6 +13,9 @@ snapshot/
 # pi-internal state (subagents, sessions)
 .pi/
 
+# qoder worktrees / session state
+.qoder/
+
 # Python bytecode / caches
 __pycache__/
 *.pyc
