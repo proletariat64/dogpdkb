@@ -222,18 +222,16 @@ def test_export_failure_preserves_corpus_and_successful_staging(run, no_merge, c
 
 
 def test_export_resume_reuses_success_and_publishes_entire_fixed_plan(run):
-    invoke, corpus, staging, failures, exports, ocr, _plan = run
+    invoke, corpus, staging, failures, exports, _ocr, _plan = run
     failures.add(2)
     with pytest.raises(SystemExit):
         invoke()
     exports.clear()
-    ocr.clear()
     failures.clear()
 
     invoke()
 
     assert exports == [2]
-    assert ocr == ["Doc-2-2026-11-01-[2].md"]
     assert (corpus / "Doc-1-2026-11-01-[1].md").read_text() == "new 1"
     assert (corpus / "Doc-2-2026-11-01-[2].md").read_text() == "new 2"
     assert not (corpus / "Old-3-2026-01-01-[3].md").exists()
@@ -241,14 +239,13 @@ def test_export_resume_reuses_success_and_publishes_entire_fixed_plan(run):
     assert json.loads((staging / "manifest.json").read_text())["status"] == "completed"
 
 
-def test_missing_raw_export_regenerates_ocr_instead_of_reusing_stale_output(
+def test_missing_raw_export_regenerates_content_instead_of_reusing_stale_output(
     run, monkeypatch
 ):
-    invoke, corpus, staging, _failures, exports, ocr, _plan = run
+    invoke, corpus, staging, _failures, exports, _ocr, _plan = run
     invoke("--no-merge")
     (staging / "raw" / "Doc-1-2026-11-01-[1].md").unlink()
     exports.clear()
-    ocr.clear()
 
     def changed_export(doc_id, doc_format=None):
         exports.append(doc_id)
@@ -258,40 +255,7 @@ def test_missing_raw_export_regenerates_ocr_instead_of_reusing_stale_output(
     invoke()
 
     assert exports == [1]
-    assert ocr == ["Doc-1-2026-11-01-[1].md"]
     assert (corpus / "Doc-1-2026-11-01-[1].md").read_text() == "regenerated"
-
-
-def test_ocr_failure_retains_manifest_and_resumes_only_failed_files(run, monkeypatch):
-    invoke, corpus, staging, _failures, exports, ocr, _plan = run
-    before = snapshot(corpus)
-    process = apply_sync.run_mdocr
-
-    def fail_second(files, out_dir):
-        if "[2]" in files[0].name:
-            return 1
-        return process(files, out_dir)
-
-    monkeypatch.setattr(apply_sync, "run_mdocr", fail_second)
-    with pytest.raises(SystemExit) as error:
-        invoke()
-
-    assert error.value.code != 0
-    assert snapshot(corpus) == before
-    manifest = json.loads((staging / "manifest.json").read_text())
-    assert manifest["status"] == "failed"
-    assert manifest["failures"][0]["stage"] == "ocr"
-    assert manifest["failures"][0]["file"] == "Doc-2-2026-11-01-[2].md"
-    exports.clear()
-    ocr.clear()
-    monkeypatch.setattr(apply_sync, "run_mdocr", process)
-
-    invoke()
-
-    assert exports == []
-    assert ocr == ["Doc-2-2026-11-01-[2].md"]
-    assert (corpus / "Doc-1-2026-11-01-[1].md").read_text() == "new 1"
-    assert (corpus / "Doc-2-2026-11-01-[2].md").read_text() == "new 2"
 
 
 @pytest.mark.parametrize("change", ["cutoff", "settings", "plan"])
@@ -376,41 +340,6 @@ def test_rejected_checkpoint_does_not_create_or_change_active_plan(run, unfinish
     assert state_path.read_bytes() == before
 
 
-@pytest.mark.parametrize("cancel", [False, True])
-def test_failed_missing_ocr_regeneration_never_trusts_partial_output(
-    run, monkeypatch, cancel
-):
-    invoke, corpus, staging, _failures, exports, ocr, _plan = run
-    invoke("--no-merge")
-    (staging / "md" / "Doc-1-2026-11-01-[1].md").unlink()
-    before = snapshot(corpus)
-    process = apply_sync.run_mdocr
-
-    def interrupted(files, out_dir):
-        (out_dir / files[0].name).write_text("partial OCR")
-        if cancel:
-            raise KeyboardInterrupt()
-        return 1
-
-    monkeypatch.setattr(apply_sync, "run_mdocr", interrupted)
-    with pytest.raises(KeyboardInterrupt if cancel else SystemExit):
-        invoke()
-    assert snapshot(corpus) == before
-    manifest = json.loads((staging / "manifest.json").read_text())
-    assert manifest["status"] == "failed"
-    completed = json.loads((staging / "checkpoints" / "ocr-complete.json").read_text())
-    assert "Doc-1-2026-11-01-[1].md" not in completed["files"]
-    exports.clear()
-    ocr.clear()
-    monkeypatch.setattr(apply_sync, "run_mdocr", process)
-
-    invoke()
-
-    assert exports == []
-    assert ocr == ["Doc-1-2026-11-01-[1].md"]
-    assert (corpus / "Doc-1-2026-11-01-[1].md").read_text() == "new 1"
-
-
 @pytest.mark.parametrize("no_merge", [False, True])
 def test_cancelled_export_reports_recovery_and_reuses_finished_checkpoints(
     run, monkeypatch, capsys, no_merge
@@ -479,9 +408,7 @@ def test_invalid_sync_state_fails_before_publication_with_retry_diagnostics(
     assert "[state] failed" in output and "Retry:" in output
 
 
-@pytest.mark.parametrize(
-    "stage", ["export", "ocr", "publish", "cancel", "export_cancel"]
-)
+@pytest.mark.parametrize("stage", ["export", "publish", "export_cancel"])
 def test_failure_retry_output_survives_unwritable_diagnostic_manifest(
     run, monkeypatch, capsys, stage
 ):
@@ -498,14 +425,6 @@ def test_failure_retry_output_survives_unwritable_diagnostic_manifest(
             return export(doc_id, doc_format)
 
         monkeypatch.setattr(apply_sync, "export_doc", cancel_export)
-    elif stage == "ocr":
-        monkeypatch.setattr(apply_sync, "run_mdocr", lambda files, out_dir: 1)
-    elif stage == "cancel":
-
-        def cancel(files, out_dir):
-            raise KeyboardInterrupt()
-
-        monkeypatch.setattr(apply_sync, "run_mdocr", cancel)
     else:
         copy = apply_sync._atomic_copy
 
@@ -526,7 +445,7 @@ def test_failure_retry_output_survives_unwritable_diagnostic_manifest(
         return replace(path, target)
 
     monkeypatch.setattr(Path, "replace", cannot_save_failure)
-    cancelled = stage in {"cancel", "export_cancel"}
+    cancelled = stage == "export_cancel"
     with pytest.raises(KeyboardInterrupt if cancelled else SystemExit) as error:
         invoke()
 
@@ -537,5 +456,5 @@ def test_failure_retry_output_survives_unwritable_diagnostic_manifest(
     assert "Retry:" in output
     assert "cannot persist failure manifest" in output
     assert "credential-value" not in output
-    expected_stage = {"cancel": "ocr", "export_cancel": "export"}.get(stage, stage)
+    expected_stage = {"export_cancel": "export"}.get(stage, stage)
     assert f"[{expected_stage}]" in output

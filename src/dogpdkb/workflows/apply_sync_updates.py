@@ -771,50 +771,10 @@ def main() -> None:
         print_retry()
         raise export_cancellation
     print(
-        f"exported {len(exported)}, skipped {len(skipped)}; running mdocr ocr ...",
+        f"exported {len(exported)}, skipped {len(skipped)}; "
+        "OCR is a best-effort stage of the unified sync runner",
         file=sys.stderr,
     )
-    try:
-        by_file = {path.name: doc for path, doc in exported}
-
-        def ocr_completed(path):
-            tracker.step(
-                str(by_file[path.name]["id"]),
-                "ocr",
-                "completed",
-                file=path.name,
-                output=str(ocr_dir / path.name),
-            )
-
-        run_ocr_with_resume(
-            [p for p, _ in exported],
-            ocr_dir,
-            staging / "checkpoints",
-            on_complete=ocr_completed,
-        )
-    except (OSError, RuntimeError, KeyboardInterrupt) as error:
-        failure = {"stage": "ocr", "reason": safe_diagnostic(error) or "cancelled"}
-        if isinstance(error, OCRFailure):
-            failure["file"] = error.file
-        tracker.phase("ocr", "failed", reason=failure["reason"])
-        if failure.get("file") in by_file:
-            tracker.step(
-                str(by_file[failure["file"]]["id"]),
-                "ocr",
-                "failed",
-                reason=failure["reason"],
-            )
-        manifest["status"] = "failed"
-        manifest["failures"].append(failure)
-        _write_failure_manifest(manifest_path, manifest)
-        print(
-            f"[ocr] {failure['reason']}; staging kept at {staging}; valid checkpoints will be reused",
-            file=sys.stderr,
-        )
-        print_retry()
-        if isinstance(error, KeyboardInterrupt):
-            raise
-        raise SystemExit(1) from error
     if errors:
         tracker.phase("download", "failed", failures=len(errors))
         print(
