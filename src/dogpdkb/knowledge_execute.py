@@ -24,6 +24,8 @@ from dogpdkb.knowledge_state import BookState, canonical_view, root_state, save_
 from dogpdkb.sync_time import now_iso
 from dogpdkb.workflows.graph_sync import doc_id
 from mdcompare.io import publish_reports, validate_outputs
+from mdocr.markdown import transform_images
+from mdocr.ocr import _OCR_BLOCK_RE, _OCR_END
 
 EXECUTION_SCHEMA = "knowledge-execution-1.0"
 APPROVAL_SCHEMA = "knowledge-approvals-2.0"
@@ -215,11 +217,15 @@ def _approved_rows(
     return selected
 
 
-def _freeze_source(source: Path, destination: Path) -> None:
-    content = source.read_bytes()
+def _freeze_bytes(content: bytes, destination: Path, *, mismatch: str) -> None:
+    """Atomically freeze ``content`` at ``destination``, idempotent on resume.
+
+    A retained file with identical bytes is left untouched; differing bytes are a
+    contract violation (the frozen input changed after it was first written).
+    """
     if destination.exists():
         if destination.read_bytes() != content:
-            raise ExecutionError("execution corpus differs from the approved raw input")
+            raise ExecutionError(mismatch)
         return
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -235,6 +241,14 @@ def _freeze_source(source: Path, destination: Path) -> None:
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _freeze_source(source: Path, destination: Path) -> None:
+    _freeze_bytes(
+        source.read_bytes(),
+        destination,
+        mismatch="execution corpus differs from the approved raw input",
+    )
 
 
 def _run_graphify(
@@ -1016,21 +1030,151 @@ def _compile_source_urls(old_graph: dict[str, Any]) -> dict[str, str]:
     return urls
 
 
+def _compile_ocr_evidence(
+    state_path: Path, book: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """Read each document's published OCR evidence from canonical state.
+
+    Ticket 05 persists ``prepared-jpeg-ocr-v1`` evidence under ``graph.ocr``. The
+    compile stage consumes it as an input contract and never re-runs OCR. Evidence
+    from this run and from prior runs is treated identically, so valid historical
+    OCR is reused and an unchanged image is not re-recognized.
+    """
+    if not state_path.is_file():
+        return {}
+    state = _load_state(state_path, book)
+    evidence: dict[str, dict[str, Any]] = {}
+    for identity, record in (state.get("documents") or {}).items():
+        if not isinstance(record, dict):
+            continue
+        graph = record.get("graph")
+        if not isinstance(graph, dict):
+            continue
+        ocr = graph.get("ocr")
+        if isinstance(ocr, dict) and ocr.get("contract") == "prepared-jpeg-ocr-v1":
+            evidence[str(identity)] = ocr
+    return evidence
+
+
+def _ocr_regions(text: str) -> list[dict[str, Any]]:
+    """Declare every mdocr block in the enriched body as a generated region.
+
+    Line numbers are 1-based and match the mdcompare ``generated-regions-v1``
+    validator: the begin marker's line and the end marker's line. Declaring them
+    lets the next batch reuse the body independently of OCR.
+    """
+    regions: list[dict[str, Any]] = []
+    for match in _OCR_BLOCK_RE.finditer(text):
+        start_line = text.count("\n", 0, match.start()) + 1
+        end_line = text.count("\n", 0, match.end() - len(_OCR_END)) + 1
+        regions.append(
+            {"kind": "mdocr_ocr", "start_line": start_line, "end_line": end_line}
+        )
+    return regions
+
+
+def _enrich_compile_body(
+    raw_text: str,
+    evidence: dict[str, Any] | None,
+    raw_path: Path,
+    state_path: Path,
+    source_version: Any,
+) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    """Layer successful OCR onto the prepared body; keep unrecognized references.
+
+    The compile input is the prepared body plus every image's valid OCR artifact
+    (this run's or historical). A successful artifact replaces the image embed with
+    its mdocr block; a failed, pending, or unavailable image keeps its original
+    reference verbatim and is recorded as a missing item. Incomplete OCR never
+    blocks the body compile. Returns ``(enriched_text, regions, execution)``.
+    """
+    images: dict[str, dict[str, Any]] = {}
+    for image in (evidence or {}).get("images") or []:
+        if isinstance(image, dict) and isinstance(image.get("resource_id"), str):
+            images[image["resource_id"]] = image
+    final_inputs: list[dict[str, Any]] = [
+        {
+            "kind": "raw",
+            "path": _relative_raw(raw_path, state_path)["path"],
+            "source_version": source_version,
+        }
+    ]
+    missing_items: list[dict[str, Any]] = []
+
+    def missing(resource_id: str, code: str, reason: str) -> None:
+        missing_items.append(
+            {
+                "kind": "ocr_artifact",
+                "resource_id": resource_id,
+                "code": code,
+                "reason": reason,
+            }
+        )
+
+    def transform(ref: Any) -> str | None:
+        record = images.get(ref.target)
+        if record is None:
+            missing(ref.target, "OCR_UNAVAILABLE", "no OCR evidence for this image")
+            return None
+        status = record.get("status")
+        if status != "success":
+            missing(
+                ref.target,
+                "OCR_FAILED" if status == "failed" else "OCR_PENDING",
+                f"OCR status is {status}; original reference retained",
+            )
+            return None
+        artifact = record.get("artifact")
+        if not isinstance(artifact, str):
+            missing(ref.target, "OCR_ARTIFACT_UNAVAILABLE", "no OCR artifact path")
+            return None
+        try:
+            block = Path(artifact).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            missing(
+                ref.target, "OCR_ARTIFACT_UNAVAILABLE", "OCR artifact is unreadable"
+            )
+            return None
+        final_inputs.append(
+            {"kind": "ocr_artifact", "resource_id": ref.target, "path": artifact}
+        )
+        prepared = record.get("prepared_image") or record.get("source_path")
+        if isinstance(prepared, str):
+            final_inputs.append(
+                {"kind": "prepared_image", "resource_id": ref.target, "path": prepared}
+            )
+        return block
+
+    enriched, _warnings, _errors = transform_images(raw_text, transform, warn=False)
+    execution = {
+        "final_inputs": final_inputs,
+        "missing_items": missing_items,
+        "completed_at": now_iso(),
+        "status": "completed",
+    }
+    return enriched, _ocr_regions(enriched), execution
+
+
 def _freeze_compile_sources(
     items: list[dict[str, Any]],
     raw_base: Path,
     staging: Path,
     source_urls: dict[str, str],
-) -> tuple[Path, dict[str, Path], list[dict[str, Any]]]:
-    """Freeze each compile item's prepared whole source into the execution corpus.
+    evidence_by_id: dict[str, dict[str, Any]],
+    state_path: Path,
+) -> tuple[Path, dict[str, Path], list[dict[str, Any]], dict[str, Any]]:
+    """Freeze each compile item's OCR-enriched whole source into the corpus.
 
-    The body is the batch's actually-prepared markdown; OCR enrichment is layered
-    on by the caller before freezing. Graphify updates by complete source, so each
-    document becomes one ``source-[id].md`` whole source, never a diff fragment.
+    The body is the batch's actually-prepared markdown plus its valid OCR
+    artifacts (item 4). Graphify updates by complete source, so each document
+    becomes one ``source-[id].md`` whole source, never a diff fragment. Returns the
+    corpus, frozen paths, export manifest rows, and per-document preparation
+    records carrying the ``execution`` contract and the generated ``regions``.
     """
     corpus = staging / "execution-corpus"
     frozen: dict[str, Path] = {}
     exported: list[dict[str, Any]] = []
+    prepared_by_id: dict[str, Any] = {}
     for item in items:
         identity = str(item["document_id"])
         raw = _resolve_raw(item.get("raw"), raw_base)
@@ -1038,15 +1182,27 @@ def _freeze_compile_sources(
             raise ExecutionError(
                 f"compile source is unavailable for document {identity}"
             )
+        enriched, regions, execution = _enrich_compile_body(
+            raw.read_text(encoding="utf-8"),
+            evidence_by_id.get(identity),
+            raw,
+            state_path,
+            item["source_version"],
+        )
         name = f"source-[{identity}].md"
-        _freeze_source(raw, corpus / name)
+        _freeze_bytes(
+            enriched.encode("utf-8"),
+            corpus / name,
+            mismatch="compile corpus differs from the enriched whole source",
+        )
         frozen[identity] = corpus / name
+        prepared_by_id[identity] = {"execution": execution, "regions": regions}
         row: dict[str, Any] = {"id": item["document_id"], "file": name}
         url = source_urls.get(identity)
         if url:
             row["url"] = url
         exported.append(row)
-    return corpus, frozen, exported
+    return corpus, frozen, exported, prepared_by_id
 
 
 def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
@@ -1099,25 +1255,29 @@ def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
         raise ExecutionError("an existing graph baseline is required")
     old_graph = _read_json(graph_dir / "graph.json")
     source_urls = _compile_source_urls(old_graph)
-    corpus, frozen, exported = _freeze_compile_sources(
-        items, raw_base, staging, source_urls
-    )
-    manifest_path = staging / "execution-manifest.json"
-    publish_reports(
-        [
-            (
-                manifest_path,
-                json.dumps(
-                    {"exported": exported, "deleted": []},
-                    ensure_ascii=False,
-                    indent=1,
-                )
-                + "\n",
-            )
-        ]
-    )
     state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with state_lock(state_path):
+        # OCR evidence is an input contract published by ticket 05. Read it under
+        # the same lock that guards the canonical update, then freeze the enriched
+        # whole sources before Graphify consumes them.
+        evidence_by_id = _compile_ocr_evidence(state_path, plan["book"])
+        corpus, frozen, exported, prepared_by_id = _freeze_compile_sources(
+            items, raw_base, staging, source_urls, evidence_by_id, state_path
+        )
+        manifest_path = staging / "execution-manifest.json"
+        publish_reports(
+            [
+                (
+                    manifest_path,
+                    json.dumps(
+                        {"exported": exported, "deleted": []},
+                        ensure_ascii=False,
+                        indent=1,
+                    )
+                    + "\n",
+                )
+            ]
+        )
         return _execute_compile_locked(
             context,
             args,
@@ -1131,6 +1291,7 @@ def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
             metadata_by_id,
             report_path,
             metadata_items,
+            prepared_by_id,
         )
 
 
@@ -1209,6 +1370,7 @@ def _execute_compile_locked(
     metadata_by_id: dict[str, dict[str, Any]],
     report_path: Path,
     metadata_items: list[dict[str, Any]],
+    prepared_by_id: dict[str, Any],
 ) -> dict[str, Any]:
     candidate_result = _run_graphify(
         args, "--candidate-only", corpus, manifest_path, log=context.log, partial=True
@@ -1260,15 +1422,28 @@ def _execute_compile_locked(
             "logical_path": "",
             "source_ref": f"{item['book_id']}:{identity}",
         }
-        record["graph"] = {
+        prepared = prepared_by_id.get(identity) or {}
+        previous_graph = record.get("graph")
+        previous_ocr = (
+            previous_graph.get("ocr") if isinstance(previous_graph, dict) else None
+        )
+        graph_record = {
             "status": "covered",
             "coverage": "compiled_whole_document",
             "version": item["source_version"],
             "raw": _relative_raw(frozen[identity], state_path),
             "content_kind": "raw",
             "metadata": metadata,
-            "body_scope": {"version": "generated-regions-v1", "regions": []},
+            "body_scope": {
+                "version": "generated-regions-v1",
+                "regions": prepared.get("regions") or [],
+            },
         }
+        # Preserve the OCR evidence contract published by ticket 05: compile
+        # consumes it as an input and must not wipe it when advancing the graph.
+        if isinstance(previous_ocr, dict):
+            graph_record["ocr"] = previous_ocr
+        record["graph"] = graph_record
         record.setdefault("steps", {})["graph_publish"] = {
             "status": "completed",
             "recorded_at": now_iso(),
@@ -1286,6 +1461,7 @@ def _execute_compile_locked(
                 "status": "published",
                 "source_scope": "whole_document",
                 "source_version": item["source_version"],
+                "execution": prepared.get("execution"),
             }
         )
     # Execute the plan's metadata maintenance for every scheduled document

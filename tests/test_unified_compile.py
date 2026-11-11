@@ -30,6 +30,9 @@ import os
 if os.environ.get("DOGPDKB_OCR_DOUBLE") == "1":
     from dogpdkb.sync_stages import register_handler, StageResult
     from dogpdkb.sync_run import read_json
+    from dogpdkb.knowledge_plan import _load_state, state_lock
+    from dogpdkb.knowledge_state import save_view
+    from mdocr.ocr import build_ocr_block
 
     def _ocr_double(context):
         plan = read_json(context.require("plan", "plan"))
@@ -39,13 +42,72 @@ if os.environ.get("DOGPDKB_OCR_DOUBLE") == "1":
                 status="skipped",
                 counts={"total": 0, "completed": 0, "reused": 0, "failed": 0},
             )
+        fail = set(
+            filter(None, os.environ.get("DOGPDKB_OCR_DOUBLE_FAIL", "").split(","))
+        )
+        cache = context.corpus.parent / "ocr-cache"
+        completed = failed = 0
+        evidence_by_id = {}
+        for item in items:
+            identity = str(item["document_id"])
+            images = []
+            for resource in item.get("resources") or []:
+                rid = resource["resource_id"]
+                slug = rid.split("://")[-1].replace("/", "_")
+                doc_dir = cache / identity
+                doc_dir.mkdir(parents=True, exist_ok=True)
+                prepared = doc_dir / (slug + ".jpg")
+                prepared.write_bytes(b"prepared-jpeg-double-bytes")
+                artifact = doc_dir / (slug + ".md")
+                record = {
+                    "resource_id": rid,
+                    "source_path": str(prepared),
+                    "prepared_image": str(prepared),
+                    "artifact": str(artifact),
+                }
+                if rid in fail:
+                    record["status"] = "failed"
+                    failed += 1
+                else:
+                    artifact.write_text(
+                        build_ocr_block(prepared.name, "OCR TEXT " + rid),
+                        encoding="utf-8",
+                    )
+                    record["status"] = "success"
+                    completed += 1
+                images.append(record)
+            evidence_by_id[identity] = {
+                "contract": "prepared-jpeg-ocr-v1",
+                "preprocessing": {"name": "mdocr", "version": "1"},
+                "configuration": {"engine": "double"},
+                "images": images,
+            }
+        state_path = context.corpus / ".sync-state.json"
+        with state_lock(state_path):
+            state = _load_state(state_path, plan["book"])
+            for identity, evidence in evidence_by_id.items():
+                record = state["documents"].setdefault(
+                    identity,
+                    {
+                        "observation": None,
+                        "corpus": {
+                            "status": "not_captured",
+                            "version": None,
+                            "raw": None,
+                        },
+                        "graph": {},
+                        "pending": [],
+                    },
+                )
+                record.setdefault("graph", {})["ocr"] = evidence
+            save_view(state_path, state)
         return StageResult(
             status="completed",
             counts={
-                "total": len(items),
-                "completed": len(items),
+                "total": completed + failed,
+                "completed": completed,
                 "reused": 0,
-                "failed": 0,
+                "failed": failed,
             },
         )
 
@@ -374,3 +436,88 @@ def test_compile_executes_planned_metadata_maintenance_for_body_reuse(
     assert doc1["graph"]["metadata"]["name"] == "One"
     assert doc1["graph"]["metadata"]["source_ref"] == "123:1"
     assert doc1["steps"]["metadata_maintenance"]["status"] == "completed"
+
+
+IMAGE_A = "https://cdn.example.invalid/a.png"
+IMAGE_B = "https://cdn.example.invalid/b.png"
+
+
+def test_compile_enriches_body_with_successful_ocr_and_records_final_inputs(
+    workspace: CompileWorkspace,
+):
+    # Doc Two's prepared body carries an image. The OCR double publishes a
+    # successful prepared-jpeg-ocr-v1 artifact for it; compile must freeze the
+    # enriched body (OCR block inserted), declare the generated region, and
+    # record the actual final inputs it used.
+    _set_detail(workspace, 2, body=f"# Two\n\n![diagram]({IMAGE_A})\n")
+
+    completed = workspace.sync()
+
+    assert completed.returncode == 0, completed.stderr
+    run_dir = workspace.only_run()
+    report = read_json(run_dir / "compile" / "compile-result.json")
+    result2 = next(row for row in report["results"] if row["document_id"] == 2)
+    execution = result2["execution"]
+    final = execution["final_inputs"]
+    assert any(item["kind"] == "raw" for item in final)
+    assert any(
+        item["kind"] == "ocr_artifact" and item["resource_id"] == IMAGE_A
+        for item in final
+    )
+    assert any(
+        item["kind"] == "prepared_image" and item["resource_id"] == IMAGE_A
+        for item in final
+    )
+    assert execution["missing_items"] == []
+    assert execution["status"] == "completed"
+
+    # The frozen compile source is the enriched whole source, not the raw body.
+    frozen = run_dir / "compile" / "execution-corpus" / "source-[2].md"
+    text = frozen.read_text(encoding="utf-8")
+    assert "mdocr:ocr-begin" in text
+    assert "OCR TEXT " + IMAGE_A in text
+
+    # The generated OCR region is declared so the next batch can reuse the body
+    # independently of OCR.
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    regions = doc2["graph"]["body_scope"]["regions"]
+    assert doc2["graph"]["body_scope"]["version"] == "generated-regions-v1"
+    assert len(regions) == 1
+    assert regions[0]["kind"] == "mdocr_ocr"
+    # The successful OCR evidence persists in canonical state for next-batch reuse.
+    assert doc2["graph"]["ocr"]["contract"] == "prepared-jpeg-ocr-v1"
+
+
+def test_compile_keeps_unrecognized_image_and_records_missing_items(
+    workspace: CompileWorkspace,
+):
+    # Two images: OCR succeeds for A and fails for B. Incomplete OCR must not
+    # block the body compile; B's original reference is kept and recorded as a
+    # missing item rather than disguised as a completed OCR input.
+    _set_detail(workspace, 2, body=f"![a]({IMAGE_A})\n\n![b]({IMAGE_B})\n")
+    workspace.env["DOGPDKB_OCR_DOUBLE_FAIL"] = IMAGE_B
+
+    completed = workspace.sync()
+
+    assert completed.returncode == 0, completed.stderr
+    run_dir = workspace.only_run()
+    report = read_json(run_dir / "compile" / "compile-result.json")
+    result2 = next(row for row in report["results"] if row["document_id"] == 2)
+    execution = result2["execution"]
+    assert any(
+        item["kind"] == "ocr_artifact" and item["resource_id"] == IMAGE_A
+        for item in execution["final_inputs"]
+    )
+    missing = execution["missing_items"]
+    assert any(item["resource_id"] == IMAGE_B for item in missing)
+    assert not any(item["resource_id"] == IMAGE_A for item in missing)
+
+    frozen = run_dir / "compile" / "execution-corpus" / "source-[2].md"
+    text = frozen.read_text(encoding="utf-8")
+    # The recognized image became an OCR block; the unrecognized one keeps its
+    # original reference verbatim.
+    assert "OCR TEXT " + IMAGE_A in text
+    assert f"![b]({IMAGE_B})" in text
+    # Only the inserted block is declared as a generated region.
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    assert len(doc2["graph"]["body_scope"]["regions"]) == 1
