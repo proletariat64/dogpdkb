@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 from dogpdkb.instance_lock import UpdateAlreadyRunning, updater_lock
@@ -19,7 +20,9 @@ from dogpdkb.sync_results import (
     DISPOSITIONS,
     RESULT_SCHEMA,
     ArchiveError,
+    load_followups,
     load_registry,
+    record_posthoc_success,
     results_root,
     save_registry,
 )
@@ -53,6 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--resolve", metavar="ID", help="record a disposition for this anomaly id"
     )
     parser.add_argument("--note", help="operator rationale stored with the disposition")
+    parser.add_argument(
+        "--evidence",
+        type=Path,
+        metavar="FILE",
+        help="post-hoc success evidence JSON (required for --disposition done)",
+    )
     return parser
 
 
@@ -91,6 +100,10 @@ def scan_view(
         registry["batch_causes"].values(),
         key=lambda row: (str(row.get("recorded_at") or ""), row["id"]),
     )
+    followups = sorted(
+        load_followups(config, book_key)["followups"].values(),
+        key=lambda row: (str(row.get("created_at") or ""), row["id"]),
+    )
     if run is not None:
         runs = [row for row in runs if row["run_id"] == run]
         anomalies = [row for row in anomalies if run in row.get("runs", [])]
@@ -103,6 +116,10 @@ def scan_view(
     for name in DISPOSITIONS:
         counts[name] = sum(1 for row in anomalies if row["disposition"] == name)
     counts["batch_causes"] = len(causes)
+    counts["compile_followups"] = len(followups)
+    counts["followups_pending"] = sum(
+        1 for row in followups if row["status"] == "pending"
+    )
     return {
         "schema_version": SCAN_SCHEMA,
         "book_key": book_key,
@@ -110,6 +127,7 @@ def scan_view(
         "runs": runs,
         "anomalies": anomalies,
         "batch_causes": causes,
+        "compile_followups": followups,
         "counts": counts,
     }
 
@@ -135,6 +153,15 @@ def report(view: dict[str, Any]) -> str:
         lines.append(
             f"  {row['id']} stage={row['stage']} code={row['code']} "
             f"affected={len(row.get('anomaly_ids', []))}"
+        )
+    lines.append(
+        f"compile followups: {counts['compile_followups']} "
+        f"pending={counts['followups_pending']}"
+    )
+    for row in view["compile_followups"]:
+        lines.append(
+            f"  {row['id']} doc={row['document_id']} version={row['version_stamp']} "
+            f"status={row['status']}"
         )
     return "\n".join(lines)
 
@@ -200,9 +227,26 @@ def main(argv: list[str] | None = None) -> int:
             if args.disposition is None:
                 parser.exit(1, "dogpdkb anomalies: --resolve requires --disposition\n")
             with updater_lock():
-                record = resolve_anomaly(
-                    config, book.key, args.resolve, args.disposition, note=args.note
-                )
+                if args.disposition == "done":
+                    if args.evidence is None:
+                        raise ArchiveError(
+                            "done requires post-hoc success evidence (--evidence FILE)"
+                        )
+                    record = record_posthoc_success(
+                        config,
+                        book,
+                        args.resolve,
+                        read_json(args.evidence),
+                        note=args.note,
+                    )
+                else:
+                    if args.evidence is not None:
+                        raise ArchiveError(
+                            "--evidence is only valid with --disposition done"
+                        )
+                    record = resolve_anomaly(
+                        config, book.key, args.resolve, args.disposition, note=args.note
+                    )
             print(json.dumps(record, ensure_ascii=False))
             return 0
         view = scan_view(

@@ -389,3 +389,137 @@ def test_stale_disposition_hands_the_failure_back_to_daily_sync(workspace: Works
         workspace.staging / "fund" / third / "capture" / "snapshot.json"
     )
     assert 2 not in snapshot["selected"]
+
+
+def write_evidence(
+    workspace: Workspace, *, cache: Path, input_changed: bool, step: str = "ocr"
+) -> Path:
+    evidence = workspace.root / "evidence.json"
+    write_json(
+        evidence,
+        {
+            "schema_version": "unified-posthoc-evidence-1.0",
+            "cache": [{"kind": "ocr", "path": str(cache)}],
+            "completion": {"step": step, "details": {"cache": str(cache)}},
+            "input_changed": input_changed,
+        },
+    )
+    return evidence
+
+
+def test_posthoc_done_updates_real_completion_and_registers_compile_followup(
+    workspace: Workspace,
+):
+    make_capture_anomaly(workspace)
+    assert workspace.sync("--stop-after", "capture").returncode == 0
+    record = only_anomaly(workspace)
+    aid = record["id"]
+    cache = workspace.root / "ocr-cache.json"
+    write_json(cache, {"image": "img-1", "text": "backfilled"})
+    evidence = write_evidence(workspace, cache=cache, input_changed=True)
+
+    resolved = anomalies_cli(
+        workspace,
+        "--resolve",
+        aid,
+        "--disposition",
+        "done",
+        "--evidence",
+        str(evidence),
+        "--note",
+        "backfilled",
+    )
+
+    assert resolved.returncode == 0, resolved.stderr
+    out = json.loads(resolved.stdout)
+    assert out["disposition"] == "done"
+    assert out["resolution"]["note"] == "backfilled"
+    assert out["resolution"]["cache"][0]["path"] == str(cache.resolve())
+    followup_id = out["resolution"]["followup_id"]
+    assert followup_id
+    # Real completion is recorded in canonical state, separate from disposition.
+    state = read_json(workspace.corpus / ".sync-state.json")
+    step = state["books"]["fund"]["documents"]["2"]["steps"]["ocr"]
+    assert step["status"] == "completed"
+    # Changing published compile input explicitly registers follow-up compile
+    # work; writing the OCR cache alone is not a completed knowledge update.
+    followups = read_json(workspace.results / "compile-followups.json")
+    assert followups["schema_version"] == "unified-compile-followups-1.0"
+    followup = followups["followups"][followup_id]
+    assert followup["document_id"] == 2
+    assert followup["status"] == "pending"
+    assert followup["anomaly_id"] == aid
+    assert followup["version_stamp"] == record["version_stamp"]
+    assert followup["inputs"] == [{"kind": "ocr", "path": str(cache.resolve())}]
+    view = json.loads(anomalies_cli(workspace, "--json").stdout)
+    assert [row["id"] for row in view["compile_followups"]] == [followup_id]
+
+    # Repeating the same post-hoc success never duplicates the follow-up work.
+    again = anomalies_cli(
+        workspace,
+        "--resolve",
+        aid,
+        "--disposition",
+        "done",
+        "--evidence",
+        str(evidence),
+    )
+    assert again.returncode == 0, again.stderr
+    followups = read_json(workspace.results / "compile-followups.json")
+    assert len(followups["followups"]) == 1
+
+
+def test_posthoc_done_refuses_missing_or_unreadable_evidence(workspace: Workspace):
+    make_capture_anomaly(workspace)
+    assert workspace.sync("--stop-after", "capture").returncode == 0
+    aid = only_anomaly(workspace)["id"]
+    registry_before = (workspace.results / "anomalies.json").read_bytes()
+    state_before = (workspace.corpus / ".sync-state.json").read_bytes()
+
+    missing = anomalies_cli(workspace, "--resolve", aid, "--disposition", "done")
+    assert missing.returncode != 0
+    assert "evidence" in missing.stderr
+
+    evidence = write_evidence(
+        workspace, cache=workspace.root / "absent.json", input_changed=True
+    )
+    unreadable = anomalies_cli(
+        workspace,
+        "--resolve",
+        aid,
+        "--disposition",
+        "done",
+        "--evidence",
+        str(evidence),
+    )
+    assert unreadable.returncode != 0
+    # Nothing is fabricated: no disposition, no canonical success, no follow-up.
+    assert (workspace.results / "anomalies.json").read_bytes() == registry_before
+    assert (workspace.corpus / ".sync-state.json").read_bytes() == state_before
+    assert not (workspace.results / "compile-followups.json").exists()
+
+
+def test_posthoc_done_without_input_change_registers_no_followup(workspace: Workspace):
+    make_capture_anomaly(workspace)
+    assert workspace.sync("--stop-after", "capture").returncode == 0
+    aid = only_anomaly(workspace)["id"]
+    cache = workspace.root / "ocr-cache.json"
+    write_json(cache, {"image": "img-1", "text": "backfilled"})
+    evidence = write_evidence(workspace, cache=cache, input_changed=False)
+
+    resolved = anomalies_cli(
+        workspace,
+        "--resolve",
+        aid,
+        "--disposition",
+        "done",
+        "--evidence",
+        str(evidence),
+    )
+
+    assert resolved.returncode == 0, resolved.stderr
+    out = json.loads(resolved.stdout)
+    assert out["disposition"] == "done"
+    assert out["resolution"]["followup_id"] is None
+    view = json.loads(anomalies_cli(workspace, "--json").stdout)
+    assert view["compile_followups"] == []

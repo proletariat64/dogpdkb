@@ -23,6 +23,7 @@ from dogpdkb.sync_time import now_iso
 ANOMALY_SCHEMA = "unified-anomalies-1.0"
 RESULT_SCHEMA = "unified-result-1.0"
 FOLLOWUP_SCHEMA = "unified-compile-followups-1.0"
+EVIDENCE_SCHEMA = "unified-posthoc-evidence-1.0"
 DISPOSITIONS = ("pending", "done", "abandoned", "stale")
 #: Archived failures handed off, given up or resolved are not re-attempted daily.
 SUPPRESSING_DISPOSITIONS = frozenset({"pending", "abandoned", "done"})
@@ -334,3 +335,181 @@ def archive_run(state: RunState, config: Any, book_key: str) -> dict[str, Any]:
     }
     atomic_json(run_result_path(config, book_key, layout.run_id), result)
     return result
+
+
+def followups_path(config: Any, book_key: str) -> Path:
+    return results_root(config, book_key) / "compile-followups.json"
+
+
+def load_followups(config: Any, book_key: str) -> dict[str, Any]:
+    path = followups_path(config, book_key)
+    if not path.is_file():
+        return {
+            "schema_version": FOLLOWUP_SCHEMA,
+            "book_key": book_key,
+            "followups": {},
+        }
+    payload = read_json(path)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != FOLLOWUP_SCHEMA
+    ):
+        raise ArchiveError(f"unsupported compile followups: {path}")
+    payload.setdefault("followups", {})
+    return payload
+
+
+def save_followups(config: Any, book_key: str, registry: dict[str, Any]) -> None:
+    atomic_json(followups_path(config, book_key), registry)
+
+
+def followup_id(book_key: str, document_id: Any, source_version: Any) -> str:
+    """One follow-up per book + document + source version (no new fingerprint)."""
+    return "-".join(
+        [_slug(book_key), _slug(document_id), version_stamp(source_version), "compile"]
+    )
+
+
+def register_compile_followup(
+    config: Any,
+    book_key: str,
+    *,
+    document_id: Any,
+    source_version: Any,
+    reason: str,
+    inputs: list[dict[str, Any]],
+    anomaly_id: str | None = None,
+    code: str = "compile_input_changed",
+) -> dict[str, Any]:
+    """Explicitly register follow-up compile work after a published input changed.
+
+    Contract for tickets 05/06: an OCR backfill that changes the input a published
+    compile consumed MUST register this follow-up; writing the OCR cache alone is
+    not a completed knowledge update. The follow-up stays ``pending`` until compile
+    publishes and records real completion. Registration is idempotent per version:
+    repeated backfills merge inputs instead of duplicating work, and a backfill
+    after a completed follow-up reopens it.
+    """
+    registry = load_followups(config, book_key)
+    fid = followup_id(book_key, document_id, source_version)
+    now = now_iso()
+    existing = registry["followups"].get(fid)
+    if existing is None:
+        record = {
+            "id": fid,
+            "book_key": book_key,
+            "document_id": document_id,
+            "source_version": source_version,
+            "version_stamp": version_stamp(source_version),
+            "code": code,
+            "reason": reason,
+            "inputs": list(inputs),
+            "anomaly_id": anomaly_id,
+            "status": "pending",
+            "created_at": now,
+            "updated_at": now,
+            "run_id": None,
+            "resolution": None,
+        }
+        registry["followups"][fid] = record
+    else:
+        known = {row["path"] for row in existing["inputs"]}
+        for row in inputs:
+            if row["path"] not in known:
+                existing["inputs"].append(row)
+                known.add(row["path"])
+        existing["reason"] = reason
+        existing["updated_at"] = now
+        if anomaly_id is not None:
+            existing["anomaly_id"] = anomaly_id
+        if existing["status"] == "done":
+            existing["status"] = "pending"
+            existing["resolution"] = None
+        record = existing
+    save_followups(config, book_key, registry)
+    return record
+
+
+def _evidence_refs(evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    """Verify post-hoc cache evidence is readable; never fabricate a work product."""
+    refs = evidence.get("cache")
+    if not isinstance(refs, list) or not refs:
+        raise ArchiveError("post-hoc evidence requires at least one cache reference")
+    verified = []
+    for row in refs:
+        if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+            raise ArchiveError("post-hoc cache reference requires a path")
+        path = Path(row["path"]).expanduser().resolve()
+        if not path.is_file():
+            raise ArchiveError(f"post-hoc cache evidence is not readable: {path}")
+        verified.append({"kind": row.get("kind", "cache"), "path": str(path)})
+    return verified
+
+
+def record_posthoc_success(
+    config: Any,
+    book: Any,
+    aid: str,
+    evidence: dict[str, Any],
+    *,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Record a post-hoc success: cache evidence + real completion + disposition.
+
+    Ordering guarantees no fabricated success: the readable cache evidence is
+    verified first, real completion is written to canonical state, follow-up
+    compile work is registered when the published input changed, and only then is
+    the disposition set to ``done``. A failure leaves the anomaly pending so the
+    agent can retry; it never marks done without real completion.
+    """
+    from dogpdkb.sync_progress import Progress
+
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get("schema_version") != EVIDENCE_SCHEMA
+    ):
+        raise ArchiveError(
+            f"unsupported post-hoc evidence schema (expected {EVIDENCE_SCHEMA})"
+        )
+    registry = load_registry(config, book.key)
+    record = registry["anomalies"].get(aid)
+    if record is None:
+        raise ArchiveError(f"unknown anomaly: {aid}")
+    cache = _evidence_refs(evidence)
+    completion = evidence.get("completion")
+    if not isinstance(completion, dict) or not isinstance(completion.get("step"), str):
+        raise ArchiveError("post-hoc evidence requires completion.step")
+    details = completion.get("details") or {}
+    if not isinstance(details, dict):
+        raise ArchiveError("post-hoc completion.details must be an object")
+
+    # Real completion first: canonical state, never the disposition alone.
+    progress = Progress(book.corpus, book.key)
+    progress.step(record["document_id"], completion["step"], "completed", **details)
+
+    followup = None
+    if evidence.get("input_changed"):
+        followup = register_compile_followup(
+            config,
+            book.key,
+            document_id=record["document_id"],
+            source_version=record["source_version"],
+            reason=evidence.get("reason")
+            or "post-hoc backfill changed the published compile input",
+            inputs=cache,
+            anomaly_id=aid,
+        )
+    now = now_iso()
+    record["disposition"] = "done"
+    record["resolved_at"] = now
+    record["resolution"] = {
+        "disposition": "done",
+        "note": note,
+        "recorded_at": now,
+        "cache": cache,
+        "completion": {"step": completion["step"], "details": details},
+        "input_changed": bool(evidence.get("input_changed")),
+        "followup_id": followup["id"] if followup else None,
+    }
+    save_registry(config, book.key, registry)
+    return record
