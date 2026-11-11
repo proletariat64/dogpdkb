@@ -170,6 +170,10 @@ def _validate_capture_paths(args: Any, snapshot_path: Path, staging: Path) -> se
     }
     if args.baseline_snapshot:
         inputs |= _raw_inputs(Path(args.baseline_snapshot).expanduser().resolve())
+    for value in getattr(args, "import_downloads", None) or []:
+        import_path = Path(value).expanduser().resolve()
+        inputs.add(import_path)
+        inputs |= _import_raw_inputs(import_path)
     outputs = [
         snapshot_path,
         staging / "pages",
@@ -373,6 +377,283 @@ def _raw_reference(path: Path, snapshot_path: Path, captured_at: str) -> dict[st
     }
 
 
+# Direct content markers of OCR enrichment. A file carrying them is an
+# enriched Markdown, never a verified raw export (no fingerprint system).
+_ENRICHED_MARKERS = ("<!-- mdocr:ocr-begin", "这是一张图片，ocr内容为")
+
+
+def _raw_validity(path: Path) -> str | None:
+    """Return None when the file is a usable raw export, else a reason code."""
+    if not path.is_file():
+        return "raw_missing"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, ValueError):
+        return "raw_invalid"
+    if any(marker in text for marker in _ENRICHED_MARKERS):
+        return "raw_enriched"
+    return None
+
+
+def _validated_version(record: Any) -> dict[str, Any] | None:
+    """Normalize a recorded version and verify its internal consistency."""
+    if not isinstance(record, dict):
+        return None
+    field = record.get("field")
+    value = record.get("value")
+    utc = record.get("utc")
+    if (
+        not isinstance(field, str)
+        or field not in {"content_updated_at", "updated_at"}
+        or not isinstance(value, str)
+        or not isinstance(utc, str)
+    ):
+        return None
+    try:
+        rebuilt = timestamp_record(value, field)
+        if parse_timestamp(utc) != parse_timestamp(rebuilt["utc"]):
+            return None
+    except ValueError:
+        return None
+    return rebuilt
+
+
+def _import_raw_inputs(path: Path) -> set[Path]:
+    """Best-effort raw references of an import record, for output protection."""
+    try:
+        payload = _read_json(path)
+    except CaptureError:
+        return set()
+    if not isinstance(payload, dict):
+        return set()
+    if payload.get("schema_version") == SCHEMA_VERSION:
+        return _raw_inputs(path)
+    documents = payload.get("documents")
+    if not isinstance(documents, dict):
+        return set()
+    result: set[Path] = set()
+    for row in documents.values():
+        if isinstance(row, dict) and isinstance(row.get("file"), str):
+            result.add((path.parent / "raw" / row["file"]).resolve())
+    return result
+
+
+def _snapshot_import_rows(payload: dict[str, Any], path: Path) -> Any:
+    exports = payload.get("exports")
+    if not isinstance(exports, dict):
+        raise CaptureError(f"import record {path.name} has no export records")
+    for key, row in exports.items():
+        if not isinstance(row, dict) or row.get("status") != "captured":
+            continue
+        raw = row.get("raw")
+        if (
+            not isinstance(raw, dict)
+            or raw.get("stage") != "raw_export"
+            or not isinstance(raw.get("path"), str)
+        ):
+            yield key, "invalid_raw_file"
+            continue
+        if row.get("detail_version") is None or row.get("listing_version") is None:
+            yield key, "version_missing"
+            continue
+        raw_path = Path(raw["path"])
+        if not raw_path.is_absolute():
+            raw_path = path.parent / raw_path
+        captured_at = raw.get("captured_at")
+        yield (
+            key,
+            {
+                "detail": row.get("detail_version"),
+                "listing": row.get("listing_version"),
+                "raw_path": raw_path.resolve(),
+                "captured_at": captured_at if isinstance(captured_at, str) else None,
+                "adapter": "imported_capture_snapshot",
+            },
+        )
+
+
+def _progress_import_rows(payload: dict[str, Any], path: Path) -> Any:
+    for key, row in payload["documents"].items():
+        if not isinstance(row, dict) or row.get("status") != "exported":
+            continue
+        file_name = row.get("file")
+        if not isinstance(file_name, str) or Path(file_name).name != file_name:
+            yield key, "invalid_raw_file"
+            continue
+        detail = row.get("source_version")
+        if detail is None:
+            # Pre-state-baseline rows recorded the detail content_updated_at
+            # (listing fallback) as a plain string; the field name is faithful.
+            stamp = row.get("remote_content_updated_at")
+            if isinstance(stamp, str) and stamp:
+                try:
+                    detail = timestamp_record(stamp, "content_updated_at")
+                except ValueError:
+                    yield key, "version_invalid"
+                    continue
+        yield (
+            key,
+            {
+                "detail": detail,
+                "listing": row.get("listing_version"),
+                "raw_path": (path.parent / "raw" / file_name).resolve(),
+                "captured_at": None,
+                "adapter": "imported_export_progress",
+            },
+        )
+
+
+def _load_imports(
+    paths: list[str] | None, book: dict[str, Any], source_url: str
+) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]]]:
+    """Load historical download records that carry reusable version evidence.
+
+    Only records proving book identity, document identity, a remote version
+    and a valid raw file become reuse candidates; filename, date or mere
+    existence never qualify. Candidates still face the same instant-match
+    evidence decision as the live capture checkpoint before any reuse.
+    """
+    candidates: dict[int, dict[str, Any]] = {}
+    summaries: list[dict[str, Any]] = []
+    for value in paths or []:
+        path = Path(value).expanduser().resolve()
+        payload = _read_json(path)
+        if not isinstance(payload, dict):
+            raise CaptureError(f"import record {path.name} must be a JSON object")
+        if payload.get("schema_version") == SCHEMA_VERSION:
+            fmt = SCHEMA_VERSION
+            if (payload.get("book") or {}).get("book_id") != book.get("book_id"):
+                raise CaptureError(
+                    f"import record {path.name} belongs to a different book"
+                )
+            rows = _snapshot_import_rows(payload, path)
+        elif isinstance(payload.get("documents"), dict) and isinstance(
+            payload.get("configuration"), dict
+        ):
+            fmt = "export-progress"
+            recorded_url = payload["configuration"].get("source_url")
+            if not isinstance(recorded_url, str) or recorded_url.rstrip("/") != (
+                source_url or ""
+            ).rstrip("/"):
+                raise CaptureError(
+                    f"import record {path.name} belongs to a different book"
+                )
+            rows = _progress_import_rows(payload, path)
+        else:
+            raise CaptureError(f"import record {path.name} has an unsupported format")
+        rejected: list[dict[str, Any]] = []
+        accepted = 0
+        for key, item in rows:
+            try:
+                doc_id = int(key)
+            except (TypeError, ValueError):
+                rejected.append({"id": key, "reason": "invalid_document_id"})
+                continue
+            if isinstance(item, str):
+                rejected.append({"id": doc_id, "reason": item})
+                continue
+            detail_version = _validated_version(item["detail"])
+            reason = None if detail_version is not None else "version_missing"
+            listing_version = None
+            if reason is None and item["listing"] is not None:
+                listing_version = _validated_version(item["listing"])
+                if listing_version is None:
+                    reason = "version_invalid"
+            if reason is None:
+                reason = _raw_validity(item["raw_path"])
+            if reason is None and doc_id in candidates:
+                reason = "duplicate_document"
+            if reason is not None:
+                rejected.append({"id": doc_id, "reason": reason})
+                continue
+            candidates[doc_id] = {
+                "detail_version": detail_version,
+                "listing_version": listing_version,
+                "raw_path": item["raw_path"],
+                "captured_at": item["captured_at"],
+                "adapter": item["adapter"],
+                "origin": str(path),
+            }
+            accepted += 1
+        summaries.append(
+            {
+                "path": str(path),
+                "format": fmt,
+                "candidates": accepted,
+                "rejected": rejected,
+                "reused": [],
+            }
+        )
+    return candidates, summaries
+
+
+def _checkpoint_listing_matches(
+    checkpoint_row: dict[str, Any], current_version: dict[str, Any]
+) -> bool:
+    """Listing evidence matches by instant; string forms may differ.
+
+    Rows without listing evidence (imported legacy downloads) rely on the
+    detail-version instant check alone.
+    """
+    recorded = checkpoint_row.get("listing_version")
+    if recorded is None:
+        return True
+    try:
+        return _instant(recorded) == _instant(current_version)
+    except CaptureError:
+        return False
+
+
+def _try_import_reuse(
+    document: dict[str, Any],
+    candidate: dict[str, Any],
+    current_version: dict[str, Any],
+    staging: Path,
+    snapshot_path: Path,
+    protected: set[Path],
+    checkpoint: dict[str, Any],
+    book: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Materialize an imported raw only when its evidence matches this batch."""
+    current_instant = _instant(current_version)
+    if _instant(candidate["detail_version"]) != current_instant:
+        return None
+    listing_version = candidate.get("listing_version")
+    if listing_version is not None and _instant(listing_version) != current_instant:
+        return None
+    if _raw_validity(candidate["raw_path"]) is not None:
+        return None
+    try:
+        text = candidate["raw_path"].read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    detail = {
+        candidate["detail_version"]["field"]: candidate["detail_version"]["value"],
+        "body": text,
+    }
+    try:
+        detail_version, raw = _save_raw(
+            document, detail, staging, snapshot_path, protected
+        )
+    except CaptureError:
+        return None
+    if candidate.get("captured_at"):
+        raw["captured_at"] = candidate["captured_at"]
+    raw["adapter"] = candidate["adapter"]
+    row: dict[str, Any] = {
+        "raw_file": Path(raw["path"]).name,
+        "captured_at": raw["captured_at"],
+        "detail_version": detail_version,
+        "adapter": raw["adapter"],
+        "imported_from": candidate["origin"],
+    }
+    if listing_version is not None:
+        row["listing_version"] = listing_version
+    checkpoint[str(document["id"])] = row
+    _save_checkpoint(staging, book, checkpoint)
+    return detail_version, raw
+
+
 def _rebase_raw(
     raw: dict[str, Any], baseline_path: Path, snapshot_path: Path
 ) -> dict[str, Any] | None:
@@ -415,11 +696,15 @@ def _save_raw(
         )
     except InputError as error:
         raise CaptureError(error.reason_code) from error
-    if raw_path.exists() and raw_path.read_text(encoding="utf-8") != detail["body"]:
+    existing_reason = _raw_validity(raw_path)
+    if (
+        existing_reason is None
+        and raw_path.read_text(encoding="utf-8") != detail["body"]
+    ):
         raise CaptureError(
             f"raw export already exists with different content: {raw_path.name}"
         )
-    if not raw_path.exists():
+    if existing_reason is not None:
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{raw_path.name}.", suffix=".tmp", dir=raw_dir
         )
@@ -666,6 +951,10 @@ def run_capture(args: Any) -> int:
         Path(args.details_dir).expanduser().resolve() if args.details_dir else None
     )
     checkpoint = _load_checkpoint(staging, book)
+    import_candidates, import_summaries = _load_imports(
+        getattr(args, "import_downloads", None), book, args.skylark_url
+    )
+    import_reused: dict[int, str] = {}
     by_id = {document["id"]: document for document in documents}
     for doc_id in selected:
         document = by_id[doc_id]
@@ -703,6 +992,7 @@ def run_capture(args: Any) -> int:
             except CaptureError:
                 detail_matches_listing = False
         reused = False
+        imported_from = None
         saved_download = (
             canonical_documents.get(str(doc_id), {})
             .get("steps", {})
@@ -716,7 +1006,7 @@ def run_capture(args: Any) -> int:
         if (
             progress
             and saved_version
-            and saved_path.is_file()
+            and _raw_validity(saved_path) is None
             and _instant(saved_version) == _instant(records[str(doc_id)]["version"])
         ):
             detail_version = saved_version
@@ -727,11 +1017,13 @@ def run_capture(args: Any) -> int:
             reused = True
         elif (
             isinstance(checkpoint_row, dict)
-            and checkpoint_row.get("listing_version") == records[str(doc_id)]["version"]
+            and _checkpoint_listing_matches(
+                checkpoint_row, records[str(doc_id)]["version"]
+            )
             and detail_matches_listing
             and isinstance(checkpoint_row.get("raw_file"), str)
             and Path(checkpoint_row["raw_file"]).name == checkpoint_row["raw_file"]
-            and (staging / "raw" / checkpoint_row["raw_file"]).is_file()
+            and _raw_validity(staging / "raw" / checkpoint_row["raw_file"]) is None
         ):
             detail_version = checkpoint_row["detail_version"]
             raw = _raw_reference(
@@ -742,48 +1034,69 @@ def run_capture(args: Any) -> int:
             raw["adapter"] = checkpoint_row["adapter"]
             reused = True
         else:
-            try:
-                if args.listing:
-                    if details_dir is None:
-                        raise CaptureError(
-                            f"document {doc_id} requires --details-dir in local adapter mode"
-                        )
-                    body, detail = _export_local(document, details_dir)
-                else:
-                    body, detail = _export_remote(document)
-                detail_version, raw = _save_raw(
+            candidate = import_candidates.get(doc_id)
+            imported = (
+                _try_import_reuse(
                     document,
-                    {**detail, "body": body},
+                    candidate,
+                    records[str(doc_id)]["version"],
                     staging,
                     snapshot_path,
                     protected_inputs,
+                    checkpoint,
+                    book,
                 )
-                raw["adapter"] = (
-                    "local_detail" if args.listing else "skylark_doc_detail"
-                )
-            except (CaptureError, OSError) as error:
-                anomalies.append({"id": doc_id, "code": "export_failed"})
-                reasons.extend(["export_failed", *prior_pending.get(doc_id, [])])
-                pending.append({"id": doc_id, "reasons": reasons})
-                exports[str(doc_id)] = {
-                    "status": "failed",
-                    "labels": labels,
+                if candidate is not None
+                else None
+            )
+            if imported is not None:
+                detail_version, raw = imported
+                reused = True
+                imported_from = candidate["origin"]
+                import_reused[doc_id] = imported_from
+            else:
+                try:
+                    if args.listing:
+                        if details_dir is None:
+                            raise CaptureError(
+                                f"document {doc_id} requires --details-dir in local adapter mode"
+                            )
+                        body, detail = _export_local(document, details_dir)
+                    else:
+                        body, detail = _export_remote(document)
+                    detail_version, raw = _save_raw(
+                        document,
+                        {**detail, "body": body},
+                        staging,
+                        snapshot_path,
+                        protected_inputs,
+                    )
+                    raw["adapter"] = (
+                        "local_detail" if args.listing else "skylark_doc_detail"
+                    )
+                except (CaptureError, OSError) as error:
+                    anomalies.append({"id": doc_id, "code": "export_failed"})
+                    reasons.extend(["export_failed", *prior_pending.get(doc_id, [])])
+                    pending.append({"id": doc_id, "reasons": reasons})
+                    exports[str(doc_id)] = {
+                        "status": "failed",
+                        "labels": labels,
+                        "listing_version": records[str(doc_id)]["version"],
+                        "original": original,
+                        "error": str(error),
+                    }
+                    if progress:
+                        progress.step(doc_id, "download", "failed", reason=str(error))
+                        progress.update(doc_id, pending=sorted(set(reasons)))
+                    continue
+                checkpoint[str(doc_id)] = {
+                    "raw_file": Path(raw["path"]).name,
+                    "captured_at": raw["captured_at"],
                     "listing_version": records[str(doc_id)]["version"],
-                    "original": original,
-                    "error": str(error),
+                    "detail_version": detail_version,
+                    "adapter": raw["adapter"],
                 }
-                if progress:
-                    progress.step(doc_id, "download", "failed", reason=str(error))
-                    progress.update(doc_id, pending=sorted(set(reasons)))
-                continue
-            checkpoint[str(doc_id)] = {
-                "raw_file": Path(raw["path"]).name,
-                "captured_at": raw["captured_at"],
-                "listing_version": records[str(doc_id)]["version"],
-                "detail_version": detail_version,
-                "adapter": raw["adapter"],
-            }
-            _save_checkpoint(staging, book, checkpoint)
+                _save_checkpoint(staging, book, checkpoint)
         if progress:
             raw_path = Path(raw["path"])
             if not raw_path.is_absolute():
@@ -831,6 +1144,7 @@ def run_capture(args: Any) -> int:
             "listing_version": records[str(doc_id)]["version"],
             "detail_version": detail_version,
             "original": original,
+            **({"imported_from": imported_from} if imported_from else {}),
         }
     for doc_id in sorted(set(prior_pending) - current_id_set):
         pending.append(
@@ -841,6 +1155,12 @@ def run_capture(args: Any) -> int:
                     *prior_pending[doc_id],
                 ],
             }
+        )
+    for summary in import_summaries:
+        summary["reused"] = sorted(
+            doc_id
+            for doc_id, origin in import_reused.items()
+            if origin == summary["path"]
         )
     snapshot = {
         "schema_version": SCHEMA_VERSION,
@@ -881,6 +1201,7 @@ def run_capture(args: Any) -> int:
         "exports": exports,
         "pending": pending,
         "anomalies": anomalies,
+        "imports": import_summaries,
     }
     _write_json(snapshot_path, snapshot)
     print(
