@@ -216,22 +216,23 @@ def test_stop_after_capture_pauses_a_resumable_run(workspace: Workspace):
     assert (run_dir / "logs" / "capture.log").is_file()
 
 
-def test_unregistered_stage_fails_loudly_after_plan_ends(workspace: Workspace):
+def test_unregistered_stage_fails_loudly_after_ocr_ends(workspace: Workspace):
     completed = workspace.sync()
 
     assert completed.returncode != 0
-    assert "ocr" in completed.stderr
+    assert "compile" in completed.stderr
     assert "no registered handler" in completed.stderr
     summary = json.loads(completed.stdout.strip().splitlines()[-1])
     assert summary["status"] == "failed"
     assert summary["stages"]["capture"] == "completed"
     assert summary["stages"]["mdcompare"] == "completed"
     assert summary["stages"]["plan"] == "completed"
+    assert summary["stages"]["ocr"] == "skipped"
     state = read_json(workspace.only_run() / "run.json")
     assert state["status"] == "failed"
-    assert state["stage_states"]["ocr"]["status"] == "failed"
-    assert state["stage_states"]["compile"]["status"] == "pending"
-    envelope = read_json(workspace.only_run() / "ocr" / "result.json")
+    assert state["stage_states"]["ocr"]["status"] == "skipped"
+    assert state["stage_states"]["compile"]["status"] == "failed"
+    envelope = read_json(workspace.only_run() / "compile" / "result.json")
     assert envelope["status"] == "failed"
     assert envelope["artifacts"] == {}
 
@@ -245,7 +246,7 @@ def test_resume_reuses_the_frozen_capture_instead_of_re_exporting(workspace: Wor
 
     resumed = workspace.sync("--resume", first["run"])
 
-    assert resumed.returncode != 0  # ocr is still unregistered
+    assert resumed.returncode != 0  # compile is still unregistered
     summary = json.loads(resumed.stdout.strip().splitlines()[-1])
     assert summary["run"] == first["run"]
     assert summary["stages"]["capture"] == "completed"
@@ -253,7 +254,7 @@ def test_resume_reuses_the_frozen_capture_instead_of_re_exporting(workspace: Wor
     assert snapshot.read_bytes() == before
     state = read_json(run_dir / "run.json")
     assert state["stage_states"]["capture"]["ended_at"] == ended_at
-    assert state["stage_states"]["ocr"]["status"] == "failed"
+    assert state["stage_states"]["compile"]["status"] == "failed"
 
 
 def test_new_batch_refuses_to_replace_a_paused_run_and_names_the_resume_target(
@@ -351,7 +352,8 @@ def test_partial_capture_hands_its_usable_set_to_the_next_stage(workspace: Works
     assert state["stage_states"]["capture"]["counts"]["completed"] == 2
     # A partial stage ends and the batch moves on; it does not abort here.
     assert state["stage_states"]["mdcompare"]["status"] in {"completed", "partial"}
-    assert state["stage_states"]["ocr"]["status"] == "failed"
+    assert state["stage_states"]["ocr"]["status"] == "skipped"
+    assert state["stage_states"]["compile"]["status"] == "failed"
     assert "no registered handler" in completed.stderr
     envelope = read_json(run_dir / "capture" / "result.json")
     assert envelope["status"] == "partial"
@@ -414,7 +416,7 @@ def test_resume_of_a_failed_batch_retries_only_the_failed_stage(workspace: Works
     run_dir = workspace.only_run()
     state = read_json(run_dir / "run.json")
     capture = state["stage_states"]["capture"]
-    first_attempt = state["stage_states"]["ocr"]["started_at"]
+    first_attempt = state["stage_states"]["compile"]["started_at"]
     snapshot = (run_dir / "capture" / "snapshot.json").read_bytes()
 
     resumed = workspace.sync("--resume", run_dir.name)
@@ -422,8 +424,8 @@ def test_resume_of_a_failed_batch_retries_only_the_failed_stage(workspace: Works
     assert resumed.returncode != 0
     state = read_json(run_dir / "run.json")
     assert state["stage_states"]["capture"] == capture
-    assert state["stage_states"]["ocr"]["started_at"] != first_attempt
-    assert state["stage_states"]["ocr"]["attempts"] == 2
+    assert state["stage_states"]["compile"]["started_at"] != first_attempt
+    assert state["stage_states"]["compile"]["attempts"] == 2
     assert state["stage_states"]["capture"]["attempts"] == 1
     assert (run_dir / "capture" / "snapshot.json").read_bytes() == snapshot
     assert workspace.runs() == [run_dir]
@@ -478,8 +480,8 @@ def test_status_reports_the_latest_batch_and_can_name_an_older_one(
     assert view["recorded_status"] == "failed"
     assert view["exit_code"] == 1
     assert view["stages"]["capture"]["status"] == "completed"
-    assert view["stages"]["ocr"]["reason"]
-    assert view["stages"]["ocr"]["result"].endswith("ocr/result.json")
+    assert view["stages"]["compile"]["reason"]
+    assert view["stages"]["compile"]["result"].endswith("compile/result.json")
     assert view["logs"]["capture"].endswith("logs/capture.log")
     assert f"--resume {older['run']}" in view["resume"]
 
