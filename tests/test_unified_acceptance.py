@@ -1,12 +1,14 @@
-"""Ticket 08 acceptance: whole-batch stage order and no-update convergence.
+"""Ticket 08 acceptance: whole-batch order, no-update and body-reuse convergence.
 
-These close the two Testing-Decisions gaps not already locked by a per-ticket
+These close the Testing-Decisions gaps not already locked by a per-ticket
 test: (1) a *successful* full batch runs all five stages in whole-batch order
-(all capture -> compare -> plan -> OCR -> compile), and (2) a second batch with
+(all capture -> compare -> plan -> OCR -> compile), (2) a second batch with
 an unchanged remote completes by reusing recorded work instead of repeating
-downloads, OCR submissions or extraction. Both drive the installed ``dogpdkb
-sync`` black box with a temporary corpus and the deterministic Graphify / OCR
-doubles; no real Yuque / OCR / Graphify / network / paid call is made.
+downloads, OCR submissions or extraction, and (3) a verified body reuse keeps
+its canonical input reference resolvable so the *next* batch still converges
+without recompiling. All drive the installed ``dogpdkb sync`` black box with a
+temporary corpus and the deterministic Graphify / OCR doubles; no real Yuque /
+OCR / Graphify / network / paid call is made.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from tests.test_unified_compile import CompileWorkspace
-from tests.test_unified_sync import STAGES, read_json
+from tests.test_unified_sync import STAGES, read_json, write_json
 
 PROGRESS = re.compile(
     r"\]\s+(capture|mdcompare|plan|ocr|compile):\s+"
@@ -103,3 +105,59 @@ def test_no_update_second_batch_completes_by_reusing_recorded_work(
         row for row in workspace.graphify_calls() if row["event"] == "extract"
     ]
     assert len(second_extracts) == len(first_extracts)
+
+
+def _canonical_raw(workspace: CompileWorkspace, doc_id: str) -> Path:
+    """Resolve a canonical graph raw reference the way the next batch will."""
+    state = read_json(workspace.corpus / ".sync-state.json")
+    reference = state["books"]["fund"]["documents"][doc_id]["graph"]["raw"]
+    assert reference["stage"] in {"raw_export", "historical_cleaned"}
+    path = Path(reference["path"])
+    return path if path.is_absolute() else workspace.corpus / path
+
+
+def test_body_reuse_survives_the_next_batch_without_recompiling(
+    workspace: CompileWorkspace,
+):
+    # Doc One's remote body equals the registered corpus baseline: the plan
+    # must reuse the existing body knowledge, not recompile it.
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["1"]["body"] = "# One\n\nOld rule.\n"
+    write_json(workspace.root / "remote.json", remote)
+
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    assert _summary(first)["status"] == "completed"
+    plan1 = read_json(workspace.runs()[-1] / "plan" / "plan.json")
+    assert {row["document_id"] for row in plan1["body_reuse"]} == {1}
+    assert {row["document_id"] for row in plan1["compile"]} == {2}
+    first_extracts = [
+        row for row in workspace.graphify_calls() if row["event"] == "extract"
+    ]
+    assert len(first_extracts) == 1  # only the new document was extracted
+
+    # The reuse record must keep a canonical input reference that resolves
+    # from the corpus state, not one relative to the mdcompare report.
+    state = read_json(workspace.corpus / ".sync-state.json")
+    graph = state["books"]["fund"]["documents"]["1"]["graph"]
+    assert graph["status"] == "covered"
+    assert graph["coverage"] == "body_reuse"
+    assert _canonical_raw(workspace, "1").is_file()
+
+    # The next daily batch with the same remote must still converge: the
+    # reused body is verified again but never recompiled or re-extracted.
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    summary = _summary(second)
+    assert summary["status"] == "completed"
+    assert summary["stages"]["compile"] == "skipped"
+    plan2 = read_json(workspace.runs()[-1] / "plan" / "plan.json")
+    assert plan2["compile"] == []
+    second_extracts = [
+        row for row in workspace.graphify_calls() if row["event"] == "extract"
+    ]
+    assert len(second_extracts) == len(first_extracts)
+
+    # Wash cleanup may retire the first run directory; the canonical reference
+    # must still resolve (migrated to the durable store) after the batch.
+    assert _canonical_raw(workspace, "1").is_file()
