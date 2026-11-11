@@ -3,11 +3,11 @@
 import json
 import os
 import sys
-import tomllib
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+import tomllib
 
 from dogpdkb import cli, doctor
 from mdocr import config as settings
