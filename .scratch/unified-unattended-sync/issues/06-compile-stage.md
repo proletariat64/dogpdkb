@@ -10,6 +10,7 @@ Blocked by: 04
 - 先读 `/tmp/unified-unattended-sync-notes/00-base-context.md`；补充笔记 `02-knowledge-modules.md`（execute 合同、Graphify 调用、候选隔离/发布恢复、必须保留的结构检查、当前批级全有或全无失败、_run_graphify 内存缓冲输出）与 `01-default-sync-pipeline.md`（update_graph/graph_sync）。工作树代码为准。
 - 04 Answer：compile 名单、输入引用、OCR 结果引用 schema、实际最终输入/缺失项字段。03 Answer：异常归档、重试抑制、OCR 后补登记后续编译。01 Answer：run 状态/阶段信封。
 - 现有 Graphify 编译缓存/隔离候选/发布恢复能力沿用，不重写 Graphify、不全量重建历史图谱。
+- 关键现状（见 00-base-context / 笔记 01/02/03）：Graphify 非 CLI 子进程，而是 `[graphify_python, update_graph.py, …]` 导入 graphify 模块；候选隔离/publication_lock/rollback/发布字节校验已存在（保留）；提取当前全有或全无（failed_chunks/uncovered_files→RuntimeError），本票改部分发布。新阶段须冻结**富化后** markdown 并按插入 OCR 块声明 body_scope `generated-regions-v1` 区域（正文复用与 OCR 独立），每图证据持久化到 wash 外。修复 update_graph 把新导出来源误标 content_kind:"historical_enriched" 的 bug。
 
 ## Acceptance and ownership
 

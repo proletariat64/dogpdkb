@@ -28,6 +28,8 @@
 - 复用既有 instance_lock 作为规格"用户级运行锁"，不另造锁。跨批次文档进度走 canonical `.sync-state.json`（Progress）；per-run 轻量状态单独保存（01）。
 - 01 期间旧 sync flag 走带弃用提示的旧执行器（过渡），最终收敛在 08；不保留另一套默认规则。
 - 比较器算法、Graphify 模型、图谱合并器不重写；不新增通用指纹系统；异常身份复用 book+doc ID+version。
+- 规格+任务图提交 `cb8dfb9`。Wave 1 已启动：01（分支 uus/01-runner-state，worktree uus-01-runner-state）∥ 02（分支 uus/02-capture-reuse，worktree uus-02-capture-reuse），后台 implementer。
+- [02 resolved](issues/02-capture-reuse.md#answer) 已合入：合并提交 `6b90ee8`（--no-ff，实现 HEAD 93ecc1e）。统一证据复用（canonical 下载→checkpoint→import→新导出），同 book+doc ID+版本瞬时相等+raw 直接有效（无新指纹）；历史富化保持 historical_enriched；观察/下载/发布版本分离。公开合同：`discover --snapshot … --import-downloads <records…>` 接受 knowledge-capture-1.0 snapshot 与 legacy export-progress.json；additive 字段 imports[]/exports[].imported_from。集成聚焦 207 passed、ruff check/format 干净、doc-guard PASS(84)。01 的 capture handler 不受影响。
 
 ## Fog
 
