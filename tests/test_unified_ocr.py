@@ -485,3 +485,68 @@ def test_same_version_archived_ocr_failure_is_not_retried_until_new_version(
     assert counts3["success"] == 1
     assert counts3["failed"] == 0
     assert workspace.submissions() == 2
+
+
+def test_posthoc_success_resolves_an_archived_ocr_failure_and_registers_compile(
+    tmp_path: Path,
+):
+    workspace = OcrWorkspace(tmp_path, mode="fail")
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+    failures = [
+        a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == "OCR_FAILED"
+    ]
+    assert len(failures) == 1
+    aid = failures[0]["id"]
+
+    # The post-hoc agent backfills the result out of band into the durable cache
+    # (outside wash) and hands the readable artifact to the disposition CLI.
+    artifact = workspace.ocr_cache / "fund" / "backfill" / "artifact.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("backfilled OCR text\n", encoding="utf-8")
+    evidence = workspace.root / "evidence.json"
+    write_json(
+        evidence,
+        {
+            "schema_version": "unified-posthoc-evidence-1.0",
+            "cache": [{"kind": "ocr", "path": str(artifact)}],
+            "completion": {"step": "ocr", "details": {"cache": str(artifact)}},
+            "input_changed": True,
+        },
+    )
+    resolved = workspace.cli(
+        "anomalies",
+        "--config",
+        str(workspace.config),
+        "--book",
+        "fund",
+        "--resolve",
+        aid,
+        "--disposition",
+        "done",
+        "--evidence",
+        str(evidence),
+    )
+    assert resolved.returncode == 0, resolved.stderr
+    record = json.loads(resolved.stdout)
+    assert record["disposition"] == "done"
+    followup_id = record["resolution"]["followup_id"]
+    assert followup_id
+
+    # Real completion is recorded in canonical state, separate from disposition.
+    state = read_json(workspace.corpus / ".sync-state.json")
+    step = state["books"]["fund"]["documents"]["2"]["steps"]["ocr"]
+    assert step["status"] == "completed"
+    # A changed published compile input explicitly registers follow-up compile
+    # work; writing the OCR cache alone is not a completed knowledge update.
+    followups = read_json(
+        workspace.root / "sync-results" / "fund" / "compile-followups.json"
+    )
+    followup = followups["followups"][followup_id]
+    assert followup["document_id"] == 2
+    assert followup["status"] == "pending"
+    assert followup["anomaly_id"] == aid
+    assert followup["version_stamp"] == failures[0]["version_stamp"]
+    assert followup["inputs"] == [{"kind": "ocr", "path": str(artifact.resolve())}]
