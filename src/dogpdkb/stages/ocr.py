@@ -29,6 +29,7 @@ from dogpdkb.ocr_cache import (
     persist_success,
     verify_reuse,
 )
+from dogpdkb.stages.plan import PLAN_SCHEMA
 from dogpdkb.sync_results import archive_anomalies, register_compile_followup
 from dogpdkb.sync_run import read_json
 from dogpdkb.sync_stages import StageContext, StageFailed, StageResult
@@ -41,7 +42,6 @@ from mdocr.paddle import OcrAuthError, OcrSharedError, PaddleClient
 from mdocr.prepare import DOWNLOAD_TIMEOUT, ImageError, ImageSkip, prepare_one
 
 OCR_SCHEMA = "unified-ocr-1.0"
-PLAN_SCHEMA = "unified-plan-1.0"
 
 
 def _plan(context: StageContext) -> dict[str, Any]:

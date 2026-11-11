@@ -14,12 +14,11 @@ from __future__ import annotations
 from typing import Any
 
 from dogpdkb.knowledge_execute import COMPILE_SCHEMA, ExecutionError, execute_compile
+from dogpdkb.stages.plan import PLAN_SCHEMA
 from dogpdkb.sync_results import archive_anomalies
 from dogpdkb.sync_run import read_json
 from dogpdkb.sync_stages import StageContext, StageFailed, StageResult
 from dogpdkb.workflows.get_sync_updates import safe_diagnostic
-
-PLAN_SCHEMA = "unified-plan-1.0"
 
 
 def _plan(context: StageContext) -> dict[str, Any]:
