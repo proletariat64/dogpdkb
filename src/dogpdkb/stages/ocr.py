@@ -27,6 +27,7 @@ from dogpdkb.ocr_cache import (
     cache_root,
     document_evidence,
     persist_success,
+    verify_reuse,
 )
 from dogpdkb.sync_results import archive_anomalies
 from dogpdkb.sync_run import read_json
@@ -145,9 +146,14 @@ def handle(context: StageContext) -> StageResult:
             if time.monotonic() >= deadline or client is None:
                 counts["unattempted"] += 1
                 missing.append(
-                    {"kind": "ocr_artifact", "resource_id": resource_id,
-                     "code": "OCR_BUDGET_EXHAUSTED" if client else "OCR_AUTH_UNAVAILABLE",
-                     "reason": "OCR not attempted"}
+                    {
+                        "kind": "ocr_artifact",
+                        "resource_id": resource_id,
+                        "code": "OCR_BUDGET_EXHAUSTED"
+                        if client
+                        else "OCR_AUTH_UNAVAILABLE",
+                        "reason": "OCR not attempted",
+                    }
                 )
                 anomalies.append(
                     _anomaly(item, resource, "OCR_UNATTEMPTED", "OCR not attempted")
@@ -156,35 +162,51 @@ def handle(context: StageContext) -> StageResult:
             try:
                 data, name = _original_bytes(resource, session)
                 prepared_path, prepared_bytes = _prepare(context, doc_id, data, name)
-                markdown = client.convert(prepared_path)
-                if not markdown.strip():
-                    raise ImageError("OCR result was blank")
                 key = prepared_path.stem
-                artifact_text = build_ocr_block("prepared.jpg", markdown)
-                record = persist_success(
+                record = verify_reuse(
                     root,
                     key,
                     resource_id=resource_id,
-                    original_name="original" + (Path(name).suffix or ".png"),
                     original_bytes=data,
                     prepared_bytes=prepared_bytes,
-                    artifact_text=artifact_text,
                 )
+                reused = record is not None
+                if not reused:
+                    markdown = client.convert(prepared_path)
+                    if not markdown.strip():
+                        raise ImageError("OCR result was blank")
+                    artifact_text = build_ocr_block("prepared.jpg", markdown)
+                    record = persist_success(
+                        root,
+                        key,
+                        resource_id=resource_id,
+                        original_name="original" + (Path(name).suffix or ".png"),
+                        original_bytes=data,
+                        prepared_bytes=prepared_bytes,
+                        artifact_text=artifact_text,
+                    )
             except (ImageError, ImageSkip, OSError, RuntimeError, ValueError) as error:
                 counts["failed"] += 1
                 reason = safe_diagnostic(error)
                 missing.append(
-                    {"kind": "ocr_artifact", "resource_id": resource_id,
-                     "code": "OCR_FAILED", "reason": reason}
+                    {
+                        "kind": "ocr_artifact",
+                        "resource_id": resource_id,
+                        "code": "OCR_FAILED",
+                        "reason": reason,
+                    }
                 )
                 anomalies.append(_anomaly(item, resource, "OCR_FAILED", reason))
                 context.log.write(f"ocr failed for {resource_id}: {reason}")
                 continue
-            counts["success"] += 1
+            counts["reused" if reused else "success"] += 1
             images.append(record)
             final_inputs.append(
-                {"kind": "ocr_artifact", "resource_id": resource_id,
-                 "path": record["artifact"]}
+                {
+                    "kind": "ocr_artifact",
+                    "resource_id": resource_id,
+                    "path": record["artifact"],
+                }
             )
             context.count(**counts)
         documents.append(
@@ -208,7 +230,9 @@ def handle(context: StageContext) -> StageResult:
             state = _load_state(state_path, plan["book"])
             for row in documents:
                 if row["ocr"]["images"]:
-                    _merge_graph_ocr(state, str(row["document_id"]), row["ocr"]["images"])
+                    _merge_graph_ocr(
+                        state, str(row["document_id"]), row["ocr"]["images"]
+                    )
             save_view(state_path, state)
 
     reference = {
@@ -242,7 +266,9 @@ def handle(context: StageContext) -> StageResult:
         artifacts={"ocr": context.layout.relative(reference_path)},
         inputs={"plan": context.layout.relative(context.require("plan", "plan"))},
         anomalies=archived,
-        reason=None if status in {"completed", "skipped"} else "OCR incomplete for some images",
+        reason=None
+        if status in {"completed", "skipped"}
+        else "OCR incomplete for some images",
     )
 
 

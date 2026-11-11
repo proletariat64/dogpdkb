@@ -16,7 +16,9 @@ from typing import Any
 
 from dogpdkb.sync_results import _slug
 from dogpdkb.sync_run import RunError, atomic_json, read_json
+from mdcompare.io import InputError
 from mdcompare.ocr import CONTRACT
+from mdcompare.prepared_image import is_prepared_jpeg
 from mdocr import __version__ as MDOCR_VERSION
 from mdocr.paddle import _MODEL
 from mdocr.prepare import JPEG_QUALITY
@@ -133,3 +135,81 @@ def load_evidence(root: Path, key: str) -> dict[str, Any] | None:
     if not isinstance(images, list) or not images:
         return None
     return payload
+
+
+def _canonical_artifact(text: str, prepared: Path, artifact: Path) -> bool:
+    """The same structural proof mdcompare applies to a cached OCR artifact.
+
+    The artifact must be a canonical, non-empty mdocr block whose declared
+    source resolves to the cached prepared JPEG beside it.
+    """
+    source = prepared.name
+    prefix = f'<!-- mdocr:ocr-begin source="{source}" -->\n\n'
+    footer = f"\n\n> Original image: [{source}]({source})\n\n<!-- mdocr:ocr-end -->"
+    if not text.startswith(prefix) or not text.endswith(footer):
+        return False
+    body = text[len(prefix) : -len(footer)]
+    if not body.strip() or "<!-- mdocr:" in body:
+        return False
+    try:
+        return (artifact.parent / source).resolve() == prepared.resolve()
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def verify_reuse(
+    root: Path,
+    key: str,
+    *,
+    resource_id: str,
+    original_bytes: bytes,
+    prepared_bytes: bytes,
+) -> dict[str, Any] | None:
+    """Return cached success evidence iff this exact content may reuse it.
+
+    Reuse follows the ``prepared-jpeg-ocr-v1`` proof: compatible normalized
+    preprocessing/configuration, the cached original and prepared JPEG matching
+    the freshly fetched/normalized bytes (so the same URL with changed content
+    never reuses, and a truncated content digest cannot alias a different
+    image), a canonical prepared JPEG, and a canonical non-empty artifact. No
+    new fingerprint is introduced — the bytes are compared directly.
+    """
+    evidence = load_evidence(root, key)
+    if evidence is None:
+        return None
+    if evidence.get("preprocessing") != PREPROCESSING:
+        return None
+    if evidence.get("configuration") != CONFIGURATION:
+        return None
+    record = next(
+        (
+            row
+            for row in evidence["images"]
+            if isinstance(row, dict) and row.get("status") == "success"
+        ),
+        None,
+    )
+    if record is None:
+        return None
+    try:
+        original = Path(record["source_path"])
+        prepared = Path(record["prepared_image"])
+        artifact = Path(record["artifact"])
+        if original.read_bytes() != original_bytes:
+            return None
+        cached_prepared = prepared.read_bytes()
+        if cached_prepared != prepared_bytes or not is_prepared_jpeg(cached_prepared):
+            return None
+        text = artifact.read_text(encoding="utf-8")
+    except (OSError, ValueError, KeyError, UnicodeDecodeError, InputError):
+        return None
+    if not _canonical_artifact(text, prepared, artifact):
+        return None
+    # Re-bind the evidence to this batch's resource_id; the durable artifact and
+    # prepared JPEG are shared because the verified content is identical.
+    return image_evidence(
+        resource_id=resource_id,
+        source_path=original,
+        prepared_image=prepared,
+        artifact=artifact,
+    )

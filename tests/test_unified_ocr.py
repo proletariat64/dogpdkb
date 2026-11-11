@@ -24,9 +24,9 @@ CONTRACT = "prepared-jpeg-ocr-v1"
 IMAGE_URL = "https://cdn.example.invalid/a.png"
 
 
-def _shim_source(log_path: Path, mode: str) -> str:
+def _shim_source(log_path: Path, mode: str, image_file: Path) -> str:
     """A sitecustomize that doubles requests.Session for images + PaddleOCR."""
-    return f'''
+    return f"""
 import io, json, time
 time.sleep = lambda seconds: None
 import requests
@@ -34,11 +34,11 @@ from PIL import Image
 
 LOG = {str(log_path)!r}
 MODE = {mode!r}
+IMAGE_FILE = {str(image_file)!r}
 
 def _png():
-    buf = io.BytesIO()
-    Image.new("RGB", (8, 8), (200, 30, 30)).save(buf, format="PNG")
-    return buf.getvalue()
+    with open(IMAGE_FILE, "rb") as stream:
+        return stream.read()
 
 class Resp:
     def __init__(self, status_code=200, json_data=None, text="", content=b""):
@@ -90,18 +90,22 @@ def _get(self, url, **kwargs):
 
 requests.Session.request = _request
 requests.Session.get = _get
-'''
+"""
 
 
 class OcrWorkspace(Workspace):
     """A Workspace whose doc 2 carries one image and whose OCR boundary is doubled."""
 
-    def __init__(self, tmp_path: Path, *, mode: str = "success", image_url: str = IMAGE_URL):
+    def __init__(
+        self, tmp_path: Path, *, mode: str = "success", image_url: str = IMAGE_URL
+    ):
         super().__init__(tmp_path, DOCUMENTS)
         self.mode = mode
         self.image_url = image_url
         self.ocr_log = tmp_path / "ocr-calls.log"
         self.ocr_cache = tmp_path / "ocr-cache"
+        self.image_file = tmp_path / "serve-image.png"
+        self.write_image(200)
         # Give doc 2 an image so the plan produces an OCR work item.
         remote = read_json(tmp_path / "remote.json")
         remote["details"]["2"]["body"] = f"body 2\n\n![img]({image_url})\n"
@@ -116,10 +120,20 @@ class OcrWorkspace(Workspace):
         shim = tmp_path / "python-shim"
         shim.mkdir()
         (shim / "sitecustomize.py").write_text(
-            _shim_source(self.ocr_log, mode), encoding="utf-8"
+            _shim_source(self.ocr_log, mode, self.image_file), encoding="utf-8"
         )
         self.env["PYTHONPATH"] = os.pathsep.join([str(shim), str(ROOT / "src")])
         self.env["PADDLEOCR_TOKEN"] = "test-token"
+
+    def write_image(self, red: int) -> None:
+        """Serve a distinct-but-valid PNG so content changes are observable."""
+        import io
+
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.new("RGB", (8, 8), (red, 30, 30)).save(buf, format="PNG")
+        self.image_file.write_bytes(buf.getvalue())
 
     def submissions(self) -> int:
         if not self.ocr_log.is_file():
@@ -130,11 +144,22 @@ class OcrWorkspace(Workspace):
             if line == "POST"
         )
 
-    def ocr_reference(self) -> dict[str, Any]:
-        return read_json(self.only_run() / "ocr" / "ocr.json")
+    def set_mode(self, mode: str) -> None:
+        """Re-bake the shim so the next sync subprocess serves a new boundary."""
+        self.mode = mode
+        shim = self.root / "python-shim" / "sitecustomize.py"
+        shim.write_text(
+            _shim_source(self.ocr_log, mode, self.image_file), encoding="utf-8"
+        )
 
-    def ocr_envelope(self) -> dict[str, Any]:
-        return read_json(self.only_run() / "ocr" / "result.json")
+    def latest_run(self) -> Path:
+        return self.runs()[-1]
+
+    def ocr_reference(self, run: Path | None = None) -> dict[str, Any]:
+        return read_json((run or self.only_run()) / "ocr" / "ocr.json")
+
+    def ocr_envelope(self, run: Path | None = None) -> dict[str, Any]:
+        return read_json((run or self.only_run()) / "ocr" / "result.json")
 
 
 @pytest.fixture
@@ -179,3 +204,77 @@ def test_ocr_stage_processes_the_planned_image_and_persists_a_success_result(
     graph = state["books"]["fund"]["documents"]["2"]["graph"]
     assert graph["ocr"]["contract"] == CONTRACT
     assert graph["ocr"]["images"][0]["status"] == "success"
+
+
+def test_repeat_sync_reuses_the_cached_success_without_a_second_submission(
+    ocr_workspace: OcrWorkspace,
+):
+    # A full sync fails at the still-unregistered compile stage, which releases
+    # the batch claim so a second batch may start. OCR runs in both batches.
+    first = ocr_workspace.sync()
+    assert first.returncode != 0
+    run1 = ocr_workspace.latest_run()
+    assert ocr_workspace.ocr_envelope(run1)["counts"]["success"] == 1
+    assert ocr_workspace.submissions() == 1
+
+    second = ocr_workspace.sync()
+    assert second.returncode != 0
+    run2 = ocr_workspace.latest_run()
+    assert run2 != run1
+    counts = ocr_workspace.ocr_envelope(run2)["counts"]
+    # Same verified content + compatible config reuses; no proactive re-OCR.
+    assert counts["reused"] == 1
+    assert counts["success"] == 0
+    assert counts["failed"] == 0
+    assert ocr_workspace.submissions() == 1
+
+    reference = ocr_workspace.ocr_reference(run2)
+    row = next(r for r in reference["documents"] if r["document_id"] == 2)
+    image = row["ocr"]["images"][0]
+    assert image["status"] == "success"
+    assert Path(image["artifact"]).is_file()
+
+
+def test_same_url_with_changed_image_content_is_recognized_again(
+    ocr_workspace: OcrWorkspace,
+):
+    ocr_workspace.sync()
+    run1 = ocr_workspace.latest_run()
+    assert ocr_workspace.ocr_envelope(run1)["counts"]["success"] == 1
+    assert ocr_workspace.submissions() == 1
+
+    # Same URL, different bytes: the URL alone must not prove the image unchanged.
+    ocr_workspace.write_image(20)
+    ocr_workspace.sync()
+    run2 = ocr_workspace.latest_run()
+    counts = ocr_workspace.ocr_envelope(run2)["counts"]
+    assert counts["success"] == 1
+    assert counts["reused"] == 0
+    assert ocr_workspace.submissions() == 2
+
+
+def test_a_blank_result_never_overwrites_a_cached_success(
+    ocr_workspace: OcrWorkspace,
+):
+    ocr_workspace.sync()
+    run1 = ocr_workspace.latest_run()
+    assert ocr_workspace.ocr_envelope(run1)["counts"]["success"] == 1
+    cached = sorted(ocr_workspace.ocr_cache.glob("fund/*/artifact.md"))
+    assert len(cached) == 1
+    before = cached[0].read_text(encoding="utf-8")
+    assert "OCR output line" in before
+
+    # A different image (cache miss) meets an unstable interface returning blank.
+    # It must fail without clobbering the valid cached success for the first image
+    # and without minting a success result of its own.
+    ocr_workspace.write_image(20)
+    ocr_workspace.set_mode("blank")
+    ocr_workspace.sync()
+    run2 = ocr_workspace.latest_run()
+    counts2 = ocr_workspace.ocr_envelope(run2)["counts"]
+    assert counts2["failed"] == 1
+    assert counts2["reused"] == 0
+    assert counts2["success"] == 0
+    still = sorted(ocr_workspace.ocr_cache.glob("fund/*/artifact.md"))
+    assert len(still) == 1
+    assert still[0].read_text(encoding="utf-8") == before
