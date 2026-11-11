@@ -29,7 +29,7 @@ from dogpdkb.ocr_cache import (
     persist_success,
     verify_reuse,
 )
-from dogpdkb.sync_results import archive_anomalies
+from dogpdkb.sync_results import archive_anomalies, register_compile_followup
 from dogpdkb.sync_run import read_json
 from dogpdkb.sync_stages import StageContext, StageFailed, StageResult
 from dogpdkb.sync_time import now_iso
@@ -136,6 +136,7 @@ def handle(context: StageContext) -> StageResult:
                 "item": item,
                 "images": [],
                 "final_inputs": [],
+                "changed_inputs": [],
                 "missing": [],
             }
             order.append(doc_id)
@@ -229,13 +230,16 @@ def handle(context: StageContext) -> StageResult:
             continue
         counts["reused" if reused else "success"] += 1
         acc["images"].append(record)
-        acc["final_inputs"].append(
-            {
-                "kind": "ocr_artifact",
-                "resource_id": resource_id,
-                "path": record["artifact"],
-            }
-        )
+        artifact_ref = {
+            "kind": "ocr_artifact",
+            "resource_id": resource_id,
+            "path": record["artifact"],
+        }
+        acc["final_inputs"].append(artifact_ref)
+        if not reused:
+            # A newly recognized image changes the compile input; a reused
+            # (unchanged, cache-hit) image does not.
+            acc["changed_inputs"].append(artifact_ref)
         context.count(**counts)
 
     # Everything from the stop onward was not executed: archive it as unfinished
@@ -284,6 +288,26 @@ def handle(context: StageContext) -> StageResult:
                         state, str(row["document_id"]), row["ocr"]["images"]
                     )
             save_view(state_path, state)
+
+    # A body-reuse source keeps its published body knowledge, but a newly
+    # recognized image changes its compile input. Register follow-up compile work
+    # (the same machinery the post-hoc backfill path uses) so this batch's compile
+    # stage republishes the source with the new image text instead of leaving it
+    # silently stale. Reused (unchanged) images and OCR failures register nothing:
+    # no published input changed, so the old knowledge is kept.
+    body_reuse_ids = {str(item["document_id"]) for item in plan.get("body_reuse") or []}
+    for doc_id in order:
+        acc = accs[doc_id]
+        if str(doc_id) not in body_reuse_ids or not acc["changed_inputs"]:
+            continue
+        register_compile_followup(
+            config,
+            context.book.key,
+            document_id=doc_id,
+            source_version=acc["item"].get("source_version"),
+            reason="OCR changed a body-reuse source's compile input",
+            inputs=acc["changed_inputs"],
+        )
 
     reference = {
         "schema_version": OCR_SCHEMA,
