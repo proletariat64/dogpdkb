@@ -29,8 +29,11 @@ def sync(
     environment["PYTHONPATH"] = str(ROOT / "src")
     if env:
         environment.update(env)
+    # Ticket 08 converged `dogpdkb sync` onto the unified runner. These legacy
+    # extraction/validation/recovery regressions exercise the retained
+    # deprecated compatibility executor directly; assertions are unchanged.
     return subprocess.run(
-        [sys.executable, "-m", "dogpdkb", "sync", *arguments],
+        [sys.executable, "-m", "dogpdkb.knowledge_sync", *arguments],
         cwd=ROOT,
         env=environment,
         text=True,

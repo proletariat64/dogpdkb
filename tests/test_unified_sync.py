@@ -302,26 +302,30 @@ def test_status_identifies_a_crashed_batch_as_interrupted_without_touching_it(
     assert (workspace.corpus / ".sync-state.json").read_bytes() == canonical
 
 
-def test_legacy_flags_still_reach_the_old_executors_with_a_deprecation_notice(
-    workspace: Workspace,
+def test_legacy_flags_forward_into_the_unified_runner_with_a_deprecation_notice(
+    tmp_path: Path,
 ):
-    knowledge = workspace.sync("--knowledge")
-    assert knowledge.returncode != 0
-    assert "deprecated legacy flags" in knowledge.stderr
-    assert "knowledge sync: INVALID_ARGUMENTS" in knowledge.stderr
+    # Ticket 08 convergence: the superseded approval executor and the old
+    # run_pipeline executor are no longer reachable from `dogpdkb sync`. Legacy
+    # flags are deprecated compatibility forwarding into the single unified
+    # entry, which imposes no human-approval / semantic-quality daily gate.
+    for index, flags in enumerate(
+        [["--knowledge"], ["--cutoff"], ["--resume", "--cutoff"]]
+    ):
+        workspace = Workspace(tmp_path / f"case-{index}", DOCUMENTS)
+        completed = workspace.sync(*flags, "--stop-after", "capture")
 
-    legacy = workspace.sync("--cutoff")
-    assert legacy.returncode != 0
-    assert "deprecated legacy flags" in legacy.stderr
-    assert "--cutoff" in legacy.stderr
-    assert "sync_knowledge_base.py" in legacy.stderr
-
-    boolean_resume = workspace.sync("--resume", "--cutoff")
-    assert boolean_resume.returncode != 0
-    assert "deprecated legacy flags" in boolean_resume.stderr
-    assert "--resume" in boolean_resume.stderr
-
-    assert workspace.runs() == []
+        assert completed.returncode == 0, completed.stderr
+        assert "deprecated legacy flags" in completed.stderr
+        # The old executors are not reached: no approval-argument error and no
+        # legacy run_pipeline recovery command.
+        assert "knowledge sync: INVALID_ARGUMENTS" not in completed.stderr
+        assert "sync_knowledge_base.py" not in completed.stderr
+        summary = json.loads(completed.stdout.strip().splitlines()[-1])
+        assert summary["status"] == "paused"
+        assert summary["stages"]["capture"] == "completed"
+        run_dir = workspace.only_run()
+        assert read_json(run_dir / "run.json")["schema_version"] == "unified-run-1.0"
 
 
 def test_zero_work_capture_is_skipped_and_the_batch_still_ends(tmp_path: Path):

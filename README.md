@@ -67,7 +67,9 @@ directories after each completed or partial batch. `dogpdkb status` and
 `dogpdkb anomalies` query that history read-only; `dogpdkb wash` inventories and
 migrates historical work directories without deleting them. See
 [unattended deployment](docs/unattended-sync.md) for copyable crontab and
-logrotate examples, durable locations and cleanup guarantees.
+logrotate examples, durable locations and cleanup guarantees. The
+[bounded offline UAT record](docs/unattended-sync-uat.md) exercises the unified
+entry on retained real Markdown with external-interface shims.
 
 ## mdocr — Markdown image prepare/OCR CLI
 

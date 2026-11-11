@@ -170,3 +170,15 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, PlanError, ValueError) as error:
         parser.exit(1, f"knowledge sync: {error}\n")
     return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    print(
+        "dogpdkb.knowledge_sync: deprecated legacy compatibility executor "
+        "(retained for migration only); `dogpdkb sync` now runs the unified "
+        "five-stage batch with no human-approval / semantic-quality daily gate.",
+        file=sys.stderr,
+    )
+    raise SystemExit(main())
