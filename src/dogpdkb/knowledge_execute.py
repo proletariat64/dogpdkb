@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from dogpdkb.instance_lock import subprocess_lock_options
@@ -27,6 +28,8 @@ from mdcompare.io import publish_reports, validate_outputs
 EXECUTION_SCHEMA = "knowledge-execution-1.0"
 APPROVAL_SCHEMA = "knowledge-approvals-2.0"
 QUALITY_SCHEMA = "knowledge-quality-cases-2.0"
+COMPILE_SCHEMA = "unified-compile-1.0"
+COMPILE_JOURNAL_SCHEMA = "unified-compile-journal-1.0"
 
 
 class ExecutionError(ValueError):
@@ -235,7 +238,13 @@ def _freeze_source(source: Path, destination: Path) -> None:
 
 
 def _run_graphify(
-    args: Any, phase: str, corpus: Path, manifest: Path
+    args: Any,
+    phase: str,
+    corpus: Path,
+    manifest: Path,
+    *,
+    log: Any = None,
+    partial: bool = False,
 ) -> dict[str, Any]:
     graph_dir = args.graph_dir.expanduser().resolve()
     graph_staging = args.staging.expanduser().resolve() / "graph-update"
@@ -252,25 +261,32 @@ def _run_graphify(
     # The parent executor owns canonical progress; this corpus is an isolated input.
     for name in ("DOGPDKB_RUN_CORPUS", "DOGPDKB_RUN_BOOK", "DOGPDKB_RUN_STAGING"):
         environment.pop(name, None)
+    command = [
+        str(interpreter),
+        str(script),
+        "--input",
+        str(corpus),
+        "--manifest",
+        str(manifest),
+        "--staging",
+        str(graph_staging),
+        "--graph-dir",
+        str(graph_dir),
+        phase,
+    ]
+    if partial:
+        command.append("--partial")
+    # Stream Graphify's own diagnostics straight into the stage log instead of
+    # buffering them in memory. With no log (legacy approval path) the output is
+    # captured so a failure can be reported without leaking tool noise to stdout.
+    stream_options = log.popen_kwargs() if log is not None else {"capture_output": True}
     completed = subprocess.run(
-        [
-            str(interpreter),
-            str(script),
-            "--input",
-            str(corpus),
-            "--manifest",
-            str(manifest),
-            "--staging",
-            str(graph_staging),
-            "--graph-dir",
-            str(graph_dir),
-            phase,
-        ],
+        command,
         env=environment,
         **subprocess_lock_options(),
         text=True,
-        capture_output=True,
         check=False,
+        **stream_options,
     )
     result_name = (
         "candidate-result.json" if phase == "--candidate-only" else "result.json"
@@ -284,11 +300,16 @@ def _run_graphify(
     return _read_json(result_path)
 
 
-def _validate_candidate_graph(
-    candidate_path: Path,
-    selected: list[tuple[dict[str, Any], dict[str, Any], Path]],
+def _validate_graph_records(
+    graph: dict[str, Any], current_sources: set[str], selected_ids: set[str]
 ) -> dict[str, Any]:
-    graph = _read_json(candidate_path)
+    """Artifact-level structure checks only: no semantic or quality gate.
+
+    Shared by the legacy approval path and the automatic compile stage. It proves
+    the candidate is a well-formed graph that covers every published whole source
+    and retains no stale ownership for those sources; it never judges node counts,
+    knowledge diffs or meaning.
+    """
     nodes = graph.get("nodes")
     links = graph.get("links")
     hyperedges = graph.get("hyperedges") or []
@@ -322,7 +343,6 @@ def _validate_candidate_graph(
         )
         if not isinstance(members, list) or not set(members) <= identities:
             raise ExecutionError("candidate graph contains a dangling hyperedge")
-    current_sources = {f"source-[{row['document_id']}].md" for row, _, _ in selected}
     covered = {
         str(record.get("source_file"))
         for record in [*nodes, *hyperedges]
@@ -333,7 +353,6 @@ def _validate_candidate_graph(
         raise ExecutionError(
             "candidate graph does not cover every approved full source"
         )
-    selected_ids = {str(row["document_id"]) for row, _, _ in selected}
     for record in [*nodes, *links, *hyperedges]:
         identity = doc_id(str(record.get("source_file") or ""))
         if (
@@ -344,6 +363,16 @@ def _validate_candidate_graph(
                 "candidate retained duplicate or stale source ownership"
             )
     return graph
+
+
+def _validate_candidate_graph(
+    candidate_path: Path,
+    selected: list[tuple[dict[str, Any], dict[str, Any], Path]],
+) -> dict[str, Any]:
+    graph = _read_json(candidate_path)
+    current_sources = {f"source-[{row['document_id']}].md" for row, _, _ in selected}
+    selected_ids = {str(row["document_id"]) for row, _, _ in selected}
+    return _validate_graph_records(graph, current_sources, selected_ids)
 
 
 def _record_text(record: dict[str, Any], field: str, nodes: dict[str, Any]) -> str:
@@ -971,3 +1000,282 @@ def run_execution(args: Any) -> int:
         print(f"knowledge sync: {error}", file=sys.stderr)
         return 1
     return 0
+
+
+def _compile_source_urls(old_graph: dict[str, Any]) -> dict[str, str]:
+    urls: dict[str, str] = {}
+    for record in [
+        *old_graph.get("nodes", []),
+        *old_graph.get("links", []),
+        *old_graph.get("hyperedges", []),
+    ]:
+        identity = doc_id(str(record.get("source_file") or ""))
+        url = record.get("source_url")
+        if identity and isinstance(url, str) and url:
+            urls.setdefault(identity, url)
+    return urls
+
+
+def _freeze_compile_sources(
+    items: list[dict[str, Any]],
+    raw_base: Path,
+    staging: Path,
+    source_urls: dict[str, str],
+) -> tuple[Path, dict[str, Path], list[dict[str, Any]]]:
+    """Freeze each compile item's prepared whole source into the execution corpus.
+
+    The body is the batch's actually-prepared markdown; OCR enrichment is layered
+    on by the caller before freezing. Graphify updates by complete source, so each
+    document becomes one ``source-[id].md`` whole source, never a diff fragment.
+    """
+    corpus = staging / "execution-corpus"
+    frozen: dict[str, Path] = {}
+    exported: list[dict[str, Any]] = []
+    for item in items:
+        identity = str(item["document_id"])
+        raw = _resolve_raw(item.get("raw"), raw_base)
+        if raw is None or not raw.is_file():
+            raise ExecutionError(
+                f"compile source is unavailable for document {identity}"
+            )
+        name = f"source-[{identity}].md"
+        _freeze_source(raw, corpus / name)
+        frozen[identity] = corpus / name
+        row: dict[str, Any] = {"id": item["document_id"], "file": name}
+        url = source_urls.get(identity)
+        if url:
+            row["url"] = url
+        exported.append(row)
+    return corpus, frozen, exported
+
+
+def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
+    """Automatic whole-source compile for the unified batch (ticket 06).
+
+    No human approval and no semantic quality gate: publication is bounded by
+    artifact checks (input readable, output parseable, graph structure, write
+    success). Successfully compiled whole sources are published and their success
+    version advances only after a real successful write; a source that fails
+    extraction keeps its old knowledge and old success version (partial
+    publication). Graphify's own output streams into the stage log.
+    """
+    items = plan.get("compile") or []
+    staging = context.directory
+    state_path = context.corpus / ".sync-state.json"
+    graph_dir = context.graph_dir
+    # The plan preserves the mdcompare raw references verbatim; they resolve
+    # against the mdcompare report that froze them, not against plan.json.
+    raw_base = context.require("mdcompare", "report")
+    report_path = staging / "compile-result.json"
+    args = SimpleNamespace(
+        graph_dir=graph_dir,
+        staging=staging,
+        graphify_python=context.config.graphify_python,
+    )
+    metadata_by_id = _compile_metadata(context)
+    if not items:
+        report = _compile_report(plan, [], [], {}, metadata_by_id, None)
+        publish_reports(
+            [(report_path, json.dumps(report, ensure_ascii=False, indent=1) + "\n")]
+        )
+        return report
+    if not (graph_dir / "graph.json").is_file():
+        raise ExecutionError("an existing graph baseline is required")
+    old_graph = _read_json(graph_dir / "graph.json")
+    source_urls = _compile_source_urls(old_graph)
+    corpus, frozen, exported = _freeze_compile_sources(
+        items, raw_base, staging, source_urls
+    )
+    manifest_path = staging / "execution-manifest.json"
+    publish_reports(
+        [
+            (
+                manifest_path,
+                json.dumps(
+                    {"exported": exported, "deleted": []},
+                    ensure_ascii=False,
+                    indent=1,
+                )
+                + "\n",
+            )
+        ]
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with state_lock(state_path):
+        return _execute_compile_locked(
+            context,
+            args,
+            plan,
+            items,
+            corpus,
+            frozen,
+            manifest_path,
+            state_path,
+            graph_dir,
+            metadata_by_id,
+            report_path,
+        )
+
+
+def _compile_metadata(context: Any) -> dict[str, dict[str, Any]]:
+    """Incoming metadata per document, from the mdcompare batch report."""
+    report_path = context.artifact("mdcompare", "report")
+    if report_path is None:
+        return {}
+    report = _read_json(report_path)
+    return {
+        str(row["document_id"]): row.get("metadata")
+        for row in report.get("documents", [])
+        if isinstance(row.get("metadata"), dict)
+    }
+
+
+def _execute_compile_locked(
+    context: Any,
+    args: Any,
+    plan: dict[str, Any],
+    items: list[dict[str, Any]],
+    corpus: Path,
+    frozen: dict[str, Path],
+    manifest_path: Path,
+    state_path: Path,
+    graph_dir: Path,
+    metadata_by_id: dict[str, dict[str, Any]],
+    report_path: Path,
+) -> dict[str, Any]:
+    candidate_result = _run_graphify(
+        args, "--candidate-only", corpus, manifest_path, log=context.log, partial=True
+    )
+    if candidate_result.get("status") != "candidate_ready":
+        raise ExecutionError("Graphify did not retain a validated candidate")
+    candidate = Path(candidate_result["candidate"])
+    published_sources = candidate_result.get("published_sources") or []
+    failed_sources = candidate_result.get("failed_sources") or []
+    published_ids = {doc_id(name) for name in published_sources} - {None}
+    failed_ids = {doc_id(name) for name in failed_sources} - {None}
+    current_sources = {f"source-[{identity}].md" for identity in published_ids}
+    # Artifact check only: a well-formed graph covering every published source.
+    _validate_graph_records(
+        _read_json(candidate / "graph.json"), current_sources, published_ids
+    )
+    published = _run_graphify(
+        args,
+        "--publish-validated",
+        corpus,
+        manifest_path,
+        log=context.log,
+        partial=True,
+    )
+    if published.get("status") != "completed":
+        raise ExecutionError("Graphify publication did not complete")
+    if (graph_dir / "graph.json").read_bytes() != (
+        candidate / "graph.json"
+    ).read_bytes():
+        raise ExecutionError("published graph differs from the retained candidate")
+    state = _load_state(state_path, plan["book"])
+    by_id = {str(item["document_id"]): item for item in items}
+    results: list[dict[str, Any]] = []
+    for identity in sorted(published_ids):
+        item = by_id.get(identity)
+        if item is None:
+            continue
+        record = state["documents"].setdefault(
+            identity,
+            {
+                "observation": None,
+                "corpus": {"status": "not_captured", "version": None, "raw": None},
+                "graph": {},
+                "pending": [],
+            },
+        )
+        metadata = metadata_by_id.get(identity) or {
+            "name": f"source-[{identity}].md",
+            "logical_path": "",
+            "source_ref": f"{item['book_id']}:{identity}",
+        }
+        record["graph"] = {
+            "status": "covered",
+            "coverage": "compiled_whole_document",
+            "version": item["source_version"],
+            "raw": _relative_raw(frozen[identity], state_path),
+            "content_kind": "raw",
+            "metadata": metadata,
+            "body_scope": {"version": "generated-regions-v1", "regions": []},
+        }
+        record.setdefault("steps", {})["graph_publish"] = {
+            "status": "completed",
+            "recorded_at": now_iso(),
+            "version": item["source_version"],
+        }
+        record["pending"] = [
+            reason
+            for reason in record.get("pending", [])
+            if reason not in {"GRAPH_UPDATE_REQUIRED", "GRAPH_SOURCE_NOT_REGISTERED"}
+        ]
+        results.append(
+            {
+                "book_id": item["book_id"],
+                "document_id": item["document_id"],
+                "status": "published",
+                "source_scope": "whole_document",
+                "source_version": item["source_version"],
+            }
+        )
+    save_view(state_path, state)
+    usage = candidate_result.get("usage") or {}
+    report = _compile_report(
+        plan, results, sorted(failed_ids), usage, metadata_by_id, candidate_result
+    )
+    publish_reports(
+        [(report_path, json.dumps(report, ensure_ascii=False, indent=1) + "\n")]
+    )
+    return report
+
+
+def _compile_report(
+    plan: dict[str, Any],
+    results: list[dict[str, Any]],
+    failed_ids: list[str],
+    usage: dict[str, Any],
+    metadata_by_id: dict[str, dict[str, Any]],
+    candidate_result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    items = plan.get("compile") or []
+    by_id = {str(item["document_id"]): item for item in items}
+    failed = [
+        {
+            "book_id": by_id[identity]["book_id"],
+            "document_id": by_id[identity]["document_id"],
+            "source_version": by_id[identity]["source_version"],
+            "code": "COMPILE_EXTRACTION_FAILED",
+            "reason": "Graphify extraction failed; old knowledge and version retained",
+        }
+        for identity in failed_ids
+        if identity in by_id
+    ]
+    tokens = usage.get("tokens") or {}
+    return {
+        "schema_version": COMPILE_SCHEMA,
+        "status": "partial" if failed else "completed",
+        "book": plan["book"],
+        "counts": {
+            "compile": len(items),
+            "published": len(results),
+            "failed": len(failed),
+            "external_calls": usage.get("external_calls"),
+            "cache_hits": usage.get("cache_hits", 0),
+        },
+        "results": results,
+        "failed": failed,
+        "tokens": {**tokens, "evidence": usage.get("token_evidence", "unknown")},
+        "usage": usage,
+        "transaction": (
+            {
+                "candidate": candidate_result.get("candidate"),
+                "backup": candidate_result.get("backup"),
+                "resume": "reuse_retained_candidate",
+            }
+            if candidate_result
+            else None
+        ),
+    }
