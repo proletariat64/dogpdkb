@@ -445,10 +445,19 @@ def _run_pipeline(
 
 @locked_main
 def main() -> None:
-    if "--knowledge" in sys.argv[1:]:
+    from dogpdkb.unified_sync import deprecation_notice, legacy_flags
+
+    arguments = sys.argv[1:]
+    legacy = legacy_flags(arguments)
+    if not legacy:
+        from dogpdkb.unified_sync import main as unified_main
+
+        raise SystemExit(unified_main(arguments))
+    print(deprecation_notice(legacy), file=sys.stderr)
+    if "--knowledge" in arguments:
         from dogpdkb.knowledge_sync import main as knowledge_main
 
-        raise SystemExit(knowledge_main(sys.argv[1:]))
+        raise SystemExit(knowledge_main(arguments))
     parser = argparse.ArgumentParser(description=__doc__)
     config_arguments(parser, book=True)
     parser.add_argument("-i", "--input", type=cli_path)
