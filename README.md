@@ -60,6 +60,15 @@ corpora can be registered with `dogpdkb init-state --config dogpdkb.toml --book 
 knowledge capture and planning then save each completed step in the corpus
 `.sync-state.json`. See [state, UTC+8 and single-updater behavior](docs/sync-state-design.md).
 
+The unattended batch runner `dogpdkb sync --config <file> --book <key>` executes
+capture, mdcompare, plan, ocr and compile in one run, records durable results and
+anomalies outside the cleanable wash workspace, and cleans earlier finished work
+directories after each completed or partial batch. `dogpdkb status` and
+`dogpdkb anomalies` query that history read-only; `dogpdkb wash` inventories and
+migrates historical work directories without deleting them. See
+[unattended deployment](docs/unattended-sync.md) for copyable crontab and
+logrotate examples, durable locations and cleanup guarantees.
+
 ## mdocr — Markdown image prepare/OCR CLI
 
 `mdocr` prepares images referenced by Markdown and can replace them with OCR
