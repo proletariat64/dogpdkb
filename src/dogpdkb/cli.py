@@ -56,6 +56,10 @@ def _main(argv: list[str] | None = None) -> int:
         from dogpdkb.sync_anomalies import main as anomalies_main
 
         return anomalies_main(arguments[1:])
+    if arguments and arguments[0] == "wash":
+        from dogpdkb.sync_wash import main as wash_main
+
+        return wash_main(arguments[1:])
     parser = argparse.ArgumentParser(description=__doc__, prog="dogpdkb")
     try:
         version = importlib.metadata.version("dogpdkb")
@@ -71,6 +75,10 @@ def _main(argv: list[str] | None = None) -> int:
     commands.add_parser(
         "anomalies",
         help="scan durable results/anomalies and record dispositions; use anomalies --help",
+    )
+    commands.add_parser(
+        "wash",
+        help="inventory historical wash workspaces and migrate necessary artifacts; use wash --help",
     )
     doctor = commands.add_parser("doctor", help="read-only, offline preflight checks")
     doctor.add_argument("--config", type=Path)
