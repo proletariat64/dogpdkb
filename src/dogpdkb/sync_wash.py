@@ -19,12 +19,16 @@ necessary artifacts without deleting whole directories.
 
 from __future__ import annotations
 
+import argparse
+import json
 import shutil
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from dogpdkb.instance_lock import UpdateAlreadyRunning, updater_lock
 from dogpdkb.ocr_cache import cache_root
 from dogpdkb.sync_results import (
     _slug,
@@ -35,6 +39,7 @@ from dogpdkb.sync_results import (
 )
 from dogpdkb.sync_run import (
     FINISHED_STATUSES,
+    RUN_SCHEMA,
     RunError,
     RunLayout,
     atomic_json,
@@ -45,11 +50,26 @@ from dogpdkb.sync_run import (
 from dogpdkb.sync_state import save_state, state_path
 from dogpdkb.sync_time import now_iso
 from dogpdkb.workflows.get_sync_updates import safe_diagnostic
+from mdocr.config import config_arguments, configure, configured_book
 
 CLEANUP_SCHEMA = "unified-wash-cleanup-1.0"
+INVENTORY_SCHEMA = "unified-wash-inventory-1.0"
 MIGRATION_SCHEMA = "unified-wash-migration-1.0"
 #: Provenance only: the durable copy is ``path``, so ``source`` never blocks.
 PROVENANCE_KEYS = frozenset({"source"})
+#: Records left by the superseded pipeline implementation.
+LEGACY_RECORDS = (
+    "pipeline-state.json",
+    "export-progress.json",
+    "capture-checkpoint.json",
+)
+#: Long-term originals and observation evidence that must outlive a wash run.
+ARTIFACT_GLOBS = ("**/raw/*.md", "**/snapshot.json")
+LEGACY_ANNOTATION = (
+    "paused under the superseded implementation; the unified runner has not "
+    "verified recovery - recovery requires validation of inputs and artifacts"
+)
+UNKNOWN_ANNOTATION = "unrecognized work directory; preserved for manual review"
 
 
 class WashError(ValueError):
@@ -223,14 +243,19 @@ def migrate_references(
     config: Any,
     book_key: str,
     corpus: Path,
-    directories: list[Path],
+    directory: Path,
     sweep: Sweep,
+    *,
+    artifacts: list[Path] | None = None,
+    strict: bool = True,
 ) -> bool:
-    """Copy referenced files out of wash and rewrite the records that point at them.
+    """Copy necessary files out of one wash directory and rewrite the records.
 
-    Returns False when any reference could not be made durable; the caller must
+    Returns False when a reference could not be made durable; the caller must
     then keep the directory. A directory reference (a live claim or a stage
-    workspace) cannot be migrated file-by-file and always blocks removal.
+    workspace) cannot be migrated file-by-file and blocks removal in ``strict``
+    mode; the historical migration still copies the files it can.
+    ``artifacts`` adds necessary products no record references yet.
     """
     rows = sources(config, book_key, corpus)
     unreadable = [row.name for row in rows if not row.readable]
@@ -239,12 +264,13 @@ def migrate_references(
             {"reason": "records-unreadable", "sources": sorted(set(unreadable))}
         )
         return False
-    found = references(rows, directories)
+    found = references(rows, [directory])
     blocked = [row for row in found if row.path.is_dir()]
-    if blocked:
+    if blocked and strict:
         sweep.failures.append(
             {
                 "reason": "directory-reference",
+                "run_id": directory.name,
                 "references": [
                     {"source": row.source, "field": row.field, "path": str(row.path)}
                     for row in blocked
@@ -253,32 +279,39 @@ def migrate_references(
         )
         return False
     mapping: dict[Path, Path] = {}
-    for row in found:
-        if row.path in mapping:
-            continue
-        run_dir = next(
-            directory for directory in directories if row.path.is_relative_to(directory)
+    wanted = [
+        path
+        for path in dict.fromkeys([row.path for row in found] + list(artifacts or []))
+        if path.is_file()
+    ]
+    for path in wanted:
+        reference = next((row for row in found if row.path == path), None)
+        target = migrated_root(config, book_key, directory.name) / path.relative_to(
+            directory
         )
         try:
-            mapping[row.path] = _persist(config, book_key, run_dir, row.path)
+            created = not target.is_file()
+            mapping[path] = _persist(config, book_key, directory, path)
         except (OSError, ValueError) as error:
             sweep.failures.append(
                 {
                     "reason": "migration-failed",
-                    "path": str(row.path),
+                    "run_id": directory.name,
+                    "path": str(path),
                     "detail": safe_diagnostic(error),
                 }
             )
             return False
-        sweep.migrated.append(
-            {
-                "run_id": run_dir.name,
-                "from": str(row.path),
-                "to": str(mapping[row.path]),
-                "source": row.source,
-                "field": row.field,
-            }
-        )
+        if created:
+            sweep.migrated.append(
+                {
+                    "run_id": directory.name,
+                    "from": str(path),
+                    "to": str(mapping[path]),
+                    "source": reference.source if reference else "artifact",
+                    "field": reference.field if reference else None,
+                }
+            )
     if not mapping:
         return True
     for row in rows:
@@ -372,12 +405,6 @@ def cleanup_wash(
             sweep.runs.append(row)
         else:
             removable.append(layout)
-    directories = [layout.root for layout in removable]
-    ready = (
-        migrate_references(config, book_key, corpus, directories, sweep)
-        if directories
-        else True
-    )
     for layout in removable:
         row = {
             "run_id": layout.run_id,
@@ -386,6 +413,7 @@ def cleanup_wash(
             "action": "kept",
             "reason": "necessary references are not durable yet",
         }
+        ready = migrate_references(config, book_key, corpus, layout.root, sweep)
         remaining = references(sources(config, book_key, corpus), [layout.root])
         if ready and not remaining:
             try:
@@ -426,19 +454,303 @@ def cleanup_wash(
     return record
 
 
+def work_dirs(config: Any, book_key: str) -> list[Path]:
+    """Every wash work directory of one book, including historical layouts."""
+    root = Path(config.staging) / book_key
+    if not root.is_dir():
+        return []
+    return sorted(
+        path.resolve()
+        for path in root.iterdir()
+        if path.is_dir() and not path.is_symlink()
+    )
+
+
+def classify(directory: Path) -> dict[str, Any]:
+    """Which implementation owns a work directory, and whether resume is proven.
+
+    Only the current runner's own ``unified-run-1.0`` records are resumable by
+    the unified runner (which re-validates artifacts on resume). A directory
+    from the superseded pipeline is never assumed recoverable: recovery requires
+    validation first.
+    """
+    state_file = directory / "run.json"
+    if state_file.is_file():
+        try:
+            payload = read_json(state_file)
+        except RunError:
+            payload = None
+        if isinstance(payload, dict) and payload.get("schema_version") == RUN_SCHEMA:
+            status, _ = observed_status(payload)
+            return {
+                "kind": "unified",
+                "status": status,
+                "resume_verified": True,
+                "annotation": None,
+            }
+    records = [name for name in LEGACY_RECORDS if (directory / name).is_file()]
+    if records:
+        status = "unknown"
+        legacy_state = directory / "pipeline-state.json"
+        if legacy_state.is_file():
+            try:
+                payload = read_json(legacy_state)
+                status = str(payload.get("status") or "unknown")
+            except RunError:
+                status = "unreadable"
+        return {
+            "kind": "legacy",
+            "status": status,
+            "resume_verified": False,
+            "annotation": LEGACY_ANNOTATION,
+            "records": records,
+        }
+    return {
+        "kind": "unknown",
+        "status": "unknown",
+        "resume_verified": False,
+        "annotation": UNKNOWN_ANNOTATION,
+    }
+
+
+def necessary_artifacts(directory: Path) -> list[Path]:
+    """Long-term originals, observation evidence and legacy recovery records."""
+    found: set[Path] = set()
+    for pattern in ARTIFACT_GLOBS:
+        found.update(
+            path.resolve() for path in directory.glob(pattern) if path.is_file()
+        )
+    for name in LEGACY_RECORDS:
+        path = directory / name
+        if path.is_file():
+            found.add(path.resolve())
+    return sorted(found)
+
+
+def _run_row(
+    config: Any,
+    book_key: str,
+    directory: Path,
+    rows: list[Source],
+) -> dict[str, Any]:
+    info = classify(directory)
+    found = references(rows, [directory])
+    artifacts = necessary_artifacts(directory)
+    archived = run_result_path(config, book_key, directory.name).is_file()
+    if (
+        info["kind"] == "unified"
+        and info["status"] in FINISHED_STATUSES
+        and archived
+        and not found
+    ):
+        action = "cleanable"
+        reason = "finished batch; automatic cleanup may remove it"
+    elif found or artifacts:
+        action = "migrate"
+        reason = "necessary artifacts or references still live only in wash"
+    else:
+        action = "preserve"
+        reason = "no necessary artifact found; kept for review"
+    return {
+        "run_id": directory.name,
+        "run_dir": str(directory),
+        **info,
+        "result_archived": archived,
+        "references": [
+            {"source": row.source, "field": row.field, "path": str(row.path)}
+            for row in found
+        ],
+        "necessary_artifacts": [str(path) for path in artifacts],
+        "action": action,
+        "reason": reason,
+    }
+
+
+def inventory(config: Any, book_key: str, *, corpus: Path) -> dict[str, Any]:
+    """Read-only first tidy: enumerate work directories, references and artifacts."""
+    rows = sources(config, book_key, corpus)
+    runs = [
+        _run_row(config, book_key, directory, rows)
+        for directory in work_dirs(config, book_key)
+    ]
+    counts = {
+        "runs": len(runs),
+        "unified": sum(1 for row in runs if row["kind"] == "unified"),
+        "legacy": sum(1 for row in runs if row["kind"] == "legacy"),
+        "unknown": sum(1 for row in runs if row["kind"] == "unknown"),
+        "references": sum(len(row["references"]) for row in runs),
+        "necessary_artifacts": sum(len(row["necessary_artifacts"]) for row in runs),
+        "cleanable": sum(1 for row in runs if row["action"] == "cleanable"),
+        "migrate": sum(1 for row in runs if row["action"] == "migrate"),
+    }
+    return {
+        "schema_version": INVENTORY_SCHEMA,
+        "book_key": book_key,
+        "staging": str(Path(config.staging)),
+        "results_dir": str(results_root(config, book_key)),
+        "counts": counts,
+        "runs": runs,
+    }
+
+
+def migrate_wash(config: Any, book_key: str, *, corpus: Path) -> dict[str, Any]:
+    """Persist necessary artifacts and rewrite old references; delete nothing.
+
+    Historical directories keep all their evidence. A legacy or unrecognized run
+    is annotated in place so nobody assumes the unified runner can resume it.
+    Repeating the migration copies nothing new (byte comparison, no fingerprint).
+    """
+    sweep = Sweep()
+    rows = []
+    for directory in work_dirs(config, book_key):
+        info = classify(directory)
+        artifacts = necessary_artifacts(directory)
+        before = len(sweep.migrated)
+        durable = migrate_references(
+            config,
+            book_key,
+            corpus,
+            directory,
+            sweep,
+            artifacts=artifacts,
+            strict=False,
+        )
+        row = {
+            "run_id": directory.name,
+            "run_dir": str(directory),
+            **info,
+            "references_migrated": durable,
+            "artifacts": [
+                {
+                    "from": str(path),
+                    "to": str(
+                        migrated_root(config, book_key, directory.name)
+                        / path.relative_to(directory)
+                    ),
+                }
+                for path in artifacts
+            ],
+            "migrated": sweep.migrated[before:],
+        }
+        if info["kind"] != "unified":
+            annotation = {
+                "schema_version": MIGRATION_SCHEMA,
+                "run_id": directory.name,
+                "kind": info["kind"],
+                "status": info["status"],
+                "resume_verified": False,
+                "annotation": info["annotation"],
+                "migrated_at": now_iso(),
+                "artifacts": row["artifacts"],
+            }
+            try:
+                atomic_json(directory / "wash-migration.json", annotation)
+            except (OSError, ValueError) as error:
+                sweep.failures.append(
+                    {
+                        "reason": "annotation-failed",
+                        "run_id": directory.name,
+                        "detail": safe_diagnostic(error),
+                    }
+                )
+        rows.append(row)
+    manifest = {
+        "schema_version": MIGRATION_SCHEMA,
+        "book_key": book_key,
+        "staging": str(Path(config.staging)),
+        "results_dir": str(results_root(config, book_key)),
+        "updated_at": now_iso(),
+        "counts": {
+            "runs": len(rows),
+            "migrated": len(sweep.migrated),
+            "failures": len(sweep.failures),
+        },
+        "runs": rows,
+        "migrated": sweep.migrated,
+        "failures": sweep.failures,
+    }
+    atomic_json(migration_record_path(config, book_key), manifest)
+    return manifest
+
+
+def report(view: dict[str, Any]) -> str:
+    """Human-readable inventory/migration summary; no document bodies."""
+    counts = view["counts"]
+    lines = [f"book {view['book_key']} staging {view['staging']}"]
+    lines.append(" ".join(f"{key}={value}" for key, value in counts.items()))
+    for row in view["runs"]:
+        lines.append(
+            f"  {row['run_id']} {row['kind']} {row['status']} "
+            f"action={row['action']} references={len(row['references'])} "
+            f"artifacts={len(row['necessary_artifacts'])}"
+        )
+        if row.get("annotation"):
+            lines.append(f"    {row['annotation']}")
+    for row in view.get("failures", []):
+        lines.append(f"  deferred: {safe_diagnostic(row)}")
+    return "\n".join(lines)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="dogpdkb wash",
+        description=(
+            "Inventory historical wash work directories and migrate necessary "
+            "artifacts into the durable results store. Never deletes a directory."
+        ),
+    )
+    config_arguments(parser, book=True)
+    parser.add_argument("--json", action="store_true", help="machine-readable report")
+    parser.add_argument(
+        "--migrate",
+        action="store_true",
+        help="copy necessary artifacts and rewrite old references (no deletion)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    args = parser.parse_args(arguments)
+    config = configure(parser, args.config)
+    book = configured_book(parser, config, args)
+    try:
+        if args.migrate:
+            with updater_lock():
+                view = migrate_wash(config, book.key, corpus=book.corpus)
+        else:
+            view = inventory(config, book.key, corpus=book.corpus)
+    except UpdateAlreadyRunning as error:
+        parser.exit(1, f"dogpdkb wash: {error}\n")
+    except (WashError, RunError, OSError, ValueError) as error:
+        parser.exit(1, f"dogpdkb wash: {safe_diagnostic(error)}\n")
+    print(json.dumps(view, ensure_ascii=False) if args.json else report(view))
+    return 0
+
+
 __all__ = [
     "CLEANUP_SCHEMA",
+    "INVENTORY_SCHEMA",
     "MIGRATION_SCHEMA",
     "Reference",
     "Source",
     "Sweep",
     "WashError",
+    "build_parser",
+    "classify",
     "cleanup_record_path",
     "cleanup_wash",
+    "inventory",
+    "main",
     "migrate_references",
+    "migrate_wash",
     "migrated_root",
     "migration_record_path",
+    "necessary_artifacts",
     "references",
+    "report",
     "run_status",
     "sources",
+    "work_dirs",
 ]

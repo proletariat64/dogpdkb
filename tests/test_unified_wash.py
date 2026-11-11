@@ -410,6 +410,6 @@ def test_wash_migrate_persists_necessary_artifacts_and_rewrites_old_references(
     assert again.returncode == 0, again.stderr
     assert json.loads(again.stdout)["counts"]["migrated"] == 0
     assert durable.read_bytes() == expected
-    assert read_json(workspace.corpus / ".sync-state.json")["books"]["fund"]["documents"][
-        "1"
-    ]["steps"]["download"]["raw"]["path"] == str(durable)
+    assert read_json(workspace.corpus / ".sync-state.json")["books"]["fund"][
+        "documents"
+    ]["1"]["steps"]["download"]["raw"]["path"] == str(durable)
