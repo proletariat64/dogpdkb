@@ -28,6 +28,44 @@ _REQUEST_RETRIES = 3
 _RETRY_DELAY = 2
 
 
+class OcrSharedError(RuntimeError):
+    """A shared cause (auth/quota) that should stop the whole batch's OCR.
+
+    Subclasses RuntimeError so existing per-image handlers keep working; the OCR
+    stage catches it specifically to stop the batch and record one batch cause
+    instead of retrying every remaining image against the same exhausted token
+    or quota. ``code`` is the stable anomaly/batch-cause code.
+    """
+
+    code = "OCR_SHARED_UNAVAILABLE"
+
+    def __init__(self, message: str, *, code: str | None = None):
+        super().__init__(message)
+        if code is not None:
+            self.code = code
+
+
+class OcrAuthError(OcrSharedError):
+    """The token is missing, rejected or expired (HTTP 401)."""
+
+    code = "OCR_AUTH_UNAVAILABLE"
+
+
+class OcrQuotaError(OcrSharedError):
+    """The shared quota/rate allowance is exhausted (HTTP 403/429)."""
+
+    code = "OCR_QUOTA_EXHAUSTED"
+
+
+def _ocr_error(status: int | None, message: str) -> RuntimeError:
+    """Classify a terminal request failure into a shared or generic error."""
+    if status == 401:
+        return OcrAuthError(message)
+    if status in (403, 429):
+        return OcrQuotaError(message)
+    return RuntimeError(message)
+
+
 def _text_only(markdown: str) -> str:
     """Remove image embeds emitted by PaddleOCR while retaining useful labels."""
 
@@ -93,18 +131,23 @@ class PaddleClient:
         delay = _RETRY_DELAY
         retries = _REQUEST_RETRIES if max_retries is None else max_retries
         for attempt in range(retries + 1):
+            status = None
             try:
                 response = self.session.request(
                     method, url, timeout=_REQUEST_TIMEOUT, **kwargs
                 )
-                if response.status_code not in _TRANSIENT_STATUS:
+                status = response.status_code
+                if status not in _TRANSIENT_STATUS:
                     response.raise_for_status()
                     return response
-                error = f"HTTP {response.status_code}: {response.text[:300]}"
+                error = f"HTTP {status}: {response.text[:300]}"
             except requests.RequestException as exc:
                 error = str(exc)
+                resp = getattr(exc, "response", None)
+                if resp is not None:
+                    status = getattr(resp, "status_code", status)
             if attempt >= retries:
-                raise RuntimeError(error)
+                raise _ocr_error(status, error)
             time.sleep(delay * (2**attempt))
         raise AssertionError("unreachable")
 

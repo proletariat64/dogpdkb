@@ -37,7 +37,7 @@ from dogpdkb.workflows.get_sync_updates import safe_diagnostic
 from mdcompare.io import publish_reports
 from mdocr.markdown import ImageRef
 from mdocr.ocr import build_ocr_block
-from mdocr.paddle import PaddleClient
+from mdocr.paddle import OcrAuthError, OcrSharedError, PaddleClient
 from mdocr.prepare import DOWNLOAD_TIMEOUT, ImageError, ImageSkip, prepare_one
 
 OCR_SCHEMA = "unified-ocr-1.0"
@@ -125,104 +125,154 @@ def handle(context: StageContext) -> StageResult:
     root = cache_root(config, context.book.key)
     deadline = time.monotonic() + float(config.ocr_budget_seconds)
 
-    counts = {"total": 0, "success": 0, "reused": 0, "failed": 0, "unattempted": 0}
-    documents: list[dict[str, Any]] = []
-    anomalies: list[dict[str, Any]] = []
+    # Per-document accumulators, in plan order, so the reference keeps a row for
+    # every planned document even when none of its images could be recognized.
+    accs: dict[Any, dict[str, Any]] = {}
+    order: list[Any] = []
+    for item in items:
+        doc_id = item["document_id"]
+        if doc_id not in accs:
+            accs[doc_id] = {
+                "item": item,
+                "images": [],
+                "final_inputs": [],
+                "missing": [],
+            }
+            order.append(doc_id)
+    work = [
+        (item, resource)
+        for item in items
+        for resource in (item.get("resources") or [])
+        if resource.get("kind") == "image"
+    ]
+
+    counts = {
+        "total": len(work),
+        "success": 0,
+        "reused": 0,
+        "failed": 0,
+        "unattempted": 0,
+    }
+    fail_anomalies: list[dict[str, Any]] = []
+    stop_anomalies: list[dict[str, Any]] = []
+    batch_cause: dict[str, Any] | None = None
+    stop_index = len(work)
     token = os.environ.get("PADDLEOCR_TOKEN", "").strip()
     session = requests.Session()
     client = PaddleClient(token, session=session) if token else None
 
-    for item in items:
-        doc_id = item["document_id"]
-        version = item.get("source_version")
-        images: list[dict[str, Any]] = []
-        final_inputs: list[dict[str, Any]] = []
-        missing: list[dict[str, Any]] = []
-        for resource in item.get("resources") or []:
-            if resource.get("kind") != "image":
-                continue
-            counts["total"] += 1
-            resource_id = resource["resource_id"]
-            if time.monotonic() >= deadline or client is None:
-                counts["unattempted"] += 1
-                missing.append(
-                    {
-                        "kind": "ocr_artifact",
-                        "resource_id": resource_id,
-                        "code": "OCR_BUDGET_EXHAUSTED"
-                        if client
-                        else "OCR_AUTH_UNAVAILABLE",
-                        "reason": "OCR not attempted",
-                    }
-                )
-                anomalies.append(
-                    _anomaly(item, resource, "OCR_UNATTEMPTED", "OCR not attempted")
-                )
-                continue
-            try:
-                data, name = _original_bytes(resource, session)
-                prepared_path, prepared_bytes = _prepare(context, doc_id, data, name)
-                key = prepared_path.stem
-                record = verify_reuse(
+    for index, (item, resource) in enumerate(work):
+        acc = accs[item["document_id"]]
+        resource_id = resource["resource_id"]
+        if time.monotonic() >= deadline:
+            batch_cause = {
+                "stage": "ocr",
+                "code": "OCR_BUDGET_EXHAUSTED",
+                "reason": "OCR time budget exhausted",
+            }
+            stop_index = index
+            break
+        try:
+            data, name = _original_bytes(resource, session)
+            prepared_path, prepared_bytes = _prepare(
+                context, item["document_id"], data, name
+            )
+            key = prepared_path.stem
+            record = verify_reuse(
+                root,
+                key,
+                resource_id=resource_id,
+                original_bytes=data,
+                prepared_bytes=prepared_bytes,
+            )
+            reused = record is not None
+            if not reused:
+                if client is None:
+                    raise OcrAuthError("PADDLEOCR_TOKEN is not available")
+                markdown = client.convert(prepared_path)
+                if not markdown.strip():
+                    raise ImageError("OCR result was blank")
+                artifact_text = build_ocr_block("prepared.jpg", markdown)
+                record = persist_success(
                     root,
                     key,
                     resource_id=resource_id,
+                    original_name="original" + (Path(name).suffix or ".png"),
                     original_bytes=data,
                     prepared_bytes=prepared_bytes,
+                    artifact_text=artifact_text,
                 )
-                reused = record is not None
-                if not reused:
-                    markdown = client.convert(prepared_path)
-                    if not markdown.strip():
-                        raise ImageError("OCR result was blank")
-                    artifact_text = build_ocr_block("prepared.jpg", markdown)
-                    record = persist_success(
-                        root,
-                        key,
-                        resource_id=resource_id,
-                        original_name="original" + (Path(name).suffix or ".png"),
-                        original_bytes=data,
-                        prepared_bytes=prepared_bytes,
-                        artifact_text=artifact_text,
-                    )
-            except (ImageError, ImageSkip, OSError, RuntimeError, ValueError) as error:
-                counts["failed"] += 1
-                reason = safe_diagnostic(error)
-                missing.append(
-                    {
-                        "kind": "ocr_artifact",
-                        "resource_id": resource_id,
-                        "code": "OCR_FAILED",
-                        "reason": reason,
-                    }
-                )
-                anomalies.append(_anomaly(item, resource, "OCR_FAILED", reason))
-                context.log.write(f"ocr failed for {resource_id}: {reason}")
-                continue
-            counts["reused" if reused else "success"] += 1
-            images.append(record)
-            final_inputs.append(
+        except OcrSharedError as error:
+            # A shared auth/quota cause stops the batch's remaining OCR.
+            batch_cause = {
+                "stage": "ocr",
+                "code": error.code,
+                "reason": safe_diagnostic(error),
+            }
+            stop_index = index
+            context.log.write(f"ocr batch stopped: {error.code}")
+            break
+        except (ImageError, ImageSkip, OSError, RuntimeError, ValueError) as error:
+            counts["failed"] += 1
+            reason = safe_diagnostic(error)
+            acc["missing"].append(
                 {
                     "kind": "ocr_artifact",
                     "resource_id": resource_id,
-                    "path": record["artifact"],
+                    "code": "OCR_FAILED",
+                    "reason": reason,
                 }
             )
+            fail_anomalies.append(_anomaly(item, resource, "OCR_FAILED", reason))
+            context.log.write(f"ocr failed for {resource_id}: {reason}")
             context.count(**counts)
-        documents.append(
+            continue
+        counts["reused" if reused else "success"] += 1
+        acc["images"].append(record)
+        acc["final_inputs"].append(
             {
-                "book_id": item.get("book_id"),
-                "document_id": doc_id,
-                "source_version": version,
-                "ocr": document_evidence(images),
-                "execution": {
-                    "final_inputs": final_inputs,
-                    "missing_items": missing,
-                    "completed_at": now_iso(),
-                    "status": "completed" if not missing else "partial",
-                },
+                "kind": "ocr_artifact",
+                "resource_id": resource_id,
+                "path": record["artifact"],
             }
         )
+        context.count(**counts)
+
+    # Everything from the stop onward was not executed: archive it as unfinished
+    # under one shared batch cause, never counted as success.
+    if batch_cause is not None:
+        for index in range(stop_index, len(work)):
+            item, resource = work[index]
+            acc = accs[item["document_id"]]
+            counts["unattempted"] += 1
+            acc["missing"].append(
+                {
+                    "kind": "ocr_artifact",
+                    "resource_id": resource["resource_id"],
+                    "code": batch_cause["code"],
+                    "reason": batch_cause["reason"],
+                }
+            )
+            stop_anomalies.append(
+                _anomaly(item, resource, batch_cause["code"], batch_cause["reason"])
+            )
+        context.count(**counts)
+
+    documents = [
+        {
+            "book_id": accs[doc_id]["item"].get("book_id"),
+            "document_id": doc_id,
+            "source_version": accs[doc_id]["item"].get("source_version"),
+            "ocr": document_evidence(accs[doc_id]["images"]),
+            "execution": {
+                "final_inputs": accs[doc_id]["final_inputs"],
+                "missing_items": accs[doc_id]["missing"],
+                "completed_at": now_iso(),
+                "status": "completed" if not accs[doc_id]["missing"] else "partial",
+            },
+        }
+        for doc_id in order
+    ]
 
     if documents:
         state_path = context.corpus / ".sync-state.json"
@@ -241,6 +291,8 @@ def handle(context: StageContext) -> StageResult:
         "documents": documents,
         "counts": dict(counts),
     }
+    if batch_cause is not None:
+        reference["batch_cause"] = dict(batch_cause)
     reference_path = context.directory / "ocr.json"
     reference_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     publish_reports(
@@ -248,12 +300,16 @@ def handle(context: StageContext) -> StageResult:
     )
 
     archived: list[dict[str, Any]] = []
-    if anomalies:
-        try:
-            archived = archive_anomalies(context, anomalies)
-        except (OSError, ValueError) as error:
-            context.log.write(f"anomaly archiving failed: {safe_diagnostic(error)}")
-            archived = anomalies
+    try:
+        if fail_anomalies:
+            archived += archive_anomalies(context, fail_anomalies)
+        if stop_anomalies:
+            archived += archive_anomalies(
+                context, stop_anomalies, batch_cause=batch_cause
+            )
+    except (OSError, ValueError) as error:
+        context.log.write(f"anomaly archiving failed: {safe_diagnostic(error)}")
+        archived = fail_anomalies + stop_anomalies
 
     status = "completed"
     if counts["total"] == 0:

@@ -22,9 +22,10 @@ ROOT = Path(__file__).resolve().parents[1]
 OCR_SCHEMA = "unified-ocr-1.0"
 CONTRACT = "prepared-jpeg-ocr-v1"
 IMAGE_URL = "https://cdn.example.invalid/a.png"
+SECOND_IMAGE_URL = "https://cdn.example.invalid/b.png"
 
 
-def _shim_source(log_path: Path, mode: str, image_file: Path) -> str:
+def _shim_source(log_path: Path, mode: str, image_file: Path, primary_url: str) -> str:
     """A sitecustomize that doubles requests.Session for images + PaddleOCR."""
     return f"""
 import io, json, time
@@ -35,10 +36,16 @@ from PIL import Image
 LOG = {str(log_path)!r}
 MODE = {mode!r}
 IMAGE_FILE = {str(image_file)!r}
+PRIMARY_URL = {primary_url!r}
 
-def _png():
-    with open(IMAGE_FILE, "rb") as stream:
-        return stream.read()
+def _png(url):
+    if url == PRIMARY_URL:
+        with open(IMAGE_FILE, "rb") as stream:
+            return stream.read()
+    seed = sum(url.encode()) % 256
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8), (seed, 90, 90)).save(buf, format="PNG")
+    return buf.getvalue()
 
 class Resp:
     def __init__(self, status_code=200, json_data=None, text="", content=b""):
@@ -70,16 +77,18 @@ def _handle(method, url, **kwargs):
                 return Resp(status_code=401, text="unauthorized")
             if MODE == "quota":
                 return Resp(status_code=403, text="quota exhausted")
-            return Resp(json_data={{"data": {{"jobId": "job-1"}}}})
+            fname = kwargs.get("files", {{}}).get("file", ("job",))[0]
+            job = "job-b" if fname.startswith("b") else "job-a"
+            return Resp(json_data={{"data": {{"jobId": job}}}})
         if method == "GET" and "/jobs/" in url:
-            if MODE == "fail":
+            if MODE == "fail" or (MODE == "isolation" and url.endswith("job-b")):
                 return Resp(json_data={{"data": {{"state": "failed", "errorMsg": "boom"}}}})
             return Resp(json_data={{"data": {{"state": "done",
                 "resultUrl": {{"jsonUrl": "https://example.com/result.jsonl"}}}}}})
         raise AssertionError(url)
     if url.startswith("https://cdn.example.invalid/"):
         _record("IMG " + url)
-        return Resp(content=_png())
+        return Resp(content=_png(url))
     raise AssertionError(f"unexpected {{method}} {{url}}")
 
 def _request(self, method, url, **kwargs):
@@ -94,21 +103,29 @@ requests.Session.get = _get
 
 
 class OcrWorkspace(Workspace):
-    """A Workspace whose doc 2 carries one image and whose OCR boundary is doubled."""
+    """A Workspace whose doc 2 carries images and whose OCR boundary is doubled."""
 
     def __init__(
-        self, tmp_path: Path, *, mode: str = "success", image_url: str = IMAGE_URL
+        self,
+        tmp_path: Path,
+        *,
+        mode: str = "success",
+        image_url: str = IMAGE_URL,
+        image_urls: list[str] | None = None,
+        budget_seconds: float | None = None,
     ):
         super().__init__(tmp_path, DOCUMENTS)
         self.mode = mode
         self.image_url = image_url
+        self.image_urls = image_urls or [image_url]
         self.ocr_log = tmp_path / "ocr-calls.log"
         self.ocr_cache = tmp_path / "ocr-cache"
         self.image_file = tmp_path / "serve-image.png"
         self.write_image(200)
-        # Give doc 2 an image so the plan produces an OCR work item.
+        # Give doc 2 images so the plan produces OCR work items.
         remote = read_json(tmp_path / "remote.json")
-        remote["details"]["2"]["body"] = f"body 2\n\n![img]({image_url})\n"
+        embeds = "\n".join(f"![img]({url})" for url in self.image_urls)
+        remote["details"]["2"]["body"] = f"body 2\n\n{embeds}\n"
         write_json(tmp_path / "remote.json", remote)
         # Persist the cache outside wash via the config system.
         self.config.write_text(
@@ -117,10 +134,17 @@ class OcrWorkspace(Workspace):
             ),
             encoding="utf-8",
         )
+        if budget_seconds is not None:
+            self.config.write_text(
+                self.config.read_text(encoding="utf-8")
+                + f"\n[ocr]\nbudget_seconds={budget_seconds}\n",
+                encoding="utf-8",
+            )
         shim = tmp_path / "python-shim"
         shim.mkdir()
         (shim / "sitecustomize.py").write_text(
-            _shim_source(self.ocr_log, mode, self.image_file), encoding="utf-8"
+            _shim_source(self.ocr_log, mode, self.image_file, self.image_url),
+            encoding="utf-8",
         )
         self.env["PYTHONPATH"] = os.pathsep.join([str(shim), str(ROOT / "src")])
         self.env["PADDLEOCR_TOKEN"] = "test-token"
@@ -149,7 +173,8 @@ class OcrWorkspace(Workspace):
         self.mode = mode
         shim = self.root / "python-shim" / "sitecustomize.py"
         shim.write_text(
-            _shim_source(self.ocr_log, mode, self.image_file), encoding="utf-8"
+            _shim_source(self.ocr_log, mode, self.image_file, self.image_url),
+            encoding="utf-8",
         )
 
     def latest_run(self) -> Path:
@@ -160,6 +185,9 @@ class OcrWorkspace(Workspace):
 
     def ocr_envelope(self, run: Path | None = None) -> dict[str, Any]:
         return read_json((run or self.only_run()) / "ocr" / "result.json")
+
+    def registry(self) -> dict[str, Any]:
+        return read_json(self.root / "sync-results" / "fund" / "anomalies.json")
 
 
 @pytest.fixture
@@ -278,3 +306,112 @@ def test_a_blank_result_never_overwrites_a_cached_success(
     still = sorted(ocr_workspace.ocr_cache.glob("fund/*/artifact.md"))
     assert len(still) == 1
     assert still[0].read_text(encoding="utf-8") == before
+
+
+def test_a_single_image_failure_is_recorded_and_the_others_continue(tmp_path: Path):
+    workspace = OcrWorkspace(
+        tmp_path, mode="isolation", image_urls=[IMAGE_URL, SECOND_IMAGE_URL]
+    )
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+
+    envelope = workspace.ocr_envelope()
+    assert envelope["status"] == "partial"
+    counts = envelope["counts"]
+    assert counts["total"] == 2
+    assert counts["success"] == 1
+    assert counts["failed"] == 1
+    assert counts["unattempted"] == 0
+    # Both images were attempted; the failure did not stop the batch.
+    assert workspace.submissions() == 2
+
+    reference = workspace.ocr_reference()
+    row = next(r for r in reference["documents"] if r["document_id"] == 2)
+    assert len(row["ocr"]["images"]) == 1
+    assert row["ocr"]["images"][0]["resource_id"] == IMAGE_URL
+    missing = row["execution"]["missing_items"]
+    assert [m["resource_id"] for m in missing] == [SECOND_IMAGE_URL]
+
+    failures = [
+        a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == "OCR_FAILED"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["resource_id"] == SECOND_IMAGE_URL
+
+
+def _batch_stop_assertions(workspace: OcrWorkspace, code: str) -> None:
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+    envelope = workspace.ocr_envelope()
+    assert envelope["status"] == "partial"
+    counts = envelope["counts"]
+    assert counts["total"] == 2
+    assert counts["success"] == 0
+    assert counts["reused"] == 0
+    assert counts["failed"] == 0
+    # The shared cause stops the batch: nothing executed is counted success.
+    assert counts["unattempted"] == 2
+    # Only the triggering submission was sent; the remaining image was not.
+    assert workspace.submissions() == 1
+
+    registry = workspace.registry()
+    causes = list(registry["batch_causes"].values())
+    assert len(causes) == 1
+    assert causes[0]["code"] == code
+    assert causes[0]["stage"] == "ocr"
+    assert len(causes[0]["anomaly_ids"]) == 2
+    affected = [
+        a
+        for a in registry["anomalies"].values()
+        if a.get("batch_cause") == causes[0]["id"]
+    ]
+    assert len(affected) == 2
+    assert {a["resource_id"] for a in affected} == {IMAGE_URL, SECOND_IMAGE_URL}
+
+
+def test_auth_unavailable_stops_the_whole_batch(tmp_path: Path):
+    workspace = OcrWorkspace(
+        tmp_path, mode="auth", image_urls=[IMAGE_URL, SECOND_IMAGE_URL]
+    )
+    _batch_stop_assertions(workspace, "OCR_AUTH_UNAVAILABLE")
+
+
+def test_quota_exhaustion_stops_the_whole_batch(tmp_path: Path):
+    workspace = OcrWorkspace(
+        tmp_path, mode="quota", image_urls=[IMAGE_URL, SECOND_IMAGE_URL]
+    )
+    _batch_stop_assertions(workspace, "OCR_QUOTA_EXHAUSTED")
+
+
+def test_budget_exhaustion_archives_unfinished_and_proceeds_to_compile(tmp_path: Path):
+    workspace = OcrWorkspace(
+        tmp_path,
+        image_urls=[IMAGE_URL, SECOND_IMAGE_URL],
+        budget_seconds=0,
+    )
+    # A full sync reaches compile (still unregistered) even though OCR ran out of
+    # budget: OCR completion is never a prerequisite for compile.
+    completed = workspace.sync()
+    summary = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert summary["stages"]["ocr"] == "partial"
+    assert summary["stages"]["compile"] == "failed"
+
+    envelope = workspace.ocr_envelope()
+    counts = envelope["counts"]
+    assert counts["total"] == 2
+    assert counts["success"] == 0
+    assert counts["reused"] == 0
+    assert counts["unattempted"] == 2
+    assert workspace.submissions() == 0
+
+    causes = list(workspace.registry()["batch_causes"].values())
+    assert len(causes) == 1
+    assert causes[0]["code"] == "OCR_BUDGET_EXHAUSTED"
+    assert len(causes[0]["anomaly_ids"]) == 2
+    # The reference still lists the document and its unrecognized images.
+    row = next(
+        r for r in workspace.ocr_reference()["documents"] if r["document_id"] == 2
+    )
+    assert len(row["execution"]["missing_items"]) == 2
