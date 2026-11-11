@@ -413,3 +413,138 @@ def test_wash_migrate_persists_necessary_artifacts_and_rewrites_old_references(
     assert read_json(workspace.corpus / ".sync-state.json")["books"]["fund"][
         "documents"
     ]["1"]["steps"]["download"]["raw"]["path"] == str(durable)
+
+
+def make_capture_anomaly(workspace: Workspace) -> None:
+    """doc 2 detail is newer than its listing: a capture anomaly with raw present."""
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["2"]["content_updated_at"] = "2026-11-10T12:00:00+08:00"
+    write_json(workspace.root / "remote.json", remote)
+
+
+def only_anomaly(workspace: Workspace) -> dict[str, Any]:
+    registry = read_json(workspace.results / "anomalies.json")
+    records = registry["anomalies"]
+    assert len(records) == 1, records
+    return next(iter(records.values()))
+
+
+def cache_entry(workspace: Workspace, key: str = "image-0123456789abcdef") -> Path:
+    """A constructed long-term OCR cache entry, independent of wash."""
+    entry = workspace.ocr_cache / key
+    entry.mkdir(parents=True)
+    (entry / "artifact.md").write_text("OCR TEXT durable\n", encoding="utf-8")
+    write_json(
+        entry / "evidence.json",
+        {
+            "contract": "prepared-jpeg-ocr-v1",
+            "images": [
+                {
+                    "resource_id": "https://example.invalid/a.png",
+                    "source_path": str(entry / "original.png"),
+                    "prepared_image": str(entry / "prepared.jpg"),
+                    "artifact": str(entry / "artifact.md"),
+                    "status": "success",
+                }
+            ],
+        },
+    )
+    return entry
+
+
+def test_archived_anomaly_inputs_and_ocr_cache_survive_cleanup(
+    workspace: Workspace,
+):
+    make_capture_anomaly(workspace)
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    assert json.loads(first.stdout.strip().splitlines()[-1])["status"] == "partial"
+    run = workspace.only_run()
+    record = only_anomaly(workspace)
+    snapshot = read_json(run / "capture" / "snapshot.json")
+    raw = (run / "capture" / snapshot["exports"]["2"]["raw"]["path"]).resolve()
+    expected = raw.read_bytes()
+    entry = cache_entry(workspace)
+    cache_before = {
+        path: path.read_bytes() for path in sorted(entry.rglob("*")) if path.is_file()
+    }
+
+    # The next finished batch cleans the anomaly's own work directory. A newer
+    # consistent remote version takes part in daily sync; the archived anomaly
+    # stays handed off for its own version.
+    remote = read_json(workspace.root / "remote.json")
+    stamp = "2026-11-11T10:00:00+08:00"
+    remote["documents"][1]["content_updated_at"] = stamp
+    remote["details"]["2"] = {"id": 2, "body": "body 2 v2", "content_updated_at": stamp}
+    write_json(workspace.root / "remote.json", remote)
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    assert not run.exists()
+    assert actions(workspace)[run.name] == "removed"
+
+    shown = workspace.cli(
+        "anomalies",
+        "--config",
+        str(workspace.config),
+        "--book",
+        "fund",
+        "--show",
+        record["id"],
+    )
+    assert shown.returncode == 0, shown.stderr
+    still = json.loads(shown.stdout)
+    assert still["disposition"] == "pending"
+    durable = Path(still["necessary_inputs"][0]["path"])
+    assert durable.is_file()
+    assert not durable.is_relative_to(workspace.staging)
+    assert durable.read_bytes() == expected
+    # The long-term OCR cache is never cleaned with wash.
+    assert {
+        path: path.read_bytes() for path in sorted(entry.rglob("*")) if path.is_file()
+    } == cache_before
+
+
+def test_cleanup_migrates_an_anomaly_input_that_only_lives_in_wash(
+    workspace: Workspace,
+):
+    finished_batch(workspace)
+    run = workspace.only_run()
+    older = clone_run(
+        run,
+        run.parent / "run-20260101-000000",
+        status="completed",
+        ended_at="2026-01-01T00:00:10+08:00",
+    )
+    archive_clone(workspace, older)
+    # A historical anomaly record whose only input copy is inside the old run.
+    raw = older / "capture" / "staging" / "raw" / "1-20261110T100000+0800.md"
+    assert raw.is_file()
+    expected = raw.read_bytes()
+    registry = read_json(workspace.results / "anomalies.json")
+    registry["anomalies"]["fund-1-legacy-ocr-image_failed"] = {
+        "id": "fund-1-legacy-ocr-image_failed",
+        "book_key": "fund",
+        "document_id": 1,
+        "source_version": None,
+        "version_stamp": "unknown",
+        "stage": "ocr",
+        "code": "image_failed",
+        "reason": "image_failed",
+        "necessary_inputs": [{"kind": "raw", "path": str(raw), "source": str(raw)}],
+        "disposition": "pending",
+        "runs": [older.name],
+        "last_run": older.name,
+        "attempts": 1,
+    }
+    write_json(workspace.results / "anomalies.json", registry)
+
+    assert workspace.sync().returncode == 0
+
+    assert not older.exists()
+    record = only_anomaly(workspace)
+    durable = Path(record["necessary_inputs"][0]["path"])
+    assert durable.is_file()
+    assert not durable.is_relative_to(workspace.staging)
+    assert durable.read_bytes() == expected
+    # Provenance is preserved; only the durable copy location is rewritten.
+    assert record["necessary_inputs"][0]["source"] == str(raw)
