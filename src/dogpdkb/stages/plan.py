@@ -23,6 +23,7 @@ from typing import Any
 
 from dogpdkb.knowledge_plan import (
     _load_state,
+    _relative_raw,
     _resolve_raw,
     _write_plan,
     state_lock,
@@ -255,12 +256,22 @@ def _update_state(
     state_path: Path,
 ) -> None:
     state = _load_state(state_path, report["book"])
+    report_path = context.require("mdcompare", "report")
     by_id = {str(row["document_id"]): row for row in report["documents"]}
     reuse_ids = {str(row["document_id"]) for row in plan["body_reuse"]}
     for doc_id, decision in plan["decisions"].items():
         row = by_id.get(doc_id)
         if row is None:
             continue
+        # Report raw references are relative to the mdcompare report, but the
+        # canonical state resolves them against the corpus: rebase them so the
+        # next batch (and wash migration) can still find the verified input.
+        resolved_raw = _resolve_raw(row.get("raw"), report_path)
+        raw_reference = (
+            _relative_raw(resolved_raw, state_path)
+            if resolved_raw is not None
+            else None
+        )
         record = state["documents"].setdefault(
             doc_id,
             {
@@ -278,14 +289,14 @@ def _update_state(
             record["corpus"] = {
                 "status": "captured",
                 "version": row["source_version"],
-                "raw": row.get("raw"),
+                "raw": raw_reference,
             }
-        if doc_id in reuse_ids and row.get("raw") is not None:
+        if doc_id in reuse_ids and raw_reference is not None:
             record["graph"] = {
                 "status": "covered",
                 "coverage": "body_reuse",
                 "version": row["source_version"],
-                "raw": row.get("raw"),
+                "raw": raw_reference,
                 "metadata": row.get("metadata")
                 or record.get("graph", {}).get("metadata"),
             }
@@ -296,7 +307,6 @@ def _update_state(
             "decision": decision["decision"],
         }
     state["book"] = report["book"]
-    report_path = context.require("mdcompare", "report")
     inputs = {report_path}
     for row in report["documents"]:
         for key in ("raw", "previous_raw"):
