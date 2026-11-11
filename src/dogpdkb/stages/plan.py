@@ -292,14 +292,20 @@ def _update_state(
                 "raw": raw_reference,
             }
         if doc_id in reuse_ids and raw_reference is not None:
-            record["graph"] = {
-                "status": "covered",
-                "coverage": "body_reuse",
-                "version": row["source_version"],
-                "raw": raw_reference,
-                "metadata": row.get("metadata")
-                or record.get("graph", {}).get("metadata"),
-            }
+            # Merge into the existing graph record: body reuse advances the
+            # verified version/raw but must preserve prior OCR reuse evidence
+            # and the generated body scope (and any other keys) so the next
+            # batch can still prove image reuse without re-OCR.
+            graph = record.setdefault("graph", {})
+            graph.update(
+                {
+                    "status": "covered",
+                    "coverage": "body_reuse",
+                    "version": row["source_version"],
+                    "raw": raw_reference,
+                    "metadata": row.get("metadata") or graph.get("metadata"),
+                }
+            )
         record.setdefault("steps", {})["plan"] = {
             "status": "completed",
             "recorded_at": now_iso(),

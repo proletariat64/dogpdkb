@@ -535,6 +535,9 @@ class OcrCompileWorkspace(OcrWorkspace):
     def graph(self) -> dict[str, Any]:
         return read_json(self.corpus / "graphify-out" / "graph.json")
 
+    def state(self) -> dict[str, Any]:
+        return read_json(self.corpus / ".sync-state.json")
+
     def compile_report(self, run: Path | None = None) -> dict[str, Any]:
         return read_json((run or self.only_run()) / "compile" / "compile-result.json")
 
@@ -629,6 +632,34 @@ def test_body_reuse_reused_image_is_not_recompiled(tmp_path: Path):
     ]
     assert len(doc1) == 1
     assert doc1[0]["status"] == "done"
+
+
+def test_body_reuse_plan_preserves_prior_ocr_evidence_and_body_scope(tmp_path: Path):
+    # Standards J14: the plan's body-reuse state update must merge into the
+    # existing graph record, not replace it. A reused source whose image is not
+    # in this batch's OCR work list never gets graph.ocr re-added by OCR, so a
+    # wholesale replace silently drops the canonical OCR reuse evidence and the
+    # generated body scope, breaking next-batch reuse proof.
+    workspace = OcrCompileWorkspace(tmp_path)
+    workspace.reuse_doc_one_with_changed_image()
+
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    doc1 = workspace.state()["books"]["fund"]["documents"]["1"]["graph"]
+    new_png = "https://cdn.example.invalid/new.png"
+    assert doc1["ocr"]["images"][0]["resource_id"] == new_png
+    assert doc1["body_scope"]["regions"]
+
+    # A later batch re-verifies the reused body. Stop after plan so OCR cannot
+    # run and re-add graph.ocr: the plan alone must preserve the prior evidence.
+    second = workspace.sync("--stop-after", "plan")
+    assert second.returncode == 0, second.stderr
+    run2 = workspace.runs()[-1]
+    plan2 = read_json(run2 / "plan" / "plan.json")
+    assert 1 in {row["document_id"] for row in plan2["body_reuse"]}
+    doc1_after = workspace.state()["books"]["fund"]["documents"]["1"]["graph"]
+    assert doc1_after["ocr"]["images"][0]["resource_id"] == new_png
+    assert doc1_after["body_scope"]["regions"]
 
 
 def test_posthoc_success_resolves_an_archived_ocr_failure_and_registers_compile(
