@@ -214,3 +214,23 @@ def test_a_new_source_version_is_compiled_normally_after_a_failure(
     doc1 = state["books"]["fund"]["documents"]["1"]
     assert doc1["graph"]["status"] == "covered"
     assert doc1["graph"]["version"]["utc"] == "2026-11-11T10:00:00+08:00"
+
+
+def test_graphify_output_streams_to_the_stage_log_not_the_console(
+    workspace: CompileWorkspace,
+):
+    completed = workspace.sync()
+
+    assert completed.returncode == 0, completed.stderr
+    log = (workspace.only_run() / "logs" / "compile.log").read_text(encoding="utf-8")
+    # Graphify's own diagnostics are streamed into the stage log...
+    assert "Graphify semantic extraction" in log
+    # ...and never reach the console (stdout is the single summary line).
+    assert "Graphify semantic extraction" not in completed.stderr
+    assert "Graphify semantic extraction" not in completed.stdout
+    assert len(completed.stdout.strip().splitlines()) == 1
+    # The default log carries no document body and no token/auth material.
+    for text in (log, completed.stdout, completed.stderr):
+        assert "body 1" not in text
+        assert "body 2" not in text
+        assert "Old rule." not in text
