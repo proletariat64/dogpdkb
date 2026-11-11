@@ -152,3 +152,65 @@ def test_partial_publication_keeps_failed_source_knowledge_and_version(
     doc2 = state["books"]["fund"]["documents"]["2"]
     assert doc2["graph"]["status"] == "covered"
     assert doc2["graph"]["version"]["utc"] == "2026-11-10T11:00:00+08:00"
+
+
+def _bump_remote_version(workspace: CompileWorkspace, doc_id: int, version: str) -> None:
+    remote = read_json(workspace.root / "remote.json")
+    for row in remote["documents"]:
+        if row["id"] == doc_id:
+            row["content_updated_at"] = version
+    remote["details"][str(doc_id)]["content_updated_at"] = version
+    remote["details"][str(doc_id)]["body"] = f"body {doc_id} revised"
+    write_json(workspace.root / "remote.json", remote)
+
+
+def test_same_version_compile_failure_is_not_retried_the_next_day(
+    workspace: CompileWorkspace,
+):
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = "source-[1]"
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    assert json.loads(first.stdout.strip().splitlines()[-1])["status"] == "partial"
+
+    # Even though extraction would now succeed, the same archived version is
+    # handed off to the post-hoc agent and must not be re-attempted daily.
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = ""
+    second = workspace.sync()
+
+    assert second.returncode == 0, second.stderr
+    plan = read_json(workspace.runs()[-1] / "plan" / "plan.json")
+    assert plan["decisions"]["1"]["decision"] == "suppressed"
+    assert [item["document_id"] for item in plan["compile"]] == []
+    envelope = read_json(workspace.runs()[-1] / "compile" / "result.json")
+    assert envelope["status"] == "skipped"
+    # No second extraction attempt for the suppressed source.
+    extracts = [
+        row["file"]
+        for row in workspace.graphify_calls()
+        if row["event"] == "extract"
+    ]
+    assert "source-[1].md" not in extracts
+
+
+def test_a_new_source_version_is_compiled_normally_after_a_failure(
+    workspace: CompileWorkspace,
+):
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = "source-[1]"
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+
+    # A genuinely new version returns the source to normal daily processing.
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = ""
+    _bump_remote_version(workspace, 1, "2026-11-11T10:00:00+08:00")
+    second = workspace.sync()
+
+    assert second.returncode == 0, second.stderr
+    plan = read_json(workspace.runs()[-1] / "plan" / "plan.json")
+    assert plan["decisions"]["1"]["decision"] == "compile"
+    graph = workspace.graph()
+    sources = {node["source_file"] for node in graph["nodes"]}
+    assert "source-[1].md" in sources
+    state = workspace.state()
+    doc1 = state["books"]["fund"]["documents"]["1"]
+    assert doc1["graph"]["status"] == "covered"
+    assert doc1["graph"]["version"]["utc"] == "2026-11-11T10:00:00+08:00"
