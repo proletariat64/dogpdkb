@@ -1,7 +1,7 @@
 # 09: 最终双轴审查修复
 
 Type: task
-Status: ready-for-agent
+Status: claimed
 Blocked by: 08
 
 ## Context
