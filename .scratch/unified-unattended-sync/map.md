@@ -30,6 +30,7 @@
 - 比较器算法、Graphify 模型、图谱合并器不重写；不新增通用指纹系统；异常身份复用 book+doc ID+version。
 - 规格+任务图提交 `cb8dfb9`。Wave 1 已启动：01（分支 uus/01-runner-state，worktree uus-01-runner-state）∥ 02（分支 uus/02-capture-reuse，worktree uus-02-capture-reuse），后台 implementer。
 - [02 resolved](issues/02-capture-reuse.md#answer) 已合入：合并提交 `6b90ee8`（--no-ff，实现 HEAD 93ecc1e）。统一证据复用（canonical 下载→checkpoint→import→新导出），同 book+doc ID+版本瞬时相等+raw 直接有效（无新指纹）；历史富化保持 historical_enriched；观察/下载/发布版本分离。公开合同：`discover --snapshot … --import-downloads <records…>` 接受 knowledge-capture-1.0 snapshot 与 legacy export-progress.json；additive 字段 imports[]/exports[].imported_from。集成聚焦 207 passed、ruff check/format 干净、doc-guard PASS(84)。01 的 capture handler 不受影响。
+- [01 resolved](issues/01-runner-state.md#answer) 已合入：合并提交 `00c2dfb`（--no-ff，实现 HEAD e5a5025；首个 implementer 触顶 150 turn，continuation 完成提交/合并/结案）。新增 unified_sync/sync_run/sync_stages/sync_status/stages.capture。公开合同：run 目录 `<staging>/<book>/<run-id>/`（run.json + `<stage>/result.json` + logs）；run 状态 `unified-run-1.0`（running/paused/completed/partial/failed/interrupted；阶段 pending/running/completed/partial/skipped/failed；config_identity resume 校验；FINISHED 释放 claim 不挡 cron）；阶段信封 `unified-stage-1.0`（artifacts/inputs/anomalies/counts）；handler `dogpdkb.stages.<stage>.HANDLER`（StageContext/StageResult/StageLog 流式日志），STAGE_OWNERS mdcompare+plan=04/ocr=05/compile=06；`dogpdkb status` 只读+JSON+pid/锁存活；legacy flag 弃用转发（08 收敛）。集成聚焦 188 passed、ruff 干净、doc-guard PASS(84)。
 
 ## Fog
 
