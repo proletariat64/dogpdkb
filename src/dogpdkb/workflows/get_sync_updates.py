@@ -904,6 +904,12 @@ def main() -> int | None:
         "--details-dir", help="local document detail JSON adapter input"
     )
     parser.add_argument("--pending-state", help="explicit prior pending-state input")
+    parser.add_argument(
+        "--import-downloads",
+        nargs="+",
+        help="historical download records (export-progress.json or capture "
+        "snapshot) reused only with matching book, version and valid raw evidence",
+    )
     args = parser.parse_args()
 
     config = configure(parser, args.config)
