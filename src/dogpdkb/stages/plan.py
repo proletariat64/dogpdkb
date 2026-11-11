@@ -203,15 +203,25 @@ def _decide(
             )
             decision = "compile"
 
-        required = (comparison.get("ocr") or {}).get("processing_required") or []
+        # The OCR work list is every incoming image the comparator did not prove
+        # reusable: processing_required (NEW/CHANGED) plus unverified UNKNOWN
+        # images. A changed or unprovable image therefore reaches OCR even when
+        # the body is reused, and body reuse never depends on OCR completing.
+        ocr = comparison.get("ocr") or {}
+        reusable = set(ocr.get("reusable") or [])
+        required = [
+            entry["resource_id"]
+            for entry in row.get("resources") or []
+            if entry.get("kind") == "image" and entry["resource_id"] not in reusable
+        ]
         if required:
             ocr_items.append(
                 {
                     **base,
                     "resources": _ocr_resources(row, required),
-                    "reusable": (comparison.get("ocr") or {}).get("reusable") or [],
-                    "reason_codes": (comparison.get("ocr") or {}).get("reason_codes")
-                    or [],
+                    "reusable": sorted(reusable),
+                    "processing_required": ocr.get("processing_required") or [],
+                    "reason_codes": ocr.get("reason_codes") or [],
                 }
             )
         tasks = _metadata_tasks(row)
