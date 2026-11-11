@@ -216,12 +216,12 @@ def test_stop_after_capture_pauses_a_resumable_run(workspace: Workspace):
     assert (run_dir / "logs" / "capture.log").is_file()
 
 
-def test_unregistered_stage_fails_loudly_after_ocr_ends(workspace: Workspace):
+def test_a_failed_compile_ends_the_batch_loudly_after_ocr(workspace: Workspace):
     completed = workspace.sync()
 
     assert completed.returncode != 0
     assert "compile" in completed.stderr
-    assert "no registered handler" in completed.stderr
+    assert "compile failed" in completed.stderr
     summary = json.loads(completed.stdout.strip().splitlines()[-1])
     assert summary["status"] == "failed"
     assert summary["stages"]["capture"] == "completed"
@@ -246,7 +246,7 @@ def test_resume_reuses_the_frozen_capture_instead_of_re_exporting(workspace: Wor
 
     resumed = workspace.sync("--resume", first["run"])
 
-    assert resumed.returncode != 0  # compile is still unregistered
+    assert resumed.returncode != 0  # compile fails via the Graphify shim
     summary = json.loads(resumed.stdout.strip().splitlines()[-1])
     assert summary["run"] == first["run"]
     assert summary["stages"]["capture"] == "completed"
@@ -354,7 +354,7 @@ def test_partial_capture_hands_its_usable_set_to_the_next_stage(workspace: Works
     assert state["stage_states"]["mdcompare"]["status"] in {"completed", "partial"}
     assert state["stage_states"]["ocr"]["status"] == "skipped"
     assert state["stage_states"]["compile"]["status"] == "failed"
-    assert "no registered handler" in completed.stderr
+    assert "compile failed" in completed.stderr
     envelope = read_json(run_dir / "capture" / "result.json")
     assert envelope["status"] == "partial"
     assert [row["document_id"] for row in envelope["anomalies"]] == [2]
