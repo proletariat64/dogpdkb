@@ -10,6 +10,7 @@ Blocked by: 02, 03
 - 先读 `/tmp/unified-unattended-sync-notes/00-base-context.md`；补充笔记 `02-knowledge-modules.md`（plan 2.0 合同、审批/质量门禁精确位置、必须保留的输入/版本校验、比较器正文/OCR 范围）。工作树代码为准。
 - 01 Answer：run 目录/阶段 I/O 信封/handler 接口。02 Answer：capture 复用证据。03 Answer：异常归档 API 与重试抑制合同。
 - 现有比较器（mdcompare.knowledge，knowledge-1.0 报告，REUSE/REVIEW/UNKNOWN/HOLD，正文/OCR 范围区分）沿用，不重写算法。旧 plan 在 run_planner 内联比较；新规格要求整批 mdcompare 阶段先完成、plan 只消费。
+- 关键现状（见 00-base-context / 笔记 03）：比较器实际 STATUSES=(REUSE,DELTA,REVIEW,NO_BODY,UNKNOWN)，GRAPHIFY_ACTIONS=(KEEP_EXISTING,HOLD_EXISTING,BODY_DELTA_CANDIDATE)。**knowledge planner 目前传 resources=[]，OCR 维度从未被行使**——本票必须把 resources 接入 plan，产出 OCR 工作名单（基于 mdcompare `prepared-jpeg-ocr-v1` 的 reusable/processing_required），并保证正文复用与 OCR 独立。图片变化由 resources.py 字节相等/s3-version-id-v1 + decisions.py choose_action 独立判定。
 
 ## Acceptance and ownership
 

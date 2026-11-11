@@ -10,6 +10,7 @@ Blocked by: 04
 - 先读 `/tmp/unified-unattended-sync-notes/00-base-context.md`；补充笔记 `03-ocr-compare-config-tests.md`（mdocr 缓存身份/复用、超时、token/额度错误、结果格式）与 `02-knowledge-modules.md`。工作树代码为准。
 - 04 Answer：plan 的 OCR 名单与 OCR 结果引用 schema（基于现有 mdocr 结果格式）。03 Answer：异常归档 API、批次共享原因、重试抑制、OCR 后补合同。
 - 现有 mdocr 图片处理/缓存能力沿用，不重写识别。
+- 关键现状（见 00-base-context / 笔记 03）：**当前没有 OCR 结果缓存**——现有复用仅靠同 markdown 内保留的 `<!-- mdocr:ocr-begin -->` 块、内容命名 assets、文件名 checkpoint。本票需新建持久 OCR 缓存（独立于待清理 run），复用判定走 mdcompare `prepared-jpeg-ocr-v1` 证明合同（preprocessing+configuration 规范化相等、原图↔ prepared 字节对应、prepared-JPEG 字节相等、规范非空产物），不新造指纹。PaddleClient：token 仅来自 env PADDLEOCR_TOKEN，60s/调用、3 次重试、POST 提交不重试（计费）、900s job 截止。auth/quota 分类、全批停止、阶段预算、成功/缓存/失败/未尝试计数均不存在，需新建。**默认 sync 现在 OCR 失败即阻断发布（apply_sync_updates.py:610-626），与规格尽力完成相反，须移除该阻断。** 配置无 OCR/cache 键：新增 TOML 键（如 [paths].ocr_cache、[ocr] 段）经 current_config() 读取并更新 snapshot()/模板/README，不新增任意环境变量（PADDLEOCR_TOKEN 保持 env）。
 
 ## Acceptance and ownership
 
