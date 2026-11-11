@@ -8,8 +8,17 @@ corpus = "graphify_flatten_ready"
 staging = "wash"
 state = "skylark_books/state"
 web = "web-output"
+# results holds durable batch results/anomalies; ocr_cache holds long-term OCR
+# success evidence. Both live outside the cleanable wash run directory.
+results = "sync-results"
+ocr_cache = "ocr-cache"
 # graph_dir defaults to <selected corpus>/graphify-out
 # graphify_python defaults to the current interpreter
+
+[ocr]
+# Best-effort OCR stage total time budget (seconds). On exhaustion the stage
+# keeps completed results, archives unfinished images and proceeds to compile.
+budget_seconds = 1800
 
 [skylark]
 mcp_url = "https://mcpgwoffice-prod.alipay.com/mcpgw/v1/shttpproxy/message/MAIN_CHAIR_mcp.ant.faas.skylarkmcpserver.skylarkmcpserver"

@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Apply a Yuque sync-updates delta: export, OCR (mdocr), merge into corpus.
+"""Apply a Yuque sync-updates delta: export and merge into the corpus.
 
 Reads a sync-updates JSON produced by get_sync_updates.py, selects recent
 additions plus all updates, renames and moves of tracked docs, then for each doc:
 
   1. exports the markdown body via the skylark MCP bridge
   2. rewrites SSO-gated image URLs to the public mirror
-  3. runs `mdocr ocr --download` so image text becomes queryable
-  4. merges the result into the corpus dir using the flatten-export
+  3. merges the result into the corpus dir using the flatten-export
      filename convention `<toc-path>__<title>-<YYYY-MM-DD>-[doc_id].md`
      (stale local copies of updated docs are removed first)
+
+OCR is no longer run here: it is a best-effort stage of the unified
+``dogpdkb sync`` runner, and publication proceeds with the available raw export
+when no OCR output exists. The ``run_ocr_with_resume`` utility remains for
+direct callers.
 
 Remote deletions are applied only from a complete snapshot of the same book;
 old and deleted files are backed up in the staging directory.
@@ -771,50 +775,10 @@ def main() -> None:
         print_retry()
         raise export_cancellation
     print(
-        f"exported {len(exported)}, skipped {len(skipped)}; running mdocr ocr ...",
+        f"exported {len(exported)}, skipped {len(skipped)}; "
+        "OCR is a best-effort stage of the unified sync runner",
         file=sys.stderr,
     )
-    try:
-        by_file = {path.name: doc for path, doc in exported}
-
-        def ocr_completed(path):
-            tracker.step(
-                str(by_file[path.name]["id"]),
-                "ocr",
-                "completed",
-                file=path.name,
-                output=str(ocr_dir / path.name),
-            )
-
-        run_ocr_with_resume(
-            [p for p, _ in exported],
-            ocr_dir,
-            staging / "checkpoints",
-            on_complete=ocr_completed,
-        )
-    except (OSError, RuntimeError, KeyboardInterrupt) as error:
-        failure = {"stage": "ocr", "reason": safe_diagnostic(error) or "cancelled"}
-        if isinstance(error, OCRFailure):
-            failure["file"] = error.file
-        tracker.phase("ocr", "failed", reason=failure["reason"])
-        if failure.get("file") in by_file:
-            tracker.step(
-                str(by_file[failure["file"]]["id"]),
-                "ocr",
-                "failed",
-                reason=failure["reason"],
-            )
-        manifest["status"] = "failed"
-        manifest["failures"].append(failure)
-        _write_failure_manifest(manifest_path, manifest)
-        print(
-            f"[ocr] {failure['reason']}; staging kept at {staging}; valid checkpoints will be reused",
-            file=sys.stderr,
-        )
-        print_retry()
-        if isinstance(error, KeyboardInterrupt):
-            raise
-        raise SystemExit(1) from error
     if errors:
         tracker.phase("download", "failed", failures=len(errors))
         print(
