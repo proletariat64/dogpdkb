@@ -12,11 +12,24 @@ from types import SimpleNamespace
 from typing import Any
 
 from dogpdkb.knowledge_capture import SCHEMA_VERSION, CaptureError, run_capture
+from dogpdkb.sync_results import archive_anomalies
 from dogpdkb.sync_run import RunError, read_json
 from dogpdkb.sync_stages import StageContext, StageFailed, StageResult
 from dogpdkb.sync_state import StateError
 
 COMPLETE = ("initialized", "captured")
+
+
+def _necessary_inputs(
+    context: StageContext, exports: dict[str, Any], doc_id: Any
+) -> list[dict[str, str]]:
+    """The raw export a post-hoc agent needs, referenced for durable persistence."""
+    raw = (exports.get(str(doc_id)) or {}).get("raw") or {}
+    reference = raw.get("path")
+    if not isinstance(reference, str) or not reference:
+        return []
+    path = (context.directory / reference).resolve()
+    return [{"kind": "raw", "path": str(path)}] if path.is_file() else []
 
 
 def _snapshot(path: Path) -> dict[str, Any] | None:
@@ -54,13 +67,16 @@ def _result(context: StageContext, snapshot: dict[str, Any]) -> StageResult:
     exports = snapshot.get("exports") or {}
     documents = snapshot.get("documents") or {}
     reused = sum(1 for row in exports.values() if row.get("reused"))
+    book_id = (snapshot.get("book") or {}).get("book_id")
     anomalies = [
         {
             "stage": "capture",
-            "book_id": (snapshot.get("book") or {}).get("book_id"),
+            "book_id": book_id,
             "document_id": row["id"],
             "code": row["code"],
+            "reason": row["code"],
             "source_version": (documents.get(str(row["id"])) or {}).get("version"),
+            "necessary_inputs": _necessary_inputs(context, exports, row["id"]),
         }
         for row in snapshot.get("anomalies") or []
     ]
@@ -95,13 +111,20 @@ def _result(context: StageContext, snapshot: dict[str, Any]) -> StageResult:
     )
 
 
+def _archived(context: StageContext, result: StageResult) -> StageResult:
+    """Persist anomalies + necessary inputs outside wash before the envelope."""
+    if result.anomalies:
+        result.anomalies = archive_anomalies(context, result.anomalies)
+    return result
+
+
 def handle(context: StageContext) -> StageResult:
     snapshot_path = context.directory / "snapshot.json"
     existing = _snapshot(snapshot_path)
     if existing is not None and existing.get("status") in COMPLETE:
         # A finished observation is never re-exported; resume reuses its evidence.
         context.log.write(f"reusing complete snapshot {snapshot_path}")
-        return _result(context, existing)
+        return _archived(context, _result(context, existing))
     baseline = _baseline(context)
     arguments = SimpleNamespace(
         snapshot=snapshot_path,
@@ -135,7 +158,7 @@ def handle(context: StageContext) -> StageResult:
             observation_status=snapshot["status"],
         )
     context.count(**result.counts)
-    return result
+    return _archived(context, result)
 
 
 HANDLER = handle

@@ -50,6 +50,7 @@ class SyncConfig:
     staging: Path
     state: Path
     web: Path
+    results: Path
     graph_dir: Path | None
     graphify_python: Path
     mcp_url: str
@@ -98,7 +99,15 @@ def load_config(path: Path | str | None = None) -> SyncConfig:
         raise ConfigError(f"cannot load config {selected}: {error}") from error
     allowed = {
         "source": {"books_file"},
-        "paths": {"corpus", "staging", "state", "web", "graph_dir", "graphify_python"},
+        "paths": {
+            "corpus",
+            "staging",
+            "state",
+            "web",
+            "results",
+            "graph_dir",
+            "graphify_python",
+        },
         "skylark": {
             "mcp_url",
             "proxy_bin",
@@ -213,6 +222,7 @@ def load_config(path: Path | str | None = None) -> SyncConfig:
         staging=required_path("paths", "staging", "wash", "DOGPDKB_STAGING"),
         state=required_path("paths", "state", "skylark_books/state", "DOGPDKB_STATE"),
         web=required_path("paths", "web", "web-output", "DOGPDKB_WEB"),
+        results=required_path("paths", "results", "sync-results"),
         graph_dir=file_path("paths", "graph_dir", env="DOGPDKB_GRAPH_DIR"),
         graphify_python=required_path(
             "paths",

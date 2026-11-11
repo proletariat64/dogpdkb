@@ -8,6 +8,8 @@ corpus = "corpus"
 staging = "staging"
 state = "state"
 web = "web"
+# Durable batch results, anomaly handoff and persisted inputs; survives wash cleanup.
+results = "sync-results"
 
 [skylark]
 mcp_url = "https://example.invalid/mcp"
