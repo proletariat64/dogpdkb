@@ -237,6 +237,9 @@ def test_partial_publication_keeps_failed_source_knowledge_and_version(
     doc2 = state["books"]["fund"]["documents"]["2"]
     assert doc2["graph"]["status"] == "covered"
     assert doc2["graph"]["version"]["utc"] == "2026-11-10T11:00:00+08:00"
+    # Item 9: a partial batch still finishes and releases the canonical claim, so
+    # the next cron run is not blocked by a residual active run.
+    assert state["active_run"] is None
 
 
 def _set_detail(workspace: CompileWorkspace, doc_id: int, **fields: Any) -> None:
@@ -521,3 +524,54 @@ def test_compile_keeps_unrecognized_image_and_records_missing_items(
     # Only the inserted block is declared as a generated region.
     doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
     assert len(doc2["graph"]["body_scope"]["regions"]) == 1
+
+
+def test_compile_consumes_pending_posthoc_followup_for_suppressed_version(
+    workspace: CompileWorkspace,
+):
+    # Doc Two's first compile fails, archiving a same-version anomaly the daily
+    # batch suppresses. A post-hoc OCR backfill that changed the published input
+    # registers followup compile work (03 contract). The compile stage must consume
+    # it: recompile the suppressed version with the updated OCR and mark the
+    # followup done only after real publication, never just because OCR was cached.
+    from dogpdkb.sync_results import load_followups, register_compile_followup
+    from mdocr.config import load_config
+
+    _set_detail(workspace, 2, body=f"# Two\n\n![diagram]({IMAGE_A})\n")
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = "source-[2]"
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+
+    config = load_config(workspace.config)
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    version = doc2["observation"]["version"]
+    artifact = doc2["graph"]["ocr"]["images"][0]["artifact"]
+    followup = register_compile_followup(
+        config,
+        "fund",
+        document_id=2,
+        source_version=version,
+        reason="post-hoc OCR backfill changed the published compile input",
+        inputs=[{"kind": "cache", "path": artifact}],
+    )
+    assert followup["status"] == "pending"
+
+    # The next daily batch would suppress this version, but the followup is real
+    # pending compile work the stage must still carry out.
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = ""
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run_dir = workspace.runs()[-1]
+    plan = read_json(run_dir / "plan" / "plan.json")
+    assert plan["decisions"]["2"]["decision"] == "suppressed"
+
+    registry = load_followups(config, "fund")
+    consumed = registry["followups"][followup["id"]]
+    assert consumed["status"] == "done"
+    assert consumed["run_id"] == run_dir.name
+
+    report = read_json(run_dir / "compile" / "compile-result.json")
+    assert 2 in {row["document_id"] for row in report["results"]}
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    assert doc2["graph"]["status"] == "covered"
+    assert doc2["graph"]["version"]["utc"] == version["utc"]

@@ -21,6 +21,7 @@ from dogpdkb.knowledge_plan import (
     state_lock_path,
 )
 from dogpdkb.knowledge_state import BookState, canonical_view, root_state, save_view
+from dogpdkb.sync_results import load_followups, save_followups, version_stamp
 from dogpdkb.sync_time import now_iso
 from dogpdkb.workflows.graph_sync import doc_id
 from mdcompare.io import publish_reports, validate_outputs
@@ -1205,6 +1206,90 @@ def _freeze_compile_sources(
     return corpus, frozen, exported, prepared_by_id
 
 
+def _pending_followup_items(
+    context: Any, plan: dict[str, Any], items: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Add pending post-hoc followup documents to this run's compile set (item 8).
+
+    A backfill that changed a published compile input registers followup work the
+    daily plan suppresses (the archived version is handed off, not retried). The
+    compile stage is the consumer: it recompiles those documents at the registered
+    version using this batch's prepared body and the updated OCR evidence. A
+    followup whose document is absent from this batch, unavailable, or observed at
+    a different version is left pending for a later batch — never fabricated.
+    """
+    registry = load_followups(context.config, context.book.key)
+    pending = [
+        record
+        for record in registry["followups"].values()
+        if record.get("status") == "pending"
+    ]
+    if not pending:
+        return items, []
+    report = _read_json(context.require("mdcompare", "report"))
+    by_id = {str(row["document_id"]): row for row in report.get("documents", [])}
+    existing = {str(item["document_id"]) for item in items}
+    book_id = plan["book"]["book_id"]
+    merged = list(items)
+    added: list[str] = []
+    for record in pending:
+        identity = str(record["document_id"])
+        if identity in existing:
+            continue
+        row = by_id.get(identity)
+        if row is None or not row.get("input_available") or row.get("raw") is None:
+            continue
+        if version_stamp(row.get("source_version")) != record.get("version_stamp"):
+            continue
+        merged.append(
+            {
+                "book_id": book_id,
+                "document_id": record["document_id"],
+                "source_version": row["source_version"],
+                "raw": row["raw"],
+            }
+        )
+        existing.add(identity)
+        added.append(record["id"])
+    return merged, added
+
+
+def _consume_followups(context: Any, results: list[dict[str, Any]]) -> list[str]:
+    """Mark pending followups done after compile really published their source.
+
+    Called only after the canonical success version is recorded, so a followup is
+    never closed on cached OCR alone. Matching is by document + source version;
+    consumption is idempotent and a crash before this point leaves the followup
+    pending for the next batch to redo.
+    """
+    registry = load_followups(context.config, context.book.key)
+    published = {
+        (str(row["document_id"]), version_stamp(row["source_version"]))
+        for row in results
+    }
+    consumed: list[str] = []
+    now = now_iso()
+    for record in registry["followups"].values():
+        if record.get("status") != "pending":
+            continue
+        key = (str(record["document_id"]), record.get("version_stamp"))
+        if key not in published:
+            continue
+        record["status"] = "done"
+        record["run_id"] = context.layout.run_id
+        record["updated_at"] = now
+        record["resolution"] = {
+            "disposition": "done",
+            "run_id": context.layout.run_id,
+            "recorded_at": now,
+            "reason": "compile published the source with the updated input",
+        }
+        consumed.append(record["id"])
+    if consumed:
+        save_followups(context.config, context.book.key, registry)
+    return consumed
+
+
 def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
     """Automatic whole-source compile for the unified batch (ticket 06).
 
@@ -1230,6 +1315,14 @@ def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
     )
     metadata_by_id = _compile_metadata(context)
     metadata_items = plan.get("metadata") or []
+    # Consume pending post-hoc followups: a backfill that changed a published
+    # compile input registers work the daily plan suppresses (item 8). Merge those
+    # documents into this run's compile set before deciding there is no body work.
+    items, followup_added = _pending_followup_items(context, plan, items)
+    if followup_added:
+        context.log.write(
+            f"consuming {len(followup_added)} pending compile followup(s)"
+        )
     if not items:
         # No body compile work, but the plan may still schedule metadata
         # maintenance (rename/move/source-ref) for reused sources. Execute it
@@ -1245,7 +1338,7 @@ def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
                 if metadata_results:
                     save_view(state_path, state)
         report = _compile_report(
-            plan, [], [], {}, metadata_by_id, None, metadata_results
+            plan, items, [], [], {}, metadata_by_id, None, metadata_results
         )
         publish_reports(
             [(report_path, json.dumps(report, ensure_ascii=False, indent=1) + "\n")]
@@ -1470,15 +1563,20 @@ def _execute_compile_locked(
         state, metadata_items, metadata_by_id
     )
     save_view(state_path, state)
+    # Real completion is recorded; only now close pending post-hoc followups whose
+    # source this run published (item 8). Never closed on cached OCR alone.
+    followups = _consume_followups(context, results)
     usage = candidate_result.get("usage") or {}
     report = _compile_report(
         plan,
+        items,
         results,
         sorted(failed_ids),
         usage,
         metadata_by_id,
         candidate_result,
         metadata_results,
+        followups,
     )
     publish_reports(
         [(report_path, json.dumps(report, ensure_ascii=False, indent=1) + "\n")]
@@ -1488,14 +1586,15 @@ def _execute_compile_locked(
 
 def _compile_report(
     plan: dict[str, Any],
+    items: list[dict[str, Any]],
     results: list[dict[str, Any]],
     failed_ids: list[str],
     usage: dict[str, Any],
     metadata_by_id: dict[str, dict[str, Any]],
     candidate_result: dict[str, Any] | None,
     metadata_results: list[dict[str, Any]] | None = None,
+    followups: list[str] | None = None,
 ) -> dict[str, Any]:
-    items = plan.get("compile") or []
     by_id = {str(item["document_id"]): item for item in items}
     failed = [
         {
@@ -1525,6 +1624,7 @@ def _compile_report(
         "results": results,
         "failed": failed,
         "metadata": metadata_results,
+        "followups": followups or [],
         "tokens": {**tokens, "evidence": usage.get("token_evidence", "unknown")},
         "usage": usage,
         "transaction": (
