@@ -28,6 +28,7 @@
 - 复用既有 instance_lock 作为规格"用户级运行锁"，不另造锁。跨批次文档进度走 canonical `.sync-state.json`（Progress）；per-run 轻量状态单独保存（01）。
 - 01 期间旧 sync flag 走带弃用提示的旧执行器（过渡），最终收敛在 08；不保留另一套默认规则。
 - 比较器算法、Graphify 模型、图谱合并器不重写；不新增通用指纹系统；异常身份复用 book+doc ID+version。
+- 规格+任务图提交 `cb8dfb9`。Wave 1 已启动：01（分支 uus/01-runner-state，worktree uus-01-runner-state）∥ 02（分支 uus/02-capture-reuse，worktree uus-02-capture-reuse），后台 implementer。
 
 ## Fog
 
