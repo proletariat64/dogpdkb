@@ -1,0 +1,120 @@
+"""Unified compile stage: whole-source update, partial publication, recovery.
+
+Ticket 06. Drives the installed ``dogpdkb sync`` black box with a temporary
+corpus and the existing deterministic Graphify stub. Ticket 05 owns the real OCR
+handler; these tests register an OCR *double* through ``sitecustomize`` that only
+produces the published OCR-result-reference contract, so compile is exercised
+without coupling to 05's code. No real Graphify / OCR / network / paid call.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from tests.test_knowledge_execute import install_graphify_stub
+from tests.test_unified_sync import DOCUMENTS, Workspace, read_json, write_json
+
+ROOT = Path(__file__).resolve().parents[1]
+COMPILE_SCHEMA = "unified-stage-1.0"
+
+# An OCR double registered at interpreter startup. It consumes the plan's OCR
+# work list and publishes the ``prepared-jpeg-ocr-v1`` evidence contract that the
+# compile stage reads; with no OCR work it skips. This is a test double only.
+OCR_DOUBLE = '''
+import os
+if os.environ.get("DOGPDKB_OCR_DOUBLE") == "1":
+    from dogpdkb.sync_stages import register_handler, StageResult
+    from dogpdkb.sync_run import read_json
+
+    def _ocr_double(context):
+        plan = read_json(context.require("plan", "plan"))
+        items = plan.get("ocr") or []
+        if not items:
+            return StageResult(
+                status="skipped",
+                counts={"total": 0, "completed": 0, "reused": 0, "failed": 0},
+            )
+        return StageResult(
+            status="completed",
+            counts={
+                "total": len(items),
+                "completed": len(items),
+                "reused": 0,
+                "failed": 0,
+            },
+        )
+
+    register_handler("ocr", _ocr_double)
+'''
+
+
+class CompileWorkspace(Workspace):
+    """The unified runner wired to the Graphify stub and an OCR double."""
+
+    def __init__(self, tmp_path: Path, documents: list[dict[str, Any]] | None = None):
+        super().__init__(tmp_path, DOCUMENTS if documents is None else documents)
+        self.stub = install_graphify_stub(tmp_path)
+        self.shim = tmp_path / "ocr-double"
+        self.shim.mkdir()
+        (self.shim / "sitecustomize.py").write_text(OCR_DOUBLE, encoding="utf-8")
+        self.env["PYTHONPATH"] = os.pathsep.join(
+            [str(self.shim), str(self.stub), str(ROOT / "src")]
+        )
+        self.env["DOGPDKB_OCR_DOUBLE"] = "1"
+        self.graphify_log = tmp_path / "graphify-calls.jsonl"
+        self.env["GRAPHIFY_STUB_LOG"] = str(self.graphify_log)
+
+    def graph(self) -> dict[str, Any]:
+        return read_json(self.corpus / "graphify-out" / "graph.json")
+
+    def state(self) -> dict[str, Any]:
+        return read_json(self.corpus / ".sync-state.json")
+
+    def compile_envelope(self) -> dict[str, Any]:
+        return read_json(self.only_run() / "compile" / "result.json")
+
+    def graphify_calls(self) -> list[dict[str, Any]]:
+        if not self.graphify_log.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.graphify_log.read_text(encoding="utf-8").splitlines()
+        ]
+
+
+@pytest.fixture
+def workspace(tmp_path: Path) -> CompileWorkspace:
+    return CompileWorkspace(tmp_path)
+
+
+def test_compile_publishes_whole_sources_and_advances_the_success_version(
+    workspace: CompileWorkspace,
+):
+    completed = workspace.sync()
+
+    assert completed.returncode == 0, completed.stderr
+    summary = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert summary["stages"]["compile"] == "completed"
+
+    envelope = workspace.compile_envelope()
+    assert envelope["schema_version"] == COMPILE_SCHEMA
+    assert envelope["status"] == "completed"
+
+    # Graphify updated by COMPLETE source: the new document is published as a
+    # whole source and the old filename for document one is replaced, not patched.
+    graph = workspace.graph()
+    sources = {node["source_file"] for node in graph["nodes"]}
+    assert "source-[2].md" in sources
+    assert "One-2026-11-10-[1].md" not in sources
+
+    # The success version advances only after a real successful write.
+    state = workspace.state()
+    doc2 = state["books"]["fund"]["documents"]["2"]
+    assert doc2["graph"]["status"] == "covered"
+    assert doc2["graph"]["version"]["utc"] == "2026-11-10T11:00:00+08:00"
