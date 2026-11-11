@@ -541,6 +541,18 @@ def test_status_reports_the_latest_batch_and_can_name_an_older_one(
     assert "unknown run: run-19990101-000000" in unknown.stderr
 
 
+def test_status_redacts_credential_forms_in_its_error_output(workspace: Workspace):
+    # F5 / Standards J16: status reports structural errors (unknown run, schema,
+    # key). They carry no secret in practice, but route them through the shared
+    # redactor like the stage diagnostics so no token/auth form can ever reach
+    # status output. The --run reference is the one user-controlled error vector.
+    leaked = workspace.status("--run", "token=supersecret123")
+
+    assert leaked.returncode != 0
+    assert "supersecret123" not in leaked.stderr
+    assert "token=[redacted]" in leaked.stderr
+
+
 def test_a_second_batch_is_rejected_while_the_first_holds_the_run_lock(
     workspace: Workspace,
 ):
