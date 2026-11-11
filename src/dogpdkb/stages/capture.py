@@ -20,6 +20,7 @@ from dogpdkb.sync_results import (
 from dogpdkb.sync_run import RunError, read_json
 from dogpdkb.sync_stages import StageContext, StageFailed, StageResult
 from dogpdkb.sync_state import StateError
+from dogpdkb.workflows.get_sync_updates import safe_diagnostic
 
 COMPLETE = ("initialized", "captured")
 
@@ -116,9 +117,18 @@ def _result(context: StageContext, snapshot: dict[str, Any]) -> StageResult:
 
 
 def _archived(context: StageContext, result: StageResult) -> StageResult:
-    """Persist anomalies + necessary inputs outside wash before the envelope."""
+    """Persist anomalies + necessary inputs outside wash before the envelope.
+
+    Archiving is best-effort: if the durable store cannot be written, the failure
+    is logged, the original anomalies stay in the envelope and the necessary
+    inputs remain readable in the run directory. A valid corpus is never broken
+    and no input is lost because archiving failed.
+    """
     if result.anomalies:
-        result.anomalies = archive_anomalies(context, result.anomalies)
+        try:
+            result.anomalies = archive_anomalies(context, result.anomalies)
+        except (OSError, ValueError) as error:
+            context.log.write(f"anomaly archiving failed: {safe_diagnostic(error)}")
     return result
 
 

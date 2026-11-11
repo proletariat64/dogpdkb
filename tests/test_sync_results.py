@@ -523,3 +523,100 @@ def test_posthoc_done_without_input_change_registers_no_followup(workspace: Work
     assert out["resolution"]["followup_id"] is None
     view = json.loads(anomalies_cli(workspace, "--json").stdout)
     assert view["compile_followups"] == []
+
+
+def test_batch_result_carries_document_identities_surviving_wash(workspace: Workspace):
+    make_capture_anomaly(workspace)
+    assert workspace.sync("--stop-after", "capture").returncode == 0
+    run_id = workspace.only_run().name
+    result_path = workspace.results / "runs" / f"{run_id}.json"
+
+    result = read_json(result_path)
+    docs = {row["document_id"]: row for row in result["documents"]}
+    assert set(docs) == {1, 2}
+    assert docs[2]["source_version"]["utc"].startswith("2026-11-10T11:00:00")
+    assert docs[1]["export_status"] == "captured"
+    assert docs[2]["export_status"] == "captured"
+
+    for run in workspace.runs():
+        for path in sorted(run.rglob("*"), reverse=True):
+            path.unlink() if path.is_file() else path.rmdir()
+        run.rmdir()
+    result = read_json(result_path)
+    assert {row["document_id"] for row in result["documents"]} == {1, 2}
+
+
+def test_archiving_failure_keeps_inputs_and_a_valid_corpus(workspace: Workspace):
+    make_capture_anomaly(workspace)
+    # Block the durable store: archiving cannot persist, but must not lose input
+    # or break a valid corpus, and the usable set still ends the stage.
+    (workspace.root / "results").write_text("not a directory", encoding="utf-8")
+
+    completed = workspace.sync("--stop-after", "capture")
+
+    assert completed.returncode == 0, completed.stderr
+    run = workspace.only_run()
+    state = read_json(run / "run.json")
+    assert state["status"] == "paused"
+    assert state["stage_states"]["capture"]["status"] == "partial"
+    assert "archiving failed" in (run / "logs" / "capture.log").read_text()
+    assert "result archiving failed" in completed.stderr
+    envelope = read_json(run / "capture" / "result.json")
+    assert envelope["status"] == "partial"
+    assert envelope["anomalies"][0]["code"] == "detail_newer_than_listing"
+    # The necessary input is still readable in the run directory (never lost).
+    snapshot = read_json(run / "capture" / "snapshot.json")
+    raw_ref = snapshot["exports"]["2"]["raw"]["path"]
+    assert (run / "capture" / raw_ref).is_file()
+    canonical = read_json(workspace.corpus / ".sync-state.json")
+    documents = canonical["books"]["fund"]["documents"]
+    assert documents["1"]["steps"]["download"]["status"] == "completed"
+    assert documents["2"]["steps"]["download"]["status"] == "completed"
+
+
+def test_batch_cause_enumerates_affected_images(tmp_path: Path):
+    """The shared token/quota contract ticket 05 consumes (no OCR stage yet)."""
+    from types import SimpleNamespace
+
+    from dogpdkb.sync_anomalies import scan_view
+    from dogpdkb.sync_results import archive_anomalies, load_registry
+
+    config = SimpleNamespace(results=tmp_path / "results")
+    context = SimpleNamespace(
+        config=config, book=SimpleNamespace(key="fund"), layout=None
+    )
+    version = {"field": "content_updated_at", "utc": "2026-11-10T11:00:00+08:00"}
+    anomalies = [
+        {
+            "stage": "ocr",
+            "document_id": 2,
+            "source_version": version,
+            "code": "ocr_unattempted",
+            "resource_id": f"img-{index}",
+            "image": {"url": f"https://example.invalid/{index}.png"},
+        }
+        for index in (1, 2)
+    ]
+    cause = {"stage": "ocr", "code": "token_invalid", "reason": "OCR token rejected"}
+
+    archived = archive_anomalies(context, anomalies, run_id="run-x", batch_cause=cause)
+
+    registry = load_registry(config, "fund")
+    assert len(registry["batch_causes"]) == 1
+    record = next(iter(registry["batch_causes"].values()))
+    assert record["code"] == "token_invalid"
+    assert record["reason"] == "OCR token rejected"
+    assert record["anomaly_ids"] == [row["id"] for row in archived]
+    assert all(row["batch_cause"] == record["id"] for row in archived)
+    # The affected images are enumerable through the scan the agent reads.
+    view = scan_view(config, "fund")
+    assert view["counts"]["batch_causes"] == 1
+    assert view["batch_causes"][0]["anomaly_ids"] == record["anomaly_ids"]
+
+    # Re-archiving the same batch cause never duplicates it.
+    again = archive_anomalies(context, anomalies, run_id="run-x", batch_cause=cause)
+    registry = load_registry(config, "fund")
+    assert len(registry["batch_causes"]) == 1
+    assert registry["batch_causes"][record["id"]]["anomaly_ids"] == [
+        row["id"] for row in again
+    ]

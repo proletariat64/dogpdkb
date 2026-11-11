@@ -16,7 +16,14 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from dogpdkb.sync_run import STAGES, RunLayout, RunState, atomic_json, read_json
+from dogpdkb.sync_run import (
+    STAGES,
+    RunError,
+    RunLayout,
+    RunState,
+    atomic_json,
+    read_json,
+)
 from dogpdkb.sync_stages import read_envelope
 from dogpdkb.sync_time import now_iso
 
@@ -236,15 +243,70 @@ def suppressing_anomalies(
     ]
 
 
+def batch_cause_id(book_key: str, run_id: str, stage: str, code: str) -> str:
+    """One batch cause per book + run + stage + code (a shared token/quota error)."""
+    return "-".join([_slug(book_key), _slug(run_id), _slug(stage), _slug(code)])
+
+
+def record_batch_cause(
+    registry: dict[str, Any],
+    book_key: str,
+    *,
+    run_id: str,
+    cause: dict[str, Any],
+    anomaly_ids: list[str],
+) -> dict[str, Any]:
+    """Record a shared batch-level cause and enumerate the affected anomalies.
+
+    A single token/quota failure that blocks many images is recorded once as a
+    batch cause (book + run + stage + code) instead of N independent root causes.
+    It enumerates the affected anomaly IDs so a post-hoc agent sees the whole
+    blast radius from one record. Idempotent per batch cause: re-archiving merges
+    the affected IDs rather than duplicating the record.
+    """
+    stage = cause["stage"]
+    code = cause["code"]
+    cid = batch_cause_id(book_key, run_id, stage, code)
+    now = now_iso()
+    existing = registry["batch_causes"].get(cid)
+    if existing is None:
+        record = {
+            "id": cid,
+            "book_key": book_key,
+            "run_id": run_id,
+            "stage": stage,
+            "code": code,
+            "reason": cause.get("reason") or code,
+            "anomaly_ids": list(anomaly_ids),
+            "recorded_at": now,
+            "updated_at": now,
+        }
+        registry["batch_causes"][cid] = record
+        return record
+    for aid in anomaly_ids:
+        if aid not in existing["anomaly_ids"]:
+            existing["anomaly_ids"].append(aid)
+    existing["updated_at"] = now
+    if cause.get("reason"):
+        existing["reason"] = cause["reason"]
+    return existing
+
+
 def archive_anomalies(
-    context: Any, anomalies: list[dict[str, Any]], *, run_id: str | None = None
+    context: Any,
+    anomalies: list[dict[str, Any]],
+    *,
+    run_id: str | None = None,
+    batch_cause: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Stage archiving API: persist anomalies + necessary inputs outside wash.
 
     Returns the enriched anomaly records (stable ``id``, durable input refs,
     disposition) for the stage envelope. Inputs are copied before the registry is
     written, so an archiving failure never leaves a ref to a missing file and never
-    touches the canonical corpus state.
+    touches the canonical corpus state. When ``batch_cause`` is given (a shared
+    token/quota failure), one batch cause is recorded and every affected anomaly
+    is stamped with its id so the whole blast radius is enumerable.
     """
     config = context.config
     book_key = context.book.key
@@ -256,12 +318,60 @@ def archive_anomalies(
         )
         for anomaly in anomalies
     ]
+    if batch_cause is not None:
+        cause = record_batch_cause(
+            registry,
+            book_key,
+            run_id=run,
+            cause=batch_cause,
+            anomaly_ids=[row["id"] for row in archived],
+        )
+        for row in archived:
+            row["batch_cause"] = cause["id"]
     save_registry(config, book_key, registry)
     return archived
 
 
 def run_result_path(config: Any, book_key: str, run_id: str) -> Path:
     return results_root(config, book_key) / "runs" / f"{_slug(run_id)}.json"
+
+
+def _document_identities(layout: RunLayout) -> list[dict[str, Any]]:
+    """Per-document identity rows from the capture snapshot, durable outside wash.
+
+    Records the doc ID, title, source version, export status and reuse so a
+    post-hoc agent can identify exactly which source version each result refers to
+    even after the wash run directory is cleaned. Reuses the existing snapshot
+    version record (no new fingerprint); a missing/unreadable snapshot degrades to
+    no rows rather than failing the whole result.
+    """
+    path = layout.stage_dir("capture") / "snapshot.json"
+    if not path.is_file():
+        return []
+    try:
+        snapshot = read_json(path)
+    except RunError:
+        return []
+    if not isinstance(snapshot, dict):
+        return []
+    records = snapshot.get("documents") or {}
+    exports = snapshot.get("exports") or {}
+    rows = []
+    for doc_id, record in sorted(records.items(), key=lambda item: str(item[0])):
+        if not isinstance(record, dict):
+            continue
+        export = exports.get(str(doc_id)) or {}
+        rows.append(
+            {
+                "document_id": record.get("id"),
+                "title": record.get("title"),
+                "source_version": record.get("version"),
+                "export_status": export.get("status"),
+                "reused": bool(export.get("reused")),
+                "labels": export.get("labels") or [],
+            }
+        )
+    return rows
 
 
 def archive_run(state: RunState, config: Any, book_key: str) -> dict[str, Any]:
@@ -329,6 +439,7 @@ def archive_run(state: RunState, config: Any, book_key: str) -> dict[str, Any]:
         "config": data.get("config"),
         "counts": data.get("counts", {}),
         "stages": stages,
+        "documents": _document_identities(layout),
         "anomaly_ids": anomaly_ids,
         "run_dir": str(layout.root),
         "results_dir": str(results_root(config, book_key)),
