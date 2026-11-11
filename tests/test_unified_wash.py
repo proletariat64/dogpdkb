@@ -10,6 +10,7 @@ corpus, graph and private artifacts are never touched.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -548,3 +549,65 @@ def test_cleanup_migrates_an_anomaly_input_that_only_lives_in_wash(
     assert durable.read_bytes() == expected
     # Provenance is preserved; only the durable copy location is rewritten.
     assert record["necessary_inputs"][0]["source"] == str(raw)
+
+
+DEPLOYMENT_DOC = Path(__file__).resolve().parents[1] / "docs" / "unattended-sync.md"
+CRON_LINE = re.compile(
+    r"^(?:\S+\s+){5}\S*dogpdkb\s+sync\b.*--config\s+\S+.*--book\s+\S+.*"
+    r">>\s*\S+\s+2>&1\s*$"
+)
+
+
+def fenced_blocks(text: str) -> list[str]:
+    blocks = []
+    current: list[str] | None = None
+    for line in text.splitlines():
+        if line.startswith("```"):
+            if current is None:
+                current = []
+            else:
+                blocks.append("\n".join(current))
+                current = None
+            continue
+        if current is not None:
+            current.append(line)
+    return blocks
+
+
+def test_deployment_doc_offers_copyable_crontab_and_logrotate_examples():
+    text = DEPLOYMENT_DOC.read_text(encoding="utf-8")
+    assert text.startswith("# ")
+    blocks = fenced_blocks(text)
+
+    cron = [
+        line
+        for block in blocks
+        for line in block.splitlines()
+        if CRON_LINE.match(line.strip())
+    ]
+    assert cron, "expected a copyable crontab line with program, config and log"
+    assert "--config" in cron[0] and "--book" in cron[0]
+    # No credential is embedded in the scheduled command.
+    assert "token=" not in cron[0].lower()
+    assert "PADDLEOCR_TOKEN=" not in cron[0]
+
+    rotation = [
+        block
+        for block in blocks
+        if "{" in block
+        and re.search(r"(?m)^\s*(daily|weekly|monthly)\s*$", block)
+        and re.search(r"(?m)^\s*rotate\s+\d+\s*$", block)
+    ]
+    assert rotation, "expected a copyable system logrotate stanza"
+    log = re.search(r">>\s*(\S+)\s+2>&1", cron[0]).group(1)
+    assert log in rotation[0], "logrotate must rotate the log the cron line appends to"
+
+    # The tool neither installs cron nor runs a rotation daemon.
+    lowered = text.lower()
+    assert "does not install" in lowered
+    assert "logrotate" in lowered
+    assert "PADDLEOCR_TOKEN" in text
+    # Deployment also documents the durable stores and the historical tidy.
+    assert "dogpdkb wash" in text
+    assert "sync-results" in text or "[paths].results" in text
+    assert "ocr-cache" in text or "[paths].ocr_cache" in text
