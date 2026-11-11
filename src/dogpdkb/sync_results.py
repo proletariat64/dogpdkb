@@ -16,7 +16,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from dogpdkb.sync_run import RunLayout, atomic_json, read_json
+from dogpdkb.sync_run import STAGES, RunLayout, RunState, atomic_json, read_json
+from dogpdkb.sync_stages import read_envelope
 from dogpdkb.sync_time import now_iso
 
 ANOMALY_SCHEMA = "unified-anomalies-1.0"
@@ -231,3 +232,80 @@ def archive_anomalies(
     ]
     save_registry(config, book_key, registry)
     return archived
+
+
+def run_result_path(config: Any, book_key: str, run_id: str) -> Path:
+    return results_root(config, book_key) / "runs" / f"{_slug(run_id)}.json"
+
+
+def archive_run(state: RunState, config: Any, book_key: str) -> dict[str, Any]:
+    """Persist the structured per-run result outside wash before the batch ends.
+
+    Assembles the durable result from the lightweight run state and the stage
+    envelopes, referencing the anomaly registry. Handlers archive their own
+    necessary inputs; any envelope anomaly not yet registered is registered here
+    as a safety net so a result never references an unrecorded anomaly.
+    """
+    layout = state.layout
+    data = state.data
+    registry = load_registry(config, book_key)
+    stages: dict[str, Any] = {}
+    anomaly_ids: list[str] = []
+    for stage in STAGES:
+        row = data["stage_states"][stage]
+        envelope = read_envelope(layout, stage)
+        if envelope is None:
+            stages[stage] = {
+                "status": row["status"],
+                "counts": row.get("counts", {}),
+                "reason": row.get("reason"),
+                "artifacts": {},
+                "anomaly_ids": [],
+                "result": None,
+            }
+            continue
+        ids = []
+        for anomaly in envelope.get("anomalies") or []:
+            aid = anomaly.get("id")
+            if aid is None:
+                aid = register_anomaly(
+                    registry,
+                    config,
+                    book_key,
+                    anomaly,
+                    run_id=layout.run_id,
+                    layout=layout,
+                )["id"]
+            ids.append(aid)
+            if aid not in anomaly_ids:
+                anomaly_ids.append(aid)
+        stages[stage] = {
+            "status": envelope["status"],
+            "counts": envelope.get("counts", {}),
+            "reason": envelope.get("reason"),
+            "artifacts": envelope.get("artifacts", {}),
+            "anomaly_ids": ids,
+            "result": layout.relative(layout.result_path(stage)),
+        }
+    save_registry(config, book_key, registry)
+    result = {
+        "schema_version": RESULT_SCHEMA,
+        "run_id": layout.run_id,
+        "book_key": book_key,
+        "book": data.get("book"),
+        "status": data["status"],
+        "stop_reason": data.get("stop_reason"),
+        "exit_code": data.get("exit_code"),
+        "started_at": data.get("started_at"),
+        "ended_at": data.get("ended_at"),
+        "duration_seconds": data.get("duration_seconds"),
+        "corpus": data.get("corpus"),
+        "config": data.get("config"),
+        "counts": data.get("counts", {}),
+        "stages": stages,
+        "anomaly_ids": anomaly_ids,
+        "run_dir": str(layout.root),
+        "results_dir": str(results_root(config, book_key)),
+    }
+    atomic_json(run_result_path(config, book_key, layout.run_id), result)
+    return result

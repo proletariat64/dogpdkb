@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from dogpdkb.sync_results import archive_run
 from dogpdkb.sync_run import (
     DONE_STAGE_STATUSES,
     FINISHED_STATUSES,
@@ -266,6 +267,14 @@ def _run(
     return "completed", None, 0
 
 
+def _archive_result(state: RunState, config: SyncConfig, book_key: str) -> None:
+    """Persist the durable per-run result; a failure is recorded, never fatal."""
+    try:
+        archive_run(state, config, book_key)
+    except (OSError, ValueError) as error:
+        report_progress(f"result archiving failed: {safe_diagnostic(error)}")
+
+
 def main(argv: list[str] | None = None) -> int:
     from dogpdkb.sync_progress import Progress
 
@@ -352,12 +361,14 @@ def main(argv: list[str] | None = None) -> int:
         if state is not None:
             state.interrupt_stages()
             state.finish("paused", stop_reason="user interrupt", exit_code=130)
+            _archive_result(state, config, book.key)
             report_progress(f"run {layout.run_id} interrupted; resume it to continue")
             print(json.dumps(state.summary(), ensure_ascii=False))
         return 130
     except (RunError, StateError, OSError, ValueError) as error:
         parser.exit(1, f"dogpdkb sync: {safe_diagnostic(error)}\n")
     state.finish(status, stop_reason=reason, exit_code=code)
+    _archive_result(state, config, book.key)
     if status in FINISHED_STATUSES:
         # A finished batch never leaves a claim that blocks the next cron run.
         progress.finish()

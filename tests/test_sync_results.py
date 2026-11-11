@@ -89,3 +89,30 @@ def test_persistent_input_survives_wash_cleanup(workspace: Workspace):
     assert durable.read_bytes() == expected
     # The registry itself is durable and still readable.
     assert only_anomaly(workspace)["document_id"] == 2
+
+
+def test_batch_result_is_persisted_outside_wash_and_survives_cleanup(
+    workspace: Workspace,
+):
+    make_capture_anomaly(workspace)
+    assert workspace.sync("--stop-after", "capture").returncode == 0
+    run_id = workspace.only_run().name
+
+    result_path = workspace.results / "runs" / f"{run_id}.json"
+    assert result_path.is_file()
+    assert not result_path.is_relative_to(workspace.staging)
+    result = read_json(result_path)
+    assert result["schema_version"] == "unified-result-1.0"
+    assert result["run_id"] == run_id
+    assert result["book_key"] == "fund"
+    assert result["status"] == "paused"
+    assert result["stages"]["capture"]["status"] == "partial"
+    assert result["counts"]["total"] == 2
+    assert result["anomaly_ids"] == [only_anomaly(workspace)["id"]]
+
+    # A finished wash run can be removed without losing the structured result.
+    for run in workspace.runs():
+        for path in sorted(run.rglob("*"), reverse=True):
+            path.unlink() if path.is_file() else path.rmdir()
+        run.rmdir()
+    assert read_json(result_path)["run_id"] == run_id
