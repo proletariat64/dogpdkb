@@ -202,6 +202,7 @@ def _rows(context: StageContext, snapshot: dict[str, Any]) -> list[dict[str, Any
             "raw": None,
             "previous_raw": None,
             "previous_kind": None,
+            "metadata": None,
             "body": None,
             "comparison": None,
             "resources": [],
@@ -263,6 +264,7 @@ def _rows(context: StageContext, snapshot: dict[str, Any]) -> list[dict[str, Any
             if frozen_old is not None
             else None,
             previous_kind=old.content_kind if old is not None else None,
+            metadata=new.metadata,
             body=body,
             comparison=comparison,
             resources=new.resources,

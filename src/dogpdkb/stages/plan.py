@@ -286,7 +286,7 @@ def _update_state(
                 "coverage": "body_reuse",
                 "version": row["source_version"],
                 "raw": row.get("raw"),
-                "metadata": (row.get("body") or {}).get("metadata")
+                "metadata": row.get("metadata")
                 or record.get("graph", {}).get("metadata"),
             }
         record.setdefault("steps", {})["plan"] = {

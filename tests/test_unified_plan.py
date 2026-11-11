@@ -112,6 +112,13 @@ def test_identical_body_reuses_existing_knowledge(workspace: Workspace):
     assert 2 in compile_ids  # the new document still compiles
     # Metadata maintenance is not dropped just because the body is reused.
     assert 1 in {row["document_id"] for row in plan["metadata"]}
+    # Body reuse keeps the existing knowledge: canonical graph stays covered and
+    # advances to the verified incoming version without a recompile.
+    state = read_json(workspace.corpus / ".sync-state.json")
+    graph = state["books"]["fund"]["documents"]["1"]["graph"]
+    assert graph["status"] == "covered"
+    assert graph["coverage"] == "body_reuse"
+    assert graph["version"]["utc"] == "2026-11-10T10:00:00+08:00"
 
 
 def test_changed_image_with_reused_body_still_goes_to_ocr(workspace: Workspace):
