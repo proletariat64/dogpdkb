@@ -29,7 +29,7 @@ def _plan(context: StageContext) -> dict[str, Any]:
     return payload
 
 
-def _anomalies(context: StageContext, report: dict[str, Any]) -> list[dict[str, Any]]:
+def _anomalies(report: dict[str, Any]) -> list[dict[str, Any]]:
     book_id = report["book"]["book_id"]
     return [
         {
@@ -67,7 +67,7 @@ def handle(context: StageContext) -> StageResult:
         raise StageFailed(f"compile failed: {safe_diagnostic(error)}") from error
     if report.get("schema_version") != COMPILE_SCHEMA:
         raise StageFailed("compile produced an unsupported result schema")
-    anomalies = _anomalies(context, report)
+    anomalies = _anomalies(report)
     if anomalies:
         try:
             anomalies = archive_anomalies(context, anomalies)
