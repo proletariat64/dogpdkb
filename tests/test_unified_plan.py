@@ -150,6 +150,11 @@ def test_new_document_image_goes_to_ocr_and_compile(workspace: Workspace):
     assert resource["url"] == "https://cdn.example.invalid/a.png"
     assert resource["kind"] == "image"
     assert resource["resource_id"] == "https://cdn.example.invalid/a.png"
+    # Ordering: compile references the OCR resources it may consume, but does not
+    # block on OCR completing.
+    compile_two = next(row for row in plan["compile"] if row["document_id"] == 2)
+    assert compile_two["ocr_dependencies"] == ["https://cdn.example.invalid/a.png"]
+    assert compile_two["ocr_blocking"] is False
 
 
 def test_rename_is_planned_as_metadata_maintenance(workspace: Workspace):

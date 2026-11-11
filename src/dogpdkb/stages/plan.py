@@ -170,6 +170,18 @@ def _decide(
         old_exists = row.get("previous_kind") is not None
         reasons = list(row.get("reason_codes") or [])
 
+        # The OCR work list is every incoming image the comparator did not prove
+        # reusable: processing_required (NEW/CHANGED) plus unverified UNKNOWN
+        # images. A changed or unprovable image therefore reaches OCR even when
+        # the body is reused, and body reuse never depends on OCR completing.
+        ocr = comparison.get("ocr") or {}
+        reusable = set(ocr.get("reusable") or [])
+        required = [
+            entry["resource_id"]
+            for entry in row.get("resources") or []
+            if entry.get("kind") == "image" and entry["resource_id"] not in reusable
+        ]
+
         # Body reuse is independent of OCR: an identical body keeps its knowledge
         # even when images changed and must be re-OCR'd.
         if old_exists and action == REUSE_ACTION and status == REUSE_STATUS:
@@ -198,22 +210,14 @@ def _decide(
                     "previous_kind": row.get("previous_kind"),
                     "scope": "whole_document",
                     "reason_codes": sorted(set(reasons)),
+                    # Compile may consume these OCR results when available but
+                    # proceeds with currently-available content otherwise.
+                    "ocr_dependencies": required,
                     "ocr_blocking": False,
                 }
             )
             decision = "compile"
 
-        # The OCR work list is every incoming image the comparator did not prove
-        # reusable: processing_required (NEW/CHANGED) plus unverified UNKNOWN
-        # images. A changed or unprovable image therefore reaches OCR even when
-        # the body is reused, and body reuse never depends on OCR completing.
-        ocr = comparison.get("ocr") or {}
-        reusable = set(ocr.get("reusable") or [])
-        required = [
-            entry["resource_id"]
-            for entry in row.get("resources") or []
-            if entry.get("kind") == "image" and entry["resource_id"] not in reusable
-        ]
         if required:
             ocr_items.append(
                 {
