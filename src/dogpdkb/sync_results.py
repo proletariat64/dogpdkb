@@ -1,7 +1,7 @@
 """Durable batch results, anomaly handoff, retry suppression and disposition.
 
 Persistent structured results and the anomaly registry live outside the cleanable
-wash run directory (``[paths].results``), so ticket 07's wash cleanup never removes
+wash run directory (``[paths].results``), so wash cleanup never removes
 the evidence a post-hoc agent needs. Anomaly identity reuses the existing
 book + document ID + source version (no new content fingerprint). Attempt/handoff
 state recorded here is separate from real success, which stays in the canonical
@@ -494,7 +494,7 @@ def register_compile_followup(
 ) -> dict[str, Any]:
     """Explicitly register follow-up compile work after a published input changed.
 
-    Contract for tickets 05/06: an OCR backfill that changes the input a published
+    An OCR backfill that changes the input a published
     compile consumed MUST register this follow-up; writing the OCR cache alone is
     not a completed knowledge update. The follow-up stays ``pending`` until compile
     publishes and records real completion. Registration is idempotent per version:

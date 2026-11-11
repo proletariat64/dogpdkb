@@ -448,7 +448,7 @@ def main() -> None:
     """The single sync entry: always the unified five-stage batch runner.
 
     Legacy flags are deprecated compatibility forwarding into the unified
-    runner (ticket 08); the superseded executors are no longer a second default.
+    runner; the superseded executors are no longer a second default.
     """
     from dogpdkb.unified_sync import (
         deprecation_notice,

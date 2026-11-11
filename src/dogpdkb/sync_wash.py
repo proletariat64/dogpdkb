@@ -86,7 +86,6 @@ class Source:
     payload: Any = None
     ignore_keys: frozenset[str] = frozenset()
     readable: bool = True
-    save: Any = None
 
 
 @dataclass
@@ -129,17 +128,17 @@ def migrated_root(config: Any, book_key: str, run_id: str) -> Path:
 
 
 def _strings(
-    payload: Any, base: Path, ignore: frozenset[str], trail: str = ""
+    payload: Any, ignore: frozenset[str], trail: str = ""
 ) -> Iterator[tuple[str, str]]:
     """Every string value with its field trail; provenance keys are skipped."""
     if isinstance(payload, dict):
         for key, value in payload.items():
             if key in ignore and isinstance(value, str):
                 continue
-            yield from _strings(value, base, ignore, f"{trail}.{key}" if trail else key)
+            yield from _strings(value, ignore, f"{trail}.{key}" if trail else key)
     elif isinstance(payload, list):
         for index, value in enumerate(payload):
-            yield from _strings(value, base, ignore, f"{trail}[{index}]")
+            yield from _strings(value, ignore, f"{trail}[{index}]")
     elif isinstance(payload, str) and payload:
         yield trail, payload
 
@@ -188,7 +187,7 @@ def references(sources_: list[Source], directories: list[Path]) -> list[Referenc
     for row in sources_:
         if row.payload is None:
             continue
-        for trail, value in _strings(row.payload, row.base, row.ignore_keys):
+        for trail, value in _strings(row.payload, row.ignore_keys):
             resolved = _resolved(row.base, value)
             if resolved is None:
                 continue

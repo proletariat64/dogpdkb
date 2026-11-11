@@ -5,7 +5,7 @@ order ``STAGES`` and only enters the next stage after the current one ends.
 Handlers are registered by name; requesting an unregistered stage is an explicit
 error, never a silent skip or a fabricated success.
 
-Later tickets add ``dogpdkb.stages.<stage>`` exposing ``HANDLER``; nothing else
+Each ``dogpdkb.stages.<stage>`` module exposes ``HANDLER``; nothing else
 in the runner has to change.
 """
 
@@ -30,15 +30,6 @@ from dogpdkb.sync_run import (
     read_json,
 )
 from dogpdkb.sync_time import now_iso
-
-#: Owner ticket for each stage that this module does not implement itself.
-STAGE_OWNERS = {
-    "capture": "01",
-    "mdcompare": "04",
-    "plan": "04",
-    "ocr": "05",
-    "compile": "06",
-}
 
 
 class StageError(ValueError):
@@ -158,8 +149,7 @@ def handler_for(stage: str) -> Handler:
     handler = _HANDLERS.get(stage)
     if handler is None:
         raise StageNotRegistered(
-            f"stage {stage} has no registered handler "
-            f"(implemented by ticket {STAGE_OWNERS[stage]}); "
+            f"stage {stage} has no registered handler; "
             f"available stages: {', '.join(registered_stages()) or 'none'}"
         )
     return handler

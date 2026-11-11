@@ -2,7 +2,7 @@
 
 Delegates to the existing ``knowledge_capture.run_capture`` and keeps the
 ``knowledge-capture-1.0`` snapshot contract unchanged. Download reuse across
-batches and the durable raw store are owned by ticket 02.
+batches and the durable raw store are owned by the capture layer.
 """
 
 from __future__ import annotations

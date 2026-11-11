@@ -24,6 +24,7 @@ from dogpdkb.sync_run import (
     read_json,
 )
 from dogpdkb.sync_time import now_iso
+from dogpdkb.workflows.get_sync_updates import safe_diagnostic
 from mdocr.config import config_arguments, configure
 
 
@@ -117,26 +118,26 @@ def _latest(layouts: list[RunLayout]) -> RunLayout | None:
     return max(pool, key=lambda row: row[0])[1] if pool else None
 
 
-def report(view: dict[str, Any]) -> str:
-    counts = view["counts"]
-    stages = " ".join(f"{name}={view['stages'][name]['status']}" for name in STAGES)
+def report(data: dict[str, Any]) -> str:
+    counts = data["counts"]
+    stages = " ".join(f"{name}={data['stages'][name]['status']}" for name in STAGES)
     lines = [
-        f"run {view['run']} book={view['book'].get('key')} status={view['status']}",
-        f"current stage: {view['current_stage'] or 'none'}",
+        f"run {data['run']} book={data['book'].get('key')} status={data['status']}",
+        f"current stage: {data['current_stage'] or 'none'}",
         f"stages: {stages}",
         (
             f"items: total={counts.get('total', 0)} "
             f"completed={counts.get('completed', 0)} "
             f"reused={counts.get('reused', 0)} failed={counts.get('failed', 0)}"
         ),
-        f"started: {view['started_at']}  last progress: {view['updated_at']}",
-        f"elapsed: {view['duration_seconds']}s",
-        f"stop reason: {view['stop_reason'] or 'none'}",
-        f"run directory: {view['run_dir']}",
-        f"logs: {view['run_dir']}/logs",
+        f"started: {data['started_at']}  last progress: {data['updated_at']}",
+        f"elapsed: {data['duration_seconds']}s",
+        f"stop reason: {data['stop_reason'] or 'none'}",
+        f"run directory: {data['run_dir']}",
+        f"logs: {data['run_dir']}/logs",
     ]
-    if view["resume"]:
-        lines.append(f"resume: {view['resume']}")
+    if data["resume"]:
+        lines.append(f"resume: {data['resume']}")
     return "\n".join(lines)
 
 
@@ -151,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             layouts = book_runs(config.staging, args.book)
     except RunError as error:
-        parser.exit(1, f"dogpdkb status: {error}\n")
+        parser.exit(1, f"dogpdkb status: {safe_diagnostic(error)}\n")
     selected = layouts[0] if args.run else _latest(layouts)
     if selected is None:
         empty = {"schema_version": RUN_SCHEMA, "status": "no-runs", "runs": 0}
@@ -167,6 +168,6 @@ def main(argv: list[str] | None = None) -> int:
             raise RunError(f"unsupported run state schema in {selected.state_path}")
         result = view(selected, payload)
     except (RunError, KeyError, TypeError) as error:
-        parser.exit(1, f"dogpdkb status: {error}\n")
+        parser.exit(1, f"dogpdkb status: {safe_diagnostic(error)}\n")
     print(json.dumps(result, ensure_ascii=False) if args.json else report(result))
     return 0

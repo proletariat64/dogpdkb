@@ -11,7 +11,7 @@ report and decides, per document:
   of body reuse (identical body with changed images still goes to OCR);
 * metadata maintenance — rename / move / source-ref changes, in this same plan.
 
-A current input that is unavailable is archived as an anomaly through ticket 03's
+A current input that is unavailable is archived as an anomaly through the
 durable API (never fabricated). Same-version archived failures are suppressed so
 the daily batch does not retry them; a new version is processed normally.
 """
@@ -292,14 +292,20 @@ def _update_state(
                 "raw": raw_reference,
             }
         if doc_id in reuse_ids and raw_reference is not None:
-            record["graph"] = {
-                "status": "covered",
-                "coverage": "body_reuse",
-                "version": row["source_version"],
-                "raw": raw_reference,
-                "metadata": row.get("metadata")
-                or record.get("graph", {}).get("metadata"),
-            }
+            # Merge into the existing graph record: body reuse advances the
+            # verified version/raw but must preserve prior OCR reuse evidence
+            # and the generated body scope (and any other keys) so the next
+            # batch can still prove image reuse without re-OCR.
+            graph = record.setdefault("graph", {})
+            graph.update(
+                {
+                    "status": "covered",
+                    "coverage": "body_reuse",
+                    "version": row["source_version"],
+                    "raw": raw_reference,
+                    "metadata": row.get("metadata") or graph.get("metadata"),
+                }
+            )
         record.setdefault("steps", {})["plan"] = {
             "status": "completed",
             "recorded_at": now_iso(),
@@ -320,7 +326,17 @@ def handle(context: StageContext) -> StageResult:
     report = _report(context)
     state_path = context.corpus / ".sync-state.json"
     plan_path = context.directory / "plan.json"
-    if plan_path.exists() or plan_path.is_symlink():
+    if plan_path.is_symlink():
+        raise StageFailed("plan output must not be a symlink")
+    # A crash after the artifact lands but before the stage records completion
+    # leaves plan.json present with the stage still non-done. Resume re-runs that
+    # stage (attempts > 1) and must rebuild it atomically, not block forever; the
+    # clobber guard only protects a fresh first attempt. validate_outputs and
+    # publish_reports still reject input collisions and replace symlink-safely.
+    if (
+        context.state.stage(context.stage).get("attempts", 1) <= 1
+        and plan_path.exists()
+    ):
         raise StageFailed("plan output already exists; resume the recorded run instead")
     suppressed = _suppressed_keys(context)
     with state_lock(state_path):

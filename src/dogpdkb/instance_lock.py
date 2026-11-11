@@ -90,13 +90,16 @@ def lock_is_held() -> bool:
     except OSError:
         return False
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return True
-    except OSError:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        fcntl.flock(fd, fcntl.LOCK_UN)
         return False
-    fcntl.flock(fd, fcntl.LOCK_UN)
-    return False
+    finally:
+        os.close(fd)
 
 
 def locked_main(function):

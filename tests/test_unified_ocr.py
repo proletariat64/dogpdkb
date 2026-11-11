@@ -499,6 +499,169 @@ def test_same_version_archived_ocr_failure_is_not_retried_until_new_version(
     assert workspace.submissions() == 2
 
 
+class OcrCompileWorkspace(OcrWorkspace):
+    """The real inline OCR handler plus the deterministic Graphify stub.
+
+    OcrWorkspace doubles the OCR boundary but leaves compile unregistered; this
+    subclass adds the Graphify stub so a full batch can really publish, letting a
+    regression observe whether OCR-driven compile follow-up work reaches the
+    published knowledge. No real Graphify / OCR / network / paid call is made.
+    """
+
+    def __init__(self, tmp_path: Path, **kwargs: Any):
+        super().__init__(tmp_path, **kwargs)
+        from tests.test_knowledge_execute import install_graphify_stub
+
+        self.stub = install_graphify_stub(tmp_path)
+        self.env["PYTHONPATH"] = os.pathsep.join(
+            [str(tmp_path / "python-shim"), str(self.stub), str(ROOT / "src")]
+        )
+        self.graphify_log = tmp_path / "graphify-calls.jsonl"
+        self.env["GRAPHIFY_STUB_LOG"] = str(self.graphify_log)
+
+    def graphify_calls(self) -> list[dict[str, Any]]:
+        if not self.graphify_log.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.graphify_log.read_text(encoding="utf-8").splitlines()
+        ]
+
+    def extracts(self) -> list[str]:
+        return [
+            row["file"] for row in self.graphify_calls() if row["event"] == "extract"
+        ]
+
+    def graph(self) -> dict[str, Any]:
+        return read_json(self.corpus / "graphify-out" / "graph.json")
+
+    def state(self) -> dict[str, Any]:
+        return read_json(self.corpus / ".sync-state.json")
+
+    def compile_report(self, run: Path | None = None) -> dict[str, Any]:
+        return read_json((run or self.only_run()) / "compile" / "compile-result.json")
+
+    def followups(self) -> dict[str, Any]:
+        path = self.root / "sync-results" / "fund" / "compile-followups.json"
+        return read_json(path) if path.is_file() else {"followups": {}}
+
+    def reuse_doc_one_with_changed_image(self) -> None:
+        """Doc One: identical body, changed image (old.png -> new.png)."""
+        (self.corpus / "One-2026-11-10-[1].md").write_text(
+            "# One\n\nOld rule.\n\n![img](https://cdn.example.invalid/old.png)\n",
+            encoding="utf-8",
+        )
+        remote = read_json(self.root / "remote.json")
+        remote["details"]["1"]["body"] = (
+            "# One\n\nOld rule.\n\n![img](https://cdn.example.invalid/new.png)\n"
+        )
+        # Keep doc Two a plain new document so OCR work is focused on doc One.
+        remote["details"]["2"]["body"] = "body 2\n"
+        write_json(self.root / "remote.json", remote)
+
+
+def test_body_reuse_changed_image_successful_ocr_is_compiled_and_publishes(
+    tmp_path: Path,
+):
+    # Spec Finding 1: a body-reuse source whose image changed and was successfully
+    # OCR'd inline must recompile so the new image text reaches the graph. The
+    # plan keeps it in body_reuse (not compile); the successful OCR must register
+    # follow-up compile work that this batch's compile stage consumes.
+    workspace = OcrCompileWorkspace(tmp_path)
+    workspace.reuse_doc_one_with_changed_image()
+
+    completed = workspace.sync()
+    assert completed.returncode == 0, completed.stderr
+    run = workspace.only_run()
+    plan = read_json(run / "plan" / "plan.json")
+    # Precondition: identical body -> body_reuse; changed image -> OCR list.
+    assert 1 in {row["document_id"] for row in plan["body_reuse"]}
+    assert 1 in {row["document_id"] for row in plan["ocr"]}
+    assert 1 not in {row["document_id"] for row in plan["compile"]}
+    assert workspace.ocr_envelope(run)["counts"]["success"] == 1
+
+    # The successful inline OCR changed the compile input: doc One is compiled
+    # this batch (via the registered follow-up), not left silently stale.
+    report = workspace.compile_report(run)
+    assert 1 in {row["document_id"] for row in report["results"]}
+    assert "source-[1].md" in workspace.extracts()
+    # The new image text reaches the published whole source and the graph.
+    frozen = (run / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" in frozen
+    assert "source-[1].md" in {n["source_file"] for n in workspace.graph()["nodes"]}
+    # The follow-up was registered and consumed only after real publication.
+    doc1 = [
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    ]
+    assert len(doc1) == 1
+    assert doc1[0]["status"] == "done"
+    assert doc1[0]["run_id"] == run.name
+
+
+def test_body_reuse_reused_image_is_not_recompiled(tmp_path: Path):
+    # Contrast for Spec Finding 1 (spec:148): once the changed image has been
+    # recognized and published, a later batch with the same remote reuses the
+    # cached image. A reused (unchanged) image is not a new compile input, so the
+    # body-reuse source must NOT be recompiled and no new follow-up may register.
+    workspace = OcrCompileWorkspace(tmp_path)
+    workspace.reuse_doc_one_with_changed_image()
+
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    run1 = workspace.runs()[-1]
+    assert 1 in {
+        row["document_id"] for row in workspace.compile_report(run1)["results"]
+    }
+    first_extracts = workspace.extracts().count("source-[1].md")
+
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run2 = workspace.runs()[-1]
+    plan2 = read_json(run2 / "plan" / "plan.json")
+    assert 1 in {row["document_id"] for row in plan2["body_reuse"]}
+    assert 1 not in {row["document_id"] for row in plan2["compile"]}
+    report2 = workspace.compile_report(run2)
+    assert 1 not in {row["document_id"] for row in report2.get("results", [])}
+    # No second extraction of doc One: no recompile, no re-billing.
+    assert workspace.extracts().count("source-[1].md") == first_extracts
+    # The batch-1 follow-up stays done; no new pending follow-up for doc One.
+    doc1 = [
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    ]
+    assert len(doc1) == 1
+    assert doc1[0]["status"] == "done"
+
+
+def test_body_reuse_plan_preserves_prior_ocr_evidence_and_body_scope(tmp_path: Path):
+    # Standards J14: the plan's body-reuse state update must merge into the
+    # existing graph record, not replace it. A reused source whose image is not
+    # in this batch's OCR work list never gets graph.ocr re-added by OCR, so a
+    # wholesale replace silently drops the canonical OCR reuse evidence and the
+    # generated body scope, breaking next-batch reuse proof.
+    workspace = OcrCompileWorkspace(tmp_path)
+    workspace.reuse_doc_one_with_changed_image()
+
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    doc1 = workspace.state()["books"]["fund"]["documents"]["1"]["graph"]
+    new_png = "https://cdn.example.invalid/new.png"
+    assert doc1["ocr"]["images"][0]["resource_id"] == new_png
+    assert doc1["body_scope"]["regions"]
+
+    # A later batch re-verifies the reused body. Stop after plan so OCR cannot
+    # run and re-add graph.ocr: the plan alone must preserve the prior evidence.
+    second = workspace.sync("--stop-after", "plan")
+    assert second.returncode == 0, second.stderr
+    run2 = workspace.runs()[-1]
+    plan2 = read_json(run2 / "plan" / "plan.json")
+    assert 1 in {row["document_id"] for row in plan2["body_reuse"]}
+    doc1_after = workspace.state()["books"]["fund"]["documents"]["1"]["graph"]
+    assert doc1_after["ocr"]["images"][0]["resource_id"] == new_png
+    assert doc1_after["body_scope"]["regions"]
+
+
 def test_posthoc_success_resolves_an_archived_ocr_failure_and_registers_compile(
     tmp_path: Path,
 ):

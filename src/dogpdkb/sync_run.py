@@ -206,7 +206,6 @@ class RunState:
         config: Path,
         identity: dict[str, Any],
         stop_after: str | None,
-        resume_of: str | None = None,
     ) -> RunState:
         started = now_iso()
         payload = {
@@ -228,7 +227,9 @@ class RunState:
             "duration_seconds": None,
             "stop_reason": None,
             "exit_code": None,
-            "resume_of": resume_of,
+            # Reserved run-schema field: resume reuses this same run record
+            # instead of creating a linked one, so no predecessor is recorded.
+            "resume_of": None,
             "counts": {"total": 0, "completed": 0, "reused": 0, "failed": 0},
             "stage_states": {
                 stage: {

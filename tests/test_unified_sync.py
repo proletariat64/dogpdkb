@@ -435,6 +435,52 @@ def test_resume_of_a_failed_batch_retries_only_the_failed_stage(workspace: Works
     assert workspace.runs() == [run_dir]
 
 
+CRASH_AFTER_PLAN_ARTIFACT = """
+import os
+from pathlib import Path
+_replace = os.replace
+def crashing_replace(source, destination):
+    result = _replace(source, destination)
+    if (
+        os.environ.get("DOGPDKB_CRASH_AFTER_PLAN") == "1"
+        and Path(destination).name == "plan.json"
+        and Path(destination).parent.name == "plan"
+    ):
+        os._exit(137)
+    return result
+os.replace = crashing_replace
+"""
+
+
+def test_resume_recovers_a_crash_between_plan_artifact_and_stage_record(
+    tmp_path: Path,
+):
+    # Standards J13 / spec:150: a hard crash after the plan artifact lands but
+    # before the stage records completion leaves plan.json present with the plan
+    # stage still "running". Resume re-runs that non-done stage, so the
+    # "output already exists" guard must not permanently block recovery.
+    workspace = Workspace(tmp_path, DOCUMENTS)
+    shim = tmp_path / "crash-shim"
+    shim.mkdir()
+    (shim / "sitecustomize.py").write_text(CRASH_AFTER_PLAN_ARTIFACT, encoding="utf-8")
+    workspace.env["PYTHONPATH"] = os.pathsep.join([str(shim), str(ROOT / "src")])
+    workspace.env["DOGPDKB_CRASH_AFTER_PLAN"] = "1"
+
+    crashed = workspace.sync()
+    assert crashed.returncode != 0
+    run = workspace.only_run()
+    assert (run / "plan" / "plan.json").is_file()
+    state = read_json(run / "run.json")
+    assert state["stage_states"]["plan"]["status"] == "running"
+
+    # Resume the same run: the plan stage must recover, not fail on the guard.
+    workspace.env["DOGPDKB_CRASH_AFTER_PLAN"] = "0"
+    workspace.sync("--resume", run.name)
+    recovered = read_json(run / "run.json")["stage_states"]["plan"]
+    assert recovered["status"] in {"completed", "partial", "skipped"}, recovered
+    assert "already exists" not in (recovered.get("reason") or "")
+
+
 def test_status_without_records_returns_normally(workspace: Workspace):
     canonical = workspace.corpus / ".sync-state.json"
     before = canonical.read_bytes()
@@ -493,6 +539,18 @@ def test_status_reports_the_latest_batch_and_can_name_an_older_one(
 
     assert unknown.returncode != 0
     assert "unknown run: run-19990101-000000" in unknown.stderr
+
+
+def test_status_redacts_credential_forms_in_its_error_output(workspace: Workspace):
+    # F5 / Standards J16: status reports structural errors (unknown run, schema,
+    # key). They carry no secret in practice, but route them through the shared
+    # redactor like the stage diagnostics so no token/auth form can ever reach
+    # status output. The --run reference is the one user-controlled error vector.
+    leaked = workspace.status("--run", "token=supersecret123")
+
+    assert leaked.returncode != 0
+    assert "supersecret123" not in leaked.stderr
+    assert "token=[redacted]" in leaked.stderr
 
 
 def test_a_second_batch_is_rejected_while_the_first_holds_the_run_lock(

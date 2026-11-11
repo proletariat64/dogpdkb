@@ -1,4 +1,4 @@
-"""compile: automatic whole-source knowledge publication (ticket 06).
+"""compile: automatic whole-source knowledge publication.
 
 Consumes the ``unified-plan-1.0`` compile list and publishes each successfully
 compiled document as a complete source through the existing Graphify candidate /
@@ -14,12 +14,11 @@ from __future__ import annotations
 from typing import Any
 
 from dogpdkb.knowledge_execute import COMPILE_SCHEMA, ExecutionError, execute_compile
+from dogpdkb.stages.plan import PLAN_SCHEMA
 from dogpdkb.sync_results import archive_anomalies
 from dogpdkb.sync_run import read_json
 from dogpdkb.sync_stages import StageContext, StageFailed, StageResult
 from dogpdkb.workflows.get_sync_updates import safe_diagnostic
-
-PLAN_SCHEMA = "unified-plan-1.0"
 
 
 def _plan(context: StageContext) -> dict[str, Any]:
@@ -30,7 +29,7 @@ def _plan(context: StageContext) -> dict[str, Any]:
     return payload
 
 
-def _anomalies(context: StageContext, report: dict[str, Any]) -> list[dict[str, Any]]:
+def _anomalies(report: dict[str, Any]) -> list[dict[str, Any]]:
     book_id = report["book"]["book_id"]
     return [
         {
@@ -49,7 +48,16 @@ def _anomalies(context: StageContext, report: dict[str, Any]) -> list[dict[str, 
 def handle(context: StageContext) -> StageResult:
     plan = _plan(context)
     result_path = context.directory / "compile-result.json"
-    if result_path.exists() or result_path.is_symlink():
+    if result_path.is_symlink():
+        raise StageFailed("compile output must not be a symlink")
+    # A crash after compile-result.json lands but before the stage records
+    # completion leaves the artifact present with the stage still non-done.
+    # Resume re-runs that stage (attempts > 1) and must rebuild it, not block
+    # forever; the clobber guard only protects a fresh first attempt.
+    if (
+        context.state.stage(context.stage).get("attempts", 1) <= 1
+        and result_path.exists()
+    ):
         raise StageFailed(
             "compile output already exists; resume the recorded run instead"
         )
@@ -59,7 +67,7 @@ def handle(context: StageContext) -> StageResult:
         raise StageFailed(f"compile failed: {safe_diagnostic(error)}") from error
     if report.get("schema_version") != COMPILE_SCHEMA:
         raise StageFailed("compile produced an unsupported result schema")
-    anomalies = _anomalies(context, report)
+    anomalies = _anomalies(report)
     if anomalies:
         try:
             anomalies = archive_anomalies(context, anomalies)
