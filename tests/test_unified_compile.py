@@ -118,3 +118,37 @@ def test_compile_publishes_whole_sources_and_advances_the_success_version(
     doc2 = state["books"]["fund"]["documents"]["2"]
     assert doc2["graph"]["status"] == "covered"
     assert doc2["graph"]["version"]["utc"] == "2026-11-10T11:00:00+08:00"
+
+
+def test_partial_publication_keeps_failed_source_knowledge_and_version(
+    workspace: CompileWorkspace,
+):
+    # Document one fails extraction this run; document two compiles successfully.
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = "source-[1]"
+
+    completed = workspace.sync()
+
+    # A partial batch still ends normally (exit 0) and hands off its usable set.
+    assert completed.returncode == 0, completed.stderr
+    summary = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert summary["status"] == "partial"
+    assert summary["stages"]["compile"] == "partial"
+    envelope = workspace.compile_envelope()
+    assert envelope["status"] == "partial"
+    assert [row["document_id"] for row in envelope["anomalies"]] == [1]
+
+    graph = workspace.graph()
+    sources = {node["source_file"] for node in graph["nodes"]}
+    assert "source-[2].md" in sources  # successful source published whole
+    assert "One-2026-11-10-[1].md" in sources  # failed source keeps old knowledge
+    assert "source-[1].md" not in sources  # failed source is not cleared/replaced
+
+    state = workspace.state()
+    doc1 = state["books"]["fund"]["documents"]["1"]
+    # The failed source keeps its old success version (here: the unversioned
+    # historical baseline); it must not advance to the newly observed version.
+    assert doc1["graph"]["version"] is None
+    assert doc1["graph"]["coverage"] == "registered_historical_baseline"
+    doc2 = state["books"]["fund"]["documents"]["2"]
+    assert doc2["graph"]["status"] == "covered"
+    assert doc2["graph"]["version"]["utc"] == "2026-11-10T11:00:00+08:00"
