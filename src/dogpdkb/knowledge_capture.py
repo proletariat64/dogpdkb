@@ -965,7 +965,7 @@ def run_capture(args: Any) -> int:
         }
         | (set(prior_pending) & current_id_set)
     )
-    # Retry suppression (ticket 03): an archived failure handed off for this exact
+    # Retry suppression: an archived failure handed off for this exact
     # source version is not re-attempted by the daily batch. A new remote version
     # never matches, so it participates normally; abandonment is version-scoped.
     suppressed: list[dict[str, Any]] = []

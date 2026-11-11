@@ -1167,7 +1167,7 @@ def _freeze_compile_sources(
     """Freeze each compile item's OCR-enriched whole source into the corpus.
 
     The body is the batch's actually-prepared markdown plus its valid OCR
-    artifacts (item 4). Graphify updates by complete source, so each document
+    artifacts. Graphify updates by complete source, so each document
     becomes one ``source-[id].md`` whole source, never a diff fragment. Returns the
     corpus, frozen paths, export manifest rows, and per-document preparation
     records carrying the ``execution`` contract and the generated ``regions``.
@@ -1209,7 +1209,7 @@ def _freeze_compile_sources(
 def _pending_followup_items(
     context: Any, plan: dict[str, Any], items: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Add pending post-hoc followup documents to this run's compile set (item 8).
+    """Add pending post-hoc followup documents to this run's compile set.
 
     A backfill that changed a published compile input registers followup work the
     daily plan suppresses (the archived version is handed off, not retried). The
@@ -1291,7 +1291,7 @@ def _consume_followups(context: Any, results: list[dict[str, Any]]) -> list[str]
 
 
 def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
-    """Automatic whole-source compile for the unified batch (ticket 06).
+    """Automatic whole-source compile for the unified batch.
 
     No human approval and no semantic quality gate: publication is bounded by
     artifact checks (input readable, output parseable, graph structure, write
@@ -1316,7 +1316,7 @@ def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
     metadata_by_id = _compile_metadata(context)
     metadata_items = plan.get("metadata") or []
     # Consume pending post-hoc followups: a backfill that changed a published
-    # compile input registers work the daily plan suppresses (item 8). Merge those
+    # compile input registers work the daily plan suppresses. Merge those
     # documents into this run's compile set before deciding there is no body work.
     items, followup_added = _pending_followup_items(context, plan, items)
     if followup_added:
@@ -1350,7 +1350,7 @@ def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
     source_urls = _compile_source_urls(old_graph)
     state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with state_lock(state_path):
-        # OCR evidence is an input contract published by ticket 05. Read it under
+        # OCR evidence is an input contract published by the OCR stage. Read it under
         # the same lock that guards the canonical update, then freeze the enriched
         # whole sources before Graphify consumes them.
         evidence_by_id = _compile_ocr_evidence(state_path, plan["book"])
@@ -1406,7 +1406,7 @@ def _apply_metadata_maintenance(
     metadata_items: list[dict[str, Any]],
     metadata_by_id: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Execute the plan's rename / move / source-ref maintenance (item 5).
+    """Execute the plan's rename / move / source-ref maintenance.
 
     Applies the incoming metadata to each planned document's canonical graph
     record and records the execution. This runs for every ``metadata[].tasks``
@@ -1532,7 +1532,7 @@ def _execute_compile_locked(
                 "regions": prepared.get("regions") or [],
             },
         }
-        # Preserve the OCR evidence contract published by ticket 05: compile
+        # Preserve the OCR evidence contract published by the OCR stage: compile
         # consumes it as an input and must not wipe it when advancing the graph.
         if isinstance(previous_ocr, dict):
             graph_record["ocr"] = previous_ocr
@@ -1564,7 +1564,7 @@ def _execute_compile_locked(
     )
     save_view(state_path, state)
     # Real completion is recorded; only now close pending post-hoc followups whose
-    # source this run published (item 8). Never closed on cached OCR alone.
+    # source this run published. Never closed on cached OCR alone.
     followups = _consume_followups(context, results)
     usage = candidate_result.get("usage") or {}
     report = _compile_report(

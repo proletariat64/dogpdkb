@@ -1,4 +1,4 @@
-"""compile: automatic whole-source knowledge publication (ticket 06).
+"""compile: automatic whole-source knowledge publication.
 
 Consumes the ``unified-plan-1.0`` compile list and publishes each successfully
 compiled document as a complete source through the existing Graphify candidate /

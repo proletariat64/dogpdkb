@@ -11,7 +11,7 @@ report and decides, per document:
   of body reuse (identical body with changed images still goes to OCR);
 * metadata maintenance — rename / move / source-ref changes, in this same plan.
 
-A current input that is unavailable is archived as an anomaly through ticket 03's
+A current input that is unavailable is archived as an anomaly through the
 durable API (never fabricated). Same-version archived failures are suppressed so
 the daily batch does not retry them; a new version is processed normally.
 """
