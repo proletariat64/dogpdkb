@@ -51,6 +51,7 @@ class SyncConfig:
     state: Path
     web: Path
     results: Path
+    ocr_cache: Path
     graph_dir: Path | None
     graphify_python: Path
     mcp_url: str
@@ -58,6 +59,7 @@ class SyncConfig:
     timeout_seconds: float
     max_retries: int
     concurrency: int
+    ocr_budget_seconds: float
     image_url_rewrites: tuple[tuple[str, str], ...]
     groups: dict[str, str]
     group_prefixes: dict[str, str]
@@ -105,6 +107,7 @@ def load_config(path: Path | str | None = None) -> SyncConfig:
             "state",
             "web",
             "results",
+            "ocr_cache",
             "graph_dir",
             "graphify_python",
         },
@@ -115,6 +118,7 @@ def load_config(path: Path | str | None = None) -> SyncConfig:
             "max_retries",
             "concurrency",
         },
+        "ocr": {"budget_seconds"},
         "images": {"url_rewrites"},
         "web": {"groups", "group_prefixes", "topics", "community_limit"},
     }
@@ -223,6 +227,7 @@ def load_config(path: Path | str | None = None) -> SyncConfig:
         state=required_path("paths", "state", "skylark_books/state", "DOGPDKB_STATE"),
         web=required_path("paths", "web", "web-output", "DOGPDKB_WEB"),
         results=required_path("paths", "results", "sync-results"),
+        ocr_cache=required_path("paths", "ocr_cache", "ocr-cache"),
         graph_dir=file_path("paths", "graph_dir", env="DOGPDKB_GRAPH_DIR"),
         graphify_python=required_path(
             "paths",
@@ -249,6 +254,7 @@ def load_config(path: Path | str | None = None) -> SyncConfig:
                 minimum=1,
             )
         ),
+        ocr_budget_seconds=number("ocr", "budget_seconds", 1800, minimum=0),
         image_url_rewrites=tuple(pairs),
         groups=groups,
         group_prefixes=prefixes,
