@@ -177,6 +177,15 @@ class OcrWorkspace(Workspace):
             encoding="utf-8",
         )
 
+    def bump_version(self, doc_id: int, stamp: str) -> None:
+        """A new remote version: listing and details must agree on the instant."""
+        remote = read_json(self.root / "remote.json")
+        for document in remote["documents"]:
+            if document["id"] == doc_id:
+                document["content_updated_at"] = stamp
+        remote["details"][str(doc_id)]["content_updated_at"] = stamp
+        write_json(self.root / "remote.json", remote)
+
     def latest_run(self) -> Path:
         return self.runs()[-1]
 
@@ -415,3 +424,64 @@ def test_budget_exhaustion_archives_unfinished_and_proceeds_to_compile(tmp_path:
         r for r in workspace.ocr_reference()["documents"] if r["document_id"] == 2
     )
     assert len(row["execution"]["missing_items"]) == 2
+
+
+def test_same_version_archived_ocr_failure_is_not_retried_until_new_version(
+    tmp_path: Path,
+):
+    workspace = OcrWorkspace(tmp_path, mode="fail")
+
+    # Batch 1: the image fails; the failure is archived for this source version.
+    # A full sync ends failed at the still-unregistered compile stage, which
+    # releases the batch claim so the next daily batch may start.
+    first = workspace.sync()
+    assert first.returncode != 0
+    run1 = workspace.latest_run()
+    assert workspace.ocr_envelope(run1)["counts"]["failed"] == 1
+    assert workspace.submissions() == 1
+    failures = [
+        a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == "OCR_FAILED"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["disposition"] == "pending"
+    assert failures[0]["attempts"] == 1
+
+    # Batch 2: the remote version is unchanged, so the archived failure is handed
+    # off to the post-hoc agent instead of being retried by the daily batch.
+    second = workspace.sync()
+    assert second.returncode != 0
+    run2 = workspace.latest_run()
+    assert run2 != run1
+    plan2 = read_json(run2 / "plan" / "plan.json")
+    assert 2 in {row["document_id"] for row in plan2["suppressed"]}
+    assert 2 not in {row["document_id"] for row in plan2["ocr"]}
+    counts2 = workspace.ocr_envelope(run2)["counts"]
+    assert counts2["total"] == 0
+    assert counts2["failed"] == 0
+    # No new billable submission and no re-registration of the same failure.
+    assert workspace.submissions() == 1
+    still = [
+        a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == "OCR_FAILED"
+    ]
+    assert len(still) == 1
+    assert still[0]["attempts"] == 1
+    assert still[0]["disposition"] == "pending"
+
+    # Batch 3: a new remote version participates in daily sync normally; the
+    # abandonment of the old version never bans the source.
+    workspace.bump_version(2, "2026-11-11T09:00:00+08:00")
+    workspace.set_mode("success")
+    third = workspace.sync()
+    assert third.returncode != 0
+    run3 = workspace.latest_run()
+    plan3 = read_json(run3 / "plan" / "plan.json")
+    assert 2 not in {row["document_id"] for row in plan3["suppressed"]}
+    assert 2 in {row["document_id"] for row in plan3["ocr"]}
+    counts3 = workspace.ocr_envelope(run3)["counts"]
+    assert counts3["success"] == 1
+    assert counts3["failed"] == 0
+    assert workspace.submissions() == 2
