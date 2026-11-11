@@ -197,6 +197,12 @@ def register_anomaly(
     if run_id not in existing["runs"]:
         existing["runs"].append(run_id)
         existing["attempts"] = existing.get("attempts", 0) + 1
+    if existing["disposition"] == "stale":
+        # An invalidated handoff was re-attempted and failed again: hand it off
+        # anew so the daily sync does not retry the same version every day.
+        existing["disposition"] = "pending"
+        existing["resolved_at"] = None
+        existing["resolution"] = None
     known = {row["path"] for row in existing["necessary_inputs"]}
     for row in inputs:
         if row["path"] not in known:
@@ -208,6 +214,25 @@ def register_anomaly(
     if anomaly.get("batch_cause"):
         existing["batch_cause"] = anomaly["batch_cause"]
     return existing
+
+
+def suppressing_anomalies(
+    config: Any, book_key: str, *, stage: str | None = None
+) -> list[dict[str, Any]]:
+    """Archived failures the daily sync must not re-attempt (handoff state).
+
+    Consumed by capture before selection: a pending/abandoned/done anomaly for a
+    source version hands that version to the post-hoc agent. ``stale`` is absent
+    by design — an invalidated handoff returns the version to normal daily sync.
+    This is attempt/handoff state only; real success stays in canonical state.
+    """
+    registry = load_registry(config, book_key)
+    return [
+        record
+        for record in registry["anomalies"].values()
+        if record["disposition"] in SUPPRESSING_DISPOSITIONS
+        and (stage is None or record["stage"] == stage)
+    ]
 
 
 def archive_anomalies(

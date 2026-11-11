@@ -359,7 +359,10 @@ def test_partial_capture_hands_its_usable_set_to_the_next_stage(workspace: Works
 
 def test_capture_that_cannot_observe_the_book_fails_the_batch(workspace: Workspace):
     remote = read_json(workspace.root / "remote.json")
-    del remote["details"]["2"]
+    # An unusable listing page: the book cannot be observed at all. (A single
+    # missing *detail* is an archived per-document export failure, not a stage
+    # failure; see test_sync_results.py.)
+    remote["page_overrides"] = {"0": {"error": "listing unavailable"}}
     write_json(workspace.root / "remote.json", remote)
 
     completed = workspace.sync()
@@ -369,7 +372,7 @@ def test_capture_that_cannot_observe_the_book_fails_the_batch(workspace: Workspa
     assert state["status"] == "failed"
     assert state["stage_states"]["capture"]["status"] == "failed"
     assert state["stage_states"]["mdcompare"]["status"] == "pending"
-    assert "doc_id=2" in state["stage_states"]["capture"]["reason"]
+    assert "observation failed" in state["stage_states"]["capture"]["reason"]
     assert "Traceback" not in completed.stderr
 
 

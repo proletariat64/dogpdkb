@@ -35,6 +35,40 @@ def make_capture_anomaly(workspace: Workspace) -> None:
     write_json(workspace.root / "remote.json", remote)
 
 
+def make_export_failure(workspace: Workspace) -> None:
+    """doc 2 detail has no body: its export fails and is archived as a failure."""
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["2"].pop("body", None)
+    write_json(workspace.root / "remote.json", remote)
+
+
+def publish_new_version(workspace: Workspace) -> None:
+    """doc 2 gets a valid, newer remote version (listing and detail agree)."""
+    remote = read_json(workspace.root / "remote.json")
+    stamp = "2026-11-11T10:00:00+08:00"
+    remote["documents"][1]["content_updated_at"] = stamp
+    remote["details"]["2"] = {
+        "id": 2,
+        "body": "body 2 v2",
+        "content_updated_at": stamp,
+    }
+    write_json(workspace.root / "remote.json", remote)
+
+
+def run_batch(workspace: Workspace) -> str:
+    """One daily batch; stages owned by later tickets may still be unregistered."""
+    completed = workspace.sync()
+    assert completed.returncode in (0, 1), completed.stderr
+    run = workspace.runs()[-1]
+    state = read_json(run / "run.json")
+    assert state["stage_states"]["capture"]["status"] in {
+        "completed",
+        "partial",
+        "skipped",
+    }, state["stage_states"]["capture"]
+    return run.name
+
+
 def only_anomaly(workspace: Workspace) -> dict[str, Any]:
     registry = read_json(workspace.results / "anomalies.json")
     assert registry["schema_version"] == "unified-anomalies-1.0"
@@ -221,3 +255,137 @@ def test_anomalies_show_reads_one_record_and_resolve_records_disposition(
     assert "missing" in unknown.stderr
     shown_unknown = anomalies_cli(workspace, "--show", "missing")
     assert shown_unknown.returncode != 0
+
+
+def test_a_single_remote_export_failure_is_archived_without_blocking_others(
+    workspace: Workspace,
+):
+    make_export_failure(workspace)
+
+    run_batch(workspace)
+
+    run = workspace.runs()[-1]
+    snapshot = read_json(run / "capture" / "snapshot.json")
+    # doc 1 still captured; doc 2's failure is an archived anomaly, not a stage failure.
+    assert snapshot["exports"]["1"]["status"] == "captured"
+    assert snapshot["exports"]["2"]["status"] == "failed"
+    assert snapshot["anomalies"] == [{"id": 2, "code": "export_failed"}]
+    record = only_anomaly(workspace)
+    assert record["code"] == "export_failed"
+    assert record["disposition"] == "pending"
+
+
+def test_archived_export_failure_is_not_retried_by_the_next_daily_sync(
+    workspace: Workspace,
+):
+    make_export_failure(workspace)
+    first = run_batch(workspace)
+    record = only_anomaly(workspace)
+    assert record["code"] == "export_failed"
+    assert record["attempts"] == 1
+
+    second = run_batch(workspace)
+
+    # The handed-off source version is not re-attempted: no new export, no new
+    # attempt recorded, and the batch still references the archived anomaly.
+    registry = read_json(workspace.results / "anomalies.json")
+    record = registry["anomalies"][record["id"]]
+    assert record["attempts"] == 1
+    assert record["runs"] == [first]
+    assert record["disposition"] == "pending"
+    snapshot = read_json(
+        workspace.staging / "fund" / second / "capture" / "snapshot.json"
+    )
+    assert 2 not in snapshot["selected"]
+    assert "2" not in snapshot["exports"]
+    assert snapshot["suppressed"] == [
+        {
+            "id": 2,
+            "anomaly_id": record["id"],
+            "code": "export_failed",
+            "version_stamp": record["version_stamp"],
+        }
+    ]
+    result = read_json(workspace.results / "runs" / f"{second}.json")
+    assert record["id"] in result["anomaly_ids"]
+    assert result["stages"]["capture"]["status"] == "partial"
+    # Attempt/handoff state never fabricates a successful download.
+    state = read_json(workspace.corpus / ".sync-state.json")
+    assert state["books"]["fund"]["documents"]["2"]["steps"]["download"]["status"] == (
+        "failed"
+    )
+
+
+def test_a_new_remote_version_syncs_normally_despite_an_archived_failure(
+    workspace: Workspace,
+):
+    make_export_failure(workspace)
+    run_batch(workspace)
+    archived = only_anomaly(workspace)
+
+    publish_new_version(workspace)
+    second = run_batch(workspace)
+
+    snapshot = read_json(
+        workspace.staging / "fund" / second / "capture" / "snapshot.json"
+    )
+    assert 2 in snapshot["selected"]
+    assert snapshot["exports"]["2"]["status"] == "captured"
+    assert snapshot["suppressed"] == []
+    # The old-version handoff is untouched; the new version produced no anomaly.
+    registry = read_json(workspace.results / "anomalies.json")
+    assert list(registry["anomalies"]) == [archived["id"]]
+    assert registry["anomalies"][archived["id"]]["attempts"] == 1
+
+
+def test_abandoning_an_old_version_does_not_ban_the_source(workspace: Workspace):
+    make_export_failure(workspace)
+    run_batch(workspace)
+    aid = only_anomaly(workspace)["id"]
+    resolved = anomalies_cli(
+        workspace,
+        "--resolve",
+        aid,
+        "--disposition",
+        "abandoned",
+        "--note",
+        "give up v1",
+    )
+    assert resolved.returncode == 0, resolved.stderr
+
+    publish_new_version(workspace)
+    second = run_batch(workspace)
+
+    snapshot = read_json(
+        workspace.staging / "fund" / second / "capture" / "snapshot.json"
+    )
+    assert snapshot["exports"]["2"]["status"] == "captured"
+    registry = read_json(workspace.results / "anomalies.json")
+    assert registry["anomalies"][aid]["disposition"] == "abandoned"
+    assert len(registry["anomalies"]) == 1
+
+
+def test_stale_disposition_hands_the_failure_back_to_daily_sync(workspace: Workspace):
+    make_export_failure(workspace)
+    first = run_batch(workspace)
+    aid = only_anomaly(workspace)["id"]
+    resolved = anomalies_cli(workspace, "--resolve", aid, "--disposition", "stale")
+    assert resolved.returncode == 0, resolved.stderr
+
+    # A stale handoff no longer suppresses: the daily batch re-attempts the export.
+    second = run_batch(workspace)
+    registry = read_json(workspace.results / "anomalies.json")
+    record = registry["anomalies"][aid]
+    assert record["attempts"] == 2
+    assert record["runs"] == [first, second]
+    # The repeated failure is handed off again instead of retrying every day.
+    assert record["disposition"] == "pending"
+
+    third = run_batch(workspace)
+    record = read_json(workspace.results / "anomalies.json")["anomalies"][aid]
+    assert record["attempts"] == 2
+    assert record["runs"] == [first, second]
+    snapshot = read_json(
+        workspace.staging / "fund" / third / "capture" / "snapshot.json"
+    )
+    assert 2 not in snapshot["selected"]
