@@ -139,6 +139,26 @@ os.replace = guarded_replace
 """
 
 
+# Hard-crash the process right after compile-result.json is published, before the
+# runner records stage completion. This leaves the artifact present with the
+# compile stage still "running" — the crash-resume window the clobber guard must
+# not permanently block (F4 / spec:150).
+CRASH_AFTER_COMPILE_ARTIFACT = """
+import os
+from pathlib import Path
+_replace = os.replace
+def crashing_replace(source, destination):
+    result = _replace(source, destination)
+    if (
+        os.environ.get("DOGPDKB_CRASH_AFTER_COMPILE") == "1"
+        and Path(destination).name == "compile-result.json"
+    ):
+        os._exit(137)
+    return result
+os.replace = crashing_replace
+"""
+
+
 class CompileWorkspace(Workspace):
     """The unified runner wired to the Graphify stub and an OCR double."""
 
@@ -382,6 +402,39 @@ def test_fault_between_publish_and_state_record_recovers_without_rebilling(
     doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
     assert doc2["graph"]["status"] == "covered"
     assert doc2["graph"]["version"]["utc"] == "2026-11-10T11:00:00+08:00"
+    assert (run_dir / "compile" / "compile-result.json").is_file()
+    assert workspace.runs() == [run_dir]
+
+
+def test_resume_recovers_a_crash_after_the_compile_artifact_lands(
+    workspace: CompileWorkspace,
+):
+    # F4 / spec:150: unlike the state-fault recovery above (which crashes before
+    # compile-result.json exists), a hard crash AFTER the artifact is published
+    # but before the stage records completion leaves compile-result.json present
+    # with the compile stage still "running". Resume re-runs that non-done stage,
+    # so the "output already exists" guard must not permanently block recovery.
+    shim_file = workspace.shim / "sitecustomize.py"
+    shim_file.write_text(
+        shim_file.read_text(encoding="utf-8") + "\n" + CRASH_AFTER_COMPILE_ARTIFACT,
+        encoding="utf-8",
+    )
+    workspace.env["DOGPDKB_CRASH_AFTER_COMPILE"] = "1"
+
+    crashed = workspace.sync()
+    assert crashed.returncode != 0
+    run_dir = workspace.only_run()
+    assert (run_dir / "compile" / "compile-result.json").is_file()
+    state = read_json(run_dir / "run.json")
+    assert state["stage_states"]["compile"]["status"] == "running"
+
+    workspace.env["DOGPDKB_CRASH_AFTER_COMPILE"] = "0"
+    resumed = workspace.sync("--resume", run_dir.name)
+
+    assert resumed.returncode == 0, resumed.stderr
+    recovered = read_json(run_dir / "run.json")["stage_states"]["compile"]
+    assert recovered["status"] in {"completed", "partial", "skipped"}, recovered
+    assert "already exists" not in (recovered.get("reason") or "")
     assert (run_dir / "compile" / "compile-result.json").is_file()
     assert workspace.runs() == [run_dir]
 

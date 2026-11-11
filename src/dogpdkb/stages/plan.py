@@ -326,7 +326,17 @@ def handle(context: StageContext) -> StageResult:
     report = _report(context)
     state_path = context.corpus / ".sync-state.json"
     plan_path = context.directory / "plan.json"
-    if plan_path.exists() or plan_path.is_symlink():
+    if plan_path.is_symlink():
+        raise StageFailed("plan output must not be a symlink")
+    # A crash after the artifact lands but before the stage records completion
+    # leaves plan.json present with the stage still non-done. Resume re-runs that
+    # stage (attempts > 1) and must rebuild it atomically, not block forever; the
+    # clobber guard only protects a fresh first attempt. validate_outputs and
+    # publish_reports still reject input collisions and replace symlink-safely.
+    if (
+        context.state.stage(context.stage).get("attempts", 1) <= 1
+        and plan_path.exists()
+    ):
         raise StageFailed("plan output already exists; resume the recorded run instead")
     suppressed = _suppressed_keys(context)
     with state_lock(state_path):
