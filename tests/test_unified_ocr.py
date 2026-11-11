@@ -150,6 +150,10 @@ class OcrWorkspace(Workspace):
         )
         self.env["PYTHONPATH"] = os.pathsep.join([str(shim), str(ROOT / "src")])
         self.env["PADDLEOCR_TOKEN"] = "test-token"
+        # The shim is re-baked between syncs (set_mode). Never cache its bytecode:
+        # a stale sitecustomize.pyc validated by (mtime, size) could silently keep
+        # the previous MODE when two mode strings share a length and a second.
+        self.env["PYTHONDONTWRITEBYTECODE"] = "1"
 
     def write_image(self, red: int) -> None:
         """Serve a distinct-but-valid PNG so content changes are observable."""
@@ -178,6 +182,11 @@ class OcrWorkspace(Workspace):
             _shim_source(self.ocr_log, mode, self.image_file, self.image_url),
             encoding="utf-8",
         )
+        # Drop any cached bytecode so the rewritten MODE is always recompiled.
+        cache = shim.parent / "__pycache__"
+        if cache.is_dir():
+            for compiled in cache.glob("sitecustomize.*.pyc"):
+                compiled.unlink(missing_ok=True)
 
     def bump_version(self, doc_id: int, stamp: str) -> None:
         """A new remote version: listing and details must agree on the instant."""
