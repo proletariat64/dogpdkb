@@ -41,7 +41,8 @@ with `preprocessing`, `configuration`, and successful `images`. Successful image
 records use status `success` (including reused results) and the same absolute
 `source_path`, `prepared_image`, `artifact` paths. `source_path` holds retained
 original bytes; `prepared_image` is the normalized JPEG; `artifact` is a complete
-marked mdocr OCR block linked to that JPEG. Callers can map resource `path` to
+marked mdocr OCR block linked to that JPEG. Enriched document blocks use absolute
+prepared-image paths so callers can relocate the returned Markdown. Callers can map resource `path` to
 `source_path` for mdcompare without parsing a block or an image.
 
 `PADDLEOCR_TOKEN` is needed only for a new OCR call. `--endpoint` overrides the

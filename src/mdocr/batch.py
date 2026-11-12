@@ -83,7 +83,7 @@ class Batch:
             if cached is not None:
                 record.update(status="reused", **cached)
                 return record, build_ocr_block(
-                    os.path.relpath(cached["prepared_image"], output.parent),
+                    cached["prepared_image"],
                     cached["text"],
                 )
             if not selected:
@@ -107,9 +107,7 @@ class Batch:
                 raise ValueError("empty OCR text")
             cached = self.write_cache(entry, prepared, text)
             record.update(status="success", **cached)
-            return record, build_ocr_block(
-                os.path.relpath(cached["prepared_image"], output.parent), text
-            )
+            return record, build_ocr_block(cached["prepared_image"], text)
         except OcrSharedError as exc:
             self.stop = exc.code
             record.update(status="failed", reason=exc.code)

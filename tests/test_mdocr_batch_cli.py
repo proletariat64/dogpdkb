@@ -143,6 +143,10 @@ def test_batch_selects_images_and_reuses_success_without_token(tmp_path):
         assert "![two](b.png)" in text
         record = row["ocr"]["images"][0]
         assert record["status"] == "success"
+        assert record["prepared_image"] in text
+        relocated = tmp_path / "published.md"
+        relocated.write_text(text)
+        assert record["prepared_image"] in relocated.read_text()
         assert (
             Path(record["source_path"]).read_bytes()
             == (tmp_path / "a.png").read_bytes()

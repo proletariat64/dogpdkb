@@ -47,6 +47,18 @@ def _main(argv: list[str] | None = None) -> int:
         from dogpdkb.discover import main as discover_main
 
         return discover_main(arguments[1:])
+    if arguments and arguments[0] == "sync":
+        from dogpdkb.sync import main as sync_main
+
+        return sync_main(arguments[1:])
+    if arguments and arguments[0] == "update-graph":
+        from dogpdkb.graph import main as graph_main
+
+        return graph_main(arguments[1:])
+    if arguments and arguments[0] == "apply":
+        from dogpdkb.apply import main as apply_main
+
+        return apply_main(arguments[1:])
     if arguments and arguments[0] in WORKFLOWS:
         script = Path(__file__).resolve().parent / "workflows" / WORKFLOWS[arguments[0]]
         return subprocess.call(
@@ -166,6 +178,9 @@ def _main(argv: list[str] | None = None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] in {*WORKFLOWS, "update", "uninstall"} - {"discover"}:
+    if arguments and arguments[0] in (
+        {*WORKFLOWS, "update", "uninstall"}
+        - {"apply", "sync", "update-graph", "discover"}
+    ):
         return locked_main(_main)(arguments)
     return _main(arguments)
