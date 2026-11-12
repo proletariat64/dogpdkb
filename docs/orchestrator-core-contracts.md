@@ -41,8 +41,10 @@ then `DOGPDKB_CONFIG`, then checkout `default.toml` / caller `dogpdkb.toml`.
   Unstarted work has no record and is not suppressed. A new version is not
   suppressed. `version_key(version)` uses an existing normalized `utc`/`value`
   timestamp or a version string; it does not hash content.
-- `store.lock()` is the nonblocking corpus write lock. No recorded run prevents
-  a later lock acquisition after a process exits. Read-only status does not lock.
+- `store.lock()` acquires corpus and actual graph target locks together, in
+  stable order and without waiting, then reloads the latest durable state.
+  No recorded run prevents acquisition after a process exits. Read-only status
+  does not lock. Public tool subprocesses retain both active lock descriptors.
 - `atomic_json(path, payload)` and `read_json(path)` are small shared public I/O.
 
 Document stage owners should keep `observed`, `raw`, `corpus`, `graph` facts
@@ -83,6 +85,10 @@ stderr and an optional log file, forwards termination to its process group, and
 returns its exit code. Callers interpret the tool's documented artifacts/codes.
 It never parses tool log text into business state. `diagnostic_argv(argv)` masks
 credential arguments for durable command records.
+
+Optional `env={...}` overrides selected variables while retaining the inherited
+tool environment; it is never persisted or printed. `settings.skylark_environment()`
+supplies configured gateway/proxy/timeout variables for listing and export.
 
 `dogpdkb.observe.main(argv=None)` implements `dogpdkb status`: config/book/run,
 json/watch. `view_run(path)` returns a read-only snapshot, with process/lock

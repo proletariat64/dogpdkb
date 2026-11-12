@@ -54,6 +54,15 @@ class Settings:
     def command(self, name: str) -> list[str]:
         return list(self.tools.get(name, (name,)))
 
+    def skylark_environment(self) -> dict[str, str]:
+        values = {
+            "UTOO_PROXY_BIN": self.proxy_bin,
+            "SKYLARK_TIMEOUT_MS": str(int(self.timeout_seconds * 1000)),
+        }
+        if self.mcp_url:
+            values["SKYLARK_MCP_URL"] = self.mcp_url
+        return values
+
     @property
     def groups(self):
         return self.web_options.get("groups", {})
