@@ -424,6 +424,40 @@ def test_quota_exhaustion_stops_the_whole_batch(tmp_path: Path):
     _batch_stop_assertions(workspace, "OCR_QUOTA_EXHAUSTED")
 
 
+@pytest.mark.parametrize(
+    "mode,code",
+    [("auth", "OCR_AUTH_UNAVAILABLE"), ("quota", "OCR_QUOTA_EXHAUSTED")],
+)
+def test_batch_stop_triggering_image_preserves_recovery_bytes(
+    tmp_path: Path, mode: str, code: str
+):
+    # [19] M15 residual: the image that TRIGGERS an auth/quota stop was already
+    # downloaded+prepared, so its stop-anomaly must reference those bytes for
+    # durable recovery (cleanup would otherwise delete them). The unattempted
+    # remainder was never downloaded and correctly carries no inputs.
+    workspace = OcrWorkspace(
+        tmp_path, mode=mode, image_urls=[IMAGE_URL, SECOND_IMAGE_URL]
+    )
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+    affected = {
+        a["resource_id"]: a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == code
+    }
+    assert set(affected) == {IMAGE_URL, SECOND_IMAGE_URL}
+    triggering = affected[IMAGE_URL]
+    kinds = {row["kind"] for row in triggering["necessary_inputs"]}
+    assert {"original_image", "prepared_image"} <= kinds
+    for row in triggering["necessary_inputs"]:
+        path = Path(row["path"])
+        assert path.is_file()
+        # The durable copy lives in the results store, not the cleanable wash run.
+        assert path.is_relative_to(workspace.root / "sync-results")
+    # The second image was never attempted: no bytes to preserve.
+    assert affected[SECOND_IMAGE_URL]["necessary_inputs"] == []
+
+
 def test_budget_exhaustion_archives_unfinished_and_proceeds_to_compile(tmp_path: Path):
     workspace = OcrWorkspace(
         tmp_path,
@@ -454,6 +488,15 @@ def test_budget_exhaustion_archives_unfinished_and_proceeds_to_compile(tmp_path:
         r for r in workspace.ocr_reference()["documents"] if r["document_id"] == 2
     )
     assert len(row["execution"]["missing_items"]) == 2
+    # The budget stop breaks BEFORE download: no image has bytes, so every
+    # stop-anomaly carries empty necessary_inputs (never a prior image's paths).
+    budget_anomalies = [
+        a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == "OCR_BUDGET_EXHAUSTED"
+    ]
+    assert len(budget_anomalies) == 2
+    assert all(a["necessary_inputs"] == [] for a in budget_anomalies)
 
 
 def test_same_version_archived_ocr_failure_is_not_retried_until_new_version(
@@ -831,6 +874,47 @@ def test_failed_ocr_anomaly_preserves_image_bytes_for_recovery(tmp_path: Path):
         assert path.is_relative_to(workspace.root / "sync-results")
 
 
+def test_same_basename_originals_do_not_collide_in_recovery_inputs(tmp_path: Path):
+    # [4] M15 regression: two same-basename, different-content images in one doc.
+    # The original was stored at src/<doc>/<name>, so the second image overwrote
+    # the first's bytes before deferred archiving copied them for recovery. The
+    # first failure's durable original_image must be ITS OWN bytes, not the
+    # second image's.
+    first_url = "https://cdn.example.invalid/first/image.png"
+    second_url = "https://cdn.example.invalid/second/image.png"
+    workspace = OcrWorkspace(
+        tmp_path,
+        mode="fail",
+        image_url=first_url,
+        image_urls=[first_url, second_url],
+    )
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+    failures = {
+        a["resource_id"]: a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == "OCR_FAILED"
+    }
+    assert set(failures) == {first_url, second_url}
+
+    def original_bytes(anomaly: dict[str, Any]) -> bytes:
+        row = next(
+            r for r in anomaly["necessary_inputs"] if r["kind"] == "original_image"
+        )
+        path = Path(row["path"])
+        assert path.is_file()
+        # The durable copy lives in the results store, not the cleanable wash run.
+        assert path.is_relative_to(workspace.root / "sync-results")
+        return path.read_bytes()
+
+    first_original = original_bytes(failures[first_url])
+    second_original = original_bytes(failures[second_url])
+    # The first image is served from the primary image file; its durable original
+    # must equal those bytes, and distinct content must not collapse to one file.
+    assert first_original == workspace.image_file.read_bytes()
+    assert first_original != second_original
+
+
 def test_changed_image_failed_reocr_does_not_publish_stale_text(tmp_path: Path):
     # H2/H8: a same-URL image whose content changed and whose re-OCR failed must not
     # keep exposing its previous success. When the document enters compile (body
@@ -879,6 +963,65 @@ def test_changed_image_failed_reocr_does_not_publish_stale_text(tmp_path: Path):
         encoding="utf-8"
     )
     assert "OCR output line" not in frozen
+
+
+def test_body_reuse_changed_image_failed_reocr_republishes_to_drop_stale_text(
+    tmp_path: Path,
+):
+    # [2] H2 deferred path: a body-reuse source with a single same-URL image whose
+    # content changed and whose re-OCR FAILS. The tombstone invalidates the prior
+    # published success, but no new OCR artifact exists (final_inputs empty). A
+    # whole-source compile follow-up must still register so the source recompiles
+    # and drops the stale OCR text instead of keeping it under an advanced version.
+    workspace = OcrCompileWorkspace(tmp_path, mode="success")
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["1"]["body"] = (
+        "# One\n\nRule v1.\n\n![img](https://cdn.example.invalid/a.png)\n"
+    )
+    remote["details"]["2"]["body"] = "body 2\n"
+    write_json(workspace.root / "remote.json", remote)
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    run1 = workspace.latest_run()
+    graph1 = workspace.state()["books"]["fund"]["documents"]["1"]["graph"]
+    assert (
+        graph1["ocr"]["images"][0]["resource_id"] == "https://cdn.example.invalid/a.png"
+    )
+    assert graph1["ocr"]["images"][0]["status"] == "success"
+    frozen1 = (run1 / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" in frozen1
+
+    # Batch 2: IDENTICAL body (body_reuse), same image URL, changed bytes, re-OCR
+    # fails. The prior published success is tombstoned with no replacement artifact.
+    workspace.write_image(20)
+    workspace.bump_version(1, "2026-11-11T10:00:00+08:00")
+    workspace.set_mode("fail")
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run2 = workspace.latest_run()
+    plan2 = read_json(run2 / "plan" / "plan.json")
+    # Precondition: identical body -> body_reuse; changed image -> OCR list.
+    assert 1 in {row["document_id"] for row in plan2["body_reuse"]}
+    assert 1 in {row["document_id"] for row in plan2["ocr"]}
+    assert 1 not in {row["document_id"] for row in plan2["compile"]}
+    assert workspace.ocr_envelope(run2)["counts"]["failed"] == 1
+
+    # The invalidated prior success registers a whole-source compile follow-up
+    # (no new artifact inputs) so the source recompiles rather than staying stale.
+    doc1 = [
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    ]
+    assert len(doc1) == 1
+    assert doc1[0]["status"] == "done"
+    assert doc1[0]["run_id"] == run2.name
+    report = workspace.compile_report(run2)
+    assert 1 in {row["document_id"] for row in report["results"]}
+    frozen2 = (run2 / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" not in frozen2
 
 
 def test_removed_image_with_prior_ocr_contribution_republishes(tmp_path: Path):

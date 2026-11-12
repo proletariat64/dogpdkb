@@ -115,7 +115,11 @@ def _parse_result_jsonl(text: str) -> str:
             continue
         try:
             blocks.append(_extract_markdown(json.loads(raw)))
-        except (json.JSONDecodeError, ValueError) as exc:
+        except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
+            # Normalize every structural failure of an untrusted result line
+            # (null pages/parsing lists, numeric text/block_content) to ValueError
+            # so the OCR per-image handler fails one image instead of aborting the
+            # whole batch on a malformed-200 nested schema (H12).
             raise ValueError(f"invalid result JSONL line {number}: {exc}") from exc
     if not blocks:
         raise ValueError("downloaded result JSONL was empty")

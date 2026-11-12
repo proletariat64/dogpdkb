@@ -12,6 +12,7 @@ unfinished. OCR completion is never a prerequisite for compile.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -79,20 +80,35 @@ def _original_bytes(
 
 def _prepare(
     context: StageContext, doc_id: Any, data: bytes, name: str
-) -> tuple[Path, bytes]:
-    """Normalize the original into a content-named prepared JPEG via mdocr."""
+) -> tuple[Path, Path, bytes]:
+    """Normalize the original into a content-named prepared JPEG via mdocr.
+
+    The original is stored under a content-addressed subdirectory so two images
+    that share a basename but differ in content cannot overwrite each other's
+    bytes before deferred anomaly archiving copies them for recovery (M15). The
+    basename is preserved so mdocr's prepared-asset name (the OCR cache key) is
+    unchanged. Returns ``(original_path, prepared_path, prepared_bytes)``.
+    """
     src_dir = context.directory / "src" / str(doc_id)
-    src_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    (src_dir / name).write_bytes(data)
+    original_dir = src_dir / hashlib.sha256(data).hexdigest()[:8]
+    original_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    original_path = original_dir / name
+    original_path.write_bytes(data)
     prepared_dir = context.directory / "prepared"
-    ref = ImageRef(alt="", target=name, title=None, is_remote=False, unsupported=False)
+    ref = ImageRef(
+        alt="",
+        target=f"{original_dir.name}/{name}",
+        title=None,
+        is_remote=False,
+        unsupported=False,
+    )
     prepared = prepare_one(
         ref,
         src_dir / "doc.md",
         prepared_dir,
         download=False,
     )
-    return prepared.path, prepared.path.read_bytes()
+    return original_path, prepared.path, prepared.path.read_bytes()
 
 
 def _merge_graph_ocr(
@@ -170,6 +186,11 @@ def handle(context: StageContext) -> StageResult:
     stop_anomalies: list[dict[str, Any]] = []
     batch_cause: dict[str, Any] | None = None
     stop_index = len(work)
+    # Recovery bytes for the image that TRIGGERS a shared auth/quota stop. It was
+    # already downloaded+prepared, so capture them in the OcrSharedError handler
+    # (where the paths are valid for that image). The budget stop breaks before
+    # download, so it leaves this empty and never borrows a prior image's paths.
+    stop_inputs: list[dict[str, Any]] = []
     token = os.environ.get("PADDLEOCR_TOKEN", "").strip()
     session = requests.Session()
     client = PaddleClient(token, session=session) if token else None
@@ -189,8 +210,7 @@ def handle(context: StageContext) -> StageResult:
         prepared_path: Path | None = None
         try:
             data, name = _original_bytes(resource, session)
-            original_path = context.directory / "src" / str(item["document_id"]) / name
-            prepared_path, prepared_bytes = _prepare(
+            original_path, prepared_path, prepared_bytes = _prepare(
                 context, item["document_id"], data, name
             )
             key = prepared_path.stem
@@ -226,6 +246,7 @@ def handle(context: StageContext) -> StageResult:
                 "reason": safe_diagnostic(error),
             }
             stop_index = index
+            stop_inputs = _image_inputs(original_path, prepared_path)
             context.log.write(f"ocr batch stopped: {error.code}")
             break
         except (ImageError, ImageSkip, OSError, RuntimeError, ValueError) as error:
@@ -277,7 +298,15 @@ def handle(context: StageContext) -> StageResult:
                 }
             )
             stop_anomalies.append(
-                _anomaly(item, resource, batch_cause["code"], batch_cause["reason"])
+                _anomaly(
+                    item,
+                    resource,
+                    batch_cause["code"],
+                    batch_cause["reason"],
+                    # Only the triggering image (index == stop_index) has bytes;
+                    # the rest were never downloaded. The budget stop has none.
+                    necessary_inputs=stop_inputs if index == stop_index else [],
+                )
             )
         context.count(**counts)
 
@@ -297,12 +326,17 @@ def handle(context: StageContext) -> StageResult:
         for doc_id in order
     ]
 
+    # Prior published SUCCESS contributions this batch invalidates (tombstones),
+    # captured per document before the merge overwrites them. A body-reuse source
+    # whose published OCR text is invalidated must republish to drop it (H2).
+    invalidated_success: dict[str, list[str]] = {}
     if documents:
         state_path = context.corpus / ".sync-state.json"
         with state_lock(state_path):
             state = _load_state(state_path, plan["book"])
             for row in documents:
                 acc = accs[row["document_id"]]
+                doc_key = str(row["document_id"])
                 tombstones = [
                     {
                         "resource_id": m["resource_id"],
@@ -310,10 +344,24 @@ def handle(context: StageContext) -> StageResult:
                     }
                     for m in acc["missing"]
                 ]
+                prior_record = state["documents"].get(doc_key) or {}
+                prior_ocr = (prior_record.get("graph") or {}).get("ocr") or {}
+                prior_success = {
+                    img["resource_id"]
+                    for img in prior_ocr.get("images") or []
+                    if isinstance(img, dict)
+                    and img.get("status") == "success"
+                    and isinstance(img.get("resource_id"), str)
+                }
+                invalidated_ids = sorted(
+                    prior_success & {m["resource_id"] for m in acc["missing"]}
+                )
+                if invalidated_ids:
+                    invalidated_success[doc_key] = invalidated_ids
                 if row["ocr"]["images"] or tombstones:
                     _merge_graph_ocr(
                         state,
-                        str(row["document_id"]),
+                        doc_key,
                         row["ocr"]["images"],
                         tombstones,
                     )
@@ -327,11 +375,18 @@ def handle(context: StageContext) -> StageResult:
     # this version, NOT against whether this run made a fresh request: a cache hit
     # on resume after an interrupted persist must still register when the published
     # source lacks the artifact. A pending follow-up already covers the work.
+    # A prior published SUCCESS this batch tombstoned (invalidated) also forces a
+    # whole-source republish even with no new artifact, so the stale OCR text is
+    # dropped rather than kept under the advanced body-reuse version (H2).
     body_reuse_ids = {str(item["document_id"]) for item in plan.get("body_reuse") or []}
     registry = load_followups(config, context.book.key)
     for doc_id in order:
         acc = accs[doc_id]
-        if str(doc_id) not in body_reuse_ids or not acc["final_inputs"]:
+        doc_key = str(doc_id)
+        if doc_key not in body_reuse_ids:
+            continue
+        invalidated = invalidated_success.get(doc_key)
+        if not acc["final_inputs"] and not invalidated:
             continue
         source_version = acc["item"].get("source_version")
         existing = registry["followups"].get(
@@ -345,14 +400,18 @@ def handle(context: StageContext) -> StageResult:
             else set()
         )
         changed = [row for row in acc["final_inputs"] if row["path"] not in published]
-        if not changed:
+        if not changed and not invalidated:
             continue
         register_compile_followup(
             config,
             context.book.key,
             document_id=doc_id,
             source_version=source_version,
-            reason="OCR changed a body-reuse source's compile input",
+            reason=(
+                "OCR changed a body-reuse source's compile input"
+                if changed
+                else "OCR contribution invalidated; republish to drop stale text"
+            ),
             inputs=changed,
         )
 

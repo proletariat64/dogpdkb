@@ -127,6 +127,67 @@ def test_convert_joins_multiline_result_jsonl(tmp_path):
     assert client.convert(image) == "a\n\nb"
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # null pages: iterating None raises TypeError.
+        {"result": {"layoutParsingResults": None}},
+        # numeric markdown.text: 123.strip() raises AttributeError.
+        {"result": {"layoutParsingResults": [{"markdown": {"text": 123}}]}},
+        # null parsing_res_list: the fallback iteration raises TypeError.
+        {
+            "result": {
+                "layoutParsingResults": [
+                    {
+                        "markdown": {"text": ""},
+                        "prunedResult": {"parsing_res_list": None},
+                    }
+                ]
+            }
+        },
+        # numeric block_content: the fallback comprehension raises AttributeError.
+        {
+            "result": {
+                "layoutParsingResults": [
+                    {
+                        "markdown": {"text": ""},
+                        "prunedResult": {"parsing_res_list": [{"block_content": 123}]},
+                    }
+                ]
+            }
+        },
+    ],
+    ids=["null_pages", "numeric_text", "null_parsing_list", "numeric_block_content"],
+)
+def test_convert_malformed_nested_result_is_value_error(tmp_path, payload):
+    # [5] H12 residual: a 200 result whose NESTED schema is malformed must
+    # normalize to ValueError at the client boundary (the OCR per-image handler
+    # catches ValueError) so one bad image fails instead of aborting the batch.
+    image = make_image(tmp_path)
+    result_url = "https://example.com/result.jsonl"
+
+    def handler(method, url, **kwargs):
+        if method == "POST":
+            return FakeResponse(json_data={"data": {"jobId": "job-1"}})
+        if url.endswith("/jobs/job-1"):
+            return FakeResponse(
+                json_data={
+                    "data": {
+                        "state": "done",
+                        "resultUrl": {"jsonUrl": result_url},
+                    }
+                }
+            )
+        if url == result_url:
+            return FakeResponse(text=json.dumps(payload))
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    client, _session = make_client(handler)
+
+    with pytest.raises(ValueError, match="invalid result JSONL line"):
+        client.convert(image)
+
+
 def test_convert_rejects_empty_result_jsonl(tmp_path):
     image = make_image(tmp_path)
     result_url = "https://example.com/result.jsonl"
