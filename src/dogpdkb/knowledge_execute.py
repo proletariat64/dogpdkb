@@ -1090,9 +1090,16 @@ def _enrich_compile_body(
     blocks the body compile. Returns ``(enriched_text, regions, execution)``.
     """
     images: dict[str, dict[str, Any]] = {}
+    normalized: dict[str, str] = {}
     for image in (evidence or {}).get("images") or []:
         if isinstance(image, dict) and isinstance(image.get("resource_id"), str):
-            images[image["resource_id"]] = image
+            resource_id = image["resource_id"]
+            images[resource_id] = image
+            # OCR evidence is keyed by the verbatim image URL (Yuque paste images
+            # carry a #fragment), but the inline enricher's ref.target is
+            # fragment-stripped. Index the normalized form as a fallback so a
+            # successfully recognized image is still compiled ([21]).
+            normalized.setdefault(resource_id.split("#", 1)[0], resource_id)
     final_inputs: list[dict[str, Any]] = [
         {
             "kind": "raw",
@@ -1114,38 +1121,44 @@ def _enrich_compile_body(
         )
 
     def transform(ref: Any) -> str | None:
-        record = images.get(ref.target)
+        resource_id = ref.target
+        record = images.get(resource_id)
+        if record is None:
+            # Fall back to the fragment-stripped evidence key, keeping the
+            # canonical (verbatim) resource id for inputs/missing/consumed ([21]).
+            resource_id = normalized.get(ref.target, ref.target)
+            record = images.get(resource_id)
         if record is None:
             missing(ref.target, "OCR_UNAVAILABLE", "no OCR evidence for this image")
             return None
         status = record.get("status")
         if status != "success":
             missing(
-                ref.target,
+                resource_id,
                 "OCR_FAILED" if status == "failed" else "OCR_PENDING",
                 f"OCR status is {status}; original reference retained",
             )
             return None
         artifact = record.get("artifact")
         if not isinstance(artifact, str):
-            missing(ref.target, "OCR_ARTIFACT_UNAVAILABLE", "no OCR artifact path")
+            missing(resource_id, "OCR_ARTIFACT_UNAVAILABLE", "no OCR artifact path")
             return None
         try:
             block = Path(artifact).read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             missing(
-                ref.target, "OCR_ARTIFACT_UNAVAILABLE", "OCR artifact is unreadable"
+                resource_id, "OCR_ARTIFACT_UNAVAILABLE", "OCR artifact is unreadable"
             )
             return None
         final_inputs.append(
-            {"kind": "ocr_artifact", "resource_id": ref.target, "path": artifact}
+            {"kind": "ocr_artifact", "resource_id": resource_id, "path": artifact}
         )
         prepared = record.get("prepared_image") or record.get("source_path")
         if isinstance(prepared, str):
             final_inputs.append(
-                {"kind": "prepared_image", "resource_id": ref.target, "path": prepared}
+                {"kind": "prepared_image", "resource_id": resource_id, "path": prepared}
             )
-        consumed.add(ref.target)
+        consumed.add(resource_id)
         return block
 
     enriched, _warnings, _errors = transform_images(raw_text, transform, warn=False)

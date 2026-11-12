@@ -746,6 +746,28 @@ def test_compile_enriches_body_with_successful_ocr_and_records_final_inputs(
     assert doc2["graph"]["ocr"]["contract"] == "prepared-jpeg-ocr-v1"
 
 
+def test_compile_enriches_fragment_image_via_normalized_fallback(
+    workspace: CompileWorkspace,
+):
+    # [21] Yuque paste images carry a #fragment in the URL. The OCR evidence is
+    # keyed by the verbatim URL (fragment included), but the inline enricher looks
+    # up the fragment-stripped target. Compile must fall back to the normalized
+    # key so the recognized text actually reaches the published whole source.
+    url = IMAGE_A + "#size=large"
+    _set_detail(workspace, 2, body=f"# Two\n\n![diagram]({url})\n")
+
+    completed = workspace.sync()
+
+    assert completed.returncode == 0, completed.stderr
+    run_dir = workspace.only_run()
+    frozen = run_dir / "compile" / "execution-corpus" / "source-[2].md"
+    text = frozen.read_text(encoding="utf-8")
+    assert "OCR TEXT " + url in text
+    report = read_json(run_dir / "compile" / "compile-result.json")
+    result2 = next(row for row in report["results"] if row["document_id"] == 2)
+    assert result2["execution"]["missing_items"] == []
+
+
 def test_compile_keeps_unrecognized_image_and_records_missing_items(
     workspace: CompileWorkspace,
 ):
