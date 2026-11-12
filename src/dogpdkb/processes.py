@@ -6,6 +6,7 @@ import codecs
 import os
 import re
 import selectors
+import shlex
 import signal
 import subprocess
 import sys
@@ -51,6 +52,9 @@ def run_command(
         log = Path(log)
         log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") if log else nullcontext(None) as stream:
+        if stream:
+            stream.write(f"command: {shlex.join(diagnostic_argv(argv))}\n")
+            stream.flush()
         try:
             child = subprocess.Popen(
                 argv,

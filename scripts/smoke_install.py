@@ -31,7 +31,8 @@ with (root / 'commands.jsonl').open('a') as stream:
 if '--help' in args:
     print(tool); raise SystemExit(0)
 if tool in ('mdcompare', 'mdocr'):
-    raise SystemExit(subprocess.call([sys.executable, '-m', tool, *args]))
+    module = 'mdocr.cli' if tool == 'mdocr' else tool
+    raise SystemExit(subprocess.call([sys.executable, '-m', module, *args]))
 def flag(name): return pathlib.Path(args[args.index(name)+1])
 def write(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -218,6 +219,7 @@ def smoke(dist: Path) -> None:
         )
         status = json.loads(run([command, "status", "--config", config, "--json"]))
         assert status["status"] == "no-runs"
+        (work / "corpus").mkdir()
         run([command, "init-state", "--config", config])
         run([command, "sync", "--config", config, "--stop-after", "plan"])
         records = list((work / "runs/funds").glob("run-*/run.json"))

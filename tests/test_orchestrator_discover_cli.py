@@ -282,3 +282,26 @@ shutil.copyfile(sys.argv[1], sys.argv[sys.argv.index("--output") + 1])
         )
     result = difference(cli("discover", "--config", config))
     assert result["documents"] == []
+
+
+def test_saved_tool_log_keeps_recoverable_command_with_credential_values_redacted(
+    tmp_path,
+):
+    config = setup(tmp_path)
+    path = listing(tmp_path, [])
+    tool = tmp_path / "skylark.py"
+    tool.write_text(
+        'import shutil,sys\nshutil.copyfile(sys.argv[1],sys.argv[sys.argv.index("--output")+1])\n'
+    )
+    with config.open("a") as stream:
+        stream.write(
+            f"[tools]\nskylark={json.dumps([sys.executable, str(tool), str(path), '--token', 'fixture-private-token', '--password=fixture-private-password'])}\n"
+        )
+    result = cli("discover", "--config", config)
+    data = difference(result)
+    log = (Path(data["listing"]).parent / "listing.log").read_text()
+    assert "command:" in log and "listing --url" in log
+    assert "--token" in log and "--password=" in log
+    assert "[redacted]" in log
+    assert "fixture-private-token" not in log
+    assert "fixture-private-password" not in log

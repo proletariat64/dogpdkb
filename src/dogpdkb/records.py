@@ -131,6 +131,11 @@ class Store:
         return self.data["documents"].get(str(doc_id), {}).get("steps", {}).get(name)
 
     def suppressed(self, doc_id: str | int, name: str, version: Any) -> bool:
+        blocked = (
+            self.data["documents"].get(str(doc_id), {}).get("blocked_versions", {})
+        )
+        if version_key(version) in blocked.get(name, {}):
+            return True
         record = self.step(doc_id, name)
         return bool(
             record
@@ -144,7 +149,7 @@ class Store:
     def complete(self, doc_id, name, version, status, run_id, **details) -> dict:
         if status not in {"running", "completed", "failed", "unknown", "skipped"}:
             raise ValueError(f"unsupported step result: {status}")
-        version_key(version)
+        key = version_key(version)
         record = {
             **details,
             "version": version,
@@ -152,7 +157,13 @@ class Store:
             "run_id": run_id,
             "updated_at": now_iso(),
         }
-        self.document(doc_id).setdefault("steps", {})[name] = record
+        document = self.document(doc_id)
+        document.setdefault("steps", {})[name] = record
+        blocked = document.setdefault("blocked_versions", {}).setdefault(name, {})
+        if status in {"running", "failed", "unknown"}:
+            blocked[key] = {"status": status, "run_id": run_id}
+        elif status == "completed":
+            blocked.pop(key, None)
         self.save()
         return record
 

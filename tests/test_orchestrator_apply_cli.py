@@ -9,6 +9,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = {
     "value": "2026-11-12T10:00:00Z",
@@ -73,7 +75,7 @@ def instance(tmp_path):
         json.dumps(
             {
                 "schema": "dogpdkb-differences-1",
-                "book": {"key": "funds"},
+                "book": {"key": "funds", "url": "https://example.invalid/team/book"},
                 "documents": [
                     {
                         "document_id": "42",
@@ -538,3 +540,138 @@ def test_compare_contract_failure_is_partial_but_valid_unknown_can_compile(tmp_p
     manifest = json.loads(Path(json.loads(unknown.stdout)["manifest"]).read_text())
     assert manifest["documents"][0]["action"] == "compile"
     assert manifest["failures"] == []
+
+
+@pytest.mark.parametrize("change", ["corpus", "graph", "source"])
+def test_paused_run_refuses_changed_source_or_write_target(tmp_path, change):
+    config, differences = instance(tmp_path)
+    paused = cli(
+        "apply", "--config", config, "--input", differences, "--stop-after", "plan"
+    )
+    assert paused.returncode == 0, paused.stderr
+    run_path = Path(json.loads(paused.stdout)["run"])
+    before = run_path.read_bytes()
+    if change in {"corpus", "source"}:
+        books = tmp_path / "books.json"
+        rows = json.loads(books.read_text())
+        rows[0]["corpus" if change == "corpus" else "url"] = (
+            "new-corpus"
+            if change == "corpus"
+            else "https://example.invalid/another-book"
+        )
+        books.write_text(json.dumps(rows))
+    else:
+        config.write_text(
+            config.read_text().replace("[paths]\n", '[paths]\ngraph_dir="new-graph"\n')
+        )
+    rejected = cli("apply", "--config", config, "--resume", run_path)
+    assert rejected.returncode == 1
+    assert "source book" in rejected.stderr or "targets changed" in rejected.stderr
+    assert (tmp_path / "events").read_text().splitlines() == ["export"]
+    assert run_path.read_bytes() == before
+    assert not list((tmp_path / "new-corpus").glob("*.md"))
+    assert not (tmp_path / "new-graph" / "graph.json").exists()
+
+
+def test_failed_version_history_survives_newer_failure_and_run_cleanup(tmp_path):
+    config, differences = instance(tmp_path)
+    frozen = tmp_path / "frozen-v1.json"
+    frozen.write_bytes(differences.read_bytes())
+    (tmp_path / "skylark.py").write_text("""import json, pathlib, sys
+root=pathlib.Path(__file__).parent
+args=sys.argv[1:]
+with (root/'events').open('a') as stream: stream.write('failed-export\\n')
+request=json.loads(pathlib.Path(args[args.index('--request')+1]).read_text())
+report={'schema':'skylark-export-result-1','status':'partial','documents':[{**row,'status':'failed','error':'fixture failure'} for row in request['documents']],'counts':{'failed':len(request['documents'])}}
+pathlib.Path(args[args.index('--output')+1]).write_text(json.dumps(report))
+raise SystemExit(2)
+""")
+    first = cli("apply", "--config", config, "--input", frozen)
+    assert first.returncode == 2, first.stderr
+    changed = json.loads(differences.read_text())
+    changed["documents"][0]["version"] = {
+        "value": "2026-11-13T10:00:00Z",
+        "utc": "2026-11-13T10:00:00+00:00",
+        "precision": "second",
+    }
+    differences.write_text(json.dumps(changed))
+    newer = cli("apply", "--config", config, "--input", differences)
+    assert newer.returncode == 2, newer.stderr
+    import shutil
+
+    shutil.rmtree(tmp_path / "runs")
+    repeated = cli("apply", "--config", config, "--input", frozen)
+    assert repeated.returncode == 2, repeated.stderr
+    assert (tmp_path / "events").read_text().splitlines() == [
+        "failed-export",
+        "failed-export",
+    ]
+
+
+def test_resumed_run_status_clears_pause_end_time_and_elapsed_keeps_advancing(tmp_path):
+    config, differences = instance(tmp_path)
+    paused = cli(
+        "apply", "--config", config, "--input", differences, "--stop-after", "plan"
+    )
+    assert paused.returncode == 0, paused.stderr
+    run_path = json.loads(paused.stdout)["run"]
+    tool = tmp_path / "slow_ocr.py"
+    tool.write_text(
+        'import pathlib,time\npathlib.Path(__file__).with_suffix(".started").touch()\ntime.sleep(60)\n'
+    )
+    config.write_text(
+        config.read_text().replace(
+            "mdocr=" + json.dumps([sys.executable, "-m", "mdocr.cli"]),
+            "mdocr=" + json.dumps([sys.executable, str(tool)]),
+        )
+    )
+    with subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "dogpdkb",
+            "apply",
+            "--config",
+            str(config),
+            "--resume",
+            run_path,
+        ],
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as process:
+        try:
+            deadline = time.monotonic() + 5
+            while (
+                not tool.with_suffix(".started").exists()
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            assert tool.with_suffix(".started").exists()
+            first = json.loads(
+                cli("status", "--config", config, "--run", run_path, "--json").stdout
+            )
+            time.sleep(1.1)
+            second = json.loads(
+                cli("status", "--config", config, "--run", run_path, "--json").stdout
+            )
+        finally:
+            process.terminate()
+            process.communicate(timeout=5)
+    assert first["alive"] is True
+    assert first["ended_at"] is None
+    assert first["exit_code"] is None
+    assert second["elapsed_seconds"] >= first["elapsed_seconds"] + 1
+
+
+def test_imported_difference_rejects_another_source_book_before_export(tmp_path):
+    config, differences = instance(tmp_path)
+    payload = json.loads(differences.read_text())
+    payload["book"]["url"] = "https://example.invalid/other/book"
+    differences.write_text(json.dumps(payload))
+    result = cli("apply", "--config", config, "--input", differences)
+    assert result.returncode == 1
+    assert "book mismatch" in result.stderr
+    assert not (tmp_path / "events").exists()
+    assert not list((tmp_path / "corpus").glob("*.md"))

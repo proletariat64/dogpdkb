@@ -231,7 +231,6 @@ def test_update_rejects_downgrade_before_download(managed, monkeypatch):
 
 
 def test_cli_requires_version_and_passes_yes(monkeypatch):
-    with pytest.raises(SystemExit):
-        cli.main(["update"])
+    assert cli.main(["update"]) == 64
     monkeypatch.setattr(lifecycle, "uninstall", lambda yes: 0 if yes else 1)
     assert cli.main(["uninstall", "--yes"]) == 0

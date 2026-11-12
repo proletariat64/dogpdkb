@@ -42,6 +42,9 @@ Reusing the same key for a different source book URL is rejected.
   Unstarted work has no record and is not suppressed. A new version is not
   suppressed. `version_key(version)` uses an existing normalized `utc`/`value`
   timestamp or a version string; it does not hash content.
+  Minimal `blocked_versions[step][version]` status/run facts preserve earlier
+  failed/unknown attempts when a newer version replaces the latest step record;
+  actual success clears only its own version's block.
 - `store.lock()` acquires corpus and actual graph target locks together, in
   stable order and without waiting, then reloads the latest durable state.
   No recorded run prevents acquisition after a process exits. Read-only status

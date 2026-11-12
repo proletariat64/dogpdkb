@@ -53,6 +53,7 @@ def prepare_inputs(settings, book, store, run, differences):
     if (
         differences.get("schema") != "dogpdkb-differences-1"
         or differences.get("book", {}).get("key") != book.key
+        or differences.get("book", {}).get("url") != book.url
     ):
         raise ValueError("difference schema or book mismatch")
     selected = differences.get("documents")
@@ -659,7 +660,14 @@ def main(argv=None):
                 if args.resume
                 else Run.create(store, "apply")
             )
-            run.data.update(status="running", pid=os.getpid(), command="apply")
+            run.data.update(
+                status="running",
+                pid=os.getpid(),
+                command="apply",
+                ended_at=None,
+                exit_code=None,
+                reason=None,
+            )
             result = apply_run(
                 settings,
                 book,

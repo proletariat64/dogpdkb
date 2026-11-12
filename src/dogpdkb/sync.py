@@ -24,7 +24,7 @@ def sync_run(settings, book, store, run, *, stop_after=None, resume=False):
         return result
     from dogpdkb.graph import run_graph
 
-    run.data.update(status="running", ended_at=None)
+    run.data.update(status="running", ended_at=None, exit_code=None, reason=None)
     run.save()
     graph_code = run_graph(
         settings, book, store, run, manifest=Path(result["manifest"])
@@ -54,7 +54,14 @@ def main(argv=None):
                 if args.resume
                 else Run.create(store, "sync")
             )
-            run.data.update(status="running", pid=os.getpid(), command="sync")
+            run.data.update(
+                status="running",
+                pid=os.getpid(),
+                command="sync",
+                ended_at=None,
+                exit_code=None,
+                reason=None,
+            )
             result = sync_run(
                 settings,
                 book,
