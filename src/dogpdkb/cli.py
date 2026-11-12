@@ -49,7 +49,7 @@ def _main(argv: list[str] | None = None) -> int:
             [sys.executable, str(script), *arguments[1:]], **subprocess_lock_options()
         )
     if arguments and arguments[0] == "status":
-        from dogpdkb.sync_status import main as status_main
+        from dogpdkb.observe import main as status_main
 
         return status_main(arguments[1:])
     if arguments and arguments[0] == "anomalies":
@@ -99,8 +99,6 @@ def _main(argv: list[str] | None = None) -> int:
     )
     initialize_state.add_argument("--config", type=Path)
     initialize_state.add_argument("--book")
-    initialize_state.add_argument("-i", "--input", type=Path)
-    initialize_state.add_argument("--graph-dir", type=Path)
     upgrade = commands.add_parser(
         "update", help="install a specified Release; retain configuration and data"
     )
@@ -111,25 +109,20 @@ def _main(argv: list[str] | None = None) -> int:
     remove.add_argument(
         "--yes", action="store_true", help="confirm noninteractive removal"
     )
-    args = parser.parse_args(arguments)
+    try:
+        args = parser.parse_args(arguments)
+    except SystemExit as error:
+        return 64 if error.code == 2 else error.code
     if args.command == "init-state":
         import json
 
-        from dogpdkb.sync_state import initialize_state
-        from mdocr.config import load_config, select_book
+        from dogpdkb.records import initialize
+        from dogpdkb.settings import load_config, select_book
 
         try:
             config = load_config(args.config)
             book = select_book(config, args.book)
-            corpus = (args.input or book.corpus).expanduser().resolve()
-            graph = (
-                (args.graph_dir or config.graph_dir or corpus / "graphify-out")
-                .expanduser()
-                .resolve()
-            )
-            result = initialize_state(
-                corpus, graph, book.key, url=book.url, name=book.name
-            )
+            result = initialize(config, book)
         except (OSError, ValueError) as error:
             parser.exit(1, f"dogpdkb init-state: {error}\n")
         print(json.dumps(result, ensure_ascii=False))
@@ -146,10 +139,13 @@ def _main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError) as error:
             parser.exit(1, f"dogpdkb {args.command}: {error}\n")
     if args.command == "doctor":
-        from dogpdkb.doctor import diagnose, print_report
+        from dogpdkb.preflight import diagnose, print_report
 
         report = diagnose(args.config, args.book, args.package, args.require_ocr)
         print_report(report, json_output=args.json)
+        for row in report:
+            if row.get("exit_code") in {130, 143}:
+                return row["exit_code"]
         return 1 if any(row["status"] == "fail" for row in report) else 0
     if args.command == "init-config":
         try:
@@ -166,6 +162,6 @@ def _main(argv: list[str] | None = None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] in {*WORKFLOWS, "init-state", "update", "uninstall"}:
+    if arguments and arguments[0] in {*WORKFLOWS, "update", "uninstall"}:
         return locked_main(_main)(arguments)
     return _main(arguments)

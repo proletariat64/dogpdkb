@@ -1,6 +1,6 @@
 # 精简配置、版本记录与进程层
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 Spec: ../spec.md
@@ -18,4 +18,13 @@ Spec: ../spec.md
 独立 worktree/branch，基于 rewrite/cli-orchestrator 当前 tip；先读 tdd 技能，以已确认 CLI seam 做 red→green。完成前合入 integration tip，运行相关检查，提交后报告 SHA。所有 shell rtk 前缀，所有代码关系先 code-review-graph repo_root=本工作树。禁止生产/付费调用，禁止修改用户原 checkout。
 
 ## Comments
+
+- Implemented settings/records/processes/observe/preflight; public shared API:
+  docs/orchestrator-core-contracts.md. init-state/status/doctor use the new core.
+- CLI red→green: empty/read-only status; abandoned running owner; registration
+  preserves existing Markdown/graph and unknown graph truth; tool diagnostics
+  visible before subprocess completion. Four focused tests pass; Ruff passes.
+- Full pipeline failure-version suppression, lock contention and signal cases
+  remain for downstream assembled CLI acceptance; these are not yet validated
+  by this ticket's four focused tests. No paid or production calls were made.
 
