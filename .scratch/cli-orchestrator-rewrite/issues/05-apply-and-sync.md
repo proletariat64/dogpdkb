@@ -1,6 +1,6 @@
 # 串行 apply、计划、语料与唯一 sync
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: 01, 02, 04
 Spec: ../spec.md
@@ -19,3 +19,10 @@ Spec: ../spec.md
 
 ## Comments
 
+
+- 2026-11-12：实现 `apply_run` 与唯一 `sync_run`；公共 API/manifest、恢复与 pending 交接见 `docs/orchestrator-apply-contracts.md`。apply/planning/sync 共 943 行。
+- 公开 CLI TDD red→green：旧 apply 不识别 plan 停点；恢复初始缺少 OCR/corpus 阶段；图片变化但正文复用误判 reuse；opaque v2→v10 被词法比较拒绝；mdocr staging 相对链接搬入 corpus 后失效。对应路径均已修复并加回归。
+- 13 个 apply/sync subprocess 场景通过：真实本地 Markdown、真实 mdcompare/mdocr（无付费 OCR）与 Skylark/特殊故障 CLI 替身；覆盖 plan 停点、恢复/输入变化/回退、OCR partial 与版本抑制、新版重试、整批阶段顺序、源级中断后未启动工作、plan 前固定范围恢复、opaque 版本及比较报告合同失败/合法 UNKNOWN。
+- 合并 04 integration 后 32 项相关 CLI 检查通过（13 apply + 10 discover + 4 core + 5 mdocr batch）；ruff、diff-check 通过，图索引更新并对 `origin/master` 分析。只调用公开 CLI，不导入工具运行时；真实 OCR/Graphify、安装验证与生产验收未执行。
+- 每阶段内部按来源串行 CLI，只在真正调用当前来源前记 attempt。共享 OCR 停止后的未启动来源保留 `pending_steps:["ocr"]`，图谱阶段不得清掉其 pending。Skylark 请求期限和 mdocr 在途期限由工具负责，无任意整批 +5 秒终止。
+- 06 提供 `dogpdkb.graph.run_graph` 后验证完整 sync 末段；本轮 sync 已验证与 discover/apply 共用运行记录并停在 plan，未假称 Graphify 集成已通过。
