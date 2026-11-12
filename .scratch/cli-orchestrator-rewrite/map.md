@@ -8,7 +8,7 @@ Default branch: origin/master
 ## Task graph
 
 01 工具CLI合同 ─────────┐
-02 基础层 → 04 discover ├→ 05 apply/sync ─┐
+02 基础层 + 08 Skylark CLI → 04 discover ├→ 05 apply/sync ─┐
 03 Graphify公开CLI ──────────────────────┴→ 06 切换/删除 → 07 交付/审查
 
 ## Notes
@@ -21,4 +21,4 @@ Default branch: origin/master
 
 ## Fog
 
-Graphify upstream源码与整来源公共合同需先验证。没有生产/付费执行授权。
+Graphify upstream源码与整来源公共合同需先验证；Skylark需独立listing/export CLI，票据08先行。没有生产/付费执行授权。
