@@ -31,4 +31,3 @@ CLI 黑盒 TDD真实Markdown；discover零正文下载，完整清单失败不�
   file modification time to break same-second run timestamp ties.
 - Core four tests also pass (14 total), Ruff and diff checks pass. No live
   gateway, production data, OCR or graph extraction was invoked.
-

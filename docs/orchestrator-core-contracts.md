@@ -26,6 +26,7 @@ then `DOGPDKB_CONFIG`, then checkout `default.toml` / caller `dogpdkb.toml`.
 
 `dogpdkb.records.Store(settings, book)` reads/writes the new state file at
 `settings.state / book.key / state.json`. It never imports old run/state formats.
+Reusing the same key for a different source book URL is rejected.
 `store.data` is a plain dictionary with `schema`, `book`, `observation` and
 `documents`. Product stages own observation and document facts and call
 `store.save()` after factual changes.
@@ -76,6 +77,9 @@ Duplicate IDs fail before any durable registration.
 Run JSON is schema `dogpdkb-run-1`, containing run_id, command, book, pid, status,
 stage, counts, started_at, updated_at, ended_at, exit_code, reason, artifacts and
 failures. Status is observationally interrupted when `running` has no live owner.
+`targets` freezes the source book URL and absolute corpus/graph targets. Loading
+a run for execution rejects changed targets before any tool call or publication;
+use a newly generated plan for a different source or target.
 
 ## Processes and observation
 

@@ -181,7 +181,6 @@ def discover(settings, book, store, run, listing=None):
         code = run_command(
             argv,
             log=run.directory / "listing.log",
-            timeout=settings.timeout_seconds,
             env=settings.skylark_environment(),
         )
         if code:

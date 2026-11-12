@@ -148,3 +148,19 @@ def test_doctor_streams_tool_diagnostics_before_process_finishes(tmp_path: Path)
     }
     assert not (tmp_path / "state").exists()
     assert not (tmp_path / "runs").exists()
+
+
+def test_durable_state_rejects_same_key_with_changed_source_book(tmp_path: Path):
+    config = instance(tmp_path)
+    (tmp_path / "corpus").mkdir()
+    assert cli("init-state", "--config", str(config)).returncode == 0
+    state = tmp_path / "state" / "funds" / "state.json"
+    before = state.read_bytes()
+    books = tmp_path / "books.json"
+    rows = json.loads(books.read_text())
+    rows[0]["url"] = "https://example.invalid/other/book"
+    books.write_text(json.dumps(rows))
+    result = cli("status", "--config", str(config), "--json")
+    assert result.returncode == 1
+    assert "source book" in result.stderr
+    assert state.read_bytes() == before

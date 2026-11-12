@@ -264,3 +264,21 @@ def test_existing_corpus_requires_explicit_initial_registration(tmp_path):
     assert result.returncode == 1
     assert "init-state" in result.stderr
     assert not (tmp_path / "state" / "funds" / "state.json").exists()
+
+
+def test_gateway_timeout_does_not_limit_complete_listing_duration(tmp_path):
+    config = setup(tmp_path)
+    path = listing(tmp_path, [])
+    tool = tmp_path / "skylark.py"
+    tool.write_text("""import os, shutil, sys, time
+assert os.environ["SKYLARK_TIMEOUT_MS"] == "100"
+time.sleep(0.2)
+shutil.copyfile(sys.argv[1], sys.argv[sys.argv.index("--output") + 1])
+""")
+    with config.open("a") as stream:
+        stream.write("[skylark]\ntimeout_seconds=0.1\n")
+        stream.write(
+            f"[tools]\nskylark={json.dumps([sys.executable, str(tool), str(path)])}\n"
+        )
+    result = difference(cli("discover", "--config", config))
+    assert result["documents"] == []

@@ -111,6 +111,8 @@ class Store:
                 raise ValueError(
                     "unsupported orchestrator state; initialize a new state"
                 )
+            if self.data["book"].get("url") != book.url:
+                raise ValueError("durable state belongs to a different source book")
         else:
             self.data = {
                 "schema": STATE_SCHEMA,
@@ -257,6 +259,11 @@ class Run:
             "run_id": run_id,
             "command": command,
             "book": store.data["book"],
+            "targets": {
+                "book_url": store.book.url,
+                "corpus": str(store.book.corpus.resolve()),
+                "graph": str(store.settings.graph_for(store.book).resolve()),
+            },
             "pid": os.getpid(),
             "lock": str(store.lock_path),
             "status": "running",
@@ -288,6 +295,13 @@ class Run:
             or data.get("book", {}).get("key") != store.book.key
         ):
             raise ValueError("run does not belong to the selected book or schema")
+        expected = {
+            "book_url": store.book.url,
+            "corpus": str(store.book.corpus.resolve()),
+            "graph": str(store.settings.graph_for(store.book).resolve()),
+        }
+        if data.get("targets") != expected:
+            raise ValueError("run source or write targets changed; generate a new plan")
         return cls(store, path.resolve(), data)
 
     def save(self) -> None:

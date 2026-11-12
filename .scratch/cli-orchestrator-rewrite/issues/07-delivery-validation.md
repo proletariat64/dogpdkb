@@ -1,6 +1,6 @@
 # 文档、隔离安装与最终验收
 
-Status: ready-for-agent
+Status: claimed
 Type: task
 Blocked by: 06
 Spec: ../spec.md
