@@ -34,6 +34,20 @@ Graphify and Yuque source/installation were not modified.
   release or new PR occurred. Table export remains a known external-tool gap;
   existing Graphify baselines must retain their original manifest.
 
+## Small subscription follow-up — 2026-11-13
+
+- Explicit document_ids allowlist applies after complete remote listing validation;
+  subscription scope is fixed in state and saved-run targets. Empty/duplicate or
+  non-string lists are rejected instead of accidentally selecting the whole book.
+- Full check: **817 tests passed** in 77.14 seconds; Ruff/205 format checks and
+  doc guard passed. New runtime includes 3,442 dogpdkb source lines plus 336 helper
+  lines: **3,778 total** (source modules still 18).
+- [Installed-wheel real three-document sync and fresh unchanged rerun](uat-small-real.md)
+  both exited 0. All tools were real, including DeepSeek extraction after explicit
+  authorization; OCR was image-free. The unchanged rerun selected zero, invoked no
+  export/compare/OCR/Graphify processes and preserved corpus/graph/manifest bytes
+  and mtimes. Broader production and image/Table coverage remain unproven.
+
 ## Historical acceptance (withdrawn dependencies)
 
 Date: 2026-11-13
