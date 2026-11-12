@@ -85,11 +85,17 @@ def _resource_catalog(data: bytes, base_dir: Path) -> list[dict[str, Any]]:
 
 
 def _incoming(
-    document: dict[str, Any], book_id: int, frozen: Path, reader: InputReader
+    document: dict[str, Any],
+    book_id: int,
+    frozen: Path,
+    reader: InputReader,
+    base_dir: Path,
 ) -> Document:
     base = _document(document, book_id, frozen)
     data = reader.read_bytes(frozen)
-    return replace(base, resources=_resource_catalog(data, frozen.parent))
+    # Freezing copies only the markdown, not sibling resources: resolve relative
+    # images against the original raw-export dir so their bytes stay available.
+    return replace(base, resources=_resource_catalog(data, base_dir))
 
 
 def _baseline(
@@ -103,11 +109,12 @@ def _baseline(
     old = _graph_document(doc_id, graph, book_id, state_path)
     if old is None:
         return None
+    base_dir = old.base_dir
     if frozen_old is not None:
         old = replace(old, path=frozen_old, base_dir=frozen_old.parent)
     data = reader.read_bytes(old.path)
     evidence = graph.get("ocr") if isinstance(graph.get("ocr"), dict) else None
-    return replace(old, resources=_resource_catalog(data, old.base_dir), ocr=evidence)
+    return replace(old, resources=_resource_catalog(data, base_dir), ocr=evidence)
 
 
 def _capture_anomalies(
@@ -249,7 +256,7 @@ def _rows(context: StageContext, snapshot: dict[str, Any]) -> list[dict[str, Any
                 # The old input is gone but the current raw is complete: the plan
                 # fully recompiles this source rather than holding or fabricating.
                 previous_missing = True
-        new = _incoming(document, book_id, frozen, reader)
+        new = _incoming(document, book_id, frozen, reader, raw_path.parent)
         old = (
             _baseline(doc_id, graph, book_id, state_path, frozen_old, reader)
             if frozen_old is not None

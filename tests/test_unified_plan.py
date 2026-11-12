@@ -219,3 +219,88 @@ def test_same_version_archived_failure_is_suppressed_until_new_version(
     plan3 = _latest_plan(workspace)
     assert 2 in {row["document_id"] for row in plan3["compile"]}
     assert 2 not in {row["document_id"] for row in plan3["suppressed"]}
+
+
+def test_incoming_relative_image_resolves_against_original_raw_dir(tmp_path: Path):
+    # M11: freezing copies only the markdown into mdcompare/inputs, not sibling
+    # resources. A relative local image must resolve against the ORIGINAL raw-export
+    # dir (where the sibling lives), not the frozen inputs dir, so its bytes stay
+    # available for reuse proof. Drives the mdcompare row builder directly because
+    # the sibling placement must be controlled relative to the pre-freeze raw path.
+    from types import SimpleNamespace
+
+    from dogpdkb.stages import mdcompare
+
+    corpus = tmp_path / "corpus"
+    staging = tmp_path / "mdcompare"
+    rawdir = tmp_path / "capture" / "raw"
+    (corpus / "graphify-out").mkdir(parents=True)
+    staging.mkdir(parents=True)
+    rawdir.mkdir(parents=True)
+    (corpus / "graphify-out" / "graph.json").write_text(
+        json.dumps({"nodes": [], "links": []}), encoding="utf-8"
+    )
+    (rawdir / "1.md").write_text(
+        "# One\n\n![chart](images/chart.png)\n", encoding="utf-8"
+    )
+    sibling = rawdir / "images" / "chart.png"
+    sibling.parent.mkdir()
+    sibling.write_bytes(b"\x89PNG\r\n\x1a\nlocal-image-bytes")
+
+    ver = {
+        "field": "content_updated_at",
+        "value": "2026-11-10T10:00:00+08:00",
+        "utc": "2026-11-10T10:00:00+08:00",
+    }
+    book = {
+        "key": "fund",
+        "book_id": 123,
+        "name": "UAT",
+        "url": "https://example.invalid/t/u",
+    }
+    state = {
+        "version": 2,
+        "active_run": None,
+        "books": {
+            "fund": {"key": "fund", "book_id": 123, "url": book["url"], "documents": {}}
+        },
+    }
+    (corpus / ".sync-state.json").write_text(json.dumps(state), encoding="utf-8")
+    snapshot = {
+        "schema_version": "knowledge-capture-1.0",
+        "status": "captured",
+        "book": book,
+        "observation": {"started_at": "x", "ended_at": "y", "timezone": "UTC+8"},
+        "listing": {"complete": True, "document_ids": [1], "document_count": 1},
+        "changes": {"new": [1], "updated": [], "renamed": [], "moved": []},
+        "selected": [1],
+        "documents": {
+            "1": {
+                "id": 1,
+                "title": "One",
+                "version": ver,
+                "toc_path": [],
+                "raw": {"path": str(rawdir / "1.md"), "stage": "raw_export"},
+            }
+        },
+        "exports": {
+            "1": {
+                "status": "captured",
+                "reused": False,
+                "raw": {"path": str(rawdir / "1.md"), "stage": "raw_export"},
+                "detail_version": ver,
+                "listing_version": ver,
+            }
+        },
+        "pending": [],
+        "anomalies": [],
+        "suppressed": [],
+    }
+    snap = staging / "snapshot.json"
+    snap.write_text(json.dumps(snapshot), encoding="utf-8")
+    ctx = SimpleNamespace(directory=staging, corpus=corpus, require=lambda s, n: snap)
+
+    rows = mdcompare._rows(ctx, snapshot)
+    row = next(r for r in rows if r["document_id"] == 1)
+    entry = next(e for e in row["resources"] if e["resource_id"] == "images/chart.png")
+    assert entry.get("path") == str(sibling.resolve())

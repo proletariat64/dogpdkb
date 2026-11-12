@@ -89,14 +89,20 @@ def test_no_update_second_batch_completes_by_reusing_recorded_work(
     assert summary["stages"]["ocr"] == "skipped"
 
     run2 = workspace.runs()[-1]
+    # Settled documents converge to no-work: the transient COMPARISON_PENDING is
+    # cleared once a terminal decision is recorded (M16), so an unchanged batch
+    # neither re-selects nor re-compares them, and a no-work document is never an
+    # anomaly (H7). The listing still observes both documents.
     capture = read_json(run2 / "capture" / "result.json")
-    assert capture["counts"]["reused"] == 2
     assert capture["counts"]["failed"] == 0
-    # Both raws are reused from the prior batch: no re-download of unchanged docs.
+    assert capture["counts"]["documents"] == 2
     snapshot = read_json(run2 / "capture" / "snapshot.json")
-    assert all(row["reused"] for row in snapshot["exports"].values())
+    assert snapshot["selected"] == []
     plan = read_json(run2 / "plan" / "plan.json")
+    assert plan["decisions"]["1"]["decision"] == "no_work"
+    assert plan["decisions"]["2"]["decision"] == "no_work"
     assert plan["compile"] == []
+    assert plan["counts"]["anomalies"] == 0
     assert read_json(run2 / "ocr" / "result.json")["status"] == "skipped"
     assert read_json(run2 / "compile" / "result.json")["status"] == "skipped"
 

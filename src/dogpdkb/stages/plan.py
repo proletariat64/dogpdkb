@@ -30,6 +30,7 @@ from dogpdkb.knowledge_plan import (
 )
 from dogpdkb.sync_results import (
     archive_anomalies,
+    load_registry,
     suppressing_anomalies,
     version_stamp,
 )
@@ -142,6 +143,12 @@ def _decide(
                 "anomaly_id": record["id"],
             }
             continue
+        if "NO_WORK" in (row.get("reason_codes") or []):
+            # A healthy no-work document (settled, unchanged, unselected) is not
+            # an unavailable input: it must never become an anomaly or make the
+            # batch partial.
+            decisions[str(doc_id)] = {"decision": "no_work"}
+            continue
         if row.get("anomaly") is not None or not row.get("input_available"):
             anomaly = row.get("anomaly") or {
                 "code": "CAPTURE_RAW_UNAVAILABLE",
@@ -177,6 +184,7 @@ def _decide(
         # the body is reused, and body reuse never depends on OCR completing.
         ocr = comparison.get("ocr") or {}
         reusable = set(ocr.get("reusable") or [])
+        removed_contributions = ocr.get("removed_contributions") or []
         required = [
             entry["resource_id"]
             for entry in row.get("resources") or []
@@ -184,8 +192,19 @@ def _decide(
         ]
 
         # Body reuse is independent of OCR: an identical body keeps its knowledge
-        # even when images changed and must be re-OCR'd.
-        if old_exists and action == REUSE_ACTION and status == REUSE_STATUS:
+        # even when images changed and must be re-OCR'd. It requires a COVERED
+        # baseline: an uncovered source has no published knowledge to keep, so an
+        # identical body must still whole-source compile rather than be falsely
+        # marked covered without ever publishing. A removed OCR contribution also
+        # blocks reuse: the published source still carries that image's OCR text,
+        # so the whole source must republish to drop it.
+        if (
+            old_exists
+            and row.get("graph_status") == "covered"
+            and action == REUSE_ACTION
+            and status == REUSE_STATUS
+            and not removed_contributions
+        ):
             body_reuse.append(
                 {
                     **base,
@@ -204,6 +223,8 @@ def _decide(
                 reasons.append("COMPARISON_UNCERTAIN_FULL_RECOMPILE")
             elif action == "BODY_DELTA_CANDIDATE" or status == "DELTA":
                 reasons.append("BODY_DELTA_FULL_RECOMPILE")
+            if removed_contributions:
+                reasons.append("OCR_CONTRIBUTION_REMOVED_FULL_RECOMPILE")
             compile_items.append(
                 {
                     **base,
@@ -291,6 +312,18 @@ def _update_state(
                 "version": row["source_version"],
                 "raw": raw_reference,
             }
+        if row.get("input_available") and decision["decision"] in {
+            "body_reuse",
+            "compile",
+        }:
+            # COMPARISON_PENDING is transient: the comparison happened and a
+            # terminal decision is recorded, so a settled document must not be
+            # re-selected by every later batch (it becomes no-work when unchanged).
+            record["pending"] = [
+                reason
+                for reason in (record.get("pending") or [])
+                if reason != "COMPARISON_PENDING"
+            ]
         if doc_id in reuse_ids and raw_reference is not None:
             # Merge into the existing graph record: body reuse advances the
             # verified version/raw but must preserve prior OCR reuse evidence
@@ -350,6 +383,21 @@ def handle(context: StageContext) -> StageResult:
                 decided["anomalies"] = anomalies
         else:
             decided["anomalies"] = []
+        # A handed-off failure that is still UNRESOLVED (pending) must stay visible
+        # at the batch level: reference its registry record in the envelope so the
+        # runner reports partial, never a fabricated completed. Resolved (done) or
+        # given-up (abandoned) suppressions are not counted. Never re-register.
+        handed_off_pending = [
+            row for row in decided["suppressed"] if row.get("disposition") == "pending"
+        ]
+        if handed_off_pending:
+            registry = load_registry(context.config, context.book.key)
+            known = {row.get("id") for row in decided["anomalies"]}
+            for row in handed_off_pending:
+                record = registry["anomalies"].get(row["anomaly_id"])
+                if record is not None and record["id"] not in known:
+                    decided["anomalies"].append(record)
+                    known.add(record["id"])
         plan = {
             "schema_version": PLAN_SCHEMA,
             "status": "planned",
@@ -391,19 +439,23 @@ def handle(context: StageContext) -> StageResult:
     counts = plan["counts"]
     context.count(**{k: v for k, v in counts.items() if k != "external_calls"})
     status = "completed"
+    reason = None
     if counts["documents"] == 0:
         status = "skipped"
     elif decided["anomalies"]:
         status = "partial"
+        reason = (
+            "input unavailable for some documents"
+            if anomalies
+            else "archived anomalies handed off"
+        )
     return StageResult(
         status=status,
         counts=counts,
         artifacts={"plan": context.layout.relative(plan_path)},
         inputs={"report": plan["mdcompare"]},
         anomalies=decided["anomalies"],
-        reason=None
-        if status == "completed"
-        else "input unavailable for some documents",
+        reason=reason,
     )
 
 

@@ -514,8 +514,9 @@ def test_status_reports_the_latest_batch_and_can_name_an_older_one(
     assert "status=paused" in latest.stdout
     assert "current stage: none" in latest.stdout
     assert "stop reason: stop-after capture" in latest.stdout
-    # The second batch reuses the first batch's downloads via canonical state.
-    assert "items: total=2 completed=2 reused=2 failed=0" in latest.stdout
+    # The first batch's plan cleared the transient COMPARISON_PENDING, so the
+    # unchanged second batch selects no documents for download (no-work).
+    assert "items: total=0 completed=0 reused=0 failed=0" in latest.stdout
     assert (
         f"logs: {workspace.staging / 'fund' / newer['run'] / 'logs'}" in latest.stdout
     )

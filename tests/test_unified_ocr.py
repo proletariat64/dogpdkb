@@ -634,16 +634,18 @@ def test_body_reuse_reused_image_is_not_recompiled(tmp_path: Path):
     }
     first_extracts = workspace.extracts().count("source-[1].md")
 
+    # An unchanged later batch is no-work for the settled source (M16): no
+    # comparison, no OCR, no recompile and no re-billing of the reused image.
     second = workspace.sync()
     assert second.returncode == 0, second.stderr
     run2 = workspace.runs()[-1]
     plan2 = read_json(run2 / "plan" / "plan.json")
-    assert 1 in {row["document_id"] for row in plan2["body_reuse"]}
+    assert plan2["decisions"]["1"]["decision"] == "no_work"
     assert 1 not in {row["document_id"] for row in plan2["compile"]}
-    report2 = workspace.compile_report(run2)
-    assert 1 not in {row["document_id"] for row in report2.get("results", [])}
+    assert read_json(run2 / "compile" / "result.json")["status"] == "skipped"
     # No second extraction of doc One: no recompile, no re-billing.
     assert workspace.extracts().count("source-[1].md") == first_extracts
+    assert workspace.submissions() == 1
     # The batch-1 follow-up stays done; no new pending follow-up for doc One.
     doc1 = [
         f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
@@ -670,6 +672,9 @@ def test_body_reuse_plan_preserves_prior_ocr_evidence_and_body_scope(tmp_path: P
 
     # A later batch re-verifies the reused body. Stop after plan so OCR cannot
     # run and re-add graph.ocr: the plan alone must preserve the prior evidence.
+    # Bump the version with identical content so the settled doc is re-compared
+    # (an unchanged batch is no-work) and the body-reuse merge path is exercised.
+    workspace.bump_version(1, "2026-11-11T10:00:00+08:00")
     second = workspace.sync("--stop-after", "plan")
     assert second.returncode == 0, second.stderr
     run2 = workspace.runs()[-1]
@@ -874,6 +879,47 @@ def test_changed_image_failed_reocr_does_not_publish_stale_text(tmp_path: Path):
         encoding="utf-8"
     )
     assert "OCR output line" not in frozen
+
+
+def test_removed_image_with_prior_ocr_contribution_republishes(tmp_path: Path):
+    # H26: a covered source whose image was successfully OCR'd must republish when
+    # a later batch REMOVES that image, even though the body text is unchanged.
+    # Body comparison excludes image embeds, so without the fix the removal is
+    # swallowed by body_reuse and the removed image's OCR text stays published.
+    workspace = OcrCompileWorkspace(tmp_path, mode="success")
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["1"]["body"] = (
+        "# One\n\nRule v1.\n\n![img](https://cdn.example.invalid/a.png)\n"
+    )
+    remote["details"]["2"]["body"] = "body 2\n"
+    write_json(workspace.root / "remote.json", remote)
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    graph1 = workspace.state()["books"]["fund"]["documents"]["1"]["graph"]
+    assert (
+        graph1["ocr"]["images"][0]["resource_id"] == "https://cdn.example.invalid/a.png"
+    )
+    assert graph1["ocr"]["images"][0]["status"] == "success"
+
+    # Same body text, image removed: the OCR contribution is gone, so the whole
+    # source must republish rather than reuse the stale body.
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["1"]["body"] = "# One\n\nRule v1.\n"
+    write_json(workspace.root / "remote.json", remote)
+    workspace.bump_version(1, "2026-11-11T10:00:00+08:00")
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run2 = workspace.latest_run()
+    plan2 = read_json(run2 / "plan" / "plan.json")
+    assert 1 in {row["document_id"] for row in plan2["compile"]}
+    assert 1 not in {row["document_id"] for row in plan2["body_reuse"]}
+    report = workspace.compile_report(run2)
+    assert 1 in {row["document_id"] for row in report["results"]}
+    frozen = (run2 / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" not in frozen
+    assert "source-[1].md" in {n["source_file"] for n in workspace.graph()["nodes"]}
 
 
 def test_cache_hit_on_resume_registers_followup_when_published_source_lacks_artifact(

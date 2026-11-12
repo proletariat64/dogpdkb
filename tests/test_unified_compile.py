@@ -314,6 +314,90 @@ def test_same_version_compile_failure_is_not_retried_the_next_day(
     assert "source-[1].md" not in extracts
 
 
+def test_unresolved_handed_off_failure_keeps_the_next_batch_partial(
+    workspace: CompileWorkspace,
+):
+    # H21/H23: a same-version compile failure handed off to the post-hoc agent
+    # stays UNRESOLVED (pending). The next daily batch must report partial — not a
+    # fabricated completed — and the plan envelope must carry the failure so the
+    # runner counts it, until the post-hoc agent disposes of it.
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = "source-[1]"
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    assert json.loads(first.stdout.strip().splitlines()[-1])["status"] == "partial"
+
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = ""
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    summary = json.loads(second.stdout.strip().splitlines()[-1])
+    assert summary["status"] == "partial"
+    run2 = workspace.runs()[-1]
+    plan = read_json(run2 / "plan" / "plan.json")
+    assert plan["decisions"]["1"]["decision"] == "suppressed"
+    assert any(a["code"] == "COMPILE_EXTRACTION_FAILED" for a in plan["anomalies"])
+    envelope = read_json(run2 / "plan" / "result.json")
+    assert envelope["status"] == "partial"
+    assert any(a["code"] == "COMPILE_EXTRACTION_FAILED" for a in envelope["anomalies"])
+
+
+def test_resolved_handed_off_failure_does_not_keep_the_batch_partial(
+    workspace: CompileWorkspace,
+):
+    # Contrast for H21: only UNRESOLVED (pending) suppressions stay visible. Once
+    # the post-hoc agent resolves the failure (done), the next batch converges to
+    # completed instead of being held partial forever.
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = "source-[1]"
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+
+    registry_path = workspace.root / "sync-results" / "fund" / "anomalies.json"
+    registry = read_json(registry_path)
+    for record in registry["anomalies"].values():
+        if record["code"] == "COMPILE_EXTRACTION_FAILED":
+            record["disposition"] = "done"
+    write_json(registry_path, registry)
+
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = ""
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    summary = json.loads(second.stdout.strip().splitlines()[-1])
+    assert summary["status"] == "completed"
+    plan = read_json(workspace.runs()[-1] / "plan" / "plan.json")
+    assert plan["decisions"]["1"]["decision"] == "suppressed"
+    assert plan["anomalies"] == []
+
+
+def test_uncovered_baseline_with_identical_body_still_compiles(
+    workspace: CompileWorkspace,
+):
+    # H24: body reuse requires a COVERED baseline. An unregistered historical
+    # baseline (uncovered) whose text matches the incoming body must still whole-
+    # source compile so its knowledge actually enters the graph — not be falsely
+    # marked covered by body reuse without ever publishing.
+    (workspace.corpus / "Two-2026-11-10-[2].md").write_text(
+        "# Two\n\nShared rule.\n", encoding="utf-8"
+    )
+    # Register the new corpus file as an UNCOVERED historical baseline (its name
+    # is absent from graph.json), the way an operator re-runs init-state.
+    initialized = workspace.cli(
+        "init-state", "--config", str(workspace.config), "--book", "fund"
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["2"]["body"] = "# Two\n\nShared rule.\n"
+    write_json(workspace.root / "remote.json", remote)
+
+    completed = workspace.sync()
+    assert completed.returncode == 0, completed.stderr
+    plan = read_json(workspace.only_run() / "plan" / "plan.json")
+    assert 2 in {row["document_id"] for row in plan["compile"]}
+    assert 2 not in {row["document_id"] for row in plan["body_reuse"]}
+    # The source is really published, not merely marked covered.
+    assert "source-[2].md" in {n["source_file"] for n in workspace.graph()["nodes"]}
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    assert doc2["graph"]["status"] == "covered"
+
+
 def test_a_new_source_version_is_compiled_normally_after_a_failure(
     workspace: CompileWorkspace,
 ):
@@ -336,6 +420,29 @@ def test_a_new_source_version_is_compiled_normally_after_a_failure(
     doc1 = state["books"]["fund"]["documents"]["1"]
     assert doc1["graph"]["status"] == "covered"
     assert doc1["graph"]["version"]["utc"] == "2026-11-11T10:00:00+08:00"
+
+
+def test_settled_document_becomes_no_work_on_the_next_unchanged_batch(
+    workspace: CompileWorkspace,
+):
+    # M16 + H7: COMPARISON_PENDING is transient. Once a comparison and a terminal
+    # decision are recorded it must clear, so a successfully synchronized document
+    # is not re-selected by every later batch. An unchanged second batch is no-work
+    # for that document, and a no-work document is never turned into an anomaly
+    # (which would falsely make the batch partial).
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    for doc in workspace.state()["books"]["fund"]["documents"].values():
+        assert "COMPARISON_PENDING" not in (doc.get("pending") or [])
+
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    summary = json.loads(second.stdout.strip().splitlines()[-1])
+    assert summary["status"] == "completed"
+    plan = read_json(workspace.runs()[-1] / "plan" / "plan.json")
+    assert plan["decisions"]["1"]["decision"] == "no_work"
+    assert plan["decisions"]["2"]["decision"] == "no_work"
+    assert plan["counts"]["anomalies"] == 0
 
 
 def test_graphify_output_streams_to_the_stage_log_not_the_console(

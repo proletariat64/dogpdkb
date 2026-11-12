@@ -36,13 +36,14 @@ no-token/auth contract targets API credentials only).
 - [x] M19: steps.ocr=partial when any planned image unfinished.
 - Regressions (tests/test_unified_ocr.py, all red→green verified): nested_marker (M6), malformed_paddle[submit,poll] (H12), partial_ocr_records_partial (M19), failed_ocr_anomaly_preserves (M15), changed_image_failed_reocr (H2/H8), cache_hit_on_resume (M4). 21 OCR + 7 paddle + 94 consumer tests green.
 
-### WP2 — plan/mdcompare (stages/plan.py, stages/mdcompare.py)
-- [ ] H7: NO_WORK guard in plan._decide before unavailable branch (coupled M16).
-- [ ] H21/H23: plan.handle append UNRESOLVED (pending) suppressed records to envelope anomalies; stage partial.
-- [ ] H24: body-reuse requires row graph_status=="covered"; else whole_document compile.
-- [ ] H26: removed image with prior OCR contribution → whole_document compile (republish).
-- [ ] M11: freeze reads frozen md but resolves resources against ORIGINAL base dir.
-- [ ] M16-plan: clear COMPARISON_PENDING in plan._update_state for settled/body-reuse docs.
+### WP2 — plan/mdcompare (stages/plan.py, stages/mdcompare.py, mdcompare/ocr.py) — DONE
+- [x] H7: NO_WORK guard in plan._decide before unavailable branch (coupled M16).
+- [x] H21/H23: plan.handle append UNRESOLVED (pending) suppressed records to envelope anomalies; stage partial.
+- [x] H24: body-reuse requires row graph_status=="covered"; else whole_document compile.
+- [x] H26: removed OCR contribution → whole_document compile. compare_ocr surfaces removed_contributions (prior success URLs absent from incoming raw — representation-independent across raw/published); plan blocks body_reuse + reason OCR_CONTRIBUTION_REMOVED_FULL_RECOMPILE.
+- [x] M11: _incoming/_baseline resolve resources against ORIGINAL base dir; markdown bytes still read from frozen path.
+- [x] M16-plan: clear COMPARISON_PENDING in plan._update_state for body_reuse/compile decisions.
+- Regressions (red→green verified): test_unified_compile.py settled→no_work / unresolved-handed-off stays partial / resolved-handed-off completes / uncovered-baseline compiles (H7,M16,H21,H24); test_unified_ocr.py removed_image_with_prior_ocr_contribution_republishes (H26); test_unified_plan.py incoming_relative_image_resolves_against_original_raw_dir (M11). M16 coupling: acceptance no-update + status tests assert no-work convergence; two reused-image OCR contrast tests updated (unchanged batch→no_work; version-bump identical content→body_reuse merge). 187 unified+comparator tests green; ruff clean.
 
 ### WP3 — compile/graph (knowledge_execute.py, workflows/update_graph.py, stages/compile.py)
 - [ ] H8-read: compile trusts graph.ocr only on success status (tombstone from WP1 drives this).
