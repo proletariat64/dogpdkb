@@ -39,6 +39,8 @@ class PreparedImage:
 
     path: Path
     source: str
+    original: Path | None = None
+    identity: str = ""
 
 
 def _safe_stem(name: str) -> str:
@@ -193,6 +195,7 @@ def prepare_one(
     download: bool,
     session: HttpClient | None = None,
     enabled_extensions: Collection[str] = DEFAULT_ENABLED_EXTENSIONS,
+    retain_original: bool = False,
 ) -> PreparedImage:
     """Normalize one eligible image into a JPEG asset under the output directory."""
     if ref.unsupported:
@@ -237,9 +240,14 @@ def prepare_one(
     try:
         asset.parent.mkdir(parents=True, exist_ok=True)
         asset.write_bytes(jpeg)
+        original = asset.with_suffix(".original") if retain_original else None
+        if original is not None:
+            original.write_bytes(data)
     except OSError as exc:
         raise ImageError(f"write failed: {exc}") from exc
     return PreparedImage(
         path=asset,
         source=asset.relative_to(output_dir).as_posix(),
+        original=original,
+        identity=digest,
     )
