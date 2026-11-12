@@ -70,13 +70,14 @@ no-token/auth contract targets API credentials only).
 - [x] M20: capture._handed_off skips disposition=="done" records (no handoff, no partial).
 - Regressions (red→green verified): test_unified_sync.py legacy_help / legacy_dry_run / resume_selects_run_under_book / status_counts_live / resume_refreshes_liveness / new_batch_reconciles_orphaned_claim / resume_reuses_incomplete_frozen_listing / resume_refuses_frozen_inputs_whose_bytes_changed; test_unified_compile.py resuming_finished_run_releases_orphaned_claim; test_sync_results.py done_anomaly_does_not_keep_next_batch_partial. 46 unified+results tests green; ruff clean.
 
-### WP5 — results/anomalies/wash/apply (sync_results.py, sync_anomalies.py, sync_wash.py, workflows/apply_sync_updates.py, scripts/smoke_install.py)
-- [ ] M3: record_posthoc_success done-path idempotency guard (identical evidence → no reopen).
-- [ ] M12: scan_view include carried anomalies via durable results anomaly_ids.
-- [ ] M18: book-keyed namespaces use validated book_key verbatim (not _slug).
-- [ ] M2: report() schema-aware for migration rows (non-JSON wash --migrate).
-- [ ] H19: publish_documents checkpoint-gate md/ preference (legacy apply).
-- [ ] LOW1: drop unused env param from smoke_unified_sync + call site.
+### WP5 — results/anomalies/wash/apply (sync_results.py, sync_anomalies.py, sync_wash.py, workflows/apply_sync_updates.py, scripts/smoke_install.py) — DONE
+- [x] M3: record_posthoc_success done-path idempotency guard (identical cache/completion/input_changed → return unchanged, no followup reopen; genuinely new evidence still reopens).
+- [x] M12: scan_view unions the runs-based filter with anomaly_ids carried in the selected durable results (read-only, no attempt increment).
+- [x] M18: book-keyed namespaces (results_root, anomaly_id, followup_id, ocr_cache.cache_root) use the validator-safe book_key verbatim; _slug kept for free-form components.
+- [x] M2: report() branches on schema_version — migration rows format references_migrated/artifacts/migrated; inventory rows unchanged. Non-JSON wash --migrate exits 0.
+- [x] H19: publish_documents prefers md/<name> only when <name> is in ocr_dir.parent/ocr-complete.json; partial/unvalidated OCR falls back to raw. test_sync.py:155 updated to record a checkpoint entry.
+- [x] LOW1: dropped unused env param from smoke_unified_sync + call site (smoke script is the test).
+- Regressions (red→green verified): test_sync_results.py replaying_identical_done_evidence_does_not_reopen_consumed_followup / run_scoped_scan_includes_carried_anomaly / book_keyed_namespaces_distinguish_trailing_hyphen_keys; test_unified_wash.py wash_migrate_non_json_report_is_readable; test_sync.py publish_documents_falls_back_to_raw_without_complete_ocr_checkpoint. results+wash+sync suites green; ruff clean.
 
 ## Gate
 make check (doc-guard + ruff + 1138 pytest) + make smoke. Push to PR #18.

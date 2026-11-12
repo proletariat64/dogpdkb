@@ -106,7 +106,12 @@ def scan_view(
     )
     if run is not None:
         runs = [row for row in runs if row["run_id"] == run]
-        anomalies = [row for row in anomalies if run in row.get("runs", [])]
+        carried = {aid for row in runs for aid in row.get("anomaly_ids", [])}
+        anomalies = [
+            row
+            for row in anomalies
+            if run in row.get("runs", []) or row["id"] in carried
+        ]
         causes = [row for row in causes if row.get("run_id") == run]
     if disposition is not None:
         anomalies = [row for row in anomalies if row["disposition"] == disposition]

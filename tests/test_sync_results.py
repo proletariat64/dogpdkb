@@ -316,6 +316,30 @@ def test_archived_export_failure_is_not_retried_by_the_next_daily_sync(
     )
 
 
+def test_run_scoped_scan_includes_an_anomaly_carried_into_a_later_result(
+    workspace: Workspace,
+):
+    make_export_failure(workspace)
+    first = run_batch(workspace)
+    aid = only_anomaly(workspace)["id"]
+    second = run_batch(workspace)
+
+    # The anomaly was registered in the first run only, but the second run's
+    # durable result carries it forward as a live handoff.
+    registry = read_json(workspace.results / "anomalies.json")
+    assert registry["anomalies"][aid]["runs"] == [first]
+    result = read_json(workspace.results / "runs" / f"{second}.json")
+    assert aid in result["anomaly_ids"]
+
+    scanned = anomalies_cli(workspace, "--run", second, "--json")
+    assert scanned.returncode == 0, scanned.stderr
+    view = json.loads(scanned.stdout)
+    assert [row["id"] for row in view["anomalies"]] == [aid]
+    assert view["counts"]["anomalies"] == 1
+    # Scanning is read-only: it never increments retry attempts.
+    assert view["anomalies"][0]["attempts"] == 1
+
+
 def test_a_new_remote_version_syncs_normally_despite_an_archived_failure(
     workspace: Workspace,
 ):
@@ -567,6 +591,77 @@ def test_done_anomaly_does_not_keep_the_next_batch_partial(workspace: Workspace)
     assert aid not in result["stages"]["capture"]["anomaly_ids"]
 
 
+def test_replaying_identical_done_evidence_does_not_reopen_a_consumed_followup(
+    workspace: Workspace,
+):
+    make_capture_anomaly(workspace)
+    assert workspace.sync("--stop-after", "capture").returncode == 0
+    aid = only_anomaly(workspace)["id"]
+    cache = workspace.root / "ocr-cache.json"
+    write_json(cache, {"image": "img-1", "text": "backfilled"})
+    evidence = write_evidence(workspace, cache=cache, input_changed=True)
+    resolved = anomalies_cli(
+        workspace,
+        "--resolve",
+        aid,
+        "--disposition",
+        "done",
+        "--evidence",
+        str(evidence),
+    )
+    assert resolved.returncode == 0, resolved.stderr
+    fid = json.loads(resolved.stdout)["resolution"]["followup_id"]
+
+    # Compile publishes the source and consumes the follow-up to done.
+    followups_path = workspace.results / "compile-followups.json"
+    followups = read_json(followups_path)
+    followups["followups"][fid]["status"] = "done"
+    followups["followups"][fid]["resolution"] = {
+        "disposition": "done",
+        "reason": "compile published the source with the updated input",
+    }
+    write_json(followups_path, followups)
+
+    # Replaying the identical post-hoc success must not reopen consumed work.
+    again = anomalies_cli(
+        workspace,
+        "--resolve",
+        aid,
+        "--disposition",
+        "done",
+        "--evidence",
+        str(evidence),
+    )
+    assert again.returncode == 0, again.stderr
+    assert read_json(followups_path)["followups"][fid]["status"] == "done"
+
+    # Genuinely new evidence still reopens the follow-up for fresh compile work.
+    fresh = workspace.root / "evidence-fresh.json"
+    write_json(
+        fresh,
+        {
+            "schema_version": "unified-posthoc-evidence-1.0",
+            "cache": [{"kind": "ocr", "path": str(cache)}],
+            "completion": {
+                "step": "ocr",
+                "details": {"cache": str(cache), "revision": 2},
+            },
+            "input_changed": True,
+        },
+    )
+    reopened = anomalies_cli(
+        workspace,
+        "--resolve",
+        aid,
+        "--disposition",
+        "done",
+        "--evidence",
+        str(fresh),
+    )
+    assert reopened.returncode == 0, reopened.stderr
+    assert read_json(followups_path)["followups"][fid]["status"] == "pending"
+
+
 def test_batch_result_carries_document_identities_surviving_wash(workspace: Workspace):
     make_capture_anomaly(workspace)
     assert workspace.sync("--stop-after", "capture").returncode == 0
@@ -662,3 +757,29 @@ def test_batch_cause_enumerates_affected_images(tmp_path: Path):
     assert registry["batch_causes"][record["id"]]["anomaly_ids"] == [
         row["id"] for row in again
     ]
+
+
+def test_book_keyed_namespaces_distinguish_trailing_hyphen_keys(tmp_path: Path):
+    """Validator-legal keys differing only by a trailing hyphen must not collide."""
+    import re
+    from types import SimpleNamespace
+
+    from dogpdkb.ocr_cache import cache_root
+    from dogpdkb.sync_results import anomaly_id, followup_id, results_root
+
+    config = SimpleNamespace(
+        results=tmp_path / "results", ocr_cache=tmp_path / "ocr-cache"
+    )
+    version = {"field": "content_updated_at", "utc": "2026-11-10T11:00:00+08:00"}
+    keys = ("fund", "fund-")
+    # Both keys are accepted by the books-file validator (mdocr/config.py).
+    assert all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", key) for key in keys)
+
+    roots = {results_root(config, key) for key in keys}
+    aids = {anomaly_id(key, 2, version, "capture", "export_failed") for key in keys}
+    fids = {followup_id(key, 2, version) for key in keys}
+    caches = {cache_root(config, key) for key in keys}
+    assert len(roots) == 2, roots
+    assert len(aids) == 2, aids
+    assert len(fids) == 2, fids
+    assert len(caches) == 2, caches

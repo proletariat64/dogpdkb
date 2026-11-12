@@ -64,7 +64,7 @@ def anomaly_id(
 ) -> str:
     """Stable identity from book + document ID + version + stage + code (+ image)."""
     parts = [
-        _slug(book_key),
+        book_key,
         _slug(document_id),
         version_stamp(source_version),
         _slug(stage),
@@ -76,7 +76,8 @@ def anomaly_id(
 
 
 def results_root(config: Any, book_key: str) -> Path:
-    return Path(config.results) / _slug(book_key)
+    # book_key is validator-safe; _slug would alias keys like "fund" and "fund-".
+    return Path(config.results) / book_key
 
 
 def registry_path(config: Any, book_key: str) -> Path:
@@ -477,7 +478,7 @@ def save_followups(config: Any, book_key: str, registry: dict[str, Any]) -> None
 def followup_id(book_key: str, document_id: Any, source_version: Any) -> str:
     """One follow-up per book + document + source version (no new fingerprint)."""
     return "-".join(
-        [_slug(book_key), _slug(document_id), version_stamp(source_version), "compile"]
+        [book_key, _slug(document_id), version_stamp(source_version), "compile"]
     )
 
 
@@ -593,6 +594,19 @@ def record_posthoc_success(
     details = completion.get("details") or {}
     if not isinstance(details, dict):
         raise ArchiveError("post-hoc completion.details must be an object")
+
+    # Replaying identical done evidence is a no-op: it must not re-register
+    # follow-up compile work that compile has already consumed to done (M3).
+    # Genuinely new evidence (different cache/completion/input_changed) falls
+    # through and reopens the follow-up for fresh compile work.
+    prior = record.get("resolution") or {}
+    if (
+        record.get("disposition") == "done"
+        and prior.get("cache") == cache
+        and prior.get("completion") == {"step": completion["step"], "details": details}
+        and prior.get("input_changed") == bool(evidence.get("input_changed"))
+    ):
+        return record
 
     # Real completion first: canonical state, never the disposition alone.
     progress = Progress(book.corpus, book.key)

@@ -14,7 +14,6 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from dogpdkb.sync_results import _slug
 from dogpdkb.sync_run import RunError, atomic_json, read_json
 from mdcompare.io import InputError
 from mdcompare.ocr import CONTRACT
@@ -33,7 +32,7 @@ CONFIGURATION = {
 
 
 def cache_root(config: Any, book_key: str) -> Path:
-    return Path(config.ocr_cache) / _slug(book_key)
+    return Path(config.ocr_cache) / book_key
 
 
 def entry_dir(root: Path, key: str) -> Path:

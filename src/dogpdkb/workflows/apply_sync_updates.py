@@ -236,10 +236,21 @@ def publish_documents(
     backup_dir: Path,
     on_complete: Callable[[Path, dict[str, Any]], None] | None = None,
 ) -> dict[str, int]:
+    # Only a validated complete OCR output may be published; a partial md/ left
+    # by an interrupted prior OCR (no checkpoint entry) must fall back to raw.
+    checkpoint = ocr_dir.parent / "ocr-complete.json"
+    completed: set[str] = set()
+    if checkpoint.is_file():
+        try:
+            completed = set(
+                json.loads(checkpoint.read_text(encoding="utf-8")).get("files", [])
+            )
+        except ValueError:
+            completed = set()
     planned: list[tuple[Path, Path, list[Path], dict[str, Any]]] = []
     for raw_path, doc in exported:
         final_source = ocr_dir / raw_path.name
-        if not final_source.is_file():
+        if raw_path.name not in completed or not final_source.is_file():
             final_source = raw_path
         if not final_source.is_file():
             raise FileNotFoundError(final_source)

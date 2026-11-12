@@ -416,6 +416,23 @@ def test_wash_migrate_persists_necessary_artifacts_and_rewrites_old_references(
     ]["1"]["steps"]["download"]["raw"]["path"] == str(durable)
 
 
+def test_wash_migrate_non_json_report_is_readable(workspace: Workspace):
+    finished_batch(workspace)
+    legacy = legacy_run(workspace)
+    raw = legacy / "raw" / "1-20260101T000000+0800.md"
+    point_state_at_legacy(workspace, raw)
+
+    migrated = wash_cli(workspace, "--migrate")
+
+    # The human-readable migration summary must not raise on migration rows,
+    # which carry references_migrated/artifacts/migrated, not inventory keys.
+    assert migrated.returncode == 0, migrated.stderr
+    assert "book fund" in migrated.stdout
+    assert legacy.name in migrated.stdout
+    assert "references_migrated=" in migrated.stdout
+    assert "action=" not in migrated.stdout
+
+
 def make_capture_anomaly(workspace: Workspace) -> None:
     """doc 2 detail is newer than its listing: a capture anomaly with raw present."""
     remote = read_json(workspace.root / "remote.json")

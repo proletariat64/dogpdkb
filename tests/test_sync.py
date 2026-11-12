@@ -166,6 +166,7 @@ def test_publish_documents_copies_assets_and_backs_up_old_document(tmp_path: Pat
     raw = raw_dir / name
     raw.write_text("raw")
     (ocr_dir / name).write_text("![image](assets/new/image.jpg)")
+    (tmp_path / "ocr-complete.json").write_text(json.dumps({"files": [name]}))
     asset = ocr_dir / "assets" / "new" / "image.jpg"
     asset.parent.mkdir(parents=True)
     asset.write_bytes(b"jpeg")
@@ -226,6 +227,31 @@ def test_publish_documents_preserves_old_document_when_source_is_missing(
         )
 
     assert old.read_text() == "old"
+
+
+def test_publish_documents_falls_back_to_raw_without_a_complete_ocr_checkpoint(
+    tmp_path: Path,
+):
+    corpus = tmp_path / "corpus"
+    raw_dir = tmp_path / "raw"
+    ocr_dir = tmp_path / "ocr"
+    for directory in (corpus, raw_dir, ocr_dir):
+        directory.mkdir()
+    name = "doc-2026-11-02-[1].md"
+    raw = raw_dir / name
+    raw.write_text("valid raw")
+    # A prior interrupted OCR left a partial output with no checkpoint entry.
+    (ocr_dir / name).write_text("partial ocr")
+
+    apply_sync.publish_documents(
+        [(raw, {"id": 1, "kind": "updated"})],
+        ocr_dir,
+        corpus,
+        tmp_path / "backup",
+    )
+
+    # An unvalidated partial OCR output must never be published over valid raw.
+    assert (corpus / name).read_text() == "valid raw"
 
 
 def test_sync_state_round_trip(tmp_path: Path):

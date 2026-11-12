@@ -677,12 +677,20 @@ def report(view: dict[str, Any]) -> str:
     counts = view["counts"]
     lines = [f"book {view['book_key']} staging {view['staging']}"]
     lines.append(" ".join(f"{key}={value}" for key, value in counts.items()))
+    migration = view.get("schema_version") == MIGRATION_SCHEMA
     for row in view["runs"]:
-        lines.append(
-            f"  {row['run_id']} {row['kind']} {row['status']} "
-            f"action={row['action']} references={len(row['references'])} "
-            f"artifacts={len(row['necessary_artifacts'])}"
-        )
+        if migration:
+            lines.append(
+                f"  {row['run_id']} {row['kind']} {row['status']} "
+                f"references_migrated={row['references_migrated']} "
+                f"artifacts={len(row['artifacts'])} migrated={len(row['migrated'])}"
+            )
+        else:
+            lines.append(
+                f"  {row['run_id']} {row['kind']} {row['status']} "
+                f"action={row['action']} references={len(row['references'])} "
+                f"artifacts={len(row['necessary_artifacts'])}"
+            )
         if row.get("annotation"):
             lines.append(f"    {row['annotation']}")
     for row in view.get("failures", []):

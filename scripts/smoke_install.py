@@ -269,9 +269,7 @@ def write_unified_remote(
     proxy.chmod(0o755)
 
 
-def smoke_unified_sync(
-    work: Path, command: Path, run, env: dict, graph_env: Path
-) -> None:
+def smoke_unified_sync(work: Path, command: Path, run, graph_env: Path) -> None:
     """Exercise the installed unified five-stage sync entry offline (ticket 08).
 
     This replaces the superseded human-approval / semantic-quality gate exercise:
@@ -855,7 +853,7 @@ def smoke(dist: Path) -> None:
         # an offline five-stage batch: a changed source compiles through the
         # deterministic Graphify stub, an unchanged second batch converges by
         # reuse with no repeat extraction.
-        smoke_unified_sync(work, command, run, env, graph_env)
+        smoke_unified_sync(work, command, run, graph_env)
         report = parse_json(run([str(command), "doctor", "--package", "--json"]))
         assert report["ok"]
         run([str(command), "init-config"], expected=1)
