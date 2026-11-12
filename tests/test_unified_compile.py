@@ -943,3 +943,58 @@ def test_referenced_html_image_ocr_success_is_still_reported_unenriched(
         item["code"] == "OCR_NOT_ENRICHED" and item["resource_id"] == IMAGE_A
         for item in result2["execution"]["missing_items"]
     )
+
+
+def test_posthoc_backfill_not_consumed_hands_off_instead_of_false_done(
+    workspace: CompileWorkspace,
+):
+    # [15] A post-hoc backfill can register a follow-up whose artifact is NOT the
+    # canonical graph.ocr success compile actually reads (stale evidence). When the
+    # source republishes without consuming that registered artifact, the follow-up
+    # must hand off (failed), never close done: writing OCR cache alone is not a
+    # completed knowledge update (M17 generalized to registered-input consumption).
+    from dogpdkb.sync_results import load_followups, register_compile_followup
+    from mdocr.config import load_config
+
+    _set_detail(workspace, 2, body=f"# Two\n\n![diagram]({IMAGE_A})\n")
+    # First compile fails so COMPARISON_PENDING is retained and the document is
+    # re-selected next batch (isolates the consumption guard from [14] selection).
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = "source-[2]"
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+
+    config = load_config(workspace.config)
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    version = doc2["observation"]["version"]
+    canonical = doc2["graph"]["ocr"]["images"][0]["artifact"]
+    # A distinct backfill artifact the canonical graph.ocr does not reference.
+    backfill = workspace.root / "backfill-artifact.md"
+    backfill.write_text("BACKFILL TEXT NOT IN GRAPH\n", encoding="utf-8")
+    backfill_path = str(backfill.resolve())
+    assert backfill_path != canonical
+    followup = register_compile_followup(
+        config,
+        "fund",
+        document_id=2,
+        source_version=version,
+        reason="post-hoc backfill changed the published compile input",
+        inputs=[{"kind": "cache", "path": backfill_path}],
+    )
+    assert followup["status"] == "pending"
+
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = ""
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run_dir = workspace.runs()[-1]
+
+    registry = load_followups(config, "fund")
+    consumed = registry["followups"][followup["id"]]
+    assert consumed["status"] == "failed"
+    assert consumed["resolution"]["disposition"] == "handed_off"
+
+    report = read_json(run_dir / "compile" / "compile-result.json")
+    result2 = next(row for row in report["results"] if row["document_id"] == 2)
+    final_paths = {i.get("path") for i in result2["execution"]["final_inputs"]}
+    assert backfill_path not in final_paths
+    frozen = run_dir / "compile" / "execution-corpus" / "source-[2].md"
+    assert "BACKFILL TEXT NOT IN GRAPH" not in frozen.read_text(encoding="utf-8")

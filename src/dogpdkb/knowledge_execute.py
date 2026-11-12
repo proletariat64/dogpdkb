@@ -1327,18 +1327,31 @@ def _consume_followups(context: Any, results: list[dict[str, Any]]) -> list[str]
             item.get("code") == "OCR_NOT_ENRICHED"
             for item in execution.get("missing_items") or []
         )
+        # Generalize the M17 guard: a follow-up is fulfilled only when the inputs
+        # it registered were actually consumed by the published compile. A post-hoc
+        # backfill whose artifact never reached the canonical graph.ocr compile reads
+        # publishes without it; closing done there would claim a knowledge update
+        # that only wrote OCR cache ([15]). Match by durable path.
+        final_paths = {item.get("path") for item in execution.get("final_inputs") or []}
+        registered = {item.get("path") for item in record.get("inputs") or []}
+        unconsumed = registered - final_paths
         record["run_id"] = context.layout.run_id
         record["updated_at"] = now
-        if unenriched:
-            # The source published, but a successful OCR input was not inserted
-            # (HTML/reference form). Do not close the follow-up as fulfilled; hand
-            # it off so the daily batch does not endlessly retry it (M17).
+        if unenriched or unconsumed:
+            # The source published, but a registered OCR input was not inserted
+            # (HTML/reference form) or not consumed at all (stale canonical
+            # evidence). Do not close the follow-up as fulfilled; hand it off so the
+            # daily batch does not endlessly retry it (M17, [15]).
             record["status"] = "failed"
             record["resolution"] = {
                 "disposition": "handed_off",
                 "run_id": context.layout.run_id,
                 "recorded_at": now,
-                "reason": "published source omitted an un-enriched OCR input",
+                "reason": (
+                    "published source omitted an un-enriched OCR input"
+                    if unenriched
+                    else "published source did not consume the registered backfill input"
+                ),
             }
         else:
             record["status"] = "done"
