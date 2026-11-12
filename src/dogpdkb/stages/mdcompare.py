@@ -67,6 +67,12 @@ def _resource_catalog(data: bytes, base_dir: Path) -> list[dict[str, Any]]:
     for use in uses:
         url = use["url"]
         if url in catalog:
+            # A plain link (attachment use) must not shadow a later image embed
+            # of the same URL: upgrade the kind so the image still reaches OCR.
+            # The resource identity stays the URL, so OCR evidence and removed-
+            # contribution detection are unchanged ([22]).
+            if use["kind"] == "image":
+                catalog[url]["kind"] = "image"
             continue
         entry: dict[str, Any] = {
             "resource_id": url,

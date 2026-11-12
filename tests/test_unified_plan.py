@@ -327,3 +327,24 @@ def test_incoming_relative_image_resolves_against_original_raw_dir(tmp_path: Pat
     row = next(r for r in rows if r["document_id"] == 1)
     entry = next(e for e in row["resources"] if e["resource_id"] == "images/chart.png")
     assert entry.get("path") == str(sibling.resolve())
+
+
+def test_link_before_embed_of_same_url_still_reaches_ocr(workspace: Workspace):
+    # [22] Dedup by URL must not let a plain link (attachment use) shadow a later
+    # image embed of the same URL. The image has to reach OCR regardless of which
+    # use appears first, otherwise its text is silently never recognized.
+    url = "https://cdn.example.invalid/a.png"
+    _set_detail(workspace, 2, body=f"[Download]({url})\n\n![Diagram]({url})\n")
+
+    completed = workspace.sync("--stop-after", "plan")
+
+    assert completed.returncode == 0, completed.stderr
+    run_dir = workspace.only_run()
+    mdcompare = read_json(run_dir / "mdcompare" / "report.json")
+    row2 = next(r for r in mdcompare["documents"] if r["document_id"] == 2)
+    entry = next(e for e in row2["resources"] if e["resource_id"] == url)
+    assert entry["kind"] == "image"
+    plan = _plan(workspace)
+    ocr = {row["document_id"]: row for row in plan["ocr"]}
+    assert 2 in ocr
+    assert url in {item["resource_id"] for item in ocr[2]["resources"]}
