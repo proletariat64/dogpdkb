@@ -36,7 +36,11 @@ Baseline corpus filename IDs may identify preexisting inventory sources; this
 only selects Graphify replacement arguments and never reads the graph itself.
 Metadata/reuse actions use Graphify metadata updates only when the graph version
 matches the comparison baseline/current version. Otherwise the complete current
-source compiles. Metadata maps source references to source URLs.
+source compiles. The initial registered baseline also permits metadata reuse
+when the comparison baseline is that exact registered day version and the public
+inventory covers its exact registered source path. An older inventory filename
+or an advanced corpus baseline does not establish this starting point.
+Metadata maps source references to source URLs.
 
 Pending selection clears only after acknowledged graph success, when its source
 version and captured metadata still match and no unstarted tool step remains.
