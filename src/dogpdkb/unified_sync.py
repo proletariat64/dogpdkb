@@ -117,7 +117,13 @@ def unified_arguments(arguments: list[str]) -> list[str]:
     legacy ``--dry-run`` maps to ``--stop-after plan`` to keep its no-write intent.
     The unified runner is the single default executor, so a legacy invocation
     runs the same five-stage batch rather than a second pipeline.
+
+    ``--dry-run`` caps the batch at plan regardless of argument order: argparse
+    keeps the LAST ``--stop-after``, so an explicit later stage would otherwise
+    win and publish despite the no-write flag. When ``--dry-run`` is present every
+    explicit ``--stop-after`` is dropped and ``plan`` is appended exactly once.
     """
+    dry_run = any(token.partition("=")[0] == "--dry-run" for token in arguments)
     kept: list[str] = []
     index = 0
     while index < len(arguments):
@@ -131,12 +137,22 @@ def unified_arguments(arguments: list[str]) -> list[str]:
             continue
         if name == "--dry-run":
             # The legacy dry run meant "stop after the plan"; preserve that
-            # no-write intent rather than silently publishing (H11).
-            kept.extend(["--stop-after", "plan"])
+            # no-write intent rather than silently publishing (H11). The cap is
+            # appended once after the pass so argument order cannot override it.
             index += 1
             continue
         if name not in _UNIFIED_VALUE_FLAGS:
             index += 1
+            continue
+        if dry_run and name == "--stop-after":
+            # Drop the explicit stage (both --stop-after=X and --stop-after X)
+            # so the dry-run plan cap below is the only --stop-after forwarded.
+            if not separator and index + 1 < len(arguments) and not arguments[
+                index + 1
+            ].startswith("-"):
+                index += 2
+            else:
+                index += 1
             continue
         if separator:
             kept.append(token)
@@ -147,6 +163,8 @@ def unified_arguments(arguments: list[str]) -> list[str]:
         else:
             # A valueless flag (e.g. the legacy boolean --resume) is dropped.
             index += 1
+    if dry_run:
+        kept.extend(["--stop-after", "plan"])
     return kept
 
 
@@ -199,7 +217,9 @@ def _unfinished(staging: Path, book_key: str) -> list[tuple[RunLayout, str]]:
     return found
 
 
-def _validate_resume(layout: RunLayout, state: RunState) -> None:
+def _validate_resume(
+    layout: RunLayout, state: RunState, config: Any, book_key: str
+) -> None:
     """A resumed batch keeps its own artifacts; missing evidence is fatal."""
     for stage in STAGES:
         row = state.stage(stage)
@@ -221,7 +241,51 @@ def _validate_resume(layout: RunLayout, state: RunState) -> None:
                     f"cannot resume {layout.run_id}: missing {stage} artifact "
                     f"{name} ({reference})"
                 )
+    _validate_capture_raws(layout, config, book_key)
     _validate_frozen_inputs(layout, state)
+
+
+def _validate_capture_raws(layout: RunLayout, config: Any, book_key: str) -> None:
+    """Byte-check each captured raw against durable capture-time evidence.
+
+    A capture-only pause has no frozen mdcompare inputs yet, so the freeze-time
+    comparison cannot run. The durable copy kept at capture time (outside wash) is
+    the source of truth: a raw MODIFIED while paused fails closed regardless of
+    mdcompare's status. A raw that is missing, unreadable or OCR-enriched is left
+    to the availability-first path (capture reuse / mdcompare archive
+    CAPTURE_RAW_UNAVAILABLE), never a hard reject (spec:144). Direct bytes, no
+    fingerprint (spec:82).
+    """
+    from dogpdkb.knowledge_capture import _raw_validity
+    from dogpdkb.knowledge_plan import _resolve_raw
+    from dogpdkb.stages.capture import capture_evidence_dir
+
+    snapshot_path = layout.stage_dir("capture") / "snapshot.json"
+    if not snapshot_path.is_file():
+        return
+    snapshot = read_json(snapshot_path)
+    if not isinstance(snapshot, dict):
+        return
+    documents = snapshot.get("documents") or {}
+    exports = snapshot.get("exports") or {}
+    evidence_dir = capture_evidence_dir(config, book_key, layout.run_id)
+    for doc_id, export in exports.items():
+        if not isinstance(export, dict) or export.get("status") != "captured":
+            continue
+        capture_ref = (documents.get(doc_id) or {}).get("raw") or export.get("raw")
+        capture_raw = _resolve_raw(capture_ref, snapshot_path)
+        if capture_raw is None or not capture_raw.is_file():
+            continue  # deleted -> availability path
+        if _raw_validity(capture_raw) is not None:
+            continue  # enriched/unreadable -> availability path ([0]/mdcompare)
+        evidence = evidence_dir / capture_raw.name
+        if not evidence.is_file():
+            continue  # no durable capture-time evidence to compare against
+        if capture_raw.read_bytes() != evidence.read_bytes():
+            raise RunError(
+                f"cannot resume {layout.run_id}: captured raw {capture_raw.name} "
+                "no longer matches the capture-time evidence"
+            )
 
 
 def _validate_frozen_inputs(layout: RunLayout, state: RunState) -> None:
@@ -432,7 +496,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"run {layout.run_id} was recorded with different configuration; "
                     "start a new run instead of resuming"
                 )
-            _validate_resume(layout, state)
+            _validate_resume(layout, state, config, book.key)
             recorded, _ = observed_status(state.data)
             if recorded in FINISHED_STATUSES and recorded != "failed":
                 report_progress(

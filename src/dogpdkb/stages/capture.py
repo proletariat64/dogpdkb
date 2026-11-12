@@ -7,14 +7,23 @@ batches and the durable raw store are owned by the capture layer.
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from dogpdkb.knowledge_capture import SCHEMA_VERSION, CaptureError, run_capture
+from dogpdkb.knowledge_capture import (
+    SCHEMA_VERSION,
+    CaptureError,
+    _raw_validity,
+    _write_json,
+    run_capture,
+)
 from dogpdkb.sync_results import (
     archive_anomalies,
     load_registry,
+    results_root,
     suppressing_anomalies,
 )
 from dogpdkb.sync_run import RunError, read_json
@@ -139,8 +148,10 @@ def _handed_off(
 
     The daily batch still reports them (partial, never a fabricated completed) so
     a handed-off failure stays visible until the post-hoc agent disposes of it.
-    A ``done`` record is already disposed: it stays suppressed (no re-export) but
-    is no current failure, so it neither hands off nor keeps the batch partial.
+    A ``done`` (resolved) or ``abandoned`` (given-up) record is already disposed:
+    it stays suppressed (no re-export) but is no current failure, so it neither
+    hands off nor keeps the batch partial. This mirrors the plan stage, which
+    carries forward only ``pending`` suppressions.
     """
     rows = snapshot.get("suppressed") or []
     if not rows:
@@ -149,7 +160,7 @@ def _handed_off(
     known = {row.get("id") for row in result.anomalies}
     for row in rows:
         record = registry["anomalies"].get(row["anomaly_id"])
-        if record is None or record.get("disposition") == "done":
+        if record is None or record.get("disposition") in {"done", "abandoned"}:
             continue
         if record["id"] not in known:
             result.anomalies.append(record)
@@ -158,6 +169,128 @@ def _handed_off(
         result.status = "partial"
         result.reason = result.reason or "archived anomalies handed off"
     return result
+
+
+def _revalidate_reused_raws(
+    context: StageContext, snapshot: dict[str, Any], snapshot_path: Path
+) -> dict[str, Any]:
+    """Re-check each reused captured raw before handing the observation downstream.
+
+    A crash-window reuse must not freeze enriched/unreadable Markdown as verified
+    raw (spec:80-82, issue-02 #1/#3). The existing ``_raw_validity`` markers decide
+    (no new fingerprint): an enriched/invalid raw becomes a visible
+    ``CAPTURE_RAW_UNAVAILABLE`` anomaly (partial), the same shape mdcompare uses
+    for a missing raw. A merely missing raw keeps today's downstream availability
+    path. The snapshot FILE is rewritten so mdcompare reads the same verdict.
+    """
+    exports = snapshot.get("exports") or {}
+    documents = snapshot.get("documents") or {}
+    anomalies = snapshot.setdefault("anomalies", [])
+    known = {
+        (row.get("id"), row.get("code"))
+        for row in anomalies
+        if isinstance(row, dict)
+    }
+    invalidated = 0
+    for doc_id, export in exports.items():
+        if not isinstance(export, dict) or export.get("status") != "captured":
+            continue
+        raw = export.get("raw") or (documents.get(doc_id) or {}).get("raw") or {}
+        reference = raw.get("path")
+        if not isinstance(reference, str) or not reference:
+            continue
+        reason = _raw_validity((snapshot_path.parent / reference).resolve())
+        if reason not in {"raw_enriched", "raw_invalid"}:
+            continue
+        numeric_id = int(doc_id)
+        export["status"] = "failed"
+        export["reused"] = False
+        export["error"] = reason
+        if (numeric_id, "CAPTURE_RAW_UNAVAILABLE") not in known:
+            anomalies.append({"id": numeric_id, "code": "CAPTURE_RAW_UNAVAILABLE"})
+            known.add((numeric_id, "CAPTURE_RAW_UNAVAILABLE"))
+        invalidated += 1
+        context.log.write(f"reused raw unavailable document={doc_id} reason={reason}")
+    if invalidated:
+        counts = snapshot.get("counts") or {}
+        counts["captured"] = sum(
+            1
+            for row in exports.values()
+            if isinstance(row, dict) and row.get("status") == "captured"
+        )
+        counts["failed"] = sum(
+            1
+            for row in exports.values()
+            if isinstance(row, dict) and row.get("status") == "failed"
+        )
+        counts["anomalies"] = len(anomalies)
+        snapshot["counts"] = counts
+        snapshot["status"] = "incomplete"
+        _write_json(snapshot_path, snapshot)
+    return snapshot
+
+
+def capture_evidence_dir(config: Any, book_key: str, run_id: str) -> Path:
+    """Durable capture-time raw evidence, outside wash (spec:130-132).
+
+    Keyed by run so a resumed batch compares against its own captured bytes.
+    Located via the durable store's public root; never cleaned with wash.
+    """
+    return results_root(config, book_key) / "capture-evidence" / run_id
+
+
+def _persist_capture_raw(source: Path, target: Path) -> None:
+    """Atomically copy raw bytes once; a conflicting durable copy is never overwritten."""
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    data = source.read_bytes()
+    if target.is_file():
+        if target.read_bytes() != data:
+            raise ValueError(f"capture evidence conflict: {target.name}")
+        return
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+    )
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _persist_capture_evidence(context: StageContext, snapshot: dict[str, Any]) -> None:
+    """Keep a durable byte copy of each captured raw so resume can detect tampering.
+
+    Best-effort (like anomaly archiving): a store failure is logged, never fatal;
+    resume integrity checking then degrades to no comparison for that document.
+    Direct bytes, no fingerprint (spec:82).
+    """
+    exports = snapshot.get("exports") or {}
+    documents = snapshot.get("documents") or {}
+    snapshot_path = context.directory / "snapshot.json"
+    evidence_dir = capture_evidence_dir(
+        context.config, context.book.key, context.layout.run_id
+    )
+    for doc_id, export in exports.items():
+        if not isinstance(export, dict) or export.get("status") != "captured":
+            continue
+        raw = export.get("raw") or (documents.get(doc_id) or {}).get("raw") or {}
+        reference = raw.get("path")
+        if not isinstance(reference, str) or not reference:
+            continue
+        source = (snapshot_path.parent / reference).resolve()
+        if not source.is_file():
+            continue
+        try:
+            _persist_capture_raw(source, evidence_dir / source.name)
+        except (OSError, ValueError) as error:
+            context.log.write(
+                f"capture evidence persistence failed: {safe_diagnostic(error)}"
+            )
 
 
 def handle(context: StageContext) -> StageResult:
@@ -175,6 +308,8 @@ def handle(context: StageContext) -> StageResult:
     ):
         # A finished observation is never re-exported; resume reuses its evidence.
         context.log.write(f"reusing complete snapshot {snapshot_path}")
+        existing = _revalidate_reused_raws(context, existing, snapshot_path)
+        _persist_capture_evidence(context, existing)
         result = _archived(context, _result(context, existing))
         return _handed_off(context, existing, result)
     baseline = _baseline(context)
@@ -204,6 +339,7 @@ def handle(context: StageContext) -> StageResult:
     snapshot = _snapshot(snapshot_path)
     if snapshot is None:
         raise StageFailed("capture produced no snapshot")
+    _persist_capture_evidence(context, snapshot)
     result = _result(context, snapshot)
     if snapshot.get("status") in COMPLETE:
         context.progress.phase(

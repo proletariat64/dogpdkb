@@ -356,6 +356,35 @@ def test_legacy_dry_run_stops_after_plan_without_publishing(tmp_path: Path):
     assert (workspace.corpus / "graphify-out" / "graph.json").read_bytes() == before
 
 
+def test_legacy_dry_run_caps_stop_after_plan_in_any_argument_order(tmp_path: Path):
+    # [7] H11 residual: --dry-run must cap the batch at plan (no OCR/publication)
+    # regardless of where an explicit --stop-after appears. argparse keeps the
+    # LAST --stop-after, so forwarding both plan and the explicit stage would let
+    # compile/ocr run despite the no-write flag when the explicit stage is last.
+    for index, flags in enumerate(
+        [
+            ["--dry-run", "--stop-after", "compile"],
+            ["--stop-after", "compile", "--dry-run"],
+            ["--dry-run", "--stop-after=compile"],
+            ["--dry-run", "--stop-after", "ocr"],
+        ]
+    ):
+        workspace = Workspace(tmp_path / f"case-{index}", DOCUMENTS)
+        before = (workspace.corpus / "graphify-out" / "graph.json").read_bytes()
+        completed = workspace.sync(*flags)
+
+        assert completed.returncode == 0, completed.stderr
+        summary = json.loads(completed.stdout.strip().splitlines()[-1])
+        assert summary["status"] == "paused", (flags, summary)
+        assert summary["stop_reason"] == "stop-after plan", (flags, summary)
+        assert summary["stages"]["plan"] == "completed", (flags, summary)
+        assert summary["stages"]["ocr"] == "pending", (flags, summary)
+        assert summary["stages"]["compile"] == "pending", (flags, summary)
+        assert (
+            workspace.corpus / "graphify-out" / "graph.json"
+        ).read_bytes() == before, flags
+
+
 def test_resume_selects_the_run_under_the_requested_book(tmp_path: Path):
     # M9: a bare run id that exists under two books must resolve within --book,
     # not the alphabetically first book. A colliding run under "aaa" must not
@@ -823,3 +852,205 @@ def test_tool_output_goes_to_the_stage_log_and_bodies_never_reach_the_console(
         assert "body 1" not in text
         assert "body 2" not in text
         assert "Old rule." not in text
+
+
+def test_abandoned_capture_anomaly_does_not_keep_the_next_batch_partial(
+    tmp_path: Path,
+):
+    # [1] M20 scope gap: an abandoned (given-up, resolved) capture anomaly is no
+    # current failure, exactly like a done one. It stays suppressed (no re-export)
+    # but must not hand back as a live anomaly that keeps every later same-version
+    # batch partial. The plan stage already carries forward only pending.
+    workspace = Workspace(tmp_path, DOCUMENTS)
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["2"].pop("body", None)  # doc2 export fails -> capture anomaly
+    write_json(workspace.root / "remote.json", remote)
+    first = workspace.sync()  # full batch reaches a terminal status (compile fails)
+    assert first.returncode != 0
+
+    registry = read_json(workspace.root / "sync-results" / "fund" / "anomalies.json")
+    capture_aids = [
+        aid
+        for aid, row in registry["anomalies"].items()
+        if row["stage"] == "capture" and row["document_id"] == 2
+    ]
+    assert len(capture_aids) == 1, registry["anomalies"]
+    aid = capture_aids[0]
+    resolved = workspace.cli(
+        "anomalies",
+        "--config",
+        str(workspace.config),
+        "--book",
+        "fund",
+        "--resolve",
+        aid,
+        "--disposition",
+        "abandoned",
+    )
+    assert resolved.returncode == 0, resolved.stderr
+    assert json.loads(resolved.stdout)["disposition"] == "abandoned"
+
+    # The next same-version batch suppresses doc2 (no re-export) and completes
+    # capture instead of counting the resolved abandonment as a live failure.
+    second = workspace.sync("--stop-after", "capture")
+    assert second.returncode == 0, second.stderr
+    run_dir = workspace.runs()[-1]
+    snapshot = read_json(run_dir / "capture" / "snapshot.json")
+    assert 2 not in snapshot["selected"]
+    assert any(row["anomaly_id"] == aid for row in snapshot["suppressed"])
+    envelope = read_json(run_dir / "capture" / "result.json")
+    assert envelope["status"] == "completed", envelope
+    assert aid not in {row.get("id") for row in envelope["anomalies"]}
+
+
+def test_reused_snapshot_rejects_enriched_raw_instead_of_faking_completed(
+    tmp_path: Path,
+):
+    # [0] H14 widened: the crash-window reuse branch never re-validated the
+    # referenced raw. A captured raw that acquired OCR-enrichment markers must
+    # NOT be handed downstream as verified raw under the original captured count
+    # and a fabricated "completed". It becomes a visible CAPTURE_RAW_UNAVAILABLE
+    # anomaly (partial), the same shape mdcompare uses for a missing raw, and the
+    # snapshot FILE is rewritten so mdcompare also drops the enriched document.
+    workspace = Workspace(tmp_path, DOCUMENTS)
+    first = workspace.result("--stop-after", "capture")
+    run_dir = workspace.only_run()
+    snapshot_path = run_dir / "capture" / "snapshot.json"
+    snapshot = read_json(snapshot_path)
+    assert snapshot["status"] == "captured"
+    raw2 = run_dir / "capture" / snapshot["documents"]["2"]["raw"]["path"]
+
+    # Simulate the crash window: capture never committed its result envelope.
+    state = read_json(run_dir / "run.json")
+    state["stage_states"]["capture"]["status"] = "running"
+    write_json(run_dir / "run.json", state)
+    (run_dir / "capture" / "result.json").unlink()
+    # doc2's captured raw acquires an OCR-enrichment marker after the snapshot.
+    raw2.write_text(
+        raw2.read_text(encoding="utf-8") + "\n<!-- mdocr:ocr-begin -->\n",
+        encoding="utf-8",
+    )
+
+    resumed = workspace.sync("--resume", first["run"], "--stop-after", "capture")
+
+    assert resumed.returncode == 0, resumed.stderr
+    summary = json.loads(resumed.stdout.strip().splitlines()[-1])
+    assert summary["stages"]["capture"] == "partial", summary
+    envelope = read_json(run_dir / "capture" / "result.json")
+    assert envelope["status"] == "partial", envelope
+    assert (2, "CAPTURE_RAW_UNAVAILABLE") in {
+        (row["document_id"], row["code"]) for row in envelope["anomalies"]
+    }
+    assert envelope["counts"]["completed"] == 1, envelope["counts"]
+    # The snapshot FILE is rewritten so mdcompare drops the enriched doc too.
+    reused = read_json(snapshot_path)
+    assert {"id": 2, "code": "CAPTURE_RAW_UNAVAILABLE"} in reused["anomalies"]
+    assert reused["exports"]["2"]["status"] == "failed"
+
+
+def test_interrupted_capture_resumes_against_the_frozen_observation(tmp_path: Path):
+    # [16] spec:79/112: the observation (scope + versions + selection) must be
+    # frozen BEFORE the export loop. A mid-export crash that loses snapshot.json
+    # must resume against the original scope, not refetch the remote and silently
+    # absorb a brand-new document or an edited version into the old batch.
+    workspace = Workspace(tmp_path, DOCUMENTS)
+    first = workspace.result("--stop-after", "capture")
+    run_dir = workspace.only_run()
+    capture_dir = run_dir / "capture"
+    snapshot_path = capture_dir / "snapshot.json"
+    original = read_json(snapshot_path)
+    assert original["listing"]["document_ids"] == [1, 2]
+    version2 = original["documents"]["2"]["version"]
+    raw2_name = original["documents"]["2"]["raw"]["path"]
+
+    # Simulate a mid-export crash: capture never committed, snapshot.json lost,
+    # but the staging observation/checkpoint/raws survive.
+    state = read_json(run_dir / "run.json")
+    state["stage_states"]["capture"]["status"] = "running"
+    write_json(run_dir / "run.json", state)
+    (capture_dir / "result.json").unlink()
+    snapshot_path.unlink()
+
+    # The remote moves on during the pause: doc2 edited + a brand-new doc3.
+    remote = read_json(workspace.root / "remote.json")
+    remote["documents"][1]["content_updated_at"] = "2026-11-11T09:00:00+08:00"
+    remote["details"]["2"] = {
+        "id": 2,
+        "body": "body 2 EDITED AFTER OBSERVATION",
+        "content_updated_at": "2026-11-11T09:00:00+08:00",
+    }
+    remote["documents"].append(
+        {
+            "id": 3,
+            "title": "Three",
+            "slug": "three",
+            "content_updated_at": "2026-11-11T08:00:00+08:00",
+        }
+    )
+    remote["details"]["3"] = {
+        "id": 3,
+        "body": "body 3",
+        "content_updated_at": "2026-11-11T08:00:00+08:00",
+    }
+    write_json(workspace.root / "remote.json", remote)
+
+    resumed = workspace.sync("--resume", first["run"], "--stop-after", "capture")
+
+    assert resumed.returncode == 0, resumed.stderr
+    reused = read_json(snapshot_path)
+    assert reused["listing"]["document_ids"] == [1, 2], reused["listing"]
+    assert reused["counts"]["documents"] == 2
+    assert "3" not in reused["exports"]
+    # doc2 keeps its ORIGINAL observed version/body, not the edited remote one.
+    row2 = reused["exports"]["2"]
+    assert row2["detail_version"]["utc"] == version2["utc"]
+    assert row2["raw"]["path"] == raw2_name
+    assert (capture_dir / row2["raw"]["path"]).read_text(encoding="utf-8") == "body 2"
+
+
+def test_resume_rejects_capture_raw_tampered_while_paused(tmp_path: Path):
+    # [20] H16 scope gap: a capture-only pause bypasses raw integrity because
+    # mdcompare is still pending. A captured raw MODIFIED while paused must fail
+    # closed on resume, not be frozen + compiled under the original captured
+    # source version. Capture-time evidence is kept durably outside wash.
+    workspace = Workspace(tmp_path, DOCUMENTS)
+    first = workspace.result("--stop-after", "capture")
+    run_dir = workspace.only_run()
+    snapshot = read_json(run_dir / "capture" / "snapshot.json")
+    raw1 = run_dir / "capture" / snapshot["documents"]["1"]["raw"]["path"]
+    raw1.write_text(
+        raw1.read_text(encoding="utf-8") + "\nTAMPERED WHILE PAUSED\n",
+        encoding="utf-8",
+    )
+
+    resumed = workspace.sync("--resume", first["run"], "--stop-after", "mdcompare")
+
+    assert resumed.returncode != 0
+    assert "no longer matches" in resumed.stderr
+    # The tampered bytes were never frozen into a mdcompare input.
+    assert not (run_dir / "mdcompare" / "result.json").exists()
+
+
+def test_resume_keeps_availability_path_when_a_paused_capture_raw_is_deleted(
+    tmp_path: Path,
+):
+    # [20] deviation guard: deletion is NOT the tamper case. A deleted captured
+    # raw stays on the availability-first path (mdcompare archives
+    # CAPTURE_RAW_UNAVAILABLE, partial), never a hard reject (spec:144, protected
+    # tests/test_unified_plan.py::test_unavailable_current_input_archives_anomaly_not_compile).
+    workspace = Workspace(tmp_path, DOCUMENTS)
+    first = workspace.result("--stop-after", "capture")
+    run_dir = workspace.only_run()
+    snapshot = read_json(run_dir / "capture" / "snapshot.json")
+    (run_dir / "capture" / snapshot["documents"]["2"]["raw"]["path"]).unlink()
+
+    resumed = workspace.sync("--resume", first["run"], "--stop-after", "mdcompare")
+
+    assert resumed.returncode == 0, resumed.stderr
+    summary = json.loads(resumed.stdout.strip().splitlines()[-1])
+    assert summary["stages"]["mdcompare"] == "partial", summary
+    report = read_json(run_dir / "mdcompare" / "report.json")
+    assert (2, "CAPTURE_RAW_UNAVAILABLE") in {
+        (row["document_id"], (row.get("anomaly") or {}).get("code"))
+        for row in report["documents"]
+    }
