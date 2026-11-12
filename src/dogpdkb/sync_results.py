@@ -10,11 +10,13 @@ corpus state; a disposition never fabricates a successful sync.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from dogpdkb.sync_run import (
     STAGES,
@@ -71,7 +73,11 @@ def anomaly_id(
         _slug(code),
     ]
     if resource_id is not None:
-        parts.append(_slug(resource_id))
+        # Lossless encoding of the image identity: _slug collapses '/', '?',
+        # '=', '&', ':' to '-', aliasing distinct URLs (e.g. /a/b.png and
+        # /a-b.png) into one anomaly. quote is injective and reversible, so each
+        # image keeps its own identity without a new content fingerprint.
+        parts.append(quote(str(resource_id), safe=""))
     return "-".join(parts)
 
 
@@ -122,7 +128,15 @@ def _persist_input(
     """
     if not source.is_file():
         raise ArchiveError(f"necessary input is not a readable file: {source}")
-    target_dir = results_root(config, book_key) / "inputs" / aid
+    # The logical id can exceed the 255-byte filesystem component limit (long
+    # query/signed image URLs; measured corpus max 858 B). Using it as one
+    # component raises ENAMETOOLONG, which loses the whole batch's archiving and
+    # the durable run result. Store inputs under a bounded digest of the id: this
+    # hashes the identity STRING, not file content (no content fingerprint), and
+    # is deterministic so re-archiving keeps the same durable copy. The full
+    # logical id stays verbatim in the registry record.
+    storage_key = hashlib.sha256(aid.encode("utf-8")).hexdigest()[:32]
+    target_dir = results_root(config, book_key) / "inputs" / storage_key
     target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     target = target_dir / source.name
     data = source.read_bytes()

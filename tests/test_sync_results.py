@@ -783,3 +783,151 @@ def test_book_keyed_namespaces_distinguish_trailing_hyphen_keys(tmp_path: Path):
     assert len(aids) == 2, aids
     assert len(fids) == 2, fids
     assert len(caches) == 2, caches
+
+
+def test_resource_ids_differing_only_by_slug_characters_stay_distinct(tmp_path: Path):
+    """[26] Two image URLs that _slug collapses to one suffix are distinct images.
+
+    ``https://host/a/b.png`` and ``https://host/a-b.png`` must keep independent
+    anomaly identities, durable records and dispositions (spec: anomalies carry
+    the image identity; a shared identity merges two images into one record).
+    """
+    from types import SimpleNamespace
+
+    from dogpdkb.sync_anomalies import resolve_anomaly
+    from dogpdkb.sync_results import anomaly_id, archive_anomalies, load_registry
+
+    config = SimpleNamespace(results=tmp_path / "results")
+    context = SimpleNamespace(
+        config=config, book=SimpleNamespace(key="fund"), layout=None
+    )
+    version = {"field": "content_updated_at", "utc": "2026-11-10T11:00:00+08:00"}
+    url_a = "https://host/a/b.png"
+    url_b = "https://host/a-b.png"
+    aid_a = anomaly_id("fund", 2, version, "ocr", "ocr_failed", url_a)
+    aid_b = anomaly_id("fund", 2, version, "ocr", "ocr_failed", url_b)
+    # The identities differ only by characters the old lossy slug collapsed.
+    assert aid_a != aid_b, (aid_a, aid_b)
+
+    anomalies = []
+    for tag, url in (("a", url_a), ("b", url_b)):
+        source = tmp_path / f"original-{tag}.png"
+        source.write_bytes(f"bytes-{tag}".encode())
+        anomalies.append(
+            {
+                "stage": "ocr",
+                "document_id": 2,
+                "source_version": version,
+                "code": "ocr_failed",
+                "resource_id": url,
+                "image": {"url": url},
+                "necessary_inputs": [{"kind": "original", "path": str(source)}],
+            }
+        )
+
+    archived = archive_anomalies(context, anomalies, run_id="run-x")
+
+    assert len(archived) == 2
+    registry = load_registry(config, "fund")
+    assert set(registry["anomalies"]) == {aid_a, aid_b}
+    # Each record keeps its own verbatim image identity, not the first URL.
+    assert registry["anomalies"][aid_a]["resource_id"] == url_a
+    assert registry["anomalies"][aid_b]["resource_id"] == url_b
+    assert registry["anomalies"][aid_a]["image"] == {"url": url_a}
+    assert registry["anomalies"][aid_b]["image"] == {"url": url_b}
+    # Two distinct durable input directories, not one merged record.
+    dir_a = Path(registry["anomalies"][aid_a]["necessary_inputs"][0]["path"]).parent
+    dir_b = Path(registry["anomalies"][aid_b]["necessary_inputs"][0]["path"]).parent
+    assert dir_a != dir_b
+    assert (
+        Path(registry["anomalies"][aid_a]["necessary_inputs"][0]["path"]).read_bytes()
+        == b"bytes-a"
+    )
+    assert (
+        Path(registry["anomalies"][aid_b]["necessary_inputs"][0]["path"]).read_bytes()
+        == b"bytes-b"
+    )
+
+    # Independent dispositions: abandoning one image leaves the other pending.
+    resolve_anomaly(config, "fund", aid_a, "abandoned", note="give up a")
+    registry = load_registry(config, "fund")
+    assert registry["anomalies"][aid_a]["disposition"] == "abandoned"
+    assert registry["anomalies"][aid_b]["disposition"] == "pending"
+
+
+def test_over_long_anomaly_id_archives_inputs_in_a_bounded_directory(tmp_path: Path):
+    """[27] An anomaly id over the 255-byte component limit must still archive.
+
+    A long query/signed image URL produces an id longer than NAME_MAX. Using it
+    as one filesystem component raises ENAMETOOLONG, which (all-or-nothing
+    archiving) loses the whole batch's registration and the durable run result.
+    The storage directory must be bounded while the full logical id is preserved
+    verbatim in the record, and scan/disposition must still resolve it.
+    """
+    from types import SimpleNamespace
+
+    from dogpdkb.sync_anomalies import resolve_anomaly, scan_view
+    from dogpdkb.sync_results import anomaly_id, archive_anomalies, load_registry
+
+    config = SimpleNamespace(results=tmp_path / "results")
+    context = SimpleNamespace(
+        config=config, book=SimpleNamespace(key="fund"), layout=None
+    )
+    version = {"field": "content_updated_at", "utc": "2026-11-10T11:00:00+08:00"}
+    long_url = "https://host/img.png?x-oss-process=image/resize,w_" + "a" * 300
+    short_url = "https://host/ok.png"
+    long_aid = anomaly_id("fund", 2, version, "ocr", "ocr_failed", long_url)
+    short_aid = anomaly_id("fund", 2, version, "ocr", "ocr_failed", short_url)
+    # Exercise the real over-limit case measured against the corpus (max 858 B).
+    assert len(long_aid.encode("utf-8")) > 255
+
+    anomalies = []
+    for tag, url in (("long", long_url), ("short", short_url)):
+        original = tmp_path / f"original-{tag}.png"
+        prepared = tmp_path / f"prepared-{tag}.jpg"
+        original.write_bytes(f"original-{tag}".encode())
+        prepared.write_bytes(f"prepared-{tag}".encode())
+        anomalies.append(
+            {
+                "stage": "ocr",
+                "document_id": 2,
+                "source_version": version,
+                "code": "ocr_failed",
+                "resource_id": url,
+                "image": {"url": url},
+                "necessary_inputs": [
+                    {"kind": "original", "path": str(original)},
+                    {"kind": "prepared", "path": str(prepared)},
+                ],
+            }
+        )
+
+    # One over-long id must not poison the whole batch's archiving.
+    archived = archive_anomalies(context, anomalies, run_id="run-x")
+
+    assert len(archived) == 2
+    registry = load_registry(config, "fund")
+    assert set(registry["anomalies"]) == {long_aid, short_aid}
+    record = registry["anomalies"][long_aid]
+    # The full logical id is preserved verbatim, not truncated to a dir name.
+    assert record["id"] == long_aid
+    assert record["resource_id"] == long_url
+    assert {Path(row["path"]).read_bytes() for row in record["necessary_inputs"]} == {
+        b"original-long",
+        b"prepared-long",
+    }
+    for row in record["necessary_inputs"]:
+        durable = Path(row["path"])
+        assert durable.is_file()
+        assert durable.is_relative_to(tmp_path / "results")
+        # Every storage path component is within the filesystem NAME_MAX limit.
+        for part in durable.parts:
+            assert len(part.encode("utf-8")) <= 255, part
+
+    # Scan and disposition still resolve the long logical id.
+    view = scan_view(config, "fund")
+    assert long_aid in {row["id"] for row in view["anomalies"]}
+    resolve_anomaly(config, "fund", long_aid, "abandoned", note="give up long")
+    registry = load_registry(config, "fund")
+    assert registry["anomalies"][long_aid]["disposition"] == "abandoned"
+    assert registry["anomalies"][short_aid]["disposition"] == "pending"
