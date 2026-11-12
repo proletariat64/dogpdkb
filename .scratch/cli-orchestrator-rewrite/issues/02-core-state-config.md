@@ -27,4 +27,3 @@ Spec: ../spec.md
 - Full pipeline failure-version suppression, lock contention and signal cases
   remain for downstream assembled CLI acceptance; these are not yet validated
   by this ticket's four focused tests. No paid or production calls were made.
-

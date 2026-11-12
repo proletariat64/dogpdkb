@@ -1,135 +1,60 @@
-# dogpdkb platform delivery and preflight
+# dogpdkb 交付与预检
 
-## Delivery boundary
+## 交付边界
 
-The Python distribution is `dogpdkb`. It includes:
+Python distribution `dogpdkb` 提供编排器、独立 mdocr/mdcompare 命令与禁用的
+配置示例。Graphify、Skylark 的运行环境独立；本轮 CLI 缺口通过工具侧 patch
+补齐，不把工具运行时放入编排器。配置、凭证、真实来源表、语料、图谱、缓存与
+run 都不在 wheel 内。旧 workflow 脚本、旧状态和旧参数不兼容。
 
-- `dogpdkb sync`: resumable discovery, export/OCR, corpus, graph and Web-data pipeline.
-- `dogpdkb discover`, `apply`, `update-graph`, `publish-web`: individual workflow stages.
-- `dogpdkb doctor`: offline preflight; `dogpdkb init-config`: safe example initialization.
-- `mdocr prepare` and `mdocr ocr`: the platform's image component.
-- Portable configuration and book-registry templates.
+日常入口为 discover、apply、update-graph、sync；status 只读；publish-web 与
+update/uninstall 独立。sync 不发布 Web，不自动清理历史目录。
+支持 Python 3.10+ POSIX；开发/CI 使用 Python 3.12，Windows 使用 WSL。
 
-Runtime workflows live in `src/dogpdkb/workflows/`. Existing `scripts/*.py`
-workflow entry points remain compatible in source checkouts. The old editable
-distribution name `mdocr` is replaced by `dogpdkb`; both executable names are
-provided by the new distribution. Existing independent mdocr installations are
-not automatically removed or upgraded.
+## 安装配置
 
-Supported runtime: Python 3.10+ on POSIX; development/CI use Python 3.12.
-The current graph publisher uses POSIX file locks, so native Windows is not
-supported; use WSL2. This build does not create a new dashboard frontend or Web
-server: the existing publisher produces catalog/map JSON for a separate server.
-
-## Build and install
-
-For anonymous Release installation and upgrades without a checkout or AntCode
-CLI, use [the Linux curl installer](installing.md). The commands below remain
-available for manual installation and development.
-
-From a checkout with Python 3.12 and uv:
+复用合适环境；需要新建时选择用户级独立环境。源码开发使用 make bootstrap。
+[Linux managed 安装与生命周期](installing.md) 保留原行为，本次不发布新版本。
 
 ```bash
-make bootstrap
 make check
 make build
 make smoke
+
+dogpdkb init-config -o ./instance
+# 编辑 instance/books.json 的路径与来源并启用
+# 在 instance/dogpdkb.toml 指定所需公开工具入口
+dogpdkb doctor --config ./instance/dogpdkb.toml --book funds
+dogpdkb init-state --config ./instance/dogpdkb.toml --book funds
 ```
 
-`make build` uses uv/setuptools to create `dist/dogpdkb-<version>.tar.gz` and
-`dist/dogpdkb-<version>-py3-none-any.whl`. The wheel is built from the source
-distribution, checking that packaged source and resources are sufficient.
-Build outputs are ignored by Git. No release is uploaded.
+init-config 拒绝覆盖现有文件或 symlink。显式 --config 优先，其次
+DOGPDKB_CONFIG；源码默认 default.toml，安装包默认调用目录 dogpdkb.toml。
+TOML 路径相对配置，来源 corpus 相对 books.json，凭证保持工具环境。
 
-Install the wheel into your chosen virtual environment, not the system Python:
+需要具备的公开工具合同：
 
-```bash
-uv venv ~/venvs/dogpdkb --python 3.12
-uv pip install --python ~/venvs/dogpdkb/bin/python dist/dogpdkb-0.1.0-py3-none-any.whl
-source ~/venvs/dogpdkb/bin/activate
-dogpdkb --version
-dogpdkb doctor --package
-```
+- [mdcompare catalog/knowledge/compare 与 mdocr batch](orchestrator-tool-contracts.md)。
+- [Graphify source-inventory/update-sources](orchestrator-graphify-contract.md)，包含独立 patch 和精确来源身份。
+- [Skylark listing/export](orchestrator-skylark-contract.md)，包含独立 patch 和可复现构建方式。
 
-The wheel does not include production configuration, credentials, Yuque source
-registries, corpus Markdown, graphs, staging/checkpoint state, or a Graphify
-environment. Installing it does not perform historical extraction or synchronization.
+工具入口可为 executable 或 argv 数组，不能是 shell 命令文本。Graphify 后端、
+mdocr 认证与工具内部参数由工具配置负责。旧版 Graphify 或只有 extension 的
+Skylark 不满足新合同；本地实现验证不代表已上游发布或全局升级。
 
-## Configure an installed platform
+## Doctor 与验证边界
 
-```bash
-mkdir -p ~/dogpdkb-instance
-cd ~/dogpdkb-instance
-dogpdkb init-config
-# Edit dogpdkb.toml and books.json before enabling your actual source.
-dogpdkb doctor --config ./dogpdkb.toml --book <book-key> --require-ocr
-```
+`dogpdkb doctor --package` 提供离线包检查；正常 doctor 读取配置和选中来源，
+调用配置的工具 --help，JSON 模式输出检查数组。它不导入工具包、不请求认证，
+不证明远端可用或完整业务合同。配置/命令不可用时返回1。真实连接、付费处理和
+生产 UAT 必须另外记录。
 
-Initialization refuses to overwrite either existing file, including symlinks.
-Example sources are disabled and use reserved `example.invalid` addresses.
-Configuration precedence remains explicit `--config`, `DOGPDKB_CONFIG`,
-then the default file. A source checkout defaults to repository `default.toml`;
-a wheel installation defaults to the caller's `./dogpdkb.toml`. Relative paths
-are anchored to the selected file, never to installed package resources.
+make smoke 检查 wheel/sdist 内容，在临时环境安装 wheel，清除源码路径与生产
+配置覆盖，证明加载安装包。然后通过公开 CLI 验证 init-config、status、计划
+检查点、显式恢复、正式语料与图谱结果；mdcompare 和无图片 mdocr 实跑，
+Skylark/Graphify 是明确的外部进程替身。没有假装安装 Graphify 内部 Python 包。
+安装/构建使用本机缓存，缺依赖时报告失败，不自动调用生产或付费服务。
 
-Operational prerequisites are separate from the platform wheel:
-
-- A configured utoo-proxy executable and Yuque gateway with working authentication.
-- An existing selected corpus and Graphify `graph.json` baseline; the platform
-  does incremental updates, not automatic historical backfill or full rebuilds.
-- A Graphify/NetworkX environment exposing the exact APIs used by the updater,
-  selected through `paths.graphify_python` or `GRAPHIFY_PYTHON`. Graphify is not
-  automatically installed or upgraded: this pipeline uses version-sensitive private
-  APIs. The updater adds its platform source/package location as an import fallback
-  when running under a separate graph interpreter, without shadowing that
-  interpreter's own dependencies.
-- A configured Graphify LLM backend for uncached extraction.
-- `PADDLEOCR_TOKEN` when image OCR is needed.
-- Writable corpus, graph, staging, state and Web output locations. The Web server
-  must follow the publisher's generation symlinks.
-
-## Doctor contract
-
-`make doctor` is equivalent to `python -m dogpdkb doctor`.
-Pass options through `DOCTOR_ARGS`, for example:
-
-```bash
-make doctor DOCTOR_ARGS=--package
-dogpdkb doctor --config ./dogpdkb.toml --book <book-key> --json
-```
-
-- `--package` checks included modules, runtime imports and templates only.
-- Normal mode also validates config/source selection, proxy availability, corpus
-  and graph baseline, writable ancestors, Graphify API imports and backend selection.
-- Missing OCR credentials are a warning unless `--require-ocr` is supplied.
-- Exit 1 means at least one failed check; exit 0 can still contain warnings.
-- JSON output contains `ok` and individual `checks` with pass/warn/fail status.
-- Token values, provider output and configuration contents are not printed.
-- No directories/data are created, no graph extraction/rebuild runs, and no
-  authentication or connectivity requests are made. The configured graph
-  interpreter is probed in a bounded subprocess. Offline success is not proof
-  that remote credentials or services work.
-
-## Installation smoke test and CI
-
-`make smoke` builds artifacts, checks their contents, and installs the wheel plus
-locked runtime dependencies into a disposable environment outside the checkout.
-It clears source-path/configuration overrides and verifies imports come from that
-environment, not the repository.
-
-It exercises both executable names, all workflow help entry points, package doctor,
-safe initialization/refusal to overwrite, expected operational-not-ready reporting,
-Web JSON publication from a tiny synthetic graph, and local-image preparation.
-Only dependency installation/building needs network access; no Yuque, OCR, LLM,
-production corpus or production output is used. Temporary installation data is
-removed when the test finishes.
-
-GitHub Actions runs `make check` then `make smoke` under its existing `check`
-job. GitHub owns source PRs, checks and merges; AntCode only hosts installation
-attachments. Release builds and uploads run locally; see [releasing](releasing.md).
-Branch protection remains
-a separate administrator setting. The Release installer performs isolated install
-and upgrade; `dogpdkb update --version X.Y.Z` and `dogpdkb uninstall` manage only
-installer-owned deployments. Successful upgrades discard the previous environment;
-configuration and user data remain separate. Build/preflight commands do not deploy
-services. Scheduler, Nginx and rollback management remain outside this scope.
+make check 与 make smoke 是本地证据。GitHub CI、已安装主机、真实付费 OCR/
+Graphify 和生产验收分别报告。[当前操作](unattended-sync.md)、
+[发布流程](releasing.md)。

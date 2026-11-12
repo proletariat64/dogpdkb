@@ -1,145 +1,63 @@
-# Unattended daily sync deployment
+# 日常知识库同步
 
-`dogpdkb sync` runs the five batch stages (capture, mdcompare, plan, ocr,
-compile) as one unattended batch. Scheduling is the operating system's job:
-crontab starts the batch, the shell appends its output to a plain log file, and
-the system logrotate rotates that file. The tool does not install cron entries,
-does not run a scheduler or log-rotation daemon, and does not change your
-crontab or logrotate configuration.
+当前合同为 CLI 编排器重写。旧 sync --knowledge、--snapshot、--dry-run、审批、
+wash/anomalies 命令和旧 checkpoint 不再支持。Web 不在 sync 内。
 
-## Locations
+## 分步与计划检查点
 
-| Purpose | Example location | Owner |
-| --- | --- | --- |
-| Program | `/home/ops/.local/bin/dogpdkb` | installer (`docs/installing.md`) |
-| Configuration | `/home/ops/.config/dogpdkb/dogpdkb.toml` | operator |
-| Book list | `/home/ops/.config/dogpdkb/books.json` | operator |
-| Batch log | `/home/ops/.local/state/dogpdkb/sync.log` | shell redirection |
-| Wash workspace | `[paths].staging` (default `wash`) | batch, cleanable |
-| Durable results | `[paths].results` (default `sync-results`) | batch, never cleaned |
-| Long-term OCR cache | `[paths].ocr_cache` (default `ocr-cache`) | batch, never cleaned |
-| Published knowledge | `[paths].corpus` and its `graphify-out` | compile publication |
+```bash
+dogpdkb discover --config /srv/kb/dogpdkb.toml --book funds
+# 采用上一步 stdout 给出的 differences 路径
+dogpdkb apply --config /srv/kb/dogpdkb.toml --book funds --input /path/differences.json
+# 采用 apply 给出的 manifest 路径
+dogpdkb update-graph --config /srv/kb/dogpdkb.toml --book funds --input /path/manifest.json
 
-Replace `/home/ops` with the account that owns the corpus and the existing
-credentials. Paths in the configuration file are relative to that file; the
-crontab below uses absolute paths because cron does not expand `~`.
+# 同一实现的串行组合
+dogpdkb sync --config /srv/kb/dogpdkb.toml --book funds --stop-after plan
+dogpdkb sync --config /srv/kb/dogpdkb.toml --book funds --resume /path/run-directory
+```
 
-## Authentication
+整批下载结束才比较，整批比较结束才生成计划，计划结束才 OCR，整批 OCR 结束
+才发布语料与编译。停在 plan 返回0并保存输入，不触发付费处理或正式语料更新。
+恢复只处理原范围；输入缺失、改变或会回退更晚成功版本时需重新生成计划。
+失败或不明步骤不靠恢复自动重试。
 
-The runtime environment provides the existing authentication; the batch never
-asks for credentials interactively and no credential belongs in a crontab line
-or in a log file.
+## cron 与日志
 
-- The Yuque gateway uses the existing `~/.utoo-proxy/utoo-proxy` login of the
-  account that runs the batch (`[skylark].proxy_bin`).
-- OCR reads `PADDLEOCR_TOKEN` from the process environment only. It is not a
-  configuration key and it is not written to results, logs or state.
-- Graphify uses `[paths].graphify_python` (default: the current interpreter).
-
-Cron starts with a minimal environment. Export `PADDLEOCR_TOKEN` through the
-environment manager your account already uses (for example a systemd user
-environment, an existing profile script sourced by a wrapper, or your secret
-manager). If you prefer a wrapper, keep it outside the repository and let it
-source the existing environment file before `exec`-ing the command below; never
-echo the token. Without a token the OCR stage archives its images as anomalies
-and the batch still finishes and publishes the usable set.
-
-## crontab
-
-One batch per book per day. `>>` appends and `2>&1` merges stderr (stage
-progress, timestamps, diagnostics) into the same plain log as stdout (the
-concise JSON batch result).
+先配置工具公开入口并执行 doctor；首次运行前以 init-state 登记现有语料。首次
+新增截止为本地文件最新日期；已存在来源按自身版本比较；日期精度同日仍会比较。
+随后使用完整观察快照。不会回填已过滤历史缺失，不会因远端缺席删除本地知识。
 
 ```cron
-# m h dom mon dow command
-30 2 * * * /home/ops/.local/bin/dogpdkb sync --config /home/ops/.config/dogpdkb/dogpdkb.toml --book fund >> /home/ops/.local/state/dogpdkb/sync.log 2>&1
+15 2 * * * /home/kb/.local/bin/dogpdkb sync --config /srv/kb/dogpdkb.toml --book funds >>/var/log/dogpdkb/result.log 2>>/var/log/dogpdkb/diagnostic.log
 ```
 
-Create the log directory once (`mkdir -p /home/ops/.local/state/dogpdkb`), then
-install the line with `crontab -e` yourself. Stagger multiple books so two
-batches never overlap: the user-level run lock refuses a concurrent batch, and
-an unfinished run must be resumed instead of replaced.
+采用系统 logrotate 管理日志。程序没有调度服务、内置轮转、自动 wash、历史引用
+搬迁或失败处置平台。run 和证据由定时清理 agent 决定处理；持久 state 独立保留，
+删除 run 不重置同版本失败抑制。OCR 成功缓存由 mdocr 管理。
 
-Exit codes: `0` for completed, partial and a normal `--stop-after` pause; `1`
-for a batch that cannot continue; `130` for a user interrupt. A partial batch is
-a finished batch: it releases the run claim, so the next cron start is not
-blocked. Never infer per-document success from the exit code alone.
-
-## logrotate
-
-The system logrotate owns rotation. Copy this stanza into
-`/etc/logrotate.d/dogpdkb` (or your user-level logrotate configuration) and
-adjust the path and retention:
-
-```text
-/home/ops/.local/state/dogpdkb/sync.log {
-    daily
-    rotate 14
-    missingok
-    notifempty
-    compress
-    delaycompress
-    copytruncate
-}
-```
-
-`copytruncate` keeps the appending cron job writing to the same inode, so no
-batch output is lost and no signal handling is needed. Check the stanza with
-`logrotate -d /etc/logrotate.d/dogpdkb` before relying on it.
-
-## Querying without touching the batch
+## 观察与退出码
 
 ```bash
-dogpdkb status --config /home/ops/.config/dogpdkb/dogpdkb.toml --book fund
-dogpdkb status --config /home/ops/.config/dogpdkb/dogpdkb.toml --json
-dogpdkb anomalies --config /home/ops/.config/dogpdkb/dogpdkb.toml --book fund
+dogpdkb status --config /srv/kb/dogpdkb.toml --book funds --json
+dogpdkb status --config /srv/kb/dogpdkb.toml --book funds --run RUN --watch --json
 ```
 
-`status` is read-only: it reports the current or most recent batch, its stage,
-counts, timings, stop reason and log location, and it distinguishes a leftover
-`running` record from a live process. Repeating it is the whole monitoring
-contract; there is no watch mode or background service. `anomalies` scans the
-durable results store and records version-scoped dispositions for the post-hoc
-agent.
+watch 是前台只读查询，JSON 模式每行一个快照。展示阶段、公开计数、耗时、最近
+进展和产物；通过进程与写锁观察遗留 running。Ctrl-C 停止观察，不终止同步。
+同目标写操作互斥，遗留 run 不构成永久锁。
 
-## Wash cleanup and durable evidence
+| 返回码 | 含义 |
+| --- | --- |
+| 0 | 完成、无工作、显式计划检查点 |
+| 2 | 可用集合完成且存在部分失败 |
+| 1 | 完整清单、公共存储、发布等整批失败 |
+| 64 | 参数错误 |
+| 130 / 143 | SIGINT / SIGTERM |
 
-Wash is batch workspace: paging, stage reports, plans and temporary compile
-files. It is never the only home of a long-term original, a successful OCR
-result, published knowledge or an anomaly recovery input.
+mdcompare 的不确定报告会让有效完整来源自动编译，不机械造成整体 partial。
+OCR partial 会保留交接并继续可用正文；单来源图编译失败保旧，成功来源继续。
+语料和图谱成功版本独立，后续成功不会掩盖前面失败。
 
-- After every completed or partial batch, the runner removes earlier finished
-  work directories under `<staging>/<book>/`, keeping the most recent finished
-  batch and every paused or unfinished one.
-- Before a directory is removed its durable result must exist, and any state,
-  cache or anomaly reference to a unique file inside it is copied to
-  `<results>/<book>/migrated/<run-id>/` and rewritten first.
-- The outcome is recorded in `<results>/<book>/cleanup.json`. A cleanup failure
-  is non-fatal: it never breaks a valid corpus, and the next finished batch
-  retries it.
-- Durable results, anomaly inputs, the long-term OCR cache and the canonical
-  corpus/graph/state are never cleaned with wash. There is no automatic
-  eviction policy for the cache or the anomaly archive.
-
-## First tidy of historical wash
-
-Historical work directories from the superseded pipeline are inventoried and
-migrated, never bulk-deleted:
-
-```bash
-dogpdkb wash --config /home/ops/.config/dogpdkb/dogpdkb.toml --book fund --json
-dogpdkb wash --config /home/ops/.config/dogpdkb/dogpdkb.toml --book fund --migrate
-```
-
-The inventory lists every work directory (unified, legacy, unrecognized), the
-durable records that still reference files inside it, and the necessary
-artifacts it holds. `--migrate` copies long-term originals, observation evidence
-and legacy recovery records into `<results>/<book>/migrated/<run-id>/`, rewrites
-the old references, and writes `<results>/<book>/wash-migration.json`. It deletes
-nothing, and repeating it copies nothing new.
-
-A legacy or unrecognized run is annotated in place (`wash-migration.json` inside
-the directory) with `resume_verified: false`: a run paused under the previous
-implementation is not assumed recoverable by the unified runner. Validate its
-inputs and artifacts before attempting any recovery, and start a new batch
-instead of resuming it when validation fails.
+[配置与使用](../README.md)、[持久状态](sync-state-design.md)、
+[工具公开合同](orchestrator-tool-contracts.md)。
