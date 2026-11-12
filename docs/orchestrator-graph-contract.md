@@ -1,59 +1,38 @@
 # Graph compilation contract
 
 `dogpdkb.graph.run_graph(settings, book, store, run, manifest=None) -> int` is
-shared by sync and the `update-graph --config FILE --input MANIFEST` command.
-The caller holds the corpus/graph writer locks. It returns 0 complete, 2 partial,
-1 batch failure, or 130/143 interrupted. It never launches Web publication.
+shared by sync and `update-graph --config FILE --input MANIFEST`. The caller
+holds corpus/graph writer locks. It never launches Web publication.
 
-Input is `dogpdkb-compile-1` from apply, bound to the selected book and run.
-Every source must remain the current corpus version at its recorded path and
-match apply's saved `input_copy` byte for byte. This existing witness detects a
-source edited after planning without adding a second fingerprint mechanism.
-Changed/missing input, an invalid manifest or a newer graph success refuses the
-old plan before starting tool work.
-The manifest's frozen `previous_graph` fact permits legitimate opaque version
-changes such as v2 to v10 while refusing an intervening successful publication;
-opaque source versions are never sorted lexically.
-Graphify reads the frozen full `input_copy` while `source_file` retains the
-canonical corpus identity. An acknowledged graph step keeps an independent byte
-copy, action and metadata; same-run/version resume skips only that exact input.
-Unknown pending discovery versions remain pending after actual graph success.
+Input is `dogpdkb-compile-1` from apply, bound to one book and run. Each selected
+source must match the current corpus version, path, metadata and saved full
+`input_copy` byte for byte. A changed/missing input or newer successful graph
+refuses the old plan. Frozen `previous_graph` facts handle opaque versions
+without sorting them lexically. The same inputs are checked after extraction.
 
-Graphify is invoked only through its documented `source-inventory` and
-`update-sources` CLI. The consumer validates their public schema, source coverage,
-counts, exit code, and graph artifact path/existence; it never reads graph node,
-edge, cache, clustering or extraction internals. Its tests deliberately use an
-opaque graph artifact that cannot be parsed as JSON.
+Graphify is an unmodified external CLI. Compilation is one native directory
+`extract` call, using its original manifest/cache. Candidate outputs stay in a
+run-owned workspace until successful validation. The orchestrator reads only
+public graph/manifest artifacts and never rewrites their graph records.
+[The native tool contract](orchestrator-graphify-contract.md) specifies exact
+argv, baseline requirements, output isolation and publication order.
 
-The compile phase runs one complete source per public CLI call, serially. Only
-the currently launched source receives a durable graph attempt. A missing,
-invalid or interrupted result records that source as unknown and stops the
-phase; sources not yet launched retain their pending work and have no graph
-attempt. Each source's request/result lives in `run/graph/<index>/`; the run
-records this evidence directory and the most recent report.
+The accepted directory-level semantics replace the discarded per-source
+protocol. All pending sources receive graph attempts before the single command.
+Only a complete successful batch advances their graph versions. Extraction
+failure keeps the old public graph and manifest and records batch failure;
+interruption or invalid artifacts are unknown. Failed/unknown current versions
+block subsequent directory scans, including other selections, so they cannot
+be retried indirectly. Separate capture/OCR failures keep the run partial while usable corpus sources
+can still compile. No failed raw input is promoted into the compile manifest.
 
-A valid Graphify success advances only that document's graph version. A source
-failure keeps its prior graph success while leaving newly published corpus
-truth intact; later sources continue. Same-version failed/unknown work is handed
-off and not retried. A successful step in the same resumed run is not repeated.
+A successful source keeps an independent input copy and metadata in dogpdkb
+state. Same-run/version resume skips only an exact match. This records observed
+source versions; it does not invent a Graphify metadata-update operation.
+Pending discovery clears only when its version/metadata still match and no
+unstarted tool step remains. Newer/unknown discoveries remain pending.
 
-Stable public source IDs are `book-key:document-id`. Source names and replacement
-lists come from public source inventory and prior recorded publication facts.
-Baseline corpus filename IDs may identify preexisting inventory sources; this
-only selects Graphify replacement arguments and never reads the graph itself.
-Metadata/reuse actions use Graphify metadata updates only when the graph version
-matches the comparison baseline/current version. Otherwise the complete current
-source compiles. The initial registered baseline also permits metadata reuse
-when the comparison baseline is that exact registered day version and the public
-inventory covers its exact registered source path. An older inventory filename
-or an advanced corpus baseline does not establish this starting point.
-Metadata maps source references to source URLs.
-
-Pending selection clears only after acknowledged graph success, when its source
-version and captured metadata still match and no unstarted tool step remains.
-A newer discovery or never-launched OCR work remains pending for a later cron.
-OCR partials and manifest failures contribute exit 2 without blocking usable
-source compilation.
-
-The independent Graphify capability and patch/install identity are documented
-in [the upstream CLI contract](orchestrator-graphify-contract.md).
+Exit 0 means successful batch or no work, 2 means failed/suppressed/incomplete
+work, 1 means invalid input/baseline/publication or unknown output, and 130/143
+means interruption. CLI logs, native candidate artifacts and dogpdkb's own
+execution report remain available for external investigation and cleanup.

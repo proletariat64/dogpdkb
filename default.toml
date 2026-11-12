@@ -18,7 +18,7 @@ ocr_cache = "ocr-cache"
 [tools]
 mdcompare = "mdcompare"
 mdocr = "mdocr"
-# Require the public source-inventory/update-sources CLI; see tool contract docs.
+# Use the original Graphify extract CLI and its native manifest/cache.
 graphify = "graphify"
 # Require the standalone listing/export CLI; may be an argv array, for example
 # ["node", "/opt/pi-skylark/dist/cli.mjs"].

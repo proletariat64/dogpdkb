@@ -115,28 +115,25 @@ def fixture(tmp_path):
         ],
     )
     tool = tmp_path / "graphify.py"
-    tool.write_text("""import json,sys
+    tool.write_text("""import json,os,sys
 from pathlib import Path
 root=Path(sys.argv[1]); command=sys.argv[2]; args=sys.argv[3:]
 def value(flag): return args[args.index(flag)+1]
 with (root/'calls.jsonl').open('a') as log: log.write(json.dumps(sys.argv[2:])+'\\n')
-output=Path(value('--output'))
-if command=='source-inventory':
- data=json.loads((root/'inventory-fixture.json').read_text()) if (root/'inventory-fixture.json').exists() else {'schema':'graphify-source-inventory-1.0','sources':[]}
-else:
- request=json.loads(Path(value('--request')).read_text()); rows=[]
- mode=(root/'mode').read_text() if (root/'mode').exists() else 'success'
- if mode=='unknown': sys.exit(1)
- if mode=='interrupt': sys.exit(130)
- for item in request['sources']:
-  rows.append({**{k:item[k] for k in ['source_id','source_file','action']},'status':'failed' if mode=='failed' or (mode=='partial' and item['source_id'].endswith(':43')) else 'completed','error':'fixture failure' if mode=='failed' else ''})
- graph=Path(value('--graph-dir'))/'graph.json'; graph.parent.mkdir(parents=True,exist_ok=True)
- if mode!='failed': graph.write_text('opaque Graphify graph: orchestrator must not parse this')
- failed=sum(r['status']=='failed' for r in rows)
- data={'schema':'graphify-source-result-1.0','status':('partial' if failed<len(rows) else 'failed') if failed else 'completed','graph':str(graph),'sources':rows,'counts':{'total':len(rows),'completed':len(rows)-failed,'failed':failed}}
- if mode=='invalid': data['sources']=[]
-output.parent.mkdir(parents=True,exist_ok=True); output.write_text(json.dumps(data))
-sys.exit(2 if command!='source-inventory' and data.get('counts',{}).get('failed') else 0)
+assert command=='extract', command
+assert '--no-cluster' in args
+assert os.environ['GRAPHIFY_OUT']=='graphify-out'
+output=Path(value('--out'))/'graphify-out'; output.mkdir(parents=True,exist_ok=True)
+mode=(root/'mode').read_text() if (root/'mode').exists() else 'success'
+if mode=='interrupt': sys.exit(130)
+if mode in ('failed','partial'):
+ (output/'graph.json').write_text('{"nodes":[{"id":"unpublished"}],"links":[]}')
+ sys.exit(1)
+if mode=='unknown':sys.exit(1)
+if mode=='invalid': (output/'graph.json').write_text('invalid'); sys.exit(0)
+if mode=='mutate': next(Path(args[0]).glob('*.md')).write_text('changed during extraction')
+(output/'graph.json').write_text(json.dumps({'nodes':[], 'links':[], 'graph':{}, 'hyperedges':[]}))
+(output/'manifest.json').write_text('{}')
 """)
     config = tmp_path / "instance.toml"
     config.write_text(
@@ -147,7 +144,7 @@ sys.exit(2 if command!='source-inventory' and data.get('counts',{}).get('failed'
     return config, manifest, source
 
 
-def cli(config, manifest):
+def cli(config, manifest, environment=None):
     return subprocess.run(
         [
             sys.executable,
@@ -159,7 +156,7 @@ def cli(config, manifest):
             "--input",
             str(manifest),
         ],
-        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+        env=environment or {**os.environ, "PYTHONPATH": str(ROOT / "src")},
         check=False,
         capture_output=True,
         text=True,
@@ -174,10 +171,9 @@ def test_complete_source_calls_only_public_graphify_and_records_success(tmp_path
     calls = [
         json.loads(line) for line in (tmp_path / "calls.jsonl").read_text().splitlines()
     ]
-    assert [row[0] for row in calls] == ["source-inventory", "update-sources"]
-    request = json.loads(Path(calls[1][calls[1].index("--request") + 1]).read_text())
-    assert Path(request["sources"][0]["path"]).read_bytes() == source.read_bytes()
-    assert request["sources"][0]["source_id"] == "funds:42"
+    assert [row[0] for row in calls] == ["extract"]
+    assert Path(calls[0][1]) == source.parent
+    assert "--no-cluster" in calls[0]
     state = json.loads((tmp_path / "state/funds/state.json").read_text())["documents"][
         "42"
     ]
@@ -241,60 +237,6 @@ def test_resuming_a_completed_graph_does_not_repeat_tool_work(tmp_path):
     assert (tmp_path / "calls.jsonl").read_bytes() == before
 
 
-def test_reuse_without_successful_graph_version_compiles_complete_source(tmp_path):
-    config, manifest, source = fixture(tmp_path)
-    data = json.loads(manifest.read_text())
-    data["documents"][0]["action"] = "reuse"
-    write(manifest, data)
-    result = cli(config, manifest)
-    assert result.returncode == 0, result.stdout + result.stderr
-    request = json.loads((manifest.parent / "graph/0/request.json").read_text())
-    assert request["sources"][0]["action"] == "compile"
-    assert Path(request["sources"][0]["path"]).read_bytes() == source.read_bytes()
-
-
-@pytest.mark.parametrize(
-    ("inventory_name", "baseline_version", "expected"),
-    [
-        ("Title-2026-11-12-[42].md", "2026-11-12", "metadata"),
-        ("Title-2026-11-11-[42].md", "2026-11-12", "compile"),
-        ("Title-2026-11-12-[42].md", "2026-11-12T09:00:00Z", "compile"),
-    ],
-)
-def test_registered_baseline_reuse_requires_exact_inventory_and_version(
-    tmp_path, inventory_name, baseline_version, expected
-):
-    config, manifest, source = fixture(tmp_path)
-    state_path = tmp_path / "state/funds/state.json"
-    state = json.loads(state_path.read_text())
-    state["documents"]["42"].update(
-        baseline={
-            "path": str(source),
-            "filename_date": "2026-11-12",
-            "precision": "day",
-        },
-        graph={"status": "unknown"},
-    )
-    write(state_path, state)
-    data = json.loads(manifest.read_text())
-    data["documents"][0].update(
-        action="reuse", baseline_version={"value": baseline_version}
-    )
-    write(manifest, data)
-    write(
-        tmp_path / "inventory-fixture.json",
-        {
-            "schema": "graphify-source-inventory-1.0",
-            "sources": [{"source_file": inventory_name}],
-        },
-    )
-    result = cli(config, manifest)
-    assert result.returncode == 0, result.stdout + result.stderr
-    request = json.loads((manifest.parent / "graph/0/request.json").read_text())
-    assert request["sources"][0]["action"] == expected
-    assert Path(request["sources"][0]["path"]).read_bytes() == source.read_bytes()
-
-
 def test_success_keeps_a_newer_discovery_pending(tmp_path):
     config, manifest, _source = fixture(tmp_path)
     state_path = tmp_path / "state/funds/state.json"
@@ -310,38 +252,7 @@ def test_success_keeps_a_newer_discovery_pending(tmp_path):
     assert json.loads(state_path.read_text())["documents"]["42"]["pending"] == pending
 
 
-def test_verified_reuse_maintains_source_metadata_without_new_extraction(tmp_path):
-    config, manifest, source = fixture(tmp_path)
-    baseline = {"utc": "2026-11-11T10:00:00+00:00"}
-    state_path = tmp_path / "state/funds/state.json"
-    state = json.loads(state_path.read_text())
-    state["documents"]["42"]["graph"] = {
-        "status": "completed",
-        "version": baseline,
-        "source_file": "old-name.md",
-    }
-    write(state_path, state)
-    data = json.loads(manifest.read_text())
-    data["documents"][0].update(action="reuse", baseline_version=baseline)
-    write(manifest, data)
-    write(
-        tmp_path / "inventory-fixture.json",
-        {
-            "schema": "graphify-source-inventory-1.0",
-            "sources": [{"source_id": "funds:42", "source_file": "old-name.md"}],
-        },
-    )
-    result = cli(config, manifest)
-    assert result.returncode == 0, result.stdout + result.stderr
-    request = json.loads((manifest.parent / "graph/0/request.json").read_text())[
-        "sources"
-    ][0]
-    assert request["action"] == "metadata"
-    assert request["replace"] == ["old-name.md", source.name]
-    assert request["metadata"]["source_url"] == "https://example.invalid/42"
-
-
-def test_partial_publication_advances_only_acknowledged_source(tmp_path):
+def test_failed_directory_batch_advances_no_source(tmp_path):
     config, manifest, _source = fixture(tmp_path)
     data = json.loads(manifest.read_text())
     second = dict(
@@ -376,12 +287,13 @@ def test_partial_publication_advances_only_acknowledged_source(tmp_path):
     result = cli(config, manifest)
     assert result.returncode == 2, result.stdout + result.stderr
     documents = json.loads(state_path.read_text())["documents"]
-    assert documents["42"]["graph"]["version"] == VERSION
+    assert "graph" not in documents["42"]
+    assert documents["42"]["steps"]["graph"]["status"] == "failed"
     assert documents["43"]["graph"] == old
     assert documents["43"]["steps"]["graph"]["status"] == "failed"
 
 
-def test_interrupt_marks_only_launched_source_unknown(tmp_path):
+def test_interrupt_marks_directory_batch_unknown(tmp_path):
     config, manifest, _source = fixture(tmp_path)
     data = json.loads(manifest.read_text())
     second = dict(
@@ -412,12 +324,12 @@ def test_interrupt_marks_only_launched_source_unknown(tmp_path):
     assert result.returncode == 130, result.stdout + result.stderr
     documents = json.loads(state_path.read_text())["documents"]
     assert documents["42"]["steps"]["graph"]["status"] == "unknown"
-    assert "graph" not in documents["43"]["steps"]
+    assert documents["43"]["steps"]["graph"]["status"] == "unknown"
     assert documents["43"]["pending"]["version"] == VERSION
     calls = [
         json.loads(line) for line in (tmp_path / "calls.jsonl").read_text().splitlines()
     ]
-    assert [row[0] for row in calls] == ["source-inventory", "update-sources"]
+    assert len(calls) == 1
 
 
 def test_old_manifest_cannot_replace_a_newer_successful_graph(tmp_path):
@@ -488,7 +400,7 @@ def test_changed_input_in_same_run_and_version_is_compiled_again(tmp_path):
     Path(data["documents"][0]["input_copy"]).write_bytes(source.read_bytes())
     assert cli(config, manifest).returncode == 0
     calls = (tmp_path / "calls.jsonl").read_text().splitlines()
-    assert len(calls) == len(before) + 2
+    assert len(calls) == len(before) + 1
 
 
 def test_unknown_pending_version_does_not_lose_acknowledged_graph_success(tmp_path):
@@ -514,3 +426,179 @@ def test_superseded_metadata_manifest_is_refused(tmp_path):
     assert result.returncode == 1
     assert "generate a new plan" in result.stderr
     assert not (tmp_path / "calls.jsonl").exists()
+
+
+def test_existing_graph_without_manifest_stops_before_extraction(tmp_path):
+    config, manifest, source = fixture(tmp_path)
+    graph = source.parent / "graphify-out/graph.json"
+    write(graph, {"nodes": [], "links": []})
+    before = graph.read_bytes()
+    result = cli(config, manifest)
+    assert result.returncode == 1, result.stderr
+    assert graph.read_bytes() == before
+    assert not (tmp_path / "calls.jsonl").exists()
+
+
+def test_failed_candidate_keeps_public_graph_and_manifest_bytes(tmp_path):
+    config, manifest, source = fixture(tmp_path)
+    graph = source.parent / "graphify-out/graph.json"
+    native_manifest = graph.with_name("manifest.json")
+    write(graph, {"nodes": [{"id": "old"}], "links": []})
+    write(native_manifest, {"preserved": True})
+    before = graph.read_bytes(), native_manifest.read_bytes()
+    (tmp_path / "mode").write_text("failed")
+    assert cli(config, manifest).returncode == 2
+    assert (graph.read_bytes(), native_manifest.read_bytes()) == before
+
+
+def test_changed_input_during_extraction_does_not_publish(tmp_path):
+    config, manifest, source = fixture(tmp_path)
+    (tmp_path / "mode").write_text("mutate")
+    assert cli(config, manifest).returncode == 1
+    assert not (source.parent / "graphify-out/graph.json").exists()
+
+
+def test_unregistered_historical_sources_are_not_backfilled(tmp_path):
+    config, manifest, source = fixture(tmp_path)
+    (source.parent / "Historical-2020-01-01-[99].md").write_text("Historical")
+    result = cli(config, manifest)
+    assert result.returncode == 1
+    assert not (tmp_path / "calls.jsonl").exists()
+
+
+def test_original_graphify_incremental_directory_preserves_other_sources(tmp_path):
+    import shutil
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    executable = shutil.which("graphify")
+    if not executable:
+        pytest.skip("original Graphify CLI is not installed")
+    config, manifest, source = fixture(tmp_path)
+    kept = source.with_name("Unchanged-[99].md")
+    kept.write_text("# Unchanged beta source\nBeta stays unchanged.\n")
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            body = "\n".join(
+                m["content"] for m in request["messages"] if m["role"] == "user"
+            )
+            calls.append(body)
+            nodes = []
+            for name in (source.name, kept.name):
+                if name in body:
+                    ident = (
+                        "kept"
+                        if name == kept.name
+                        else "fresh"
+                        if "Changed alpha" in body
+                        else "old"
+                    )
+                    nodes.append(
+                        {
+                            "id": ident,
+                            "label": ident,
+                            "file_type": "concept",
+                            "source_file": name,
+                        }
+                    )
+            result = json.dumps(
+                {
+                    "id": "fixture",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "fixture",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps({"nodes": nodes, "edges": []}),
+                            },
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(result)))
+            self.end_headers()
+            self.wfile.write(result)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    environment = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path / "home"),
+        "PYTHONPATH": str(ROOT / "src"),
+        "OPENAI_API_KEY": "offline-fixture",
+        "OPENAI_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
+        "OPENAI_MODEL": "fixture",
+        "NO_PROXY": "127.0.0.1,localhost",
+        "GRAPHIFY_API_TIMEOUT": "5",
+        "GRAPHIFY_MAX_RETRIES": "0",
+        "GRAPHIFY_FORCE": "1",
+    }
+    try:
+        before = subprocess.run(
+            [
+                executable,
+                "extract",
+                str(source.parent),
+                "--no-cluster",
+                "--backend",
+                "openai",
+                "--model",
+                "fixture",
+            ],
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert before.returncode == 0, before.stdout + before.stderr
+        source.write_text("# Changed alpha\nThis is the revised full alpha source.\n")
+        data = json.loads(manifest.read_text())
+        Path(data["documents"][0]["input_copy"]).write_bytes(source.read_bytes())
+        config.write_text(
+            config.read_text().split("[tools]")[0]
+            + "[tools]\ngraphify="
+            + json.dumps(executable)
+            + "\n"
+        )
+        result = cli(config, manifest, environment)
+        assert result.returncode == 0, result.stdout + result.stderr
+        graph = json.loads((source.parent / "graphify-out/graph.json").read_text())
+        assert {n["id"] for n in graph["nodes"]} == {"kept", "fresh"}
+        assert len(calls) == 2
+        assert source.name in calls[1]
+        assert kept.name not in calls[1]
+        count = len(calls)
+        assert cli(config, manifest, environment).returncode == 0
+        assert len(calls) == count
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_usable_corpus_compiles_despite_separate_apply_failures(tmp_path):
+    config, manifest, _ = fixture(tmp_path)
+    data = json.loads(manifest.read_text())
+    data["failures"] = [{"document_id": "43", "step": "ocr", "reason": "fixture"}]
+    write(manifest, data)
+    result = cli(config, manifest)
+    assert result.returncode == 2, result.stdout + result.stderr
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    assert state["documents"]["42"]["graph"]["version"] == VERSION

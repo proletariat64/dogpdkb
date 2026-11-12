@@ -3,8 +3,7 @@
 ## 交付边界
 
 Python distribution `dogpdkb` 提供编排器、独立 mdocr/mdcompare 命令与禁用的
-配置示例。Graphify、Skylark 的运行环境独立；本轮 CLI 缺口通过工具侧 patch
-补齐，不把工具运行时放入编排器。配置、凭证、真实来源表、语料、图谱、缓存与
+配置示例。Graphify、Skylark 的运行环境独立；Graphify、Yuque 禁止修改源码，Skylark 使用已恢复的 CLI；不把工具运行时放入编排器。配置、凭证、真实来源表、语料、图谱、缓存与
 run 都不在 wheel 内。旧 workflow 脚本、旧状态和旧参数不兼容。
 
 日常入口为 discover、apply、update-graph、sync；status 只读；publish-web 与
@@ -35,12 +34,12 @@ TOML 路径相对配置，来源 corpus 相对 books.json，凭证保持工具�
 需要具备的公开工具合同：
 
 - [mdcompare catalog/knowledge/compare 与 mdocr batch](orchestrator-tool-contracts.md)。
-- [Graphify source-inventory/update-sources](orchestrator-graphify-contract.md)，包含独立 patch 和精确来源身份。
-- [Skylark listing/export](orchestrator-skylark-contract.md)，包含独立 patch 和可复现构建方式。
+- [Graphify 原版 extract](orchestrator-graphify-contract.md)，使用目录级原生增量及隔离输出。
+- [Skylark listing/export](orchestrator-skylark-contract.md)，使用已恢复的独立 CLI。
 
 工具入口可为 executable 或 argv 数组，不能是 shell 命令文本。Graphify 后端、
-mdocr 认证与工具内部参数由工具配置负责。旧版 Graphify 或只有 extension 的
-Skylark 不满足新合同；本地实现验证不代表已上游发布或全局升级。
+mdocr 认证与工具内部参数由工具配置负责。Graphify 使用原版 CLI，已有图必须保留原生 manifest；Skylark 需要独立 CLI 入口。
+本地验证不代表工具已全局安装。
 
 ## Doctor 与验证边界
 

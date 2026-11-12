@@ -1,18 +1,16 @@
 # Skylark listing/export CLI contract
 
-Implementation lives in the independent `pi_skylark` project, branch
-`feat/orchestrator-export-cli`, commit `0e7c21883481d04a42a771c6fad1ddd5e6e0aa91`,
-based on `bff715483d19a0e470259abcb932d2369158e6b5`. Original checkout and its
-local edits are preserved. [Reproducible patch](../upstream/skylark-listing-export-cli.patch)
-contains the implementation and public CLI tests. The tool is not globally
-installed or released by this change.
+Use the restored independent Skylark CLI, commit
+`0e7c21883481d04a42a771c6fad1ddd5e6e0aa91`, branch
+`feat/orchestrator-export-cli`. The restored build is currently
+`/tmp/pi-skylark-restored-cli-0e7c218/dist/cli.mjs`; the original checkout's
+uncommitted edits remain separate. No Graphify or Yuque source changes are needed.
 
-Apply the patch in a checkout of the base, reuse/install its npm dependencies,
-then `npm run build` and `npm test`. Configure dogpdkb `[tools]` with
-`skylark = ["node", "/path/to/pi_skylark/dist/cli.mjs"]`, or install its `skylark`
-bin. Tool environment retains `UTOO_PROXY_BIN`, `SKYLARK_MCP_URL`,
-`SKYLARK_TIMEOUT_MS`, `SKYLARK_MAX_RETRIES` and existing SSO; no credential
-configuration belongs in a saved plan.
+Configure `[tools]` with `skylark = ["node", "/path/to/pi_skylark/dist/cli.mjs"]`,
+or use the installed `skylark` bin. Tool environment retains `UTOO_PROXY_BIN`,
+`SKYLARK_MCP_URL`, `SKYLARK_TIMEOUT_MS`, `SKYLARK_MAX_RETRIES` and existing SSO.
+Do not persist credentials in a saved plan. Image download has no independent
+CLI entry in this build; image links in Markdown are not downloaded images.
 
 `skylark listing --url BOOK_URL --output JSON` emits `skylark-listing-1`:
 `complete: true`, `book` (book_id/url/items_count/name), `documents`, `toc`,

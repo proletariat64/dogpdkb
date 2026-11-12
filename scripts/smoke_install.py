@@ -57,15 +57,10 @@ elif tool == 'skylark' and args[0] == 'export':
             'metadata':{'title':f"Source {doc['document_id']}"}})
     write(flag('--output'), {'schema':'skylark-export-result-1','status':'completed',
         'documents':rows,'counts':{'total':len(rows),'completed':len(rows),'failed':0}})
-elif tool == 'graphify' and args[0] == 'source-inventory':
-    write(flag('--output'), {'schema':'graphify-source-inventory-1.0','sources':[]})
-elif tool == 'graphify' and args[0] == 'update-sources':
-    rows=json.loads(flag('--request').read_text())['sources']
-    graph=flag('--graph-dir')/'graph.json'
-    write(graph, {'nodes':[], 'links':[], 'smoke_sources':[row['source_id'] for row in rows]})
-    write(flag('--output'), {'schema':'graphify-source-result-1.0','status':'completed',
-        'graph':str(graph),'sources':[{**row,'status':'completed'} for row in rows],
-        'counts':{'total':len(rows),'completed':len(rows),'failed':0}})
+elif tool == 'graphify' and args[0] == 'extract':
+    graph=flag('--out')/'graphify-out/graph.json'
+    write(graph, {'nodes':[], 'links':[], 'graph':{}})
+    write(graph.with_name('manifest.json'), {})
 else:
     raise SystemExit('unexpected public command')
 """
@@ -250,9 +245,7 @@ def smoke(dist: Path) -> None:
             i for i, name in enumerate(phases) if name == "mdcompare"
         ) < phases.index("mdocr")
         assert phases.index("mdocr") < next(
-            i
-            for i, row in enumerate(calls)
-            if row[:2] == ["graphify", "update-sources"]
+            i for i, row in enumerate(calls) if row[:2] == ["graphify", "extract"]
         )
         print(
             "Installed CLI smoke passed: isolated wheel, plan/resume, real mdcompare/mdocr, external Skylark/Graphify fixtures."

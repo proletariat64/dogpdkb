@@ -12,7 +12,7 @@ Scope: implemented, independently reviewed, verified and delivered on rewrite/cl
 
 ## Solution
 
-重写为只负责范围选择、计划、串行 CLI 调用、结果记录和只读观察的编排器。保留 discover、apply、update-graph、sync 的操作方式，底层只留一条实现；mdocr、mdcompare、Graphify 和 Skylark 保持独立工具边界。缺少所需公开能力时先补工具 CLI 或 MCP 产物合同，不在编排器复刻工具内部逻辑。
+重写为只负责范围选择、计划、串行 CLI 调用、结果记录和只读观察的编排器。保留 discover、apply、update-graph、sync 的操作方式，底层只留一条实现；mdocr、mdcompare、Graphify 和 Skylark 保持独立工具边界。Graphify、Yuque 使用原版公开接口；仅自有工具允许补充 CLI 或 MCP 产物合同，不在编排器复刻工具内部逻辑。
 
 默认流程完成整批扫描、下载、比较、计划、OCR 和图谱更新；可停在计划处检查并显式恢复。OCR 或单篇编译失败不阻断可用集合；失败和不明结果持久移交定时清理 agent，同版本失败不参加日常自动重试。Web 独立，既有语料与图谱保留为起点。目标编排器规模为 4–6k 行，职责预算约 4,850 行。
 
@@ -84,7 +84,7 @@ Scope: implemented, independently reviewed, verified and delivered on rewrite/cl
 - 编排器只拥有范围选择、动作策略、顺序、调用结果和真实成功记录。mdocr、mdcompare、Graphify 仅通过独立公开 CLI 调用；Skylark 通过公开 CLI 或 MCP 调用。
 - 禁止静态或动态导入这些工具包，禁止通过自有子进程脚本绕回工具内部，禁止复制工具提取、比较、OCR、缓存或图合并算法。
 - 工具 CLI、MCP endpoint 和文档化 JSON、Markdown、manifest 是唯一集成合同。只检查公开 schema、退出码及产物可用性，不把内部节点身份、OCR block 格式、模型常量或缓存布局写成 fatal 条件。
-- 工具缺能力时先核实并修改其公开接口，不降级到内部调用。prepared image 和 OCR block 的制作、格式检查及缓存归 mdocr；比较规则归 mdcompare；提取、来源替换、节点重映射及图合并归 Graphify。
+- 工具缺能力时先核实公开接口；Graphify、Yuque 禁止修改源码或依赖 fork，仅自有工具可扩展公开接口。prepared image 和 OCR block 的制作、格式检查及缓存归 mdocr；比较规则归 mdcompare；提取、来源替换、节点重映射及图合并归 Graphify。
 - 保留产品策略、稳定来源身份和真实版本事实；删除旧执行器、历史状态导入、旧参数转发、重复审批和动态 handler 注册框架。命令名可以保留，不承担旧实现和旧状态兼容。
 
 ### 命令、整批顺序与计划
@@ -112,7 +112,7 @@ Scope: implemented, independently reviewed, verified and delivered on rewrite/cl
 - mdcompare 的公开报告决定正文复用、图片处理与元数据维护。明确复用则保留已有正文知识；新来源、正文变化、缺少旧输入或比较不确定时，当前完整输入有效就自动完整编译，不设人工审批或语义质量门槛。
 - 正文复用不覆盖图片处理决策。图片变化或 OCR 补充影响编译输入时仍进入相应工具步骤；缺少当前完整输入时记录失败，不能用片段或旧内容冒充当前全文。
 - OCR 尽力完成，单项失败和共享认证/额度错误由工具公开报告区分。有效历史结果与本次成功内容可用时继续，失败或未尝试项如实保留；不完整 OCR 不阻断正文编译。
-- Graphify 按完整来源更新，成功来源继续发布，失败来源保留旧贡献和旧成功版本。公共存储或发布失败属于整批无法继续。
+- Graphify 使用原版 extract 对目录原生增量编译，manifest/cache 和合并归工具。整批成功才发布及推进本批 graph 状态；失败保留旧图，已有图缺 manifest 时停止，避免历史回填。
 
 ### 版本记录、恢复与失败交接
 
@@ -161,7 +161,7 @@ Scope: implemented, independently reviewed, verified and delivered on rewrite/cl
 
 - mdcompare 已有 manifest 输入和 JSON 报告，需按公开报告和退出码映射集成；不能复用其 Python 类型、私有 parser 或算法。
 - mdocr 的逐图选择、成功复用、失败/未尝试清单和结构化证据由其 CLI 提供，不能由编排器制造 prepared image 或 OCR block 的内部证明。
-- Graphify 的整来源替换、部分失败保旧、逐来源成功报告、候选发布、来源清单与元数据维护能力，先核实公开合同，不足则补工具 CLI。现有命令名称不足以证明满足这些要求。
+- Graphify 使用未修改的目录级 extract 与公开 graph/manifest/cache 产物；不要求逐来源报告、来源清单或元数据更新命令。对现有目录原生增量，并在运行目录隔离候选输出，成功后发布。
 - Skylark 完整 listing/export 及表格导出需核实公开 MCP 能力，不足则上游补充。此前未访问远程网关，不把本机代码调查当线上能力证明。
 - 先在工具侧确认并验证公共合同，再实现精简配置与版本记录、唯一命令调用链、监控和结果输出，同时移除旧执行器；最后完成合同验收、仓库必要门禁、隔离安装 smoke 和规模核对。不交付两套默认流水线并存的过渡成品。
 

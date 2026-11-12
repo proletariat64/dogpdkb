@@ -33,7 +33,8 @@ Skylark, mdcompare, mdocr and Graphify own their tool algorithms and runtime.
 - In `src/dogpdkb/`, call tools only through subprocess argv and documented
   JSON/Markdown artifacts. Importing tool packages, private symbols or invoking
   those imports through a helper script is forbidden, including `mdocr.config`.
-- Missing capabilities belong in the tool's public CLI/artifact schema. Keep
+- Graphify and Yuque are external tools: never change their source or require a fork.
+  Only user-owned tools may receive authorized CLI extensions. Keep
   comparison/OCR/cache/graph extraction and merging inside their tools.
 - Run `init-state` before using an existing corpus. It registers facts without
   rewriting Markdown/graph or importing old runs/state. Preserve separate
@@ -103,6 +104,7 @@ in a layer. A direct graphify→U-A transform must synthesize all of those.
 
 ## Conventions for agents working here
 
+- The `yuque` CLI supports listing and downloading Yuque resources. Sync uses the restored Skylark CLI.
 - Sync recent deltas only; historical missing docs were intentionally filtered—do not backfill.
 
 1. **Fast path for corpus questions:** if `graphify_flatten_ready/graphify-out/graph.json`

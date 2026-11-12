@@ -1,5 +1,41 @@
 # CLI orchestrator rewrite acceptance
 
+> The custom Graphify integration is withdrawn. Current evidence uses original Graphify and the restored Skylark CLI; see the native follow-up below. The earlier acceptance is historical only.
+
+## Native Graphify follow-up — 2026-11-13
+
+Current implementation supersedes the historical custom Graphify delivery below.
+User accepted native directory-level incremental compilation and selected the
+restored Skylark CLI at `/tmp/pi-skylark-restored-cli-0e7c218/dist/cli.mjs`.
+Graphify and Yuque source/installation were not modified.
+
+- Removed the custom Graphify commands, request/result schemas and source inventory.
+  Use original `extract CORPUS --out WORKSPACE --no-cluster`, copied native
+  manifest/cache, isolated candidate outputs, then complete-batch publication.
+  Existing graph without its native manifest stops before any historical scan.
+- Failed/unknown current versions cannot be retried indirectly through another
+  directory scan. Separate capture/OCR failures still permit usable body compilation.
+- `make check`: doc-guard 109 documents, Ruff/205 formatting checks,
+  **812 tests passed in 75.94 seconds**. Focused Graphify/boundary tests passed.
+- The original installed Graphify CLI was exercised through a subprocess with a
+  localhost provider: two-source baseline, one changed source, unchanged rerun,
+  preservation of unrelated graph contribution. No paid provider was called.
+- Wheel/sdist in `/tmp/dogpdkb-native-cli-dist`; all 43 runtime modules match source
+  bytes. Disposable installed-wheel smoke passes plan/resume/serial order with
+  real local mdcompare/image-less mdocr and external Skylark/Graphify fixtures.
+- Real restored Skylark listing: complete=true, 7,550 rows, 7,550 unique IDs,
+  advertised count 7,550. Live exports: ordinary Doc and Sheet succeeded; native
+  Table failed with backend `skylark_doc_detail` unsupported-type error. No tool
+  source was patched to hide it. Raw trial artifacts are retained separately in
+  `/tmp/dogpdkb-native-graphify-probe/` and are not committed.
+- Graphify adapter: **330 lines**, down from 451. All dogpdkb source **3,411 lines**;
+  runtime helpers 336, total **3,747**. Earlier 3,874 count is historical.
+- No production corpus/graph/state writes, paid OCR/extraction, deployment,
+  release or new PR occurred. Table export remains a known external-tool gap;
+  existing Graphify baselines must retain their original manifest.
+
+## Historical acceptance (withdrawn dependencies)
+
 Date: 2026-11-13
 Branch: rewrite/cli-orchestrator
 Review base: 2da50e218148a4f3530c789abbdfa45939d5f4f3

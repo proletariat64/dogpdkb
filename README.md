@@ -36,7 +36,7 @@ Markdown 语料；`update-graph --input MANIFEST` 编译。`sync` 共用这套�
 
 同版本同一步骤的失败或不明结果不会在日常运行自动重试，由定时清理 agent 排查。
 新版本仍正常处理；OCR 失败不阻断可用正文编译。缺席只记录，不自动删除既有语料
-或图谱。失败图谱不回滚已更新语料；Graphify 保留失败来源的旧知识。
+或图谱。失败图谱不回滚已更新语料；Graphify 编译按目录整批成功后发布；失败保留旧图。
 
 ## 配置与工具边界
 
@@ -56,12 +56,11 @@ skylark = ["node", "/opt/pi-skylark/dist/cli.mjs"]
 本轮新增能力必须先提供给所选工具入口：
 
 - [mdcompare catalog、mdocr batch](docs/orchestrator-tool-contracts.md)，随本仓库 wheel 提供。
-- [Graphify source-inventory/update-sources](docs/orchestrator-graphify-contract.md)：独立上游 patch 与精确安装身份。
-- [Skylark listing/export](docs/orchestrator-skylark-contract.md)：独立上游 patch 与构建方法。
+- [Graphify 原版 CLI](docs/orchestrator-graphify-contract.md)：目录级增量、原生 manifest/cache 和整批发布。
+- [Skylark listing/export](docs/orchestrator-skylark-contract.md)：已恢复的独立 CLI 与构建方法。
 
-后两项有可复现实现与本地验证，不代表已全球安装或发布。旧 Graphify、仅有 pi
-extension 的 Skylark 不满足新合同。`dogpdkb doctor --config FILE --book funds`
-只检查公开入口；完整合同由验收证明。
+Graphify 直接使用未修改的已发布 CLI；已有图缺少其原生 manifest 时停止，
+不自动回填历史。Skylark 使用已恢复的独立 CLI，配置它的真实可执行路径。
 
 ## 安装与独立功能
 
