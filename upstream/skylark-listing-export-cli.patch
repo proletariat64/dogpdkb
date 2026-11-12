@@ -48,7 +48,7 @@ index 0000000..83084ab
 +tests using a local fake proxy; no live gateway, OCR or extraction is called.
 diff --git a/cli.ts b/cli.ts
 new file mode 100644
-index 0000000..3ce578a
+index 0000000..52c22ef
 --- /dev/null
 +++ b/cli.ts
 @@ -0,0 +1,140 @@
@@ -82,8 +82,8 @@ index 0000000..3ce578a
 + if(String(resolved?.type).toLowerCase()!=='book')throw Error('URL must resolve to a book');
 + const book_id=id(resolved.id??resolved.book_id);
 + const book=await call('skylark_book_detail',{book_id});
-+ const total=Number(book?.items_count);
-+ if(!Number.isInteger(total)||total<0)throw Error('book items_count is missing or invalid');
++ const total=book?.items_count;
++ if(typeof total!=='number'||!Number.isInteger(total)||total<0)throw Error('book items_count is missing or invalid');
 + const documents:Json[]=[], seen=new Set<string>();
 + for(let offset=0;offset<total;offset+=50){
 +  const page=await call('skylark_doc_list',{book_id,limit:50,offset});
@@ -259,10 +259,10 @@ index f19158e..75dcc1e 100644
  		"@earendil-works/pi-coding-agent": "^0.84.1",
 diff --git a/test/cli.mjs b/test/cli.mjs
 new file mode 100644
-index 0000000..7941498
+index 0000000..ac5d895
 --- /dev/null
 +++ b/test/cli.mjs
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,56 @@
 +import { build } from 'esbuild';
 +import { spawnSync } from 'node:child_process';
 +import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
@@ -279,7 +279,7 @@ index 0000000..7941498
 +const data=(name,args)=>{
 + appendFileSync(process.env.CALLS, JSON.stringify({name,args})+'\\n');
 + if(name==='skylark_resolve_url') return {type:'Book',id:9};
-+ if(name==='skylark_book_detail') return {id:9,name:'Book',items_count:2};
++ if(name==='skylark_book_detail') return {id:9,name:'Book',items_count:process.env.BAD_COUNT?JSON.parse(process.env.BAD_COUNT):2};
 + if(name==='skylark_book_toc') return [{type:'DOC',doc_id:1,title:'One'}];
 + if(name==='skylark_doc_list') return process.env.BAD_LIST ? [{id:1}] : [{id:1,title:'One',content_updated_at:'2026-11-12T01:02:03Z'},{id:2,title:'Table',format:'laketable',content_updated_at:'2026-11-12T02:00:00Z'}];
 + if(name==='skylark_doc_detail') return args.doc_id===3?{id:3,title:'Bad'}:{id:args.doc_id,title:'One',body:'Actual body',content_updated_at:'2026-11-12T01:02:03Z'};
@@ -302,6 +302,12 @@ index 0000000..7941498
 + const rejected=join(dir,'incomplete.json');
 + r=run(['listing','--url','https://example/book','--output',rejected],{BAD_LIST:'1'});
 + assert.equal(r.status,1);assert.equal(existsSync(rejected),false);
++ for(const count of ['null','false','"2"']){
++  const bad=join(dir,`count-${count}.json`);
++  r=run(['listing','--url','https://example/book','--output',bad],{BAD_COUNT:count});
++  assert.equal(r.status,1,`invalid count ${count} must not form a complete listing`);
++  assert.equal(existsSync(bad),false);
++ }
 + const request=join(dir,'request.json'),report=join(dir,'report.json');
 + writeFileSync(request,JSON.stringify({schema:'skylark-export-request-1',documents:[{document_id:'1',path:join(dir,'one.md')},{document_id:'2',format:'laketable',path:join(dir,'table.md')},{document_id:'3',path:join(dir,'bad.md')}]}));
 + r=run(['export','--request',request,'--output',report]);

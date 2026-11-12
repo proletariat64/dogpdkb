@@ -87,7 +87,7 @@ CLI, observation, process, Web and lifecycle implementations.
   identity in `docs/upstream/graphify-source-update/`; public subprocess tests
   include a localhost provider. The user's installed Graphify was untouched.
 - Skylark: independent source commit
-  `ee9f2dbaecd639ca51960e9e0fbd29d7fb6ee714`; reproducible patch in
+  `0e7c21883481d04a42a771c6fad1ddd5e6e0aa91`; reproducible patch in
   `upstream/skylark-listing-export-cli.patch`, fake MCP and real Markdown tests.
   No authenticated gateway request was made.
 

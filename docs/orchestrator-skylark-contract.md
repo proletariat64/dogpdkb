@@ -1,7 +1,7 @@
 # Skylark listing/export CLI contract
 
 Implementation lives in the independent `pi_skylark` project, branch
-`feat/orchestrator-export-cli`, commit `ee9f2dbaecd639ca51960e9e0fbd29d7fb6ee714`,
+`feat/orchestrator-export-cli`, commit `0e7c21883481d04a42a771c6fad1ddd5e6e0aa91`,
 based on `bff715483d19a0e470259abcb932d2369158e6b5`. Original checkout and its
 local edits are preserved. [Reproducible patch](../upstream/skylark-listing-export-cli.patch)
 contains the implementation and public CLI tests. The tool is not globally
@@ -48,5 +48,5 @@ publication policy. It never parses MCP envelopes or renders remote tables.
 
 Validation: public CLI subprocess tests use a local fake stdio MCP proxy and real
 Markdown outputs: complete metadata-only listing; incomplete listing rejection;
-regular/table export; malformed source isolation. Existing eight transport/retry
+regular/table export; malformed source isolation; null/boolean/string listing total rejection. Existing eight transport/retry
 tests also pass. No live gateway, paid OCR, graph extraction or production write.
