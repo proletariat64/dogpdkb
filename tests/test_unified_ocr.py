@@ -88,7 +88,7 @@ def _handle(method, url, **kwargs):
             job = "job-b" if fname.startswith("b") else "job-a"
             return Resp(json_data={{"data": {{"jobId": job}}}})
         if method == "GET" and "/jobs/" in url:
-            if MODE == "fail" or (MODE == "isolation" and url.endswith("job-b")):
+            if MODE == "fail" or MODE == "crash_register_fail" or (MODE == "isolation" and url.endswith("job-b")):
                 return Resp(json_data={{"data": {{"state": "failed", "errorMsg": "boom"}}}})
             if MODE == "malformed_poll":
                 return Resp(json_data={{"data": {{"state": "done"}}}})
@@ -109,7 +109,7 @@ def _get(self, url, **kwargs):
 requests.Session.request = _request
 requests.Session.get = _get
 
-if MODE == "crash_register":
+if MODE in ("crash_register", "crash_register_fail"):
     # Model an interruption AFTER persist_success + graph.ocr merge but BEFORE
     # follow-up registration: the durable cache holds the artifact, yet no
     # follow-up was registered. A resume must still register on the cache hit.
@@ -728,6 +728,49 @@ def test_body_reuse_plan_preserves_prior_ocr_evidence_and_body_scope(tmp_path: P
     assert doc1_after["body_scope"]["regions"]
 
 
+def test_compile_fragment_fallback_prefers_referenced_over_stale(tmp_path: Path):
+    # G3: real OCR merges a stale failed contribution (url#old) with the current
+    # successful one (url#new). The fragment-stripped compile fallback must prefer
+    # the resource the CURRENT raw references, not whichever stale key sorted first,
+    # so the recognized text reaches the published source THIS batch (the [6] prune
+    # only cleans the published evidence for the next batch).
+    workspace = OcrCompileWorkspace(tmp_path, mode="fail")
+    old_url = IMAGE_URL + "#old"
+    new_url = IMAGE_URL + "#new"
+
+    def set_body(body: str) -> None:
+        remote = read_json(workspace.root / "remote.json")
+        remote["details"]["2"]["body"] = body
+        write_json(workspace.root / "remote.json", remote)
+
+    set_body(f"# Two old\n\n![img]({old_url})\n")
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    assert doc2["graph"]["ocr"]["images"][0]["resource_id"] == old_url
+    assert doc2["graph"]["ocr"]["images"][0]["status"] == "failed"
+
+    # New version, new fragment, OCR now succeeds: real OCR MERGES the prior failed
+    # #old with the new success #new (it does not clobber), ordered #old first.
+    workspace.set_mode("success")
+    set_body(f"# Two new\n\n![img]({new_url})\n")
+    workspace.bump_version(2, "2026-11-11T11:00:00+08:00")
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run2 = workspace.runs()[-1]
+    report = workspace.compile_report(run2)
+    result2 = next(row for row in report["results"] if row["document_id"] == 2)
+    frozen = (run2 / "compile" / "execution-corpus" / "source-[2].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" in frozen
+    assert not any(
+        m.get("resource_id") in {IMAGE_URL, old_url, new_url}
+        and m.get("code") in {"OCR_FAILED", "OCR_PENDING", "OCR_UNAVAILABLE"}
+        for m in result2["execution"]["missing_items"]
+    )
+
+
 def test_posthoc_success_resolves_an_archived_ocr_failure_and_registers_compile(
     tmp_path: Path,
 ):
@@ -790,7 +833,15 @@ def test_posthoc_success_resolves_an_archived_ocr_failure_and_registers_compile(
     assert followup["status"] == "pending"
     assert followup["anomaly_id"] == aid
     assert followup["version_stamp"] == failures[0]["version_stamp"]
-    assert followup["inputs"] == [{"kind": "ocr", "path": str(artifact.resolve())}]
+    # G4: inputs carry the anomaly's resource_id so a later corrected backfill can
+    # retire this superseded input per resource.
+    assert followup["inputs"] == [
+        {
+            "kind": "ocr",
+            "path": str(artifact.resolve()),
+            "resource_id": failures[0]["resource_id"],
+        }
+    ]
 
 
 # --- OCR adjudication fix regressions (WP1) ---------------------------------
@@ -1022,6 +1073,58 @@ def test_body_reuse_changed_image_failed_reocr_republishes_to_drop_stale_text(
         encoding="utf-8"
     )
     assert "OCR output line" not in frozen2
+
+
+def test_body_reuse_failed_reocr_crash_before_save_recovers_on_resume(tmp_path: Path):
+    # G2/[2]: the republish intent must be written BEFORE the tombstone replaces the
+    # published success. A crash after save_view but before registration (the old
+    # order) loses the invalidation: resume sees only the tombstone, cannot
+    # reconstruct prior_success, skips registration, and leaves stale OCR text
+    # published. Write-ahead registration keeps the intent (or the intact success)
+    # durable so resume still republishes and drops the stale text.
+    workspace = OcrCompileWorkspace(tmp_path, mode="success")
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["1"]["body"] = (
+        "# One\n\nRule v1.\n\n![img](https://cdn.example.invalid/a.png)\n"
+    )
+    remote["details"]["2"]["body"] = "body 2\n"
+    write_json(workspace.root / "remote.json", remote)
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    run1 = workspace.latest_run()
+    graph1 = workspace.state()["books"]["fund"]["documents"]["1"]["graph"]
+    assert graph1["ocr"]["images"][0]["status"] == "success"
+    frozen1 = (run1 / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" in frozen1
+
+    # Batch 2: identical body (body_reuse), same URL, changed bytes, re-OCR FAILS.
+    # Crash at registration entry: in the old order save_view already tombstoned the
+    # success; in the write-ahead order the tombstone has not been saved yet.
+    workspace.write_image(20)
+    workspace.bump_version(1, "2026-11-11T10:00:00+08:00")
+    workspace.set_mode("crash_register_fail")
+    second = workspace.sync()
+    assert second.returncode == 130, second.stderr
+    run2 = workspace.latest_run()
+
+    # Resume with re-OCR still failing: the invalidation must survive and the source
+    # must republish WITHOUT the stale OCR text.
+    workspace.set_mode("fail")
+    third = workspace.sync("--resume", run2.name)
+    assert third.returncode == 0, third.stderr
+    report = workspace.compile_report(run2)
+    assert 1 in {r["document_id"] for r in report["results"]}
+    frozen2 = (run2 / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" not in frozen2
+    doc1 = [
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    ]
+    assert len(doc1) == 1
+    assert doc1[0]["status"] == "done"
 
 
 def test_removed_image_with_prior_ocr_contribution_republishes(tmp_path: Path):

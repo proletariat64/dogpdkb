@@ -1141,3 +1141,260 @@ def test_posthoc_ocr_backfill_materializes_into_graph_and_reaches_compile(
     assert consumed["status"] == "done", consumed
     frozen = run_dir / "compile" / "execution-corpus" / "source-[2].md"
     assert "BACKFILL OCR TEXT" in frozen.read_text(encoding="utf-8")
+
+
+def test_posthoc_ocr_backfill_rejects_stale_version(workspace: CompileWorkspace):
+    # G1/[5]: a v1 OCR anomaly resolved after v2 was published must not overwrite
+    # v2's completion state or replace v2's OCR with v1 text when the image URL is
+    # reused. Reject stale evidence before any canonical write; anomaly stays pending.
+    from dogpdkb.sync_results import load_registry, register_anomaly, save_registry
+    from mdocr.config import load_config
+
+    _set_detail(workspace, 2, body=f"# Two\n\n![diagram]({IMAGE_A})\n")
+    workspace.env["DOGPDKB_OCR_DOUBLE_FAIL"] = IMAGE_A
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    config = load_config(workspace.config)
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    v1 = doc2["observation"]["version"]
+    registry = load_registry(config, "fund")
+    anomaly = register_anomaly(
+        registry,
+        config,
+        "fund",
+        {
+            "stage": "ocr",
+            "document_id": 2,
+            "source_version": v1,
+            "code": "OCR_FAILED",
+            "reason": "OCR result was blank",
+            "resource_id": IMAGE_A,
+            "image": {"resource_id": IMAGE_A, "url": IMAGE_A},
+            "necessary_inputs": [],
+        },
+        run_id=workspace.runs()[-1].name,
+    )
+    save_registry(config, "fund", registry)
+    aid = anomaly["id"]
+
+    # Advance to v2 with the SAME image, now recognized: v2 publishes success OCR.
+    v2_stamp = "2026-11-11T11:00:00+08:00"
+    remote = read_json(workspace.root / "remote.json")
+    for row in remote["documents"]:
+        if row["id"] == 2:
+            row["content_updated_at"] = v2_stamp
+    remote["details"]["2"]["content_updated_at"] = v2_stamp
+    remote["details"]["2"]["body"] = f"# Two v2\n\n![diagram]({IMAGE_A})\n"
+    write_json(workspace.root / "remote.json", remote)
+    workspace.env["DOGPDKB_OCR_DOUBLE_FAIL"] = ""
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    assert doc2["observation"]["version"]["utc"] == v2_stamp
+    v2_image = next(
+        img for img in doc2["graph"]["ocr"]["images"] if img["resource_id"] == IMAGE_A
+    )
+    assert v2_image["status"] == "success"
+    v2_artifact = v2_image["artifact"]
+
+    # Resolve the STALE v1 anomaly with a v1 backfill: it must be rejected.
+    backfill = workspace.root / "stale-backfill.md"
+    backfill.write_text("STALE V1 OCR TEXT\n", encoding="utf-8")
+    evidence = workspace.root / "evidence.json"
+    write_json(
+        evidence,
+        {
+            "schema_version": "unified-posthoc-evidence-1.0",
+            "cache": [{"kind": "ocr", "path": str(backfill.resolve())}],
+            "completion": {
+                "step": "ocr",
+                "details": {"cache": str(backfill.resolve())},
+            },
+            "input_changed": True,
+        },
+    )
+    resolved = workspace.cli(
+        "anomalies",
+        "--config",
+        str(workspace.config),
+        "--book",
+        "fund",
+        "--resolve",
+        aid,
+        "--disposition",
+        "done",
+        "--evidence",
+        str(evidence),
+    )
+    assert resolved.returncode != 0
+    record = load_registry(config, "fund")["anomalies"][aid]
+    assert record["disposition"] == "pending"
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    image = next(
+        img for img in doc2["graph"]["ocr"]["images"] if img["resource_id"] == IMAGE_A
+    )
+    assert image["status"] == "success"
+    assert image["artifact"] == v2_artifact
+
+
+def test_posthoc_ocr_backfill_requires_identifiable_artifact(
+    workspace: CompileWorkspace,
+):
+    # [6]: an OCR anomaly whose evidence has no identifiable OCR artifact (two
+    # default kind="cache" refs) must not silently no-op yet mark done. Require a
+    # successful graph.ocr materialization before recording completion/disposition.
+    from dogpdkb.sync_results import load_registry, register_anomaly, save_registry
+    from mdocr.config import load_config
+
+    _set_detail(workspace, 2, body=f"# Two\n\n![diagram]({IMAGE_A})\n")
+    workspace.env["DOGPDKB_OCR_DOUBLE_FAIL"] = IMAGE_A
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    config = load_config(workspace.config)
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    registry = load_registry(config, "fund")
+    anomaly = register_anomaly(
+        registry,
+        config,
+        "fund",
+        {
+            "stage": "ocr",
+            "document_id": 2,
+            "source_version": doc2["observation"]["version"],
+            "code": "OCR_FAILED",
+            "reason": "OCR result was blank",
+            "resource_id": IMAGE_A,
+            "image": {"resource_id": IMAGE_A, "url": IMAGE_A},
+            "necessary_inputs": [],
+        },
+        run_id=workspace.runs()[-1].name,
+    )
+    save_registry(config, "fund", registry)
+    aid = anomaly["id"]
+
+    ref_a = workspace.root / "ref-a.md"
+    ref_b = workspace.root / "ref-b.md"
+    ref_a.write_text("A\n", encoding="utf-8")
+    ref_b.write_text("B\n", encoding="utf-8")
+    evidence = workspace.root / "evidence.json"
+    write_json(
+        evidence,
+        {
+            "schema_version": "unified-posthoc-evidence-1.0",
+            "cache": [
+                {"kind": "cache", "path": str(ref_a.resolve())},
+                {"kind": "cache", "path": str(ref_b.resolve())},
+            ],
+            "completion": {"step": "ocr", "details": {}},
+            "input_changed": True,
+        },
+    )
+    resolved = workspace.cli(
+        "anomalies",
+        "--config",
+        str(workspace.config),
+        "--book",
+        "fund",
+        "--resolve",
+        aid,
+        "--disposition",
+        "done",
+        "--evidence",
+        str(evidence),
+    )
+    assert resolved.returncode != 0
+    record = load_registry(config, "fund")["anomalies"][aid]
+    assert record["disposition"] == "pending"
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    image = next(
+        img for img in doc2["graph"]["ocr"]["images"] if img["resource_id"] == IMAGE_A
+    )
+    assert image["status"] == "failed"
+    assert doc2.get("steps", {}).get("ocr", {}).get("status") != "completed"
+
+
+def test_posthoc_corrected_backfill_retires_superseded_followup_input(
+    workspace: CompileWorkspace,
+):
+    # G4/[16]: a corrected backfill B for the same image/version replaces A in
+    # canonical graph.ocr. The reopened follow-up must retire A's registered path,
+    # not accumulate it: compile can only consume B, so retaining A would mark the
+    # follow-up failed even though B was successfully published.
+    from dogpdkb.sync_results import (
+        load_followups,
+        load_registry,
+        register_anomaly,
+        save_registry,
+    )
+    from mdocr.config import load_config
+
+    _set_detail(workspace, 2, body=f"# Two\n\n![diagram]({IMAGE_A})\n")
+    workspace.env["DOGPDKB_OCR_DOUBLE_FAIL"] = IMAGE_A
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    config = load_config(workspace.config)
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    registry = load_registry(config, "fund")
+    anomaly = register_anomaly(
+        registry,
+        config,
+        "fund",
+        {
+            "stage": "ocr",
+            "document_id": 2,
+            "source_version": doc2["observation"]["version"],
+            "code": "OCR_FAILED",
+            "reason": "OCR result was blank",
+            "resource_id": IMAGE_A,
+            "image": {"resource_id": IMAGE_A, "url": IMAGE_A},
+            "necessary_inputs": [],
+        },
+        run_id=workspace.runs()[-1].name,
+    )
+    save_registry(config, "fund", registry)
+    aid = anomaly["id"]
+
+    def resolve(text: str, name: str) -> str:
+        artifact = workspace.root / name
+        artifact.write_text(text, encoding="utf-8")
+        path = str(artifact.resolve())
+        evidence = workspace.root / "evidence.json"
+        write_json(
+            evidence,
+            {
+                "schema_version": "unified-posthoc-evidence-1.0",
+                "cache": [{"kind": "ocr", "path": path}],
+                "completion": {"step": "ocr", "details": {"cache": path}},
+                "input_changed": True,
+            },
+        )
+        resolved = workspace.cli(
+            "anomalies",
+            "--config",
+            str(workspace.config),
+            "--book",
+            "fund",
+            "--resolve",
+            aid,
+            "--disposition",
+            "done",
+            "--evidence",
+            str(evidence),
+        )
+        assert resolved.returncode == 0, resolved.stderr
+        return json.loads(resolved.stdout)["resolution"]["followup_id"]
+
+    fid = resolve("BACKFILL A TEXT\n", "backfill-a.md")
+    fid = resolve("BACKFILL B TEXT\n", "backfill-b.md")
+
+    # Unchanged batch: compile reads the corrected graph.ocr (B) via the follow-up
+    # and must consume it to done — A's superseded path is no longer registered.
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run_dir = workspace.runs()[-1]
+    consumed = load_followups(config, "fund")["followups"][fid]
+    assert consumed["status"] == "done", consumed
+    frozen = run_dir / "compile" / "execution-corpus" / "source-[2].md"
+    body = frozen.read_text(encoding="utf-8")
+    assert "BACKFILL B TEXT" in body
+    assert "BACKFILL A TEXT" not in body

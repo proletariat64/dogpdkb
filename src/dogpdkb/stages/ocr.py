@@ -147,6 +147,63 @@ def _merge_graph_ocr(
     }
 
 
+def _register_body_reuse_followups(
+    context: StageContext,
+    plan: dict[str, Any],
+    accs: dict[Any, dict[str, Any]],
+    doc_ids: list[Any],
+    invalidated_success: dict[str, list[str]],
+) -> None:
+    # A body-reuse source keeps its published body knowledge, but an OCR artifact
+    # the published source does not yet contain changes its compile input. Register
+    # follow-up compile work (the same machinery the post-hoc backfill path uses) so
+    # this batch's compile stage republishes the source with the new image text. The
+    # delta is measured against the inputs of the consumed (done) follow-up at this
+    # version, NOT against whether this run made a fresh request: a cache hit on
+    # resume after an interrupted persist must still register when the published
+    # source lacks the artifact. A pending follow-up already covers the work. A prior
+    # published SUCCESS this batch tombstoned (invalidated) also forces a whole-source
+    # republish even with no new artifact, so the stale OCR text is dropped rather
+    # than kept under the advanced body-reuse version (H2).
+    config = context.config
+    body_reuse_ids = {str(item["document_id"]) for item in plan.get("body_reuse") or []}
+    registry = load_followups(config, context.book.key)
+    for doc_id in doc_ids:
+        acc = accs[doc_id]
+        doc_key = str(doc_id)
+        if doc_key not in body_reuse_ids:
+            continue
+        invalidated = invalidated_success.get(doc_key)
+        if not acc["final_inputs"] and not invalidated:
+            continue
+        source_version = acc["item"].get("source_version")
+        existing = registry["followups"].get(
+            followup_id(context.book.key, doc_id, source_version)
+        )
+        if existing is not None and existing.get("status") == "pending":
+            continue
+        published = (
+            {row["path"] for row in existing.get("inputs", [])}
+            if existing is not None and existing.get("status") == "done"
+            else set()
+        )
+        changed = [row for row in acc["final_inputs"] if row["path"] not in published]
+        if not changed and not invalidated:
+            continue
+        register_compile_followup(
+            config,
+            context.book.key,
+            document_id=doc_id,
+            source_version=source_version,
+            reason=(
+                "OCR changed a body-reuse source's compile input"
+                if changed
+                else "OCR contribution invalidated; republish to drop stale text"
+            ),
+            inputs=changed,
+        )
+
+
 def handle(context: StageContext) -> StageResult:
     plan = _plan(context)
     items = plan.get("ocr") or []
@@ -365,55 +422,25 @@ def handle(context: StageContext) -> StageResult:
                         row["ocr"]["images"],
                         tombstones,
                     )
+            # G2/[2]: write-ahead the invalidation republish intent BEFORE save_view
+            # replaces the published success with a tombstone. A crash after save_view
+            # but before registration would lose the invalidation (resume sees only the
+            # tombstone and cannot reconstruct prior_success), leaving stale OCR text
+            # published for a body-reuse source whose re-OCR still fails. Registering
+            # the invalidation first makes the intent durable; registration is
+            # idempotent on resume. Success-driven follow-ups register after save_view
+            # so the merged graph.ocr success is already durable when a crash hits
+            # registration (the resume cache-hit path relies on it).
+            _register_body_reuse_followups(
+                context,
+                plan,
+                accs,
+                [doc_id for doc_id in order if str(doc_id) in invalidated_success],
+                invalidated_success,
+            )
             save_view(state_path, state)
 
-    # A body-reuse source keeps its published body knowledge, but an OCR artifact
-    # the published source does not yet contain changes its compile input. Register
-    # follow-up compile work (the same machinery the post-hoc backfill path uses)
-    # so this batch's compile stage republishes the source with the new image text.
-    # The delta is measured against the inputs of the consumed (done) follow-up at
-    # this version, NOT against whether this run made a fresh request: a cache hit
-    # on resume after an interrupted persist must still register when the published
-    # source lacks the artifact. A pending follow-up already covers the work.
-    # A prior published SUCCESS this batch tombstoned (invalidated) also forces a
-    # whole-source republish even with no new artifact, so the stale OCR text is
-    # dropped rather than kept under the advanced body-reuse version (H2).
-    body_reuse_ids = {str(item["document_id"]) for item in plan.get("body_reuse") or []}
-    registry = load_followups(config, context.book.key)
-    for doc_id in order:
-        acc = accs[doc_id]
-        doc_key = str(doc_id)
-        if doc_key not in body_reuse_ids:
-            continue
-        invalidated = invalidated_success.get(doc_key)
-        if not acc["final_inputs"] and not invalidated:
-            continue
-        source_version = acc["item"].get("source_version")
-        existing = registry["followups"].get(
-            followup_id(context.book.key, doc_id, source_version)
-        )
-        if existing is not None and existing.get("status") == "pending":
-            continue
-        published = (
-            {row["path"] for row in existing.get("inputs", [])}
-            if existing is not None and existing.get("status") == "done"
-            else set()
-        )
-        changed = [row for row in acc["final_inputs"] if row["path"] not in published]
-        if not changed and not invalidated:
-            continue
-        register_compile_followup(
-            config,
-            context.book.key,
-            document_id=doc_id,
-            source_version=source_version,
-            reason=(
-                "OCR changed a body-reuse source's compile input"
-                if changed
-                else "OCR contribution invalidated; republish to drop stale text"
-            ),
-            inputs=changed,
-        )
+    _register_body_reuse_followups(context, plan, accs, order, invalidated_success)
 
     reference = {
         "schema_version": OCR_SCHEMA,

@@ -539,11 +539,20 @@ def register_compile_followup(
         }
         registry["followups"][fid] = record
     else:
-        known = {row["path"] for row in existing["inputs"]}
+        # G4/[16]: a corrected backfill for the same image supersedes its earlier
+        # artifact. Retire that resource's obsolete paths so compile (which can
+        # only consume the latest canonical artifact) is not failed by an input it
+        # can never publish; inputs for other images are preserved.
+        new_rids = {row.get("resource_id") for row in inputs if row.get("resource_id")}
+        kept = [
+            row for row in existing["inputs"] if row.get("resource_id") not in new_rids
+        ]
+        known = {row["path"] for row in kept}
         for row in inputs:
             if row["path"] not in known:
-                existing["inputs"].append(row)
+                kept.append(row)
                 known.add(row["path"])
+        existing["inputs"] = kept
         existing["reason"] = reason
         existing["updated_at"] = now
         if anomaly_id is not None:
@@ -574,17 +583,21 @@ def _evidence_refs(evidence: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _materialize_ocr_backfill(
     book: Any, record: dict[str, Any], cache: list[dict[str, Any]]
-) -> None:
+) -> bool:
     """Write a post-hoc OCR backfill into the canonical graph.ocr compile reads.
 
     compile enriches only ``status == "success"`` graph.ocr images; a backfill that
     lives solely in the evidence cache never reaches the published source. Match
     the failed image by the anomaly's resource_id and flip it to success with the
     backfill artifact, preserving its durable prepared/source paths.
+
+    Returns True only when a real canonical image was updated. Evidence archived
+    for an older version (the document advanced since) or without an identifiable
+    artifact returns False so the caller refuses a false completion (G1/[5], [6]).
     """
     resource_id = record.get("resource_id")
     if not isinstance(resource_id, str):
-        return
+        return False
     artifact = next(
         (row["path"] for row in cache if row.get("kind") in {"ocr", "ocr_artifact"}),
         None,
@@ -592,20 +605,26 @@ def _materialize_ocr_backfill(
     if artifact is None and len(cache) == 1:
         artifact = cache[0]["path"]
     if artifact is None:
-        return
+        return False
     from dogpdkb.sync_state import document_record, load_state, save_state
 
     state = load_state(book.corpus, book.key)
     doc = document_record(state, book.key, str(record["document_id"]))
+    # G1/[5]: reject evidence archived for an older version once the document has
+    # advanced, so resolving v1 cannot overwrite v2's OCR or completion state.
+    observed = (doc.get("observation") or {}).get("version")
+    if version_stamp(observed) != record.get("version_stamp"):
+        return False
     ocr = (doc.get("graph") or {}).get("ocr")
     if not isinstance(ocr, dict) or not isinstance(ocr.get("images"), list):
-        return
+        return False
     for image in ocr["images"]:
         if isinstance(image, dict) and image.get("resource_id") == resource_id:
             image["status"] = "success"
             image["artifact"] = artifact
             save_state(book.corpus, state)
-            return
+            return True
+    return False
 
 
 def record_posthoc_success(
@@ -660,12 +679,33 @@ def record_posthoc_success(
 
     # Real completion first: canonical state, never the disposition alone.
     progress = Progress(book.corpus, book.key)
+    # G1/[5] + [6]: an OCR backfill must materialize into the canonical graph.ocr
+    # compile reads BEFORE any completion/disposition is recorded. A stale version
+    # or unidentifiable artifact leaves the anomaly pending rather than fabricating
+    # a done whose follow-up could never be consumed.
+    if (
+        record.get("stage") == "ocr"
+        and evidence.get("input_changed")
+        and completion["step"] == "ocr"
+        and not _materialize_ocr_backfill(book, record, cache)
+    ):
+        raise ArchiveError(
+            "post-hoc OCR backfill could not be materialized into graph.ocr "
+            "(stale version or no identifiable artifact); anomaly left pending"
+        )
     progress.step(record["document_id"], completion["step"], "completed", **details)
-    if evidence.get("input_changed") and completion["step"] == "ocr":
-        _materialize_ocr_backfill(book, record, cache)
 
     followup = None
     if evidence.get("input_changed"):
+        # Tag inputs with the anomaly's resource_id so a corrected backfill for the
+        # same image retires its superseded path (G4/[16]); capture anomalies carry
+        # no resource_id and keep their untagged inputs.
+        rid = record.get("resource_id")
+        inputs = (
+            [{**row, "resource_id": rid} for row in cache]
+            if isinstance(rid, str)
+            else cache
+        )
         followup = register_compile_followup(
             config,
             book.key,
@@ -673,7 +713,7 @@ def record_posthoc_success(
             source_version=record["source_version"],
             reason=evidence.get("reason")
             or "post-hoc backfill changed the published compile input",
-            inputs=cache,
+            inputs=inputs,
             anomaly_id=aid,
         )
     now = now_iso()
