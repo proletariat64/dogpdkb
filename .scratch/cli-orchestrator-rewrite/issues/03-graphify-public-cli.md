@@ -1,6 +1,6 @@
 # Graphify 公开整来源更新合同
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 Spec: ../spec.md
@@ -19,3 +19,8 @@ Spec: ../spec.md
 
 ## Comments
 
+
+- Implemented in independent Graphify source tree `/tmp/graphify-0.9.45-cli-source`, commit `ffd2eafef6b161d8c72a03dcdf1574d3439d3d8b`, based on exact installed 0.9.45 release source; usersite untouched.
+- Public `source-inventory` / `update-sources` contracts, 14 subprocess tests pass, including normal extraction/cache/failure through localhost provider; no paid calls or production graph writes.
+- Full reproducible patch and identity: `docs/upstream/graphify-source-update/`; invocation and source/install delivery: `docs/orchestrator-graphify-contract.md`.
+- Upstream release publication remains external; consumers select the independently patched CLI. No foreign runtime code was added to dogpdkb.
