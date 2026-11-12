@@ -69,8 +69,11 @@ def _handle(method, url, **kwargs):
             return Resp(text="")
         if MODE == "garbage":
             return Resp(text="this is not valid json")
+        text = "OCR output line"
+        if MODE == "nested":
+            text = 'transcribed <!-- mdocr:ocr-begin source="x" --> marker'
         payload = {{"result": {{"layoutParsingResults": [
-            {{"markdown": {{"text": "OCR output line"}}}}]}}}}
+            {{"markdown": {{"text": text}}}}]}}}}
         return Resp(text=json.dumps(payload))
     if "paddleocr.aistudio-app.com" in url:
         if method == "POST" and url.endswith("/jobs"):
@@ -79,12 +82,16 @@ def _handle(method, url, **kwargs):
                 return Resp(status_code=401, text="unauthorized")
             if MODE == "quota":
                 return Resp(status_code=403, text="quota exhausted")
+            if MODE == "malformed_submit":
+                return Resp(json_data={{"data": {{}}}})
             fname = kwargs.get("files", {{}}).get("file", ("job",))[0]
             job = "job-b" if fname.startswith("b") else "job-a"
             return Resp(json_data={{"data": {{"jobId": job}}}})
         if method == "GET" and "/jobs/" in url:
             if MODE == "fail" or (MODE == "isolation" and url.endswith("job-b")):
                 return Resp(json_data={{"data": {{"state": "failed", "errorMsg": "boom"}}}})
+            if MODE == "malformed_poll":
+                return Resp(json_data={{"data": {{"state": "done"}}}})
             return Resp(json_data={{"data": {{"state": "done",
                 "resultUrl": {{"jsonUrl": "https://example.com/result.jsonl"}}}}}})
         raise AssertionError(url)
@@ -101,6 +108,17 @@ def _get(self, url, **kwargs):
 
 requests.Session.request = _request
 requests.Session.get = _get
+
+if MODE == "crash_register":
+    # Model an interruption AFTER persist_success + graph.ocr merge but BEFORE
+    # follow-up registration: the durable cache holds the artifact, yet no
+    # follow-up was registered. A resume must still register on the cache hit.
+    import dogpdkb.stages.ocr as _ocrmod
+
+    def _boom(*args, **kwargs):
+        raise KeyboardInterrupt("simulated interrupt before follow-up registration")
+
+    _ocrmod.register_compile_followup = _boom
 """
 
 
@@ -725,3 +743,184 @@ def test_posthoc_success_resolves_an_archived_ocr_failure_and_registers_compile(
     assert followup["anomaly_id"] == aid
     assert followup["version_stamp"] == failures[0]["version_stamp"]
     assert followup["inputs"] == [{"kind": "ocr", "path": str(artifact.resolve())}]
+
+
+# --- OCR adjudication fix regressions (WP1) ---------------------------------
+
+
+def test_nested_marker_ocr_output_is_recorded_as_failure(tmp_path: Path):
+    # MEDIUM6: an OCR artifact whose body contains a nested mdocr marker fails the
+    # canonical structural check. It must be recorded as an image failure, never
+    # minted as success nor written to the durable cache.
+    workspace = OcrWorkspace(tmp_path, mode="nested")
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+    counts = workspace.ocr_envelope()["counts"]
+    assert counts["failed"] == 1
+    assert counts["success"] == 0
+    state = read_json(workspace.corpus / ".sync-state.json")
+    graph = state["books"]["fund"]["documents"]["2"]["graph"]
+    images = graph.get("ocr", {}).get("images", [])
+    assert all(row.get("status") != "success" for row in images)
+    # No durable success entry was written for the invalid artifact.
+    assert not any(workspace.ocr_cache.glob("*/evidence.json"))
+
+
+@pytest.mark.parametrize("mode", ["malformed_submit", "malformed_poll"])
+def test_malformed_paddle_response_is_per_image_failure_not_batch_abort(
+    tmp_path: Path, mode: str
+):
+    # H12: a 200 response with a malformed schema (missing data.jobId / resultUrl)
+    # must normalize to a per-image failure, not escape as KeyError/TypeError and
+    # abort the whole batch before compile.
+    workspace = OcrWorkspace(tmp_path, mode=mode)
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+    envelope = workspace.ocr_envelope()
+    assert envelope["status"] == "partial"
+    assert envelope["counts"]["failed"] == 1
+    failures = [
+        a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == "OCR_FAILED"
+    ]
+    assert len(failures) == 1
+
+
+def test_partial_ocr_records_partial_canonical_step_status(tmp_path: Path):
+    # MEDIUM19: a document with one success and one failure must record steps.ocr
+    # partial, matching ocr.json, not disguise partial execution as completed.
+    workspace = OcrWorkspace(
+        tmp_path, mode="isolation", image_urls=[IMAGE_URL, SECOND_IMAGE_URL]
+    )
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+    counts = workspace.ocr_envelope()["counts"]
+    assert counts["success"] == 1
+    assert counts["failed"] == 1
+    state = read_json(workspace.corpus / ".sync-state.json")
+    step = state["books"]["fund"]["documents"]["2"]["steps"]["ocr"]
+    assert step["status"] == "partial"
+
+
+def test_failed_ocr_anomaly_preserves_image_bytes_for_recovery(tmp_path: Path):
+    # MEDIUM15: a recognition failure after preparation must reference the available
+    # original/prepared bytes so archive_anomalies persists them durably before wash
+    # cleanup deletes the run workspace.
+    workspace = OcrWorkspace(tmp_path, mode="fail")
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+    failures = [
+        a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == "OCR_FAILED"
+    ]
+    assert len(failures) == 1
+    inputs = failures[0]["necessary_inputs"]
+    kinds = {row["kind"] for row in inputs}
+    assert {"original_image", "prepared_image"} <= kinds
+    for row in inputs:
+        path = Path(row["path"])
+        assert path.is_file()
+        # The durable copy lives in the results store, not the cleanable wash run.
+        assert path.is_relative_to(workspace.root / "sync-results")
+
+
+def test_changed_image_failed_reocr_does_not_publish_stale_text(tmp_path: Path):
+    # H2/H8: a same-URL image whose content changed and whose re-OCR failed must not
+    # keep exposing its previous success. When the document enters compile (body
+    # delta), the stale text must NOT be published and a missing item is recorded.
+    workspace = OcrCompileWorkspace(tmp_path, mode="success")
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["1"]["body"] = (
+        "# One\n\nRule v1.\n\n![img](https://cdn.example.invalid/a.png)\n"
+    )
+    remote["details"]["2"]["body"] = "body 2\n"
+    write_json(workspace.root / "remote.json", remote)
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    graph1 = workspace.state()["books"]["fund"]["documents"]["1"]["graph"]
+    assert (
+        graph1["ocr"]["images"][0]["resource_id"] == "https://cdn.example.invalid/a.png"
+    )
+    assert graph1["ocr"]["images"][0]["status"] == "success"
+
+    # Same URL, changed bytes, body delta forces compile, re-OCR fails.
+    workspace.write_image(20)
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["1"]["body"] = (
+        "# One\n\nA completely different settlement policy applies now.\n\n"
+        "![img](https://cdn.example.invalid/a.png)\n"
+    )
+    write_json(workspace.root / "remote.json", remote)
+    workspace.bump_version(1, "2026-11-11T10:00:00+08:00")
+    workspace.set_mode("fail")
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run2 = workspace.latest_run()
+    assert workspace.ocr_envelope(run2)["counts"]["failed"] == 1
+    graph2 = workspace.state()["books"]["fund"]["documents"]["1"]["graph"]
+    row = next(
+        r
+        for r in graph2["ocr"]["images"]
+        if r["resource_id"] == "https://cdn.example.invalid/a.png"
+    )
+    assert row["status"] != "success"
+    report = workspace.compile_report(run2)
+    doc1 = next(r for r in report["results"] if r["document_id"] == 1)
+    missing = doc1["execution"]["missing_items"]
+    assert any(m["resource_id"] == "https://cdn.example.invalid/a.png" for m in missing)
+    frozen = (run2 / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" not in frozen
+
+
+def test_cache_hit_on_resume_registers_followup_when_published_source_lacks_artifact(
+    tmp_path: Path,
+):
+    # MEDIUM4: an interrupt AFTER persist_success + graph.ocr merge but BEFORE
+    # follow-up registration leaves the artifact in the durable cache while the
+    # published source lacks it and no follow-up exists. Resuming re-runs OCR as a
+    # cache hit (reused); the registration delta must be measured against the
+    # published input, not against whether this run made a fresh request, so the
+    # follow-up is still registered and compile republishes the new image text.
+    workspace = OcrCompileWorkspace(tmp_path, mode="crash_register")
+    workspace.reuse_doc_one_with_changed_image()
+
+    first = workspace.sync()
+    assert first.returncode == 130, first.stderr
+    run1 = workspace.latest_run()
+    # The artifact is durable and the graph holds the success, but registration
+    # never ran: no follow-up was recorded and compile never published doc One.
+    cached = sorted(workspace.ocr_cache.glob("fund/*/artifact.md"))
+    assert len(cached) == 1
+    assert "OCR output line" in cached[0].read_text(encoding="utf-8")
+    assert (
+        workspace.state()["books"]["fund"]["documents"]["1"]["graph"]["ocr"]["images"][
+            0
+        ]["status"]
+        == "success"
+    )
+    assert not [
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    ]
+
+    workspace.set_mode("success")
+    second = workspace.sync("--resume", run1.name)
+    assert second.returncode == 0, second.stderr
+    # OCR re-ran as a cache hit (no second billable submission) and the fix
+    # registered the follow-up the interrupted batch never recorded.
+    assert workspace.ocr_envelope(run1)["counts"]["reused"] == 1
+    assert workspace.submissions() == 1
+    report = workspace.compile_report(run1)
+    assert 1 in {r["document_id"] for r in report["results"]}
+    frozen = (run1 / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" in frozen
+    doc1 = [
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    ]
+    assert len(doc1) == 1
+    assert doc1[0]["status"] == "done"

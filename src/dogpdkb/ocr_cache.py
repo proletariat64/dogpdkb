@@ -21,7 +21,7 @@ from mdcompare.ocr import CONTRACT
 from mdcompare.prepared_image import is_prepared_jpeg
 from mdocr import __version__ as MDOCR_VERSION
 from mdocr.paddle import _MODEL
-from mdocr.prepare import JPEG_QUALITY
+from mdocr.prepare import JPEG_QUALITY, ImageError
 
 #: Normalized processing identity; reuse requires old/new to match exactly.
 PREPROCESSING = {"name": "mdocr", "version": MDOCR_VERSION}
@@ -108,6 +108,8 @@ def persist_success(
     original = entry / original_name
     prepared = entry / "prepared.jpg"
     artifact = entry / "artifact.md"
+    if not _canonical_artifact(artifact_text, prepared, artifact):
+        raise ImageError("OCR artifact failed structural validation")
     _write_bytes(original, original_bytes)
     _write_bytes(prepared, prepared_bytes)
     _write_bytes(artifact, artifact_text.encode("utf-8"))

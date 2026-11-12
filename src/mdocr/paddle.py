@@ -79,6 +79,10 @@ def _text_only(markdown: str) -> str:
 
 
 def _extract_markdown(payload: dict[str, Any]) -> str:
+    if not isinstance(payload, dict):
+        # ValueError, not TypeError: the OCR per-image handler catches ValueError
+        # so a malformed result line fails one image instead of aborting the batch.
+        raise ValueError("result line was not a JSON object")  # noqa: TRY004
     blocks: list[str] = []
     result = payload.get("result", payload)
     pages = result.get("layoutParsingResults", []) if isinstance(result, dict) else []
@@ -175,17 +179,35 @@ class PaddleClient:
                 data=payload,
                 files={"file": (image_path.name, stream)},
             )
-        return response.json()["data"]["jobId"]
+        try:
+            job_id = response.json()["data"]["jobId"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "malformed PaddleOCR submit response: missing data.jobId"
+            ) from exc
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError("malformed PaddleOCR submit response: empty data.jobId")
+        return job_id
 
     def _poll(self, job_id: str) -> str:
         deadline = time.monotonic() + _JOB_TIMEOUT
         while time.monotonic() < deadline:
-            payload = self._request(
-                "GET", f"{_JOB_URL}/{job_id}", headers=self.headers
-            ).json()["data"]
-            state = payload["state"]
+            try:
+                payload = self._request(
+                    "GET", f"{_JOB_URL}/{job_id}", headers=self.headers
+                ).json()["data"]
+                state = payload["state"]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "malformed PaddleOCR job response: missing data.state"
+                ) from exc
             if state == "done":
-                url = payload["resultUrl"]["jsonUrl"]
+                try:
+                    url = payload["resultUrl"]["jsonUrl"]
+                except (KeyError, TypeError) as exc:
+                    raise ValueError(
+                        "malformed PaddleOCR job response: missing resultUrl.jsonUrl"
+                    ) from exc
                 result = self._request("GET", url).text
                 return _text_only(_parse_result_jsonl(result))
             if state == "failed":

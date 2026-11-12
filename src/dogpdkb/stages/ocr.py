@@ -30,7 +30,12 @@ from dogpdkb.ocr_cache import (
     verify_reuse,
 )
 from dogpdkb.stages.plan import PLAN_SCHEMA
-from dogpdkb.sync_results import archive_anomalies, register_compile_followup
+from dogpdkb.sync_results import (
+    archive_anomalies,
+    followup_id,
+    load_followups,
+    register_compile_followup,
+)
 from dogpdkb.sync_run import read_json
 from dogpdkb.sync_stages import StageContext, StageFailed, StageResult
 from dogpdkb.sync_time import now_iso
@@ -91,7 +96,10 @@ def _prepare(
 
 
 def _merge_graph_ocr(
-    state: dict[str, Any], doc_id: str, images: list[dict[str, Any]]
+    state: dict[str, Any],
+    doc_id: str,
+    images: list[dict[str, Any]],
+    tombstones: list[dict[str, Any]] = (),
 ) -> None:
     record = state["documents"].setdefault(
         doc_id,
@@ -111,9 +119,14 @@ def _merge_graph_ocr(
                 merged[row["resource_id"]] = row
     for row in images:
         merged[row["resource_id"]] = row
+    # A planned image that did not succeed this batch must not keep exposing its
+    # previous success: tombstone it so compile keeps the reference and records a
+    # missing item instead of publishing stale text for changed content.
+    for row in tombstones:
+        merged[row["resource_id"]] = row
     graph["ocr"] = document_evidence(list(merged.values()))
     record.setdefault("steps", {})["ocr"] = {
-        "status": "completed",
+        "status": "partial" if tombstones else "completed",
         "recorded_at": now_iso(),
     }
 
@@ -136,7 +149,6 @@ def handle(context: StageContext) -> StageResult:
                 "item": item,
                 "images": [],
                 "final_inputs": [],
-                "changed_inputs": [],
                 "missing": [],
             }
             order.append(doc_id)
@@ -173,8 +185,11 @@ def handle(context: StageContext) -> StageResult:
             }
             stop_index = index
             break
+        original_path: Path | None = None
+        prepared_path: Path | None = None
         try:
             data, name = _original_bytes(resource, session)
+            original_path = context.directory / "src" / str(item["document_id"]) / name
             prepared_path, prepared_bytes = _prepare(
                 context, item["document_id"], data, name
             )
@@ -224,7 +239,15 @@ def handle(context: StageContext) -> StageResult:
                     "reason": reason,
                 }
             )
-            fail_anomalies.append(_anomaly(item, resource, "OCR_FAILED", reason))
+            fail_anomalies.append(
+                _anomaly(
+                    item,
+                    resource,
+                    "OCR_FAILED",
+                    reason,
+                    necessary_inputs=_image_inputs(original_path, prepared_path),
+                )
+            )
             context.log.write(f"ocr failed for {resource_id}: {reason}")
             context.count(**counts)
             continue
@@ -236,10 +259,6 @@ def handle(context: StageContext) -> StageResult:
             "path": record["artifact"],
         }
         acc["final_inputs"].append(artifact_ref)
-        if not reused:
-            # A newly recognized image changes the compile input; a reused
-            # (unchanged, cache-hit) image does not.
-            acc["changed_inputs"].append(artifact_ref)
         context.count(**counts)
 
     # Everything from the stop onward was not executed: archive it as unfinished
@@ -283,30 +302,58 @@ def handle(context: StageContext) -> StageResult:
         with state_lock(state_path):
             state = _load_state(state_path, plan["book"])
             for row in documents:
-                if row["ocr"]["images"]:
+                acc = accs[row["document_id"]]
+                tombstones = [
+                    {
+                        "resource_id": m["resource_id"],
+                        "status": "failed" if m["code"] == "OCR_FAILED" else "pending",
+                    }
+                    for m in acc["missing"]
+                ]
+                if row["ocr"]["images"] or tombstones:
                     _merge_graph_ocr(
-                        state, str(row["document_id"]), row["ocr"]["images"]
+                        state,
+                        str(row["document_id"]),
+                        row["ocr"]["images"],
+                        tombstones,
                     )
             save_view(state_path, state)
 
-    # A body-reuse source keeps its published body knowledge, but a newly
-    # recognized image changes its compile input. Register follow-up compile work
-    # (the same machinery the post-hoc backfill path uses) so this batch's compile
-    # stage republishes the source with the new image text instead of leaving it
-    # silently stale. Reused (unchanged) images and OCR failures register nothing:
-    # no published input changed, so the old knowledge is kept.
+    # A body-reuse source keeps its published body knowledge, but an OCR artifact
+    # the published source does not yet contain changes its compile input. Register
+    # follow-up compile work (the same machinery the post-hoc backfill path uses)
+    # so this batch's compile stage republishes the source with the new image text.
+    # The delta is measured against the inputs of the consumed (done) follow-up at
+    # this version, NOT against whether this run made a fresh request: a cache hit
+    # on resume after an interrupted persist must still register when the published
+    # source lacks the artifact. A pending follow-up already covers the work.
     body_reuse_ids = {str(item["document_id"]) for item in plan.get("body_reuse") or []}
+    registry = load_followups(config, context.book.key)
     for doc_id in order:
         acc = accs[doc_id]
-        if str(doc_id) not in body_reuse_ids or not acc["changed_inputs"]:
+        if str(doc_id) not in body_reuse_ids or not acc["final_inputs"]:
+            continue
+        source_version = acc["item"].get("source_version")
+        existing = registry["followups"].get(
+            followup_id(context.book.key, doc_id, source_version)
+        )
+        if existing is not None and existing.get("status") == "pending":
+            continue
+        published = (
+            {row["path"] for row in existing.get("inputs", [])}
+            if existing is not None and existing.get("status") == "done"
+            else set()
+        )
+        changed = [row for row in acc["final_inputs"] if row["path"] not in published]
+        if not changed:
             continue
         register_compile_followup(
             config,
             context.book.key,
             document_id=doc_id,
-            source_version=acc["item"].get("source_version"),
+            source_version=source_version,
             reason="OCR changed a body-reuse source's compile input",
-            inputs=acc["changed_inputs"],
+            inputs=changed,
         )
 
     reference = {
@@ -352,8 +399,24 @@ def handle(context: StageContext) -> StageResult:
     )
 
 
+def _image_inputs(
+    original_path: Path | None, prepared_path: Path | None
+) -> list[dict[str, Any]]:
+    """Reference whatever original/prepared bytes exist so cleanup preserves them."""
+    inputs: list[dict[str, Any]] = []
+    if original_path is not None and original_path.is_file():
+        inputs.append({"kind": "original_image", "path": str(original_path)})
+    if prepared_path is not None and prepared_path.is_file():
+        inputs.append({"kind": "prepared_image", "path": str(prepared_path)})
+    return inputs
+
+
 def _anomaly(
-    item: dict[str, Any], resource: dict[str, Any], code: str, reason: str
+    item: dict[str, Any],
+    resource: dict[str, Any],
+    code: str,
+    reason: str,
+    necessary_inputs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return {
         "stage": "ocr",
@@ -364,7 +427,7 @@ def _anomaly(
         "reason": reason,
         "resource_id": resource["resource_id"],
         "image": {"resource_id": resource["resource_id"], "url": resource.get("url")},
-        "necessary_inputs": [],
+        "necessary_inputs": list(necessary_inputs or []),
     }
 
 
