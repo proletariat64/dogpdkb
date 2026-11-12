@@ -160,14 +160,25 @@ def clone_run(source: Path, target: Path, **changes: Any) -> Path:
 
 
 def archive_clone(workspace: Workspace, run: Path) -> Path:
-    """Give a constructed run the durable result a real finish would archive."""
+    """Give a constructed run the durable result a real finish would archive.
+
+    A real finish archives the run's own terminal status and ended_at, so the
+    clone's result must reflect its run.json rather than the copied source's
+    earlier pause; otherwise it would be a stale archive, not a current final one.
+    """
     source = workspace.results / "runs" / f"{run.name}.json"
     if not source.is_file():
         existing = sorted((workspace.results / "runs").glob("*.json"))
         assert existing, "expected a durable batch result to copy"
         source = existing[0]
     payload = read_json(source)
-    payload.update(run_id=run.name, run_dir=str(run))
+    state = read_json(run / "run.json")
+    payload.update(
+        run_id=run.name,
+        run_dir=str(run),
+        status=state["status"],
+        ended_at=state.get("ended_at"),
+    )
     target = workspace.results / "runs" / f"{run.name}.json"
     write_json(target, payload)
     return target
@@ -251,6 +262,52 @@ def test_cleanup_defers_a_workspace_whose_result_is_not_archived(
     assert workspace.sync().returncode == 0
     assert not older.exists()
     assert actions(workspace)[older.name] == "removed"
+
+
+def test_cleanup_keeps_a_finished_run_whose_durable_result_is_stale_paused(
+    workspace: Workspace,
+):
+    """[8] A stale paused result is not a current final archive of a finished run.
+
+    Existence-only archive checking lets cleanup delete a finished run whose
+    durable result still describes an earlier pause, losing run-dir-only evidence
+    the stale result never captured. Cleanup must require a current final archive
+    (matching status/ended_at), not mere existence, before removing the work dir.
+    """
+    assert workspace.sync("--stop-after", "capture").returncode == 0
+    original = workspace.only_run()
+    # A finished run (run.json completed) ...
+    older = clone_run(
+        original,
+        original.parent / "run-20260101-000000",
+        status="completed",
+        ended_at="2026-01-01T00:00:10+08:00",
+    )
+    # ... whose durable result is STALE: still the paused archive, not a final one.
+    stale = read_json(workspace.results / "runs" / f"{original.name}.json")
+    assert stale["status"] == "paused"
+    stale.update(run_id=older.name, run_dir=str(older))
+    write_json(workspace.results / "runs" / f"{older.name}.json", stale)
+    # Run-dir-only evidence the stale paused result never captured.
+    evidence = older / "capture" / "snapshot.json"
+    assert evidence.is_file()
+    expected = evidence.read_bytes()
+
+    resumed = workspace.sync("--resume", original.name)
+    assert resumed.returncode == 0, resumed.stderr
+    assert json.loads(resumed.stdout.strip().splitlines()[-1])["status"] == "completed"
+
+    # The finished run is kept: its archive is stale, so cleanup must not delete it.
+    assert older.is_dir()
+    assert evidence.is_file()
+    assert evidence.read_bytes() == expected
+    row = next(
+        item
+        for item in cleanup_record(workspace)["runs"]
+        if item["run_id"] == older.name
+    )
+    assert row["action"] == "kept"
+    assert actions(workspace)[older.name] == "kept"
 
 
 def test_cleanup_failure_is_recorded_and_retried_without_failing_the_batch(

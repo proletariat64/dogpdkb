@@ -238,7 +238,12 @@ def publish_documents(
 ) -> dict[str, int]:
     # Only a validated complete OCR output may be published; a partial md/ left
     # by an interrupted prior OCR (no checkpoint entry) must fall back to raw.
-    checkpoint = ocr_dir.parent / "ocr-complete.json"
+    # The legacy executor wrote the checkpoint in run_ocr_with_resume's state_dir
+    # (staging/checkpoints) while ocr_dir is staging/md, so honor that historical
+    # location first and keep the flat path as a compatibility fallback.
+    checkpoint = ocr_dir.parent / "checkpoints" / "ocr-complete.json"
+    if not checkpoint.is_file():
+        checkpoint = ocr_dir.parent / "ocr-complete.json"
     completed: set[str] = set()
     if checkpoint.is_file():
         try:
