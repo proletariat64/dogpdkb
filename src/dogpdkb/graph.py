@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
+from dogpdkb.planning import reject_rollback
 from dogpdkb.processes import run_command
 from dogpdkb.records import Run, Store, atomic_json, read_json, version_key
 from dogpdkb.settings import load_config, select_book
@@ -53,6 +55,7 @@ def _manifest(settings, book, store, run, reference):
         if (
             version_key(current.get("version")) != version
             or Path(current.get("path", "")).resolve() != path.resolve()
+            or current.get("metadata", {}) != row.get("metadata", {})
         ):
             raise ValueError(
                 f"corpus version changed for {doc_id}; generate a new plan"
@@ -66,14 +69,7 @@ def _manifest(settings, book, store, run, reference):
             raise ValueError(
                 f"corpus input changed or missing for {doc_id}; generate a new plan"
             )
-        graph = document.get("graph", {})
-        if (
-            graph.get("status") == "completed"
-            and version_key(graph.get("version")) > version
-        ):
-            raise ValueError(
-                f"newer graph already published for {doc_id}; generate a new plan"
-            )
+        reject_rollback(store, [row])
     return data
 
 
@@ -178,6 +174,11 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
             and previous["status"] == "completed"
             and previous.get("run_id") == run.id
             and version_key(previous["version"]) == version_key(version)
+            and previous.get("action") == row["action"]
+            and previous.get("metadata") == row.get("metadata", {})
+            and Path(previous.get("input_copy", "")).is_file()
+            and Path(previous["input_copy"]).read_bytes()
+            == Path(row["path"]).read_bytes()
         ):
             continue
         pending.append(row)
@@ -257,7 +258,7 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
         item = {
             "source_id": source_id,
             "source_file": source_file,
-            "path": row["path"],
+            "path": row["input_copy"],
             "replace": old,
             "metadata": metadata,
             "action": action,
@@ -337,7 +338,16 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
         failed += source_failed
         doc_id = row["document_id"]
         status = result_row["status"]
+        acknowledgement = {}
         if status == "completed":
+            witness = run.directory / "graph-success" / f"{doc_id}.md"
+            witness.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(row["input_copy"], witness)
+            acknowledgement = {
+                "input_copy": str(witness),
+                "action": row["action"],
+                "metadata": row.get("metadata", {}),
+            }
             document = store.document(doc_id)
             document["graph"] = {
                 "status": "completed",
@@ -349,6 +359,7 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
             pending = document.get("pending")
             if (
                 pending
+                and pending.get("version") is not None
                 and not row.get("pending_steps")
                 and version_key(pending["version"]) == version_key(row["version"])
                 and pending.get("metadata")
@@ -364,6 +375,7 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
             run.id,
             report=str(report_path),
             reason=result_row.get("error"),
+            **acknowledgement,
         )
         if status == "failed":
             run.failure(

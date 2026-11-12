@@ -334,7 +334,11 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
-        source = select_book(config, args.book)
+        source = (
+            None
+            if args.input and args.output and args.book_url
+            else select_book(config, args.book)
+        )
     except ValueError as error:
         parser.error(str(error))
     args.input = args.input or source.corpus
@@ -352,7 +356,7 @@ def main(argv=None) -> None:
         args.input,
         graph,
         {
-            "name": args.book_name or source.name or source.url,
+            "name": args.book_name or (source.name if source else args.book_url),
             "url": args.book_url or source.url,
         },
         config,

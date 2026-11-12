@@ -1,8 +1,8 @@
 # dogpdkb CLI 编排器重写
 
-Status: ready-for-agent
+Status: implemented
 Date: 2026-11-12
-Scope: specification published; implementation not started
+Scope: implemented, independently reviewed, verified and delivered on rewrite/cli-orchestrator
 
 ## Problem Statement
 
@@ -202,11 +202,11 @@ Scope: specification published; implementation not started
 
 ## Further Notes
 
-- Q1–Q14 已确认，状态为 ready-for-agent。当前交付是本地 tracker 中的规格，不是重写、工具升级或真实运行验收已经完成的声明。
+- Q1–Q14 已确认；本规格现已在 rewrite/cli-orchestrator 实现并通过仓库与隔离安装验收。各票据已结案，实际证据见 [acceptance](acceptance.md)，审查处置见 [review](review.md)。付费处理、生产运行、上游发布与全局安装未执行。
 - [研究证据与当前模块删改映射](research.md) 保留现场规模、CLI 能力核验、历史规格冲突和具体文件映射，作为实施定位附件；本规格按职责描述合同，不绑定内部文件布局。
 - 对本次重写覆盖的行为，当前已确认合同优先于旧日常同步、状态迁移和无人值守规格。产品决策已收敛，工具公开合同的核实/补齐是实施前置任务。
 - 行数是职责规模约束，不能以削弱真实版本、失败保旧、输入完整性或公开 CLI 边界来达标，也不能借保留无关兼容使规模失控。
-- 实施时保留当前未提交修改与运行数据；本次发布只整理本功能的规格和研究附件。
+- 实施保留原 checkout 未提交修改与运行数据。规格发布阶段仅整理本功能附件；后续 `$implement-spec` 授权的实现与验证独立记录在本目录票据和验收记录。
 
 ## Comments
 
@@ -215,3 +215,5 @@ Scope: specification published; implementation not started
 - Q9–Q12：用户回复 all yes，确认 apply 独立更新语料、计划固定且不得回退新版本、缺席只记录、保留现有语料/图谱起点及原增量语义。
 - Q13–Q14：用户回复 all yes，确认 status/run/json/watch、只使用公开进度、整批顺序、计划检查点和工具自管内部并发；确认规格定稿但不启动实现。
 - 本次通过 to-spec 模板整理并发布；已确认的 CLI 黑盒测试边界沿用，不重新访谈。
+
+- 2026-11-12 用户随后调用 `$implement-spec`，授权按本规格实施；2026-11-13 最终仓库检查、独立审查修复与隔离安装验证完成，全部八张票据结案。

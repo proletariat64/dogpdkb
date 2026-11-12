@@ -31,3 +31,7 @@ CLI 黑盒 TDD真实Markdown；discover零正文下载，完整清单失败不�
   file modification time to break same-second run timestamp ties.
 - Core four tests also pass (14 total), Ruff and diff checks pass. No live
   gateway, production data, OCR or graph extraction was invoked.
+
+## Answer
+
+完整观察、首次截止、已有来源版本/同日判定和后续快照差分已完成；缺席仅记录，不下载正文、不回填历史。CLI 验收含不完整清单拒绝与 init-state 起点，见 [contract](../../../docs/orchestrator-discover-contract.md) 和 [acceptance](../acceptance.md)。

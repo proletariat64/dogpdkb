@@ -153,4 +153,11 @@ def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] in {"update", "uninstall"}:
         return locked_main(_main)(arguments)
-    return _main(arguments)
+    from dogpdkb.lifecycle import runtime_lock
+
+    try:
+        with runtime_lock():
+            return _main(arguments)
+    except ValueError as error:
+        print(f"dogpdkb: {error}", file=sys.stderr)
+        return 1

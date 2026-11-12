@@ -97,6 +97,7 @@ def fixture(tmp_path):
                         "path": str(source),
                         "version": VERSION,
                         "input_copy": str(witness),
+                        "metadata": document["metadata"],
                     },
                 }
             },
@@ -175,7 +176,7 @@ def test_complete_source_calls_only_public_graphify_and_records_success(tmp_path
     ]
     assert [row[0] for row in calls] == ["source-inventory", "update-sources"]
     request = json.loads(Path(calls[1][calls[1].index("--request") + 1]).read_text())
-    assert request["sources"][0]["path"] == str(source)
+    assert Path(request["sources"][0]["path"]).read_bytes() == source.read_bytes()
     assert request["sources"][0]["source_id"] == "funds:42"
     state = json.loads((tmp_path / "state/funds/state.json").read_text())["documents"][
         "42"
@@ -249,7 +250,7 @@ def test_reuse_without_successful_graph_version_compiles_complete_source(tmp_pat
     assert result.returncode == 0, result.stdout + result.stderr
     request = json.loads((manifest.parent / "graph/0/request.json").read_text())
     assert request["sources"][0]["action"] == "compile"
-    assert request["sources"][0]["path"] == str(source)
+    assert Path(request["sources"][0]["path"]).read_bytes() == source.read_bytes()
 
 
 @pytest.mark.parametrize(
@@ -291,7 +292,7 @@ def test_registered_baseline_reuse_requires_exact_inventory_and_version(
     assert result.returncode == 0, result.stdout + result.stderr
     request = json.loads((manifest.parent / "graph/0/request.json").read_text())
     assert request["sources"][0]["action"] == expected
-    assert request["sources"][0]["path"] == str(source)
+    assert Path(request["sources"][0]["path"]).read_bytes() == source.read_bytes()
 
 
 def test_success_keeps_a_newer_discovery_pending(tmp_path):
@@ -367,6 +368,7 @@ def test_partial_publication_advances_only_acknowledged_source(tmp_path):
             "path": second["path"],
             "version": VERSION,
             "input_copy": second["input_copy"],
+            "metadata": second["metadata"],
         },
     }
     write(state_path, state)
@@ -401,6 +403,7 @@ def test_interrupt_marks_only_launched_source_unknown(tmp_path):
             "path": second["path"],
             "version": VERSION,
             "input_copy": second["input_copy"],
+            "metadata": second["metadata"],
         },
     }
     write(state_path, state)
@@ -426,9 +429,40 @@ def test_old_manifest_cannot_replace_a_newer_successful_graph(tmp_path):
     write(state_path, data)
     result = cli(config, manifest)
     assert result.returncode == 1
-    assert "newer graph already published" in result.stderr
+    assert "newer graph version exists" in result.stderr
     assert not (tmp_path / "calls.jsonl").exists()
     assert json.loads(state_path.read_text())["documents"]["42"]["graph"] == graph
+
+
+@pytest.mark.parametrize("current_graph, expected", [("v2", 0), ("v11", 1)])
+def test_opaque_graph_versions_use_frozen_success_facts(
+    tmp_path, current_graph, expected
+):
+    config, manifest, _source = fixture(tmp_path)
+    data = json.loads(manifest.read_text())
+    data["documents"][0].update(
+        version={"value": "v10"},
+        previous_graph={"status": "completed", "version": {"value": "v2"}},
+    )
+    write(manifest, data)
+    state_path = tmp_path / "state/funds/state.json"
+    state = json.loads(state_path.read_text())
+    document = state["documents"]["42"]
+    document["corpus"]["version"] = {"value": "v10"}
+    document["graph"] = {
+        "status": "completed",
+        "version": {"value": current_graph},
+    }
+    write(state_path, state)
+    result = cli(config, manifest)
+    assert result.returncode == expected, result.stdout + result.stderr
+    if expected == 0:
+        assert json.loads(state_path.read_text())["documents"]["42"]["graph"][
+            "version"
+        ] == {"value": "v10"}
+    else:
+        assert "generate a new plan" in result.stderr
+        assert not (tmp_path / "calls.jsonl").exists()
 
 
 def test_graph_success_keeps_never_started_ocr_pending(tmp_path):
@@ -443,3 +477,40 @@ def test_graph_success_keeps_never_started_ocr_pending(tmp_path):
     ]["42"]
     assert document["graph"]["version"] == VERSION
     assert document["pending"]["version"] == VERSION
+
+
+def test_changed_input_in_same_run_and_version_is_compiled_again(tmp_path):
+    config, manifest, source = fixture(tmp_path)
+    assert cli(config, manifest).returncode == 0
+    before = (tmp_path / "calls.jsonl").read_text().splitlines()
+    source.write_text("Full source with newly completed OCR.\n")
+    data = json.loads(manifest.read_text())
+    Path(data["documents"][0]["input_copy"]).write_bytes(source.read_bytes())
+    assert cli(config, manifest).returncode == 0
+    calls = (tmp_path / "calls.jsonl").read_text().splitlines()
+    assert len(calls) == len(before) + 2
+
+
+def test_unknown_pending_version_does_not_lose_acknowledged_graph_success(tmp_path):
+    config, manifest, _source = fixture(tmp_path)
+    state_path = tmp_path / "state/funds/state.json"
+    data = json.loads(state_path.read_text())
+    data["documents"]["42"]["pending"]["version"] = None
+    write(state_path, data)
+    result = cli(config, manifest)
+    assert result.returncode == 0, result.stdout + result.stderr
+    document = json.loads(state_path.read_text())["documents"]["42"]
+    assert document["graph"]["version"] == VERSION
+    assert document["pending"]["version"] is None
+
+
+def test_superseded_metadata_manifest_is_refused(tmp_path):
+    config, manifest, _source = fixture(tmp_path)
+    state_path = tmp_path / "state/funds/state.json"
+    state = json.loads(state_path.read_text())
+    state["documents"]["42"]["corpus"]["metadata"] = {"logical_path": "New folder"}
+    write(state_path, state)
+    result = cli(config, manifest)
+    assert result.returncode == 1
+    assert "generate a new plan" in result.stderr
+    assert not (tmp_path / "calls.jsonl").exists()

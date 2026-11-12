@@ -3,6 +3,8 @@
 import fcntl
 import io
 import os
+import subprocess
+import sys
 from http.client import HTTPMessage
 from pathlib import Path
 from urllib.request import Request
@@ -63,6 +65,48 @@ def test_lock_blocks_uninstall_and_installer(managed):
         assert result.returncode != 0
         assert "Another installation operation" in result.stderr
     assert managed.version() == "dogpdkb 0.1.0"
+
+
+def test_active_cli_blocks_installer_removal(managed, tmp_path):
+    from tests.test_orchestrator_operations_cli import config, line
+
+    tool = tmp_path / "slow.py"
+    tool.write_text(
+        'import time\nprint("runtime active", flush=True)\ntime.sleep(30)\n'
+    )
+    settings = config(tmp_path / "runtime", tool=tool)
+    environment = (managed.prefix / "current").resolve()
+    launcher = (
+        "import sys;sys.prefix=sys.argv.pop(1);"
+        "from dogpdkb.cli import main;raise SystemExit(main())"
+    )
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            launcher,
+            str(environment),
+            "doctor",
+            "--config",
+            str(settings),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+        },
+    )
+    try:
+        assert "runtime active" in line(process.stderr)
+        result = managed.run("0.1.1")
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "Another installation operation" in result.stderr
+        assert environment.is_dir()
+    finally:
+        process.terminate()
+        process.communicate(timeout=5)
 
 
 def test_unmanaged_interpreter_is_refused(monkeypatch, tmp_path):

@@ -25,3 +25,7 @@ Spec: ../spec.md
 - Durable graph versions advance only on acknowledged publication; failed/unknown versions remain quarantined. Interrupted current sources are unknown; later unstarted sources retain pending work and have no graph attempt. Reuse requires verified graph baseline and metadata acknowledgement. Input witnesses prevent stale manifest execution; pending clears only for matching version/metadata with no unstarted OCR step.
 - Merged integration05 `7f6be0312d59c385680afb17196ed1474c517dc6`; joint public CLI tests: 44 passed (12 graph, 13 apply/sync, 14 core/discover, 5 Web). Focused Ruff/format and diff checks pass; graph refreshed and changes analyzed against origin/master.
 - Boundary test confirms zero foreign imports in src/dogpdkb. Full runtime guard currently has only two violations in old `scripts/smoke_install.py`; deleting those embedded foreign imports is ticket07 scope and the only remaining guard dependency. Root explicitly authorized landing06 before07 to avoid an integration cycle. Full repository gates/install proof remain07.
+
+## Answer
+
+Graphify 薄适配、直接入口和状态监控已切换，旧执行器/内部工具算法/重复状态与清理平台已删除。保留独立 Web/lifecycle。最终守卫含 smoke 脚本零越界，真实 graph 内容保持不透明；见 [graph contract](../../../docs/orchestrator-graph-contract.md) 和 [acceptance](../acceptance.md)。

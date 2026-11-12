@@ -26,3 +26,7 @@ Spec: ../spec.md
 - 合并 04 integration 后 32 项相关 CLI 检查通过（13 apply + 10 discover + 4 core + 5 mdocr batch）；ruff、diff-check 通过，图索引更新并对 `origin/master` 分析。只调用公开 CLI，不导入工具运行时；真实 OCR/Graphify、安装验证与生产验收未执行。
 - 每阶段内部按来源串行 CLI，只在真正调用当前来源前记 attempt。共享 OCR 停止后的未启动来源保留 `pending_steps:["ocr"]`，图谱阶段不得清掉其 pending。Skylark 请求期限和 mdocr 在途期限由工具负责，无任意整批 +5 秒终止。
 - 06 提供 `dogpdkb.graph.run_graph` 后验证完整 sync 末段；本轮 sync 已验证与 discover/apply 共用运行记录并停在 plan，未假称 Graphify 集成已通过。
+
+## Answer
+
+唯一串行 apply/sync 已完成：整批下载、比较、固定计划、OCR、正式语料与 manifest。CLI 测试覆盖暂停/恢复、部分失败、版本抑制和未启动工作；最终审查补充了 OCR 期间输入变化拒绝。合同见 [apply](../../../docs/orchestrator-apply-contracts.md)，结果见 [acceptance](../acceptance.md)。

@@ -104,7 +104,7 @@ def paddle_service():
                 self.reply(
                     {
                         "data": {
-                            "state": "done",
+                            "state": state.get("poll_state", "done"),
                             "resultUrl": {
                                 "jsonUrl": f"http://127.0.0.1:{self.server.server_port}/result"
                             },
@@ -140,7 +140,7 @@ def test_batch_selects_images_and_reuses_success_without_token(tmp_path):
         assert state["posts"] == 1
         text = Path(row["output"]).read_text()
         assert text.count("Recognized knowledge") == 2
-        assert "![two](b.png)" in text
+        assert f"![two]({tmp_path / 'b.png'})" in text
         record = row["ocr"]["images"][0]
         assert record["status"] == "success"
         assert record["prepared_image"] in text
@@ -160,6 +160,65 @@ def test_batch_selects_images_and_reuses_success_without_token(tmp_path):
         assert result.returncode == 0, result.stderr
         assert report["documents"][0]["resources"][0]["status"] == "reused"
         assert state["posts"] == 1
+
+
+def test_retained_relative_images_still_resolve_after_output_moves(tmp_path):
+    image = tmp_path / "image.png"
+    Image.new("RGB", (8, 8), "red").save(image)
+    (tmp_path / "raw.md").write_text("Body\n![image](image.png)\n")
+    result, report = invoke(
+        tmp_path, [{"document_id": "doc", "path": "raw.md", "resources": []}]
+    )
+    assert result.returncode == 0, result.stderr
+    assert f"![image]({image})" in Path(report["documents"][0]["output"]).read_text()
+
+
+def test_preserved_ocr_block_keeps_image_reference_when_output_moves(tmp_path):
+    image = tmp_path / "prepared.jpg"
+    Image.new("RGB", (8, 8), "red").save(image)
+    (tmp_path / "raw.md").write_text(
+        '<!-- mdocr:ocr-begin source="prepared.jpg" -->\n\nPrior recognized text\n\n'
+        "> Original image: [prepared.jpg](prepared.jpg)\n\n<!-- mdocr:ocr-end -->"
+    )
+    result, report = invoke(
+        tmp_path, [{"document_id": "doc", "path": "raw.md", "resources": []}]
+    )
+    assert result.returncode == 0, result.stderr
+    output = Path(report["documents"][0]["output"]).read_text()
+    assert f'source="{image}"' in output
+    assert f"]({image})" in output
+    assert "Prior recognized text" in output
+
+
+def test_report_cannot_overwrite_unselected_local_image(tmp_path):
+    image = tmp_path / "image.png"
+    Image.new("RGB", (8, 8), "red").save(image)
+    original = image.read_bytes()
+    (tmp_path / "raw.md").write_text("Body\n![image](image.png)\n")
+    result, _report = invoke(
+        tmp_path,
+        [{"document_id": "doc", "path": "raw.md", "resources": []}],
+        "--report",
+        str(image),
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert image.read_bytes() == original
+
+
+def test_malformed_provider_state_is_reported_as_failure(tmp_path):
+    Image.new("RGB", (8, 8), "red").save(tmp_path / "image.png")
+    (tmp_path / "raw.md").write_text("Body\n![image](image.png)\n")
+    with paddle_service() as (endpoint, state):
+        state["poll_state"] = []
+        result, report = invoke(
+            tmp_path,
+            [{"document_id": "doc", "path": "raw.md"}],
+            "--endpoint",
+            endpoint,
+            token="local-test-only",
+        )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert report["documents"][0]["resources"][0]["status"] == "failed"
 
 
 def test_batch_shared_auth_failure_stops_new_calls_and_retry_uses_only_successes(

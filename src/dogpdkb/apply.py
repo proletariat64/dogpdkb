@@ -17,6 +17,8 @@ from dogpdkb.planning import (
     make_plan,
     reject_rollback,
     same_version,
+    validate_inputs,
+    validate_plan,
 )
 from dogpdkb.processes import diagnostic_argv, run_command
 from dogpdkb.records import Run, Store, atomic_json, read_json, version_key
@@ -70,11 +72,37 @@ def prepare_inputs(settings, book, store, run, differences):
         raise ValueError("difference source IDs must be unique and nonempty")
     atomic_json(run.directory / "differences.json", differences)
     run.data["artifacts"]["differences"] = str(run.directory / "differences.json")
+    prepared_path = run.directory / "prepared-inputs.json"
+    prepared = read_json(prepared_path) if prepared_path.exists() else {}
+    validate_inputs(prepared.values(), check_baseline=True)
+
+    def freeze_input(row):
+        identifier = row["document_id"]
+        if identifier not in prepared:
+            witness = run.directory / "plan-inputs" / f"{row['slot']}.md"
+            witness.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(row["raw_path"], witness)
+            row["input_copy"] = str(witness)
+            baseline = row["baseline"].get("path")
+            if baseline and Path(baseline).is_file():
+                expected = run.directory / "baseline-inputs" / f"{row['slot']}.md"
+                expected.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(baseline, expected)
+                row["baseline_input_copy"] = str(expected)
+            prepared[identifier] = row
+            atomic_json(prepared_path, prepared)
+            run.data["artifacts"]["prepared_inputs"] = str(prepared_path)
+            run.save()
+
     rows, requests = [], []
     for index, selected_row in enumerate(selected):
         row = dict(selected_row)
         row["slot"] = index
         identifier = row["document_id"] = str(row["document_id"])
+        if identifier in prepared:
+            reject_rollback(store, [prepared[identifier]])
+            rows.append(prepared[identifier])
+            continue
         try:
             version_key(row.get("version"))
         except ValueError:
@@ -100,6 +128,7 @@ def prepare_inputs(settings, book, store, run, differences):
             and previous.get("metadata") == desired_metadata
         ):
             row["raw_path"] = str(existing.resolve())
+            freeze_input(row)
         elif store.suppressed(identifier, "export", row["version"]):
             failure(run, row, "export", "VERSION_ATTEMPT_SUPPRESSED")
             continue
@@ -183,6 +212,7 @@ def prepare_inputs(settings, book, store, run, differences):
                     "metadata": descriptor(book, row, row["raw_path"])["metadata"],
                 }
                 store.save()
+                freeze_input(row)
                 kept.add(row["document_id"])
             else:
                 failure(
@@ -196,17 +226,6 @@ def prepare_inputs(settings, book, store, run, differences):
             if code not in {0, 2}:
                 raise ValueError(f"Skylark export unavailable ({code}); see {report}")
         rows = [row for row in rows if row["document_id"] in kept]
-    for index, row in enumerate(rows):
-        witness = run.directory / "plan-inputs" / f"{index}.md"
-        witness.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(row["raw_path"], witness)
-        row["input_copy"] = str(witness)
-        baseline = row["baseline"].get("path")
-        if baseline and Path(baseline).is_file():
-            expected = run.directory / "baseline-inputs" / f"{index}.md"
-            expected.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(baseline, expected)
-            row["baseline_input_copy"] = str(expected)
     return rows
 
 
@@ -336,9 +355,15 @@ def ocr_inputs(settings, book, store, run, rows):
     results, stop = {}, None
     deadline = time.monotonic() + settings.ocr_budget_seconds
     for index, row in enumerate(rows):
+        validate_inputs([row])
         identifier, version = row["document_id"], row["version"]
         previous = store.step(identifier, "ocr")
-        if previous and same_version(previous["version"], version):
+        if (
+            previous
+            and previous.get("status") in {"completed", "failed"}
+            and previous.get("exit_code") in {0, 2}
+            and same_version(previous["version"], version)
+        ):
             try:
                 request = read_json(Path(previous["input"]))
                 old_input = next(
@@ -349,6 +374,10 @@ def ocr_inputs(settings, book, store, run, rows):
                 if Path(old_input).read_bytes() != Path(row["raw_path"]).read_bytes():
                     raise ValueError("OCR input changed")
                 report = read_json(Path(previous["report"]))
+                if report.get("schema_version") != "mdocr-batch-1.0":
+                    raise ValueError("unreliable historical OCR report")
+                if len(report["documents"]) != 1:
+                    raise ValueError("historical OCR source mismatch")
                 match = next(
                     r
                     for r in report["documents"]
@@ -365,7 +394,7 @@ def ocr_inputs(settings, book, store, run, rows):
                             report=previous["report"],
                         )
                     continue
-            except (ValueError, KeyError, TypeError, StopIteration):
+            except (OSError, ValueError, KeyError, TypeError, StopIteration):
                 pass
         if store.suppressed(identifier, "ocr", version):
             failure(run, row, "ocr", "VERSION_ATTEMPT_SUPPRESSED")
@@ -414,6 +443,21 @@ def ocr_inputs(settings, book, store, run, rows):
                 remaining,
             ],
         )
+        try:
+            validate_inputs([row])
+        except ValueError:
+            store.complete(
+                identifier,
+                "ocr",
+                version,
+                "unknown",
+                run.id,
+                report=str(report),
+                input=str(request),
+                exit_code=code,
+            )
+            failure(run, row, "ocr", "PLAN_INPUT_CHANGED", report=str(report))
+            raise
         result = {}
         try:
             payload = read_json(report)
@@ -524,6 +568,7 @@ def publish_corpus(book, store, run, rows, results):
                 **document,
                 "document_id": identifier,
                 "action": action,
+                "previous_graph": row["previous_graph"],
                 "baseline_version": row["baseline"].get("version"),
                 "pending_metadata": row.get("metadata", {}),
                 "pending_steps": ["ocr"]
@@ -588,8 +633,6 @@ def apply_run(
     if stop_after == "plan":
         run.finish("paused")
         return {"exit_code": 0, "paused": True, "manifest": None}
-    from dogpdkb.planning import validate_plan
-
     validate_plan(
         plan,
         book,
@@ -597,6 +640,12 @@ def apply_run(
         check_baseline=not run.data.get("artifacts", {}).get("manifest"),
     )
     results = ocr_inputs(settings, book, store, run, plan["documents"])
+    validate_plan(
+        plan,
+        book,
+        store,
+        check_baseline=not run.data.get("artifacts", {}).get("manifest"),
+    )
     manifest = publish_corpus(book, store, run, plan["documents"], results)
     partial = bool(run.data["failures"])
     if run.data["command"] != "sync":
@@ -668,15 +717,19 @@ def main(argv=None):
                 exit_code=None,
                 reason=None,
             )
-            result = apply_run(
-                settings,
-                book,
-                store,
-                run,
-                args.input,
-                stop_after=args.stop_after,
-                resume=bool(args.resume),
-            )
+            try:
+                result = apply_run(
+                    settings,
+                    book,
+                    store,
+                    run,
+                    args.input,
+                    stop_after=args.stop_after,
+                    resume=bool(args.resume),
+                )
+            except InterruptedError as error:
+                record_interruption(store, run, error.args[0])
+                return error.args[0]
             if not result["paused"]:
                 run.finish(
                     "partial" if result["exit_code"] == 2 else "completed",
@@ -684,11 +737,6 @@ def main(argv=None):
                 )
             print(json.dumps({**result, "run": str(run.path)}, ensure_ascii=False))
             return result["exit_code"]
-    except InterruptedError as error:
-        code = error.args[0]
-        if run:
-            record_interruption(store, run, code)
-        return code
     except (OSError, ValueError, KeyError, TypeError) as error:
         if run:
             run.finish("failed", 1, str(error))

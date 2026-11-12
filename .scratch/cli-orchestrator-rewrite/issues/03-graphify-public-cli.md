@@ -24,3 +24,7 @@ Spec: ../spec.md
 - Public `source-inventory` / `update-sources` contracts, 14 subprocess tests pass, including normal extraction/cache/failure through localhost provider; no paid calls or production graph writes.
 - Full reproducible patch and identity: `docs/upstream/graphify-source-update/`; invocation and source/install delivery: `docs/orchestrator-graphify-contract.md`.
 - Upstream release publication remains external; consumers select the independently patched CLI. No foreign runtime code was added to dogpdkb.
+
+## Answer
+
+独立 Graphify 提交 `ffd2eaf` 提供 source-inventory/update-sources，14 个公共子进程合同测试及补丁重放通过。可复现源码身份与补丁见 [upstream delivery](../../../docs/upstream/graphify-source-update/identity.json)，调用见 [contract](../../../docs/orchestrator-graphify-contract.md)。未全局安装、发布或写生产图谱。

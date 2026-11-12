@@ -7,6 +7,12 @@ stop_after=None, resume=False)` consumes a frozen discover difference object
 `stop_after="plan"` prepares all raw downloads and comparison reports, saves a
 fixed plan, and returns 0 without OCR or corpus writes. Resume uses the same run
 and validates its saved inputs; it never downloads missing plan inputs.
+Each raw input is checked against its saved byte copy before and after its OCR
+call, and all plan inputs are checked again before corpus publication. A changed
+in-flight OCR input records an unknown outcome and requires a new plan.
+`prepared-inputs.json` freezes each completed/reused download before comparison;
+pre-plan resume validates those inputs rather than overwriting their witnesses
+or downloading missing prepared content. Only unstarted exports proceed.
 
 Public CLI: `dogpdkb apply --config FILE [--book KEY] --input DIFFERENCES
 [--stop-after plan]`; resume: `--resume RUN` instead of --input.
@@ -52,9 +58,18 @@ contains the frozen raw discover metadata and controls acknowledgement together
 with the version. Export has no whole-batch timeout derived from Skylark's
 per-request timeout; Skylark owns request/retry limits. OCR consumes its explicit
 batch budget across serial documents.
+The orchestrator passes `resources: null`: mdocr owns image selection and checks
+its successful cache. An absent/unusable cache makes necessary OCR work eligible;
+an unchanged comparison report is not permission to discard old OCR silently.
+The orchestrator does not normalize a foreign tool's URL selector format.
 
 A plan freezes `previous_corpus` and `previous_graph`; a difference freezes its
-`local` facts. Resume accepts the requested success version or those exact
+`local` facts. The compile manifest carries `previous_graph` through to graph
+submission. Resume accepts the requested success version or those exact
 previous facts, and refuses another intervening success. Opaque versions are
-never lexically ordered. Timestamp ordering is used only when a manually supplied
-difference lacks frozen facts; an opaque update then requires fresh discovery.
+never lexically ordered. Timestamp ordering applies to chronologically meaningful
+versions; a manually supplied opaque update without frozen facts requires fresh
+discovery.
+Provably older timestamps are refused even with matching frozen facts. Day-only
+versions compare business dates in UTC+8, so same-day precise versions remain
+eligible for comparison.

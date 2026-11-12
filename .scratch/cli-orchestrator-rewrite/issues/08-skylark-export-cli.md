@@ -27,3 +27,7 @@ Supplement: reproduced null/false count wrongly becoming a complete empty listin
 Upstream now requires a real nonnegative integer total; null, boolean and string
 count subprocess regressions pass with no successful output. `npm test` and build
 pass at the updated upstream commit; complete patch and identity are refreshed.
+
+## Answer
+
+独立 Skylark 提交 `0e7c218` 提供完整 listing、普通正文与表格 export，工具内分页/渲染/资源引用处理；8 个网关场景、CLI 合同及非法总数回归通过。补丁与构建说明见 [contract](../../../docs/orchestrator-skylark-contract.md)。原 checkout 保留，未全局安装或进行生产请求。

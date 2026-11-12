@@ -5,14 +5,27 @@ import os
 import time
 from collections import Counter
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import requests
 
 from . import __version__
-from .markdown import transform_images
-from .ocr import _protect_existing_blocks, _restore_blocks, build_ocr_block
+from .markdown import iter_image_matches, render_image, transform_images
+from .ocr import (
+    _OCR_BLOCK_RE,
+    _protect_existing_blocks,
+    _restore_blocks,
+    build_ocr_block,
+)
 from .paddle import _MODEL, OcrSharedError, PaddleClient
 from .prepare import JPEG_QUALITY, ImageError, ImageSkip, prepare_one
+
+
+def _local_image_path(target, source):
+    parsed = urlsplit(target)
+    if not parsed.scheme and not parsed.netloc:
+        return (source.parent / unquote(parsed.path)).resolve()
+    return None
 
 
 def _documents(manifest: Path) -> list[dict]:
@@ -116,6 +129,7 @@ class Batch:
             ImageSkip,
             OSError,
             ValueError,
+            TypeError,
             RuntimeError,
             requests.RequestException,
         ):
@@ -178,6 +192,17 @@ class Batch:
         records = {}
         replacements = {}
         protected, placeholders = _protect_existing_blocks(text)
+        relocated = []
+        for marker, block in placeholders:
+            reference = _OCR_BLOCK_RE.fullmatch(block).group(1)
+            image = _local_image_path(reference, source)
+            if image is not None:
+                block = block.replace(f'source="{reference}"', f'source="{image}"', 1)
+                block = block.replace(
+                    f"> Original image: [{reference}]({reference})",
+                    f"> Original image: [{image}]({image})",
+                )
+            relocated.append((marker, block))
 
         def transform(ref):
             if ref.target not in records:
@@ -185,9 +210,14 @@ class Batch:
                 records[ref.target], replacements[ref.target] = self.resource(
                     ref, source, output, selected
                 )
-            return replacements[ref.target]
+            replacement = replacements[ref.target]
+            if replacement is None and not ref.is_remote and not ref.unsupported:
+                return render_image(
+                    ref.alt, str((source.parent / ref.target).resolve()), ref.title
+                )
+            return replacement
 
-        transformed, warnings, _ = transform_images(protected, transform)
+        transformed, warnings, errors = transform_images(protected, transform)
         if selection is not None:
             for target in selection:
                 if target not in records:
@@ -197,9 +227,10 @@ class Batch:
                         "reason": "RESOURCE_NOT_FOUND",
                     }
         return (
-            _restore_blocks(transformed, placeholders),
+            _restore_blocks(transformed, relocated),
             list(records.values()),
             warnings,
+            errors,
         )
 
 
@@ -212,6 +243,20 @@ def run_batch(args) -> int:
     protected = {args.manifest.resolve()} | {
         (args.manifest.parent / row["path"]).resolve() for row in documents
     }
+    for document in documents:
+        source = (args.manifest.parent / document["path"]).resolve()
+        try:
+            text = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        for _match, ref in iter_image_matches(text):
+            image = _local_image_path(ref.target, source)
+            if image is not None:
+                protected.add(image)
+        for block in _OCR_BLOCK_RE.finditer(text):
+            image = _local_image_path(block.group(1), source)
+            if image is not None:
+                protected.add(image)
     outputs = [
         (args.output_dir / str(i) / "document.md").resolve()
         for i in range(len(documents))
@@ -246,7 +291,7 @@ def run_batch(args) -> int:
             except (OSError, UnicodeError):
                 row["error"] = "DOCUMENT_READ_FAILED"
             else:
-                text, resources, warnings = batch.document(
+                text, resources, warnings, errors = batch.document(
                     text, source, output, document.get("resources")
                 )
                 atomic_write(output, text)
@@ -263,7 +308,7 @@ def run_batch(args) -> int:
                         )
                     resource.pop("text", None)
                 row["ocr"]["images"] = images
-                partial = any(
+                partial = bool(errors) or any(
                     r["status"] in {"failed", "unattempted"} for r in resources
                 )
                 row.update(
@@ -271,6 +316,7 @@ def run_batch(args) -> int:
                     status="partial" if partial else "completed",
                     resources=resources,
                     warnings=warnings,
+                    errors=errors,
                 )
             rows.append(row)
     finally:

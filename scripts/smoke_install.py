@@ -6,12 +6,17 @@ import argparse
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
+from subprocess import PIPE
+
+try:
+    from .process import run as run_process
+except ImportError:
+    from process import run as run_process
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -139,12 +144,13 @@ def smoke(dist: Path) -> None:
         env["XDG_STATE_HOME"] = str(work / "user-state")
 
         def run(args, expected=0):
-            result = subprocess.run(
+            result = run_process(
                 list(map(str, args)),
                 cwd=work,
                 env=env,
                 text=True,
-                capture_output=True,
+                stdout=PIPE,
+                stderr=PIPE,
                 timeout=180,
                 check=False,
             )

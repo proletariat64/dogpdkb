@@ -62,21 +62,20 @@ def main(argv=None):
                 exit_code=None,
                 reason=None,
             )
-            result = sync_run(
-                settings,
-                book,
-                store,
-                run,
-                stop_after=args.stop_after,
-                resume=bool(args.resume),
-            )
+            try:
+                result = sync_run(
+                    settings,
+                    book,
+                    store,
+                    run,
+                    stop_after=args.stop_after,
+                    resume=bool(args.resume),
+                )
+            except InterruptedError as error:
+                record_interruption(store, run, error.args[0])
+                return error.args[0]
             print(json.dumps({**result, "run": str(run.path)}, ensure_ascii=False))
             return result["exit_code"]
-    except InterruptedError as error:
-        code = error.args[0]
-        if run:
-            record_interruption(store, run, code)
-        return code
     except DiscoverError as error:
         code = error.exit_code
         if run:

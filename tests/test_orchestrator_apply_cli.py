@@ -414,6 +414,74 @@ raise SystemExit(2)
     assert state["documents"]["43"]["steps"]["ocr"]["status"] == "completed"
 
 
+@pytest.mark.parametrize("changed_document", [0, 1])
+def test_input_changed_during_ocr_is_refused_before_publication(
+    tmp_path, changed_document
+):
+    config, differences = instance(tmp_path)
+    two_sources(tmp_path, differences)
+    tool = tmp_path / "ocr_wait.py"
+    tool.write_text("""import json,sys,time
+from pathlib import Path
+root=Path(__file__).parent; args=sys.argv[1:]
+def option(name): return Path(args[args.index(name)+1])
+doc=json.loads(option('--manifest').read_text())['documents'][0]
+with (root/'ocr-calls').open('a') as log: log.write(doc['document_id']+'\\n')
+(root/'ocr-started').touch()
+deadline=time.monotonic()+5
+while not (root/'ocr-release').exists():
+ if time.monotonic()>deadline: raise SystemExit(1)
+ time.sleep(.01)
+output=option('--output-dir')/'document.md'; output.parent.mkdir(parents=True,exist_ok=True)
+output.write_bytes(Path(doc['path']).read_bytes())
+option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[]}]}))
+""")
+    config.write_text(
+        config.read_text().replace(
+            "mdocr=" + json.dumps([sys.executable, "-m", "mdocr.cli"]),
+            "mdocr=" + json.dumps([sys.executable, str(tool)]),
+        )
+    )
+    paused = cli(
+        "apply", "--config", config, "--input", differences, "--stop-after", "plan"
+    )
+    assert paused.returncode == 0, paused.stderr
+    run_path = json.loads(paused.stdout)["run"]
+    run = json.loads(Path(run_path).read_text())
+    plan = json.loads(Path(run["artifacts"]["plan"]).read_text())
+    with subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "dogpdkb",
+            "apply",
+            "--config",
+            str(config),
+            "--resume",
+            run_path,
+        ],
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as process:
+        deadline = time.monotonic() + 5
+        try:
+            while not (tmp_path / "ocr-started").exists():
+                assert time.monotonic() < deadline
+                time.sleep(0.02)
+            Path(plan["documents"][changed_document]["raw_path"]).write_text(
+                "Changed after frozen plan.\n"
+            )
+        finally:
+            (tmp_path / "ocr-release").touch()
+        _stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 1, stderr
+    assert "generate a new plan" in stderr
+    assert not list((tmp_path / "corpus").glob("*.md"))
+    assert (tmp_path / "ocr-calls").read_text().splitlines() == ["42"]
+
+
 def test_opaque_versions_advance_by_frozen_facts_and_old_plan_is_refused(tmp_path):
     config, differences = instance(tmp_path)
     data = json.loads(differences.read_text())
@@ -443,6 +511,102 @@ def test_opaque_versions_advance_by_frozen_facts_and_old_plan_is_refused(tmp_pat
         "newer corpus version" in stale.stderr
         or "changed corpus version" in stale.stderr
     )
+
+
+def test_frozen_success_facts_do_not_authorize_timestamp_rollback(tmp_path):
+    config, differences = instance(tmp_path)
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 0, first.stderr
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    selected = json.loads(differences.read_text())
+    selected["documents"][0].update(
+        local=state["documents"]["42"],
+        version={"value": "2026-11-11T10:00:00Z"},
+    )
+    differences.write_text(json.dumps(selected))
+    result = cli("apply", "--config", config, "--input", differences)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "newer corpus version" in result.stderr
+    assert (tmp_path / "events").read_text().splitlines() == ["export"]
+
+
+def test_registered_day_baseline_allows_same_local_day_timestamp(tmp_path):
+    config, differences = instance(tmp_path)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "Title-2026-11-12-[42].md").write_text("Previous body\n")
+    registered = cli("init-state", "--config", config)
+    assert registered.returncode == 0, registered.stderr
+    selected = json.loads(differences.read_text())
+    selected["documents"][0]["version"] = {
+        "value": "2026-11-12T01:00:00+08:00",
+        "utc": "2026-11-11T17:00:00+00:00",
+        "precision": "second",
+    }
+    differences.write_text(json.dumps(selected))
+    remote = json.loads((tmp_path / "remote.json").read_text())
+    remote["42"]["version"] = "2026-11-12T01:00:00+08:00"
+    (tmp_path / "remote.json").write_text(json.dumps(remote))
+    result = cli("apply", "--config", config, "--input", differences)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "events").read_text().splitlines() == ["export"]
+
+
+@pytest.mark.parametrize(
+    ("schema", "code"), [("unsupported", 0), ("mdocr-batch-1.0", 1)]
+)
+def test_unreliable_ocr_report_is_never_reused_as_success(tmp_path, schema, code):
+    config, differences = instance(tmp_path)
+    tool = tmp_path / "ocr_unreliable.py"
+    tool.write_text(
+        "import json,sys\nfrom pathlib import Path\na=sys.argv[1:]\n"
+        "def option(k): return Path(a[a.index(k)+1])\n"
+        "doc=json.loads(option('--manifest').read_text())['documents'][0]\n"
+        "out=option('--output-dir')/'output.md';out.parent.mkdir(parents=True,exist_ok=True)\n"
+        "out.write_text('UNRELIABLE OCR OUTPUT')\n"
+        f"option('--report').write_text(json.dumps({{'schema_version':{schema!r},'documents':[{{'document_id':doc['document_id'],'status':'completed','output':str(out)}}]}}))\n"
+        f"raise SystemExit({code})\n"
+    )
+    config.write_text(
+        config.read_text().replace(
+            "mdocr=" + json.dumps([sys.executable, "-m", "mdocr.cli"]),
+            "mdocr=" + json.dumps([sys.executable, str(tool)]),
+        )
+    )
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 2, first.stderr
+    second = cli("apply", "--config", config, "--input", differences)
+    assert second.returncode == 2, second.stdout + second.stderr
+    manifest = json.loads(Path(json.loads(second.stdout)["manifest"]).read_text())
+    assert "UNRELIABLE" not in Path(manifest["documents"][0]["path"]).read_text()
+
+
+def test_missing_historical_ocr_input_does_not_abort_fresh_apply(tmp_path):
+    config, differences = instance(tmp_path)
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 0, first.stderr
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    Path(state["documents"]["42"]["raw"]["path"]).unlink()
+    second = cli("apply", "--config", config, "--input", differences)
+    assert second.returncode == 0, second.stdout + second.stderr
+
+
+@pytest.mark.parametrize("suffix", ["#width=600", ""])
+def test_image_selection_is_owned_by_mdocr(tmp_path, monkeypatch, suffix):
+    from PIL import Image
+
+    monkeypatch.delenv("PADDLEOCR_TOKEN", raising=False)
+    config, differences = instance(tmp_path)
+    image = tmp_path / "image space.png"
+    Image.new("RGB", (8, 8), "red").save(image)
+    remote = json.loads((tmp_path / "remote.json").read_text())
+    remote["42"]["body"] += f"\n![image](../../../../image%20space.png{suffix})\n"
+    (tmp_path / "remote.json").write_text(json.dumps(remote))
+    result = cli("apply", "--config", config, "--input", differences)
+    assert result.returncode == 2, result.stderr
+    run = json.loads(Path(json.loads(result.stdout)["run"]).read_text())
+    report = json.loads(Path(run["artifacts"]["ocr_report"]).read_text())
+    assert report["documents"][0]["resources"][0]["reason"] == "OCR_AUTH_UNAVAILABLE"
 
 
 def test_resume_before_plan_keeps_original_scope_and_processes_unstarted_source(
@@ -491,6 +655,59 @@ def test_resume_before_plan_keeps_original_scope_and_processes_unstarted_source(
     assert [row["document_id"] for row in manifest["documents"]] == ["43"]
     assert any(row["document_id"] == "42" for row in manifest["failures"])
     assert not any("44" in path.name for path in (tmp_path / "corpus").glob("*.md"))
+
+
+@pytest.mark.parametrize("mutation", ["changed", "missing"])
+def test_resume_before_plan_refuses_changed_prepared_input(tmp_path, mutation):
+    config, differences = instance(tmp_path)
+    original = config.read_text()
+    tool = tmp_path / "compare_wait.py"
+    tool.write_text(
+        "from pathlib import Path\nimport time\n"
+        "Path(__file__).with_name('compare-started').touch()\ntime.sleep(30)\n"
+    )
+    config.write_text(
+        original.replace(
+            "mdcompare=" + json.dumps([sys.executable, "-m", "mdcompare"]),
+            "mdcompare=" + json.dumps([sys.executable, str(tool)]),
+        )
+    )
+    with subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "dogpdkb",
+            "apply",
+            "--config",
+            str(config),
+            "--input",
+            str(differences),
+        ],
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as process:
+        deadline = time.monotonic() + 5
+        while not (tmp_path / "compare-started").exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        process.terminate()
+        process.communicate(timeout=5)
+        assert process.returncode == 143
+    run_path = next((tmp_path / "runs/funds").glob("*/run.json"))
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    raw = Path(state["documents"]["42"]["raw"]["path"])
+    if mutation == "missing":
+        raw.unlink()
+    else:
+        raw.write_text("Edited prepared source.\n")
+    config.write_text(original)
+    result = cli("apply", "--config", config, "--resume", run_path)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "generate a new plan" in result.stderr
+    assert (tmp_path / "events").read_text().splitlines() == ["export"]
+    assert not list((tmp_path / "corpus").glob("*.md"))
 
 
 def test_compare_contract_failure_is_partial_but_valid_unknown_can_compile(tmp_path):

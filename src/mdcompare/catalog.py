@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from .history import _source_view
 from .io import InputReader, publish_reports, referenced_paths, validate_outputs
 from .manifest import ManifestError, load_manifest
 from .model import CompareOptions
@@ -41,8 +42,19 @@ def catalog_manifest(source: Path, output: Path) -> None:
             for key, entry in declared.items()
             if isinstance(entry.get("url"), str)
         }
-        uses, warnings = _uses(reader.read_bytes(document.path), valid)
-        resources = {}
+        data = reader.read_bytes(document.path)
+        if (
+            document.content_kind == "historical_enriched"
+            and document.provenance.get("contract") == "mdocr-raw-snapshot-v1"
+        ):
+            data = _source_view(document, data, reader, CompareOptions())
+        uses, warnings = _uses(data, valid)
+        resources = (
+            dict(declared) if document.content_kind == "historical_enriched" else {}
+        )
+        for entry in resources.values():
+            if isinstance(entry.get("path"), str):
+                entry["path"] = str(document.resolve(entry["path"]).resolve())
         for use in uses:
             target = use["url"]
             entry = dict(
@@ -55,11 +67,25 @@ def catalog_manifest(source: Path, output: Path) -> None:
             )
             if isinstance(entry.get("path"), str):
                 entry["path"] = str(document.resolve(entry["path"]).resolve())
-            elif not urlsplit(target).scheme:
+            elif not urlsplit(target).scheme and not urlsplit(target).netloc:
                 path = (document.path.parent / unquote(urlsplit(target).path)).resolve()
                 if path.is_file():
                     entry["path"] = str(path)
+            reserved = declared.get(entry["resource_id"])
+            if reserved is not None and reserved.get("url") != target:
+                raise ManifestError("RESOURCE_ID_COLLISION")
             resources.setdefault(entry["resource_id"], entry)
+        provenance = row.get("provenance", {})
+        if isinstance(provenance, dict):
+            if isinstance(provenance.get("raw_path"), str):
+                provenance["raw_path"] = str(
+                    document.resolve(provenance["raw_path"]).resolve()
+                )
+            for block in provenance.get("blocks", []):
+                if isinstance(block, dict):
+                    for key in ("prepared_image", "artifact_path"):
+                        if isinstance(block.get(key), str):
+                            block[key] = str(document.resolve(block[key]).resolve())
         row.update(
             path=str(document.path.resolve()),
             resources=list(resources.values()),

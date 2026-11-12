@@ -11,6 +11,13 @@ match apply's saved `input_copy` byte for byte. This existing witness detects a
 source edited after planning without adding a second fingerprint mechanism.
 Changed/missing input, an invalid manifest or a newer graph success refuses the
 old plan before starting tool work.
+The manifest's frozen `previous_graph` fact permits legitimate opaque version
+changes such as v2 to v10 while refusing an intervening successful publication;
+opaque source versions are never sorted lexically.
+Graphify reads the frozen full `input_copy` while `source_file` retains the
+canonical corpus identity. An acknowledged graph step keeps an independent byte
+copy, action and metadata; same-run/version resume skips only that exact input.
+Unknown pending discovery versions remain pending after actual graph success.
 
 Graphify is invoked only through its documented `source-inventory` and
 `update-sources` CLI. The consumer validates their public schema, source coverage,

@@ -27,3 +27,7 @@ Spec: ../spec.md
 - Full pipeline failure-version suppression, lock contention and signal cases
   remain for downstream assembled CLI acceptance; these are not yet validated
   by this ticket's four focused tests. No paid or production calls were made.
+
+## Answer
+
+自有配置、持久版本事实、目标锁、子进程与只读 status 已接入唯一流水线；中断、并发、退出码与监控已由最终 CLI 验收补齐。合同见 [core](../../../docs/orchestrator-core-contracts.md)，实际证据见 [acceptance](../acceptance.md)。

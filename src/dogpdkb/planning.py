@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
-from dogpdkb.records import atomic_json, read_json, version_key
+from dogpdkb.records import UTC8, atomic_json, read_json, version_key
 
 
 def same_version(left, right):
@@ -25,6 +25,32 @@ def reject_rollback(store, documents):
             version = current.get(stage, {}).get("version")
             if version is None or version_key(version) == requested:
                 continue
+            try:
+                before = datetime.fromisoformat(
+                    version_key(version).replace("Z", "+00:00")
+                )
+                desired = datetime.fromisoformat(requested.replace("Z", "+00:00"))
+                before = before.replace(tzinfo=before.tzinfo or UTC8)
+                desired = desired.replace(tzinfo=desired.tzinfo or UTC8)
+            except ValueError:
+                ordered = False
+            else:
+                ordered = True
+                day_precision = any(
+                    isinstance(value, dict)
+                    and value.get("precision") == "day"
+                    or len(version_key(value)) == 10
+                    for value in (version, row["version"])
+                )
+                rollback = (
+                    before.astimezone(UTC8).date() > desired.astimezone(UTC8).date()
+                    if day_precision
+                    else before > desired
+                )
+                if rollback:
+                    raise ValueError(
+                        f"newer {stage} version exists for {row['document_id']}; generate a new plan"
+                    )
             # A saved plan/difference binds the successful facts it observed.
             # No ordering can be inferred from opaque versions such as v2/v10.
             key = f"previous_{stage}"
@@ -38,20 +64,9 @@ def reject_rollback(store, documents):
                 raise ValueError(
                     f"changed {stage} version exists for {row['document_id']}; generate a new plan"
                 )
-            try:
-                before = datetime.fromisoformat(
-                    version_key(version).replace("Z", "+00:00")
-                )
-                desired = datetime.fromisoformat(requested.replace("Z", "+00:00"))
-                before = before.replace(tzinfo=before.tzinfo or timezone.utc)
-                desired = desired.replace(tzinfo=desired.tzinfo or timezone.utc)
-            except ValueError as error:
+            if not ordered:
                 raise ValueError(
                     f"changed {stage} version lacks frozen facts for {row['document_id']}; generate a new plan"
-                ) from error
-            if before > desired:
-                raise ValueError(
-                    f"newer {stage} version exists for {row['document_id']}; generate a new plan"
                 )
 
 
@@ -105,23 +120,12 @@ def make_plan(book, run, documents, knowledge, comparison):
         ):
             action = "compile"
             reasons.append("RESOURCE_OR_OCR_CHANGED")
-        images = (
-            [r["url"] for r in row["resources"] if r.get("kind") == "image"]
-            if row.get("resources") is not None
-            else None
-        )
-        selected = (
-            []
-            if resources in {"UNCHANGED", "NOT_APPLICABLE"}
-            and ocr in {"UNCHANGED", "NOT_APPLICABLE"}
-            else images
-        )
         rows.append(
             {
                 **row,
                 "action": action,
                 "reason_codes": reasons,
-                "ocr_resources": selected,
+                "ocr_resources": None,
             }
         )
     plan = {
@@ -141,7 +145,11 @@ def validate_plan(plan, book, store, *, check_baseline=False):
     if plan.get("schema") != "dogpdkb-plan-1" or plan.get("book") != book.key:
         raise ValueError("plan schema or book mismatch")
     reject_rollback(store, plan["documents"])
-    for row in plan["documents"]:
+    validate_inputs(plan["documents"], check_baseline=check_baseline)
+
+
+def validate_inputs(documents, *, check_baseline=False):
+    for row in documents:
         try:
             if (
                 Path(row["raw_path"]).read_bytes()

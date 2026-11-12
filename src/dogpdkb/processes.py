@@ -14,6 +14,7 @@ import time
 from contextlib import nullcontext
 from pathlib import Path
 
+from dogpdkb.lifecycle import runtime_lock_fds
 from dogpdkb.records import lock_fds
 
 
@@ -62,7 +63,7 @@ def run_command(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
-                pass_fds=lock_fds(),
+                pass_fds=lock_fds() + runtime_lock_fds(),
                 env={**os.environ, **(env or {})},
             )
         except OSError as error:
