@@ -1099,10 +1099,13 @@ def _enrich_compile_body(
             # OCR evidence is keyed by the verbatim image URL (Yuque paste images
             # carry a #fragment), but the inline enricher's ref.target is
             # fragment-stripped. Index the normalized form as a fallback so a
-            # successfully recognized image is still compiled ([21]). When several
-            # fragments share a base, prefer the one the CURRENT raw references so a
-            # stale failed/pending contribution cannot shadow the live one (G3).
+            # successfully recognized image is still compiled ([21]). Only images
+            # the CURRENT raw references may supply that fallback: a stale fragment
+            # of the same base must not provide OCR text for the live image, which
+            # would insert old text when the live image has no evidence (G3).
             base = resource_id.split("#", 1)[0]
+            if referenced is not None and resource_id not in referenced:
+                continue
             prev = normalized.get(base)
             if prev is None or (
                 referenced is not None

@@ -778,6 +778,48 @@ def test_compile_enriches_fragment_image_via_normalized_fallback(
     assert result2["execution"]["missing_items"] == []
 
 
+def test_compile_fallback_ignores_stale_fragment_when_referenced_image_has_no_evidence(
+    tmp_path: Path,
+):
+    # G3 (Greptile "Changed images get old text"): the fragment-stripped fallback
+    # must draw only from images the CURRENT raw references. When the live image
+    # (#new) has no OCR evidence but a stale fragment of the same base (#old) does,
+    # compile must NOT insert the old text; it keeps the live reference verbatim and
+    # records the live image as unavailable.
+    from dogpdkb.knowledge_execute import _enrich_compile_body
+
+    base = "https://cdn.example.invalid/diagram.png"
+    artifact = tmp_path / "old.md"
+    artifact.write_text("STALE OCR TEXT\n", encoding="utf-8")
+    raw = tmp_path / "raw.md"
+    raw_text = f"# T\n\n![diagram]({base}#new)\n"
+    raw.write_text(raw_text, encoding="utf-8")
+    evidence = {
+        "contract": "prepared-jpeg-ocr-v1",
+        "images": [
+            {
+                "resource_id": f"{base}#old",
+                "status": "success",
+                "artifact": str(artifact),
+            }
+        ],
+    }
+    enriched, _regions, execution = _enrich_compile_body(
+        raw_text,
+        evidence,
+        raw,
+        tmp_path / ".sync-state.json",
+        "v2",
+        {f"{base}#new"},
+    )
+    assert "STALE OCR TEXT" not in enriched
+    assert f"![diagram]({base}#new)" in enriched
+    assert any(item["code"] == "OCR_UNAVAILABLE" for item in execution["missing_items"])
+    assert not any(
+        item.get("path") == str(artifact) for item in execution["final_inputs"]
+    )
+
+
 def test_compile_keeps_unrecognized_image_and_records_missing_items(
     workspace: CompileWorkspace,
 ):
