@@ -9,9 +9,7 @@ from dogpdkb.processes import run_command
 from dogpdkb.settings import load_config, select_book
 
 
-def diagnose(
-    config: Path | None, book: str | None, package_only=False, require_ocr=False
-) -> list[dict]:
+def diagnose(config: Path | None, book: str | None, package_only=False) -> list[dict]:
     report = [{"name": "package", "status": "ok"}]
     if package_only:
         return report

@@ -1,6 +1,6 @@
 # 图谱薄适配、入口切换与旧代删除
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: 03, 05
 Spec: ../spec.md
@@ -19,3 +19,9 @@ Spec: ../spec.md
 
 ## Comments
 
+
+- Implemented `graph.run_graph` and direct CLI routing. Graphify receives one complete source per serial public subprocess, with public inventory/report validation only; the graph artifact is opaque.
+- Removed 55 obsolete source/test files, including both old pipelines, foreign tool internals, duplicated state/results/progress, cleanup/disposition platforms and mirrored legacy tests. Retained independent Web/lifecycle; Web now uses orchestrator settings only.
+- Durable graph versions advance only on acknowledged publication; failed/unknown versions remain quarantined. Interrupted current sources are unknown; later unstarted sources retain pending work and have no graph attempt. Reuse requires verified graph baseline and metadata acknowledgement. Input witnesses prevent stale manifest execution; pending clears only for matching version/metadata with no unstarted OCR step.
+- Merged integration05 `7f6be0312d59c385680afb17196ed1474c517dc6`; joint public CLI tests: 44 passed (12 graph, 13 apply/sync, 14 core/discover, 5 Web). Focused Ruff/format and diff checks pass; graph refreshed and changes analyzed against origin/master.
+- Boundary test confirms zero foreign imports in src/dogpdkb. Full runtime guard currently has only two violations in old `scripts/smoke_install.py`; deleting those embedded foreign imports is ticket07 scope and the only remaining guard dependency. Root explicitly authorized landing06 before07 to avoid an integration cycle. Full repository gates/install proof remain07.
