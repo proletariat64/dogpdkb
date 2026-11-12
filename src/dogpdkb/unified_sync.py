@@ -92,12 +92,15 @@ def legacy_flags(arguments: list[str]) -> list[str]:
 
 def deprecation_notice(flags: list[str]) -> str:
     listed = ", ".join(sorted(set(flags)))
-    return (
+    notice = (
         f"dogpdkb sync: deprecated legacy flags ({listed}); the legacy sync "
         "executor is removed and this invocation is forwarded to the unified "
         "runner. The unified runner accepts --config, --book, --stop-after and "
         "--resume <run>; legacy-only flags are ignored."
     )
+    if "--dry-run" in flags:
+        notice += " --dry-run maps to --stop-after plan (no publication)."
+    return notice
 
 
 #: The unified runner's own value-taking flags. A legacy invocation keeps only
@@ -110,14 +113,28 @@ def unified_arguments(arguments: list[str]) -> list[str]:
 
     ``--config``, ``--book``, ``--stop-after`` and a valued ``--resume <run>``
     are kept; superseded executor flags (and a valueless boolean ``--resume``)
-    are dropped. The unified runner is the single default executor, so a legacy
-    invocation runs the same five-stage batch rather than a second pipeline.
+    are dropped. ``-h``/``--help`` is preserved so help is still printed, and the
+    legacy ``--dry-run`` maps to ``--stop-after plan`` to keep its no-write intent.
+    The unified runner is the single default executor, so a legacy invocation
+    runs the same five-stage batch rather than a second pipeline.
     """
     kept: list[str] = []
     index = 0
     while index < len(arguments):
         token = arguments[index]
         name, separator, _value = token.partition("=")
+        if name in {"-h", "--help"}:
+            # Help must survive forwarding so the unified parser prints it instead
+            # of stripping it and running a real batch (H5).
+            kept.append(token)
+            index += 1
+            continue
+        if name == "--dry-run":
+            # The legacy dry run meant "stop after the plan"; preserve that
+            # no-write intent rather than silently publishing (H11).
+            kept.extend(["--stop-after", "plan"])
+            index += 1
+            continue
         if name not in _UNIFIED_VALUE_FLAGS:
             index += 1
             continue
@@ -204,6 +221,53 @@ def _validate_resume(layout: RunLayout, state: RunState) -> None:
                     f"cannot resume {layout.run_id}: missing {stage} artifact "
                     f"{name} ({reference})"
                 )
+    _validate_frozen_inputs(layout, state)
+
+
+def _validate_frozen_inputs(layout: RunLayout, state: RunState) -> None:
+    """Byte-check frozen planning inputs against the capture evidence.
+
+    mdcompare freezes each selected document's raw export verbatim and compile
+    later publishes those bytes under the original source_version. Artifact
+    existence alone cannot catch a frozen input that was altered after freezing,
+    so a resumed batch re-runs the freeze-time byte comparison against the
+    captured raw and fails closed on any mismatch.
+    """
+    from dogpdkb.knowledge_plan import _resolve_raw
+
+    if state.stage("mdcompare")["status"] not in DONE_STAGE_STATUSES:
+        return
+    capture = read_envelope(layout, "capture") or {}
+    mdcompare = read_envelope(layout, "mdcompare") or {}
+    snapshot_ref = (capture.get("artifacts") or {}).get("snapshot")
+    report_ref = (mdcompare.get("artifacts") or {}).get("report")
+    if not snapshot_ref or not report_ref:
+        return
+    snapshot_path = layout.resolve(snapshot_ref)
+    report_path = layout.resolve(report_ref)
+    snapshot = read_json(snapshot_path)
+    report = read_json(report_path)
+    documents = snapshot.get("documents") or {}
+    exports = snapshot.get("exports") or {}
+    for row in report.get("documents") or []:
+        frozen = _resolve_raw(row.get("raw"), report_path)
+        if frozen is None:
+            continue
+        doc_id = str(row["document_id"])
+        capture_ref = (documents.get(doc_id) or {}).get("raw") or (
+            exports.get(doc_id) or {}
+        ).get("raw")
+        capture_raw = _resolve_raw(capture_ref, snapshot_path)
+        if capture_raw is None or not capture_raw.is_file():
+            raise RunError(
+                f"cannot resume {layout.run_id}: frozen input {frozen.name} has "
+                "no captured raw evidence to verify against"
+            )
+        if not frozen.is_file() or frozen.read_bytes() != capture_raw.read_bytes():
+            raise RunError(
+                f"cannot resume {layout.run_id}: frozen input {frozen.name} no "
+                "longer matches the captured raw bytes"
+            )
 
 
 def _inputs(layout: RunLayout, stage: str) -> dict[str, Any]:
@@ -356,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
     progress: Any = None
     try:
         if args.resume:
-            layout = find_run(config.staging, args.resume)
+            layout = find_run(config.staging, args.resume, book.key)
             state = RunState.load(layout)
             if state.data["book"]["key"] != book.key:
                 raise RunError(
@@ -374,9 +438,13 @@ def main(argv: list[str] | None = None) -> int:
                 report_progress(
                     f"run {layout.run_id} already {recorded}; nothing to do"
                 )
+                Progress(
+                    corpus, book.key, url=book.url, name=book.name
+                ).reconcile_finished_claim()
                 print(json.dumps(state.summary(), ensure_ascii=False))
                 return 0
             report_progress(f"resuming run {layout.run_id} ({recorded})")
+            state.begin_resume()
         else:
             pending = _unfinished(config.staging, book.key)
             if pending:
@@ -399,6 +467,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         try:
             progress = Progress(corpus, book.key, url=book.url, name=book.name)
+            # Clear a claim orphaned by a crash after a prior run finished, so it
+            # cannot block this batch; a live claim is left untouched.
+            progress.reconcile_finished_claim()
             # Bind the canonical claim to the frozen capture observation, exactly
             # as knowledge_capture does, so a resumed batch keeps its identity.
             snapshot_path = layout.stage_dir("capture") / "snapshot.json"
@@ -431,10 +502,11 @@ def main(argv: list[str] | None = None) -> int:
     except (RunError, StateError, OSError, ValueError) as error:
         parser.exit(1, f"dogpdkb sync: {safe_diagnostic(error)}\n")
     state.finish(status, stop_reason=reason, exit_code=code)
-    _archive_result(state, config, book.key)
     if status in FINISHED_STATUSES:
-        # A finished batch never leaves a claim that blocks the next cron run.
+        # Release the claim as soon as the result is terminal, before any archive
+        # I/O: a crash while archiving must not orphan the claim and block cron.
         progress.finish()
+    _archive_result(state, config, book.key)
     if status in ("completed", "partial"):
         # Only a successfully ended batch cleans earlier finished workspaces,
         # and only after its own result and necessary inputs are durable.

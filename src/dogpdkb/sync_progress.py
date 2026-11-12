@@ -166,6 +166,40 @@ class Progress:
             self.root["active_run"] = None
             save_state(self.corpus, self.root)
 
+    def reconcile_finished_claim(self) -> None:
+        """Release a claim orphaned by a crash after its run reached a terminal result.
+
+        The claim identity is the frozen capture snapshot, so walk up to the run
+        record. A finished run no longer needs the canonical claim; clearing it
+        lets the next unattended batch start. A live (unfinished) claim is never
+        touched, so this never interrupts a running batch.
+        """
+        from dogpdkb.sync_run import FINISHED_STATUSES, observed_status, read_json
+
+        self._reload()
+        active = self.root.get("active_run")
+        staging = (active or {}).get("staging")
+        if not staging:
+            return
+        claimed = Path(staging)
+        run_state = next(
+            (
+                candidate / "run.json"
+                for candidate in (claimed, *claimed.parents)
+                if (candidate / "run.json").is_file()
+            ),
+            None,
+        )
+        if run_state is None:
+            return
+        try:
+            status, _ = observed_status(read_json(run_state))
+        except (OSError, ValueError):
+            return
+        if status in FINISHED_STATUSES:
+            self.root["active_run"] = None
+            save_state(self.corpus, self.root)
+
     def reference(self, path: Path, stage: str = "raw_export"):
         path = Path(path).resolve()
         return {

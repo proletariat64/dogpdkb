@@ -525,6 +525,48 @@ def test_posthoc_done_without_input_change_registers_no_followup(workspace: Work
     assert view["compile_followups"] == []
 
 
+def test_done_anomaly_does_not_keep_the_next_batch_partial(workspace: Workspace):
+    make_export_failure(workspace)
+    run_batch(workspace)
+    record = only_anomaly(workspace)
+    aid = record["id"]
+    cache = workspace.root / "ocr-cache.json"
+    write_json(cache, {"image": "img-1", "text": "backfilled"})
+    evidence = write_evidence(workspace, cache=cache, input_changed=False)
+    resolved = anomalies_cli(
+        workspace,
+        "--resolve",
+        aid,
+        "--disposition",
+        "done",
+        "--evidence",
+        str(evidence),
+    )
+    assert resolved.returncode == 0, resolved.stderr
+    assert json.loads(resolved.stdout)["disposition"] == "done"
+
+    # A disposed (done) anomaly is no current failure: the next daily batch
+    # still suppresses the resolved version (no re-export) but completes capture
+    # instead of handing the resolved record back as a live anomaly.
+    second = run_batch(workspace)
+    snapshot = read_json(
+        workspace.staging / "fund" / second / "capture" / "snapshot.json"
+    )
+    assert 2 not in snapshot["selected"]
+    assert snapshot["suppressed"] == [
+        {
+            "id": 2,
+            "anomaly_id": aid,
+            "code": "export_failed",
+            "version_stamp": record["version_stamp"],
+        }
+    ]
+    result = read_json(workspace.results / "runs" / f"{second}.json")
+    assert result["stages"]["capture"]["status"] == "completed"
+    assert aid not in result["anomaly_ids"]
+    assert aid not in result["stages"]["capture"]["anomaly_ids"]
+
+
 def test_batch_result_carries_document_identities_surviving_wash(workspace: Workspace):
     make_capture_anomaly(workspace)
     assert workspace.sync("--stop-after", "capture").returncode == 0

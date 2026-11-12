@@ -139,6 +139,8 @@ def _handed_off(
 
     The daily batch still reports them (partial, never a fabricated completed) so
     a handed-off failure stays visible until the post-hoc agent disposes of it.
+    A ``done`` record is already disposed: it stays suppressed (no re-export) but
+    is no current failure, so it neither hands off nor keeps the batch partial.
     """
     rows = snapshot.get("suppressed") or []
     if not rows:
@@ -147,7 +149,9 @@ def _handed_off(
     known = {row.get("id") for row in result.anomalies}
     for row in rows:
         record = registry["anomalies"].get(row["anomaly_id"])
-        if record is not None and record["id"] not in known:
+        if record is None or record.get("disposition") == "done":
+            continue
+        if record["id"] not in known:
             result.anomalies.append(record)
             known.add(record["id"])
     if result.anomalies and result.status == "completed":
@@ -159,7 +163,16 @@ def _handed_off(
 def handle(context: StageContext) -> StageResult:
     snapshot_path = context.directory / "snapshot.json"
     existing = _snapshot(snapshot_path)
-    if existing is not None and existing.get("status") in COMPLETE:
+    # An export-partial ("incomplete") snapshot still froze a complete listing,
+    # selection and per-doc versions. Reuse that observation on resume rather than
+    # refetching the remote and mixing new input into the old batch; only a
+    # snapshot whose listing itself never completed is re-observed.
+    listing_complete = (
+        existing is not None and (existing.get("listing") or {}).get("complete") is True
+    )
+    if existing is not None and (
+        existing.get("status") in COMPLETE or listing_complete
+    ):
         # A finished observation is never re-exported; resume reuses its evidence.
         context.log.write(f"reusing complete snapshot {snapshot_path}")
         result = _archived(context, _result(context, existing))

@@ -58,6 +58,14 @@ def view(layout: RunLayout, payload: dict[str, Any]) -> dict[str, Any]:
     if status == "interrupted" and not reason:
         reason = "process exited without a recorded result"
     book = payload.get("book") or {}
+    # Aggregate the recorded stage counts on read so a live (not yet finished)
+    # batch shows current progress instead of the zero/stale run-level totals (M10).
+    counts: dict[str, int] = {"total": 0, "completed": 0, "reused": 0, "failed": 0}
+    for name in STAGES:
+        for key in counts:
+            value = stages[name].get("counts", {}).get(key, 0)
+            if type(value) is int:
+                counts[key] += value
     return {
         "schema_version": RUN_SCHEMA,
         "run": payload["run_id"],
@@ -83,7 +91,7 @@ def view(layout: RunLayout, payload: dict[str, Any]) -> dict[str, Any]:
             }
             for name in STAGES
         },
-        "counts": payload.get("counts", {}),
+        "counts": counts,
         "started_at": payload.get("started_at"),
         "updated_at": payload.get("updated_at"),
         "ended_at": ended,

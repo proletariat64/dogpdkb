@@ -225,6 +225,31 @@ def test_compile_publishes_whole_sources_and_advances_the_success_version(
     assert doc2["graph"]["version"]["utc"] == "2026-11-10T11:00:00+08:00"
 
 
+def test_resuming_a_finished_run_releases_its_orphaned_claim(
+    workspace: CompileWorkspace,
+):
+    # H15: resuming an already-finished run returns early; it must still release a
+    # claim orphaned by a crash between recording the result and releasing it.
+    canonical = workspace.corpus / ".sync-state.json"
+    completed = workspace.sync()
+    assert completed.returncode == 0, completed.stderr
+    run_dir = workspace.only_run()
+    assert read_json(canonical)["active_run"] is None
+    state = read_json(canonical)
+    state["active_run"] = {
+        "staging": str(run_dir / "capture" / "snapshot.json"),
+        "book_key": "fund",
+        "phase": "capture",
+    }
+    write_json(canonical, state)
+
+    resumed = workspace.sync("--resume", run_dir.name)
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert "already completed" in resumed.stderr
+    assert read_json(canonical)["active_run"] is None
+
+
 def test_partial_publication_keeps_failed_source_knowledge_and_version(
     workspace: CompileWorkspace,
 ):

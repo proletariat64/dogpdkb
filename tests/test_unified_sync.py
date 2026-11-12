@@ -328,6 +328,93 @@ def test_legacy_flags_forward_into_the_unified_runner_with_a_deprecation_notice(
         assert read_json(run_dir / "run.json")["schema_version"] == "unified-run-1.0"
 
 
+def test_legacy_help_prints_help_without_running_a_batch(tmp_path: Path):
+    # H5: a legacy flag plus --help must still print help, not strip --help and
+    # run a real (unlocked) batch. No run directory may be created.
+    workspace = Workspace(tmp_path, DOCUMENTS)
+    completed = workspace.sync("--knowledge", "--help")
+
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout.lower()
+    assert "--stop-after" in completed.stdout
+    assert workspace.runs() == []
+
+
+def test_legacy_dry_run_stops_after_plan_without_publishing(tmp_path: Path):
+    # H11: the legacy --dry-run meant "stop after the plan" (no compile/publish).
+    # It must map to --stop-after plan, never silently become a full publication.
+    workspace = Workspace(tmp_path, DOCUMENTS)
+    before = (workspace.corpus / "graphify-out" / "graph.json").read_bytes()
+    completed = workspace.sync("--dry-run")
+
+    assert completed.returncode == 0, completed.stderr
+    summary = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert summary["status"] == "paused"
+    assert summary["stop_reason"] == "stop-after plan"
+    assert summary["stages"]["plan"] == "completed"
+    assert summary["stages"]["compile"] == "pending"
+    assert (workspace.corpus / "graphify-out" / "graph.json").read_bytes() == before
+
+
+def test_resume_selects_the_run_under_the_requested_book(tmp_path: Path):
+    # M9: a bare run id that exists under two books must resolve within --book,
+    # not the alphabetically first book. A colliding run under "aaa" must not
+    # hijack (or block) the resume of the "fund" run.
+    workspace = Workspace(tmp_path, DOCUMENTS)
+    paused = workspace.result("--stop-after", "capture")
+    run_id = paused["run"]
+    fund_run = workspace.staging / "fund" / run_id
+    collision = workspace.staging / "aaa" / run_id
+    collision.mkdir(parents=True)
+    payload = read_json(fund_run / "run.json")
+    payload["book"]["key"] = "aaa"
+    write_json(collision / "run.json", payload)
+
+    completed = workspace.sync("--resume", run_id)
+
+    assert "belongs to book aaa" not in completed.stderr
+    assert f"resuming run {run_id}" in completed.stderr
+
+
+def test_status_counts_reflect_live_stage_progress(workspace: Workspace):
+    # M10: a paused (not finished) batch has zero run-level counts in run.json;
+    # status must aggregate the recorded stage counts so live progress is visible.
+    workspace.result("--stop-after", "capture")
+    view = json.loads(workspace.status("--json").stdout)
+    assert view["status"] == "paused"
+    assert view["counts"]["total"] == 2
+    assert view["counts"]["completed"] == 2
+
+
+def test_resume_refreshes_liveness_metadata(tmp_path: Path):
+    # M8: a resumed batch runs under a new process. Resume must record the new pid
+    # and running status and clear the prior terminal fields, so observed_status
+    # reports the live batch instead of mislabelling it interrupted.
+    from dogpdkb.sync_run import RunLayout, RunState
+
+    layout = RunLayout(tmp_path / "run-x", "fund")
+    layout.root.mkdir(parents=True)
+    state = RunState.create(
+        layout,
+        book={"key": "fund", "name": "F", "url": "u"},
+        corpus=tmp_path,
+        config=tmp_path / "c.toml",
+        identity={},
+        stop_after=None,
+    )
+    state.finish("paused", stop_reason="stop-after capture", exit_code=0)
+    state.data["pid"] = 999999  # a stale, dead pid from the original process
+
+    state.begin_resume()
+
+    assert state.data["pid"] == os.getpid()
+    assert state.data["status"] == "running"
+    assert state.data["ended_at"] is None
+    assert state.data["duration_seconds"] is None
+    assert state.data["stop_reason"] is None
+    assert state.data["exit_code"] is None
+
+
 def test_zero_work_capture_is_skipped_and_the_batch_still_ends(tmp_path: Path):
     workspace = Workspace(tmp_path, [])
 
@@ -412,6 +499,28 @@ def test_resume_refuses_inputs_that_no_longer_match_the_original_batch(
     assert resumed.returncode != 0
     assert "different configuration" in resumed.stderr
     assert len(workspace.runs()) == 1
+
+
+def test_resume_refuses_frozen_inputs_whose_bytes_changed(workspace: Workspace):
+    # H16: resume must byte-check the frozen planning inputs against the capture
+    # evidence, not just confirm the report/plan artifacts exist. Altered frozen
+    # bytes would otherwise be compiled and published under the original version.
+    first = workspace.result("--stop-after", "plan")
+    run_dir = workspace.only_run()
+    frozen = sorted(
+        path
+        for path in (run_dir / "mdcompare" / "inputs").glob("*.md")
+        if not path.name.endswith("-previous.md")
+    )
+    assert frozen, "expected frozen planning inputs after stop-after plan"
+    target = frozen[0]
+    target.write_bytes(target.read_bytes() + b"\ntampered\n")
+
+    resumed = workspace.sync("--resume", first["run"])
+
+    assert resumed.returncode != 0
+    assert "frozen input" in resumed.stderr
+    assert workspace.runs() == [run_dir]
 
 
 def test_resume_of_a_failed_batch_retries_only_the_failed_stage(workspace: Workspace):
@@ -621,6 +730,75 @@ def test_a_finished_batch_releases_the_claim_and_a_paused_one_keeps_it(
     assert len(workspace.runs()) == 1
     workspace.sync("--stop-after", "capture")
     assert len(workspace.runs()) == 2
+
+
+def test_new_batch_reconciles_a_claim_orphaned_by_a_finished_run(workspace: Workspace):
+    # H15: a crash after the terminal result is recorded but before the claim is
+    # released leaves active_run bound to a finished run. The next cron batch must
+    # reconcile that stale claim instead of being blocked forever.
+    canonical = workspace.corpus / ".sync-state.json"
+    first = workspace.sync()
+    assert first.returncode != 0  # compile fails without Graphify: a terminal result
+    run_dir = workspace.only_run()
+    assert read_json(canonical)["active_run"] is None
+    state = read_json(canonical)
+    state["active_run"] = {
+        "staging": str(run_dir / "capture" / "snapshot.json"),
+        "book_key": "fund",
+        "phase": "capture",
+    }
+    write_json(canonical, state)
+
+    second = workspace.sync()
+
+    assert "unfinished sync plan exists" not in second.stderr
+    assert len(workspace.runs()) == 2  # a new batch started despite the stale claim
+    assert read_json(canonical)["active_run"] is None
+
+
+def test_resume_reuses_an_incomplete_snapshots_frozen_listing(workspace: Workspace):
+    # H14: a crash after the export-partial (incomplete) snapshot was written but
+    # before the capture envelope committed must reuse the frozen listing on
+    # resume, not refetch the remote and mix new input into the old batch.
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["2"].pop("body", None)  # doc2 export fails -> incomplete snapshot
+    write_json(workspace.root / "remote.json", remote)
+    first = workspace.result("--stop-after", "capture")
+    run_dir = workspace.only_run()
+    snapshot_path = run_dir / "capture" / "snapshot.json"
+    snapshot = read_json(snapshot_path)
+    assert snapshot["status"] == "incomplete"
+    assert snapshot["listing"]["complete"] is True
+
+    # Simulate the crash window: capture never committed its result envelope.
+    state = read_json(run_dir / "run.json")
+    state["stage_states"]["capture"]["status"] = "running"
+    write_json(run_dir / "run.json", state)
+    (run_dir / "capture" / "result.json").unlink()
+
+    # A new remote document appears after the observation was frozen.
+    remote = read_json(workspace.root / "remote.json")
+    remote["documents"].append(
+        {
+            "id": 3,
+            "title": "Three",
+            "slug": "three",
+            "content_updated_at": "2026-11-10T12:00:00+08:00",
+        }
+    )
+    remote["details"]["3"] = {
+        "id": 3,
+        "body": "body 3",
+        "content_updated_at": "2026-11-10T12:00:00+08:00",
+    }
+    write_json(workspace.root / "remote.json", remote)
+
+    resumed = workspace.sync("--resume", first["run"], "--stop-after", "capture")
+
+    assert resumed.returncode == 0, resumed.stderr
+    reused = read_json(snapshot_path)
+    assert reused["counts"]["documents"] == 2  # frozen listing, not the new remote
+    assert reused["listing"]["document_ids"] == [1, 2]
 
 
 def test_tool_output_goes_to_the_stage_log_and_bodies_never_reach_the_console(

@@ -316,6 +316,24 @@ class RunState:
             if row["status"] == "running":
                 row.update(status="pending", ended_at=None, reason=None)
 
+    def begin_resume(self) -> None:
+        """Re-establish live run metadata when a paused/interrupted run resumes.
+
+        The resumed batch runs under a new process; record its pid and running
+        status and clear the prior attempt's terminal fields so observed_status
+        reports the live batch rather than an interrupted one (M8).
+        """
+        self.data.update(
+            pid=os.getpid(),
+            status="running",
+            current_stage=None,
+            ended_at=None,
+            duration_seconds=None,
+            stop_reason=None,
+            exit_code=None,
+        )
+        self.save()
+
     def finish(self, status: str, *, stop_reason: str | None, exit_code: int) -> None:
         if status not in RUN_STATUSES:
             raise RunError(f"unknown run status: {status}")

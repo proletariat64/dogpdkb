@@ -58,16 +58,17 @@ no-token/auth contract targets API credentials only).
 - Regressions (red→green verified): test_unified_compile.py emptied_document_advances_success_state_and_becomes_no_work (H9), compile_failure_anomaly_references_the_frozen_compile_input (M21); test_update_graph.py partial_publication_does_not_advance_failed_sources (H4); test_unified_ocr.py failed_ocr_followup_is_not_retried_the_next_day (H22), resume_after_followup_consumption_reuses_retained_candidate (H25), html_image_ocr_success_is_recorded_unenriched_and_handed_off (M17); test_unified_plan.py compile_decision_retains_comparison_pending_until_compile_publishes + body-reuse pending-clear assertion (M16-plan). Full gate green.
 - Pre-existing test assertions corrected (both encoded pre-M16 re-selection of settled docs; confirmed failing at WP2 HEAD e2b7c02): test_unified_sync.py status test now expects the failed-compile batch to re-select (total=2); scripts/smoke_install.py second batch now asserts no-work convergence (total=0/reused=0) instead of reused=1. make check 1158 passed + make smoke PASS.
 
-### WP4 — runner/status/lock (unified_sync.py, sync_run.py, sync_status.py, instance_lock.py, sync_knowledge_base.py, stages/capture.py)
-- [ ] H5: preserve -h/--help through unified_arguments (no unlocked write).
-- [ ] H11: legacy --dry-run → --stop-after plan (or reject), never full publication.
-- [ ] H15: release canonical claim before archive I/O; reconcile stale active_run on terminal resume/new claim.
-- [ ] H16: _validate_resume byte-compare frozen inputs/*.md against capture evidence.
-- [ ] M8: resume refresh pid + running status, clear terminal fields.
-- [ ] M9: find_run(..., book.key) on resume.
-- [ ] M10: sync_status.view aggregate current stage counts on read.
-- [ ] H14: capture.handle reuse snapshot when listing.complete regardless of overall status.
-- [ ] M20: capture._handed_off skip disposition=="done" when counting toward partial.
+### WP4 — runner/status/lock (unified_sync.py, sync_run.py, sync_status.py, sync_progress.py, stages/capture.py) — DONE
+- [x] H5: preserve -h/--help through unified_arguments (no unlocked write).
+- [x] H11: legacy --dry-run → --stop-after plan, never full publication (deprecation notice maps it).
+- [x] H15: release canonical claim before archive I/O; Progress.reconcile_finished_claim clears a stale active_run bound to a finished run on terminal resume and before every new claim.
+- [x] H16: _validate_frozen_inputs byte-compares each frozen mdcompare inputs/*.md against the captured raw (freeze-time comparison), fail closed on mismatch.
+- [x] M8: RunState.begin_resume refreshes pid + running status, clears terminal fields.
+- [x] M9: find_run(config.staging, args.resume, book.key) on resume.
+- [x] M10: sync_status.view aggregates live stage counts on read.
+- [x] H14: capture.handle reuses any snapshot whose listing.complete is True (incl. export-partial "incomplete"), not just COMPLETE status.
+- [x] M20: capture._handed_off skips disposition=="done" records (no handoff, no partial).
+- Regressions (red→green verified): test_unified_sync.py legacy_help / legacy_dry_run / resume_selects_run_under_book / status_counts_live / resume_refreshes_liveness / new_batch_reconciles_orphaned_claim / resume_reuses_incomplete_frozen_listing / resume_refuses_frozen_inputs_whose_bytes_changed; test_unified_compile.py resuming_finished_run_releases_orphaned_claim; test_sync_results.py done_anomaly_does_not_keep_next_batch_partial. 46 unified+results tests green; ruff clean.
 
 ### WP5 — results/anomalies/wash/apply (sync_results.py, sync_anomalies.py, sync_wash.py, workflows/apply_sync_updates.py, scripts/smoke_install.py)
 - [ ] M3: record_posthoc_success done-path idempotency guard (identical evidence → no reopen).
