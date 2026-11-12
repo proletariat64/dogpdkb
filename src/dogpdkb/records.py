@@ -222,6 +222,9 @@ def initialize(settings: Settings, book: Book) -> dict:
                 ignored += 1
                 continue
             date, doc_id = match.groups()
+            if book.document_ids is not None and doc_id not in book.document_ids:
+                ignored += 1
+                continue
             try:
                 datetime.strptime(date, "%Y-%m-%d")
             except ValueError as error:

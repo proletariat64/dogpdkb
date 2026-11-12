@@ -124,7 +124,11 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
         return 1
     if not graph_path.exists():
         selected = {Path(row["path"]).resolve() for row in pending}
-        if any(path.resolve() not in selected for path in book.corpus.glob("*.md")):
+        if any(
+            path.resolve() not in selected
+            for path in book.corpus.rglob("*.md")
+            if not path.resolve().is_relative_to(graph_dir.resolve())
+        ):
             run.failure(step="graph", reason="GRAPHIFY_BASELINE_REQUIRED")
             return 1
     import tempfile

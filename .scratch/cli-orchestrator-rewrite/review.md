@@ -98,3 +98,25 @@ Independent day-precision verification reran the original public reproduction an
 same-business-day regression successfully. All eight local tickets include Answer
 sections and linked map decisions. Final full gate, installed-wheel proof, exact
 archive bytes and physical line counts are recorded in [acceptance](acceptance.md).
+
+
+## Native CLI/subscription follow-up OCR — 2026-11-13
+
+OCR range b7ffb144..3390063 completed on all six selected source/config items,
+zero failed items: one high and two medium findings. All three were reproduced
+through public CLI regressions (three failures before the fix) and corrected:
+
+- High: recursive historical Markdown was missed by the initial graph baseline
+  guard. The guard now checks recursive Markdown, excluding its output directory.
+- Medium: explicit document_ids=null silently enabled whole-book discovery.
+  Only omission means whole book; null is rejected before any source request.
+- Medium: scoped init-state could register other corpus IDs and then mark them
+  absent. Initialization now skips other IDs and absence is scoped to subscribed IDs.
+
+Focused discovery/graph suite: 41 passed. Final make check: 820 passed in 74.49s,
+Ruff/format and 110-document guard passed. Final wheel/sdist built; isolated
+installed smoke passed. Final wheel installed into the live UAT venv and resumed
+the completed three-document run with exit 0, empty stderr and unchanged Markdown,
+graph and manifest bytes/mtimes. No additional model extraction was needed.
+The complete OCR run was not repeated; focused regressions and full gates prove
+these corrections. Greptile review is requested on PR #19 after the final push.

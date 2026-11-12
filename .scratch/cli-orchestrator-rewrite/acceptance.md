@@ -48,6 +48,15 @@ Graphify and Yuque source/installation were not modified.
   export/compare/OCR/Graphify processes and preserved corpus/graph/manifest bytes
   and mtimes. Broader production and image/Table coverage remain unproven.
 
+## Final review corrections — 2026-11-13
+
+Three follow-up OCR findings were reproduced and fixed: null scope expansion,
+false out-of-scope absence, and nested historical Markdown backfill. Final check:
+**820 passed in 74.49s**, Ruff/format and doc guard passed; installed-wheel smoke
+and final-wheel resume of the completed real UAT passed. No new external model
+call was needed. [Review details](review.md) and [UAT details](uat-small-real.md).
+Final source count: 3,452 dogpdkb lines + 336 runtime helper lines = **3,788**.
+
 ## Historical acceptance (withdrawn dependencies)
 
 Date: 2026-11-13

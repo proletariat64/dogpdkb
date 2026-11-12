@@ -458,9 +458,12 @@ def test_changed_input_during_extraction_does_not_publish(tmp_path):
     assert not (source.parent / "graphify-out/graph.json").exists()
 
 
-def test_unregistered_historical_sources_are_not_backfilled(tmp_path):
+@pytest.mark.parametrize("folder", ["", "archive"])
+def test_unregistered_historical_sources_are_not_backfilled(tmp_path, folder):
     config, manifest, source = fixture(tmp_path)
-    (source.parent / "Historical-2020-01-01-[99].md").write_text("Historical")
+    historical = source.parent / folder / "Historical-2020-01-01-[99].md"
+    historical.parent.mkdir(parents=True, exist_ok=True)
+    historical.write_text("Historical")
     result = cli(config, manifest)
     assert result.returncode == 1
     assert not (tmp_path / "calls.jsonl").exists()

@@ -211,7 +211,7 @@ def select_book(settings: Settings, key: str | None = None) -> Book:
         if "DOGPDKB_CORPUS" in os.environ:
             corpus = settings.corpus
         document_ids = row.get("document_ids")
-        if document_ids is not None:
+        if "document_ids" in row:
             if (
                 not isinstance(document_ids, list)
                 or not document_ids

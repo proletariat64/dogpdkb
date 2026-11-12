@@ -62,3 +62,14 @@ installed mdcompare/mdocr and the unmodified user-level Graphify executable.
 109-document guard passed. Focused small-subscription/core checks: 22 passed.
 Native Graphify isolated tests and installed-wheel smoke are recorded separately
 in acceptance.md; test substitutes there are not presented as this live UAT.
+
+## Final review corrections
+
+The live full extraction and fresh no-op scan above used runtime 3390063. Later
+review fixes only tightened null allowlists, scoped baseline registration/absence,
+and recursive historical-file guards. Each had a failing CLI regression before
+fixing. Final local check: 820 passed in 74.49s; installed smoke passed.
+The final wheel from `/tmp/dogpdkb-small-subscription-final-dist` was installed in
+the same isolated UAT venv. Resuming the completed live run returned 0 with empty
+stderr and unchanged corpus/graph/manifest bytes and mtimes. No paid extraction
+was repeated, and this resume is distinct from the fresh no-op scan above.

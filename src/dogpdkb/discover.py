@@ -247,9 +247,12 @@ def discover(settings, book, store, run, listing=None):
             reasons = list(dict.fromkeys([*reasons, *pending["reasons"]]))
         if reasons:
             selected.append({**row, "reasons": reasons, "local": deepcopy(local)})
-    absent = sorted(
-        (set(before) | set(documents) | set(book.document_ids or ())) - set(current)
+    expected_ids = (
+        set(book.document_ids)
+        if book.document_ids is not None
+        else set(before) | set(documents)
     )
+    absent = sorted(expected_ids - set(current))
     differences = {
         "schema": "dogpdkb-differences-1",
         "book": store.data["book"],

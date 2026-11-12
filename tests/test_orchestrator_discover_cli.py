@@ -344,7 +344,7 @@ def test_document_subscription_filters_after_complete_listing_and_pins_scope(tmp
     assert state_path.read_bytes() == before
 
 
-@pytest.mark.parametrize("scope", [[], ["2", "2"], [2], "2"])
+@pytest.mark.parametrize("scope", [None, [], ["2", "2"], [2], "2"])
 def test_invalid_subscription_cannot_expand_to_entire_book(tmp_path, scope):
     config = tmp_path / "instance.toml"
     config.write_text('[source]\nbooks_file="books.json"\n')
@@ -362,3 +362,43 @@ def test_invalid_subscription_cannot_expand_to_entire_book(tmp_path, scope):
     result = cli("discover", "--config", config)
     assert result.returncode == 1
     assert "document_ids" in result.stderr
+
+
+def test_subscription_init_state_does_not_mark_other_corpus_ids_absent(tmp_path):
+    config = tmp_path / "instance.toml"
+    config.write_text(
+        '[source]\nbooks_file="books.json"\n[paths]\nstate="state"\nstaging="runs"\n'
+    )
+    (tmp_path / "books.json").write_text(
+        json.dumps(
+            [
+                {
+                    "key": "funds",
+                    "url": "https://example.invalid/book",
+                    "corpus": "corpus",
+                    "document_ids": ["42"],
+                }
+            ]
+        )
+    )
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for ident in (42, 43):
+        (corpus / f"Source-2026-11-12-[{ident}].md").write_text(
+            "# Real corpus source\n"
+        )
+    assert cli("init-state", "--config", config).returncode == 0
+    path = listing(
+        tmp_path,
+        [
+            {"document_id": str(i), "title": str(i), "version": "2026-11-12T10:00:00Z"}
+            for i in (42, 43)
+        ],
+    )
+    diff = difference(cli("discover", "--config", config, "--listing", path))
+    assert diff["absent"] == []
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    assert set(state["documents"]) == {"42"}
+    assert (
+        corpus / "Source-2026-11-12-[43].md"
+    ).read_text() == "# Real corpus source\n"
