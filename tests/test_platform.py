@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+import tomllib
 
 from dogpdkb import cli, doctor
 from mdocr import config as settings
@@ -88,6 +89,16 @@ def test_init_config_is_disabled_and_preserves_existing_files(tmp_path):
     books = json.loads(config.books_file.read_text())
     assert books and all(book["enabled"] is False for book in books)
     assert ".invalid" in config.mcp_url
+    # The portable template carries the durable OCR cache and stage budget keys;
+    # both are part of the non-secret snapshot used for resume compatibility.
+    template = tomllib.loads((tmp_path / "dogpdkb.toml").read_text(encoding="utf-8"))
+    assert template["paths"]["ocr_cache"] == "ocr-cache"
+    assert template["ocr"]["budget_seconds"] == 1800
+    assert config.ocr_cache == (tmp_path / "ocr-cache").resolve()
+    assert config.ocr_budget_seconds == 1800
+    snapshot = config.snapshot()
+    assert snapshot["ocr_cache"] == str(config.ocr_cache)
+    assert snapshot["ocr_budget_seconds"] == 1800
     with pytest.raises(settings.ConfigError, match="exactly one"):
         settings.select_book(config)
     before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}

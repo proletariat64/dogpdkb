@@ -103,6 +103,45 @@ def stop_group(process):
     process.communicate(timeout=10)
 
 
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").exists(), reason="Linux descriptor inspection"
+)
+def test_lock_is_held_does_not_leak_descriptors(tmp_path, monkeypatch):
+    # The read-only liveness probe is called repeatedly by `dogpdkb status` and
+    # the unattended runner. Every probe must close the descriptor it opens, on
+    # both the held and the free path, or a long-lived watch loop exhausts fds.
+    import fcntl
+
+    from dogpdkb import instance_lock
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.delenv("DOGPDKB_UPDATE_LOCK_FD", raising=False)
+    lock_path = Path(tmp_path / "state") / "dogpdkb" / "sync.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.touch()
+
+    def open_fds() -> int:
+        return len(os.listdir("/proc/self/fd"))
+
+    # Free lock: repeated probes return False and leak nothing.
+    before = open_fds()
+    for _ in range(50):
+        assert instance_lock.lock_is_held() is False
+    assert open_fds() <= before
+
+    # Held lock: repeated probes return True and leak nothing.
+    holder = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        before = open_fds()
+        for _ in range(50):
+            assert instance_lock.lock_is_held() is True
+        assert open_fds() <= before
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+
+
 def test_updater_rejects_other_plans_but_keeps_read_only_cli_available(tmp_path):
     env = environment(tmp_path)
     process = start_blocked_publisher(tmp_path, env)

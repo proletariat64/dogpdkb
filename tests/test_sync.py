@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
 
+from dogpdkb.sync_time import UTC8
 from scripts import apply_sync_updates as apply_sync
 from scripts import get_sync_updates as get_sync
 
@@ -165,6 +166,9 @@ def test_publish_documents_copies_assets_and_backs_up_old_document(tmp_path: Pat
     raw = raw_dir / name
     raw.write_text("raw")
     (ocr_dir / name).write_text("![image](assets/new/image.jpg)")
+    checkpoints = tmp_path / "checkpoints"
+    checkpoints.mkdir()
+    (checkpoints / "ocr-complete.json").write_text(json.dumps({"files": [name]}))
     asset = ocr_dir / "assets" / "new" / "image.jpg"
     asset.parent.mkdir(parents=True)
     asset.write_bytes(b"jpeg")
@@ -225,6 +229,92 @@ def test_publish_documents_preserves_old_document_when_source_is_missing(
         )
 
     assert old.read_text() == "old"
+
+
+def test_publish_documents_falls_back_to_raw_without_a_complete_ocr_checkpoint(
+    tmp_path: Path,
+):
+    corpus = tmp_path / "corpus"
+    raw_dir = tmp_path / "raw"
+    ocr_dir = tmp_path / "ocr"
+    for directory in (corpus, raw_dir, ocr_dir):
+        directory.mkdir()
+    name = "doc-2026-11-02-[1].md"
+    raw = raw_dir / name
+    raw.write_text("valid raw")
+    # A prior interrupted OCR left a partial output: the historical checkpoint
+    # (staging/checkpoints) validates other documents but not this one.
+    (ocr_dir / name).write_text("partial ocr")
+    checkpoints = tmp_path / "checkpoints"
+    checkpoints.mkdir()
+    (checkpoints / "ocr-complete.json").write_text(
+        json.dumps({"files": ["other-2026-11-02-[9].md"]})
+    )
+
+    apply_sync.publish_documents(
+        [(raw, {"id": 1, "kind": "updated"})],
+        ocr_dir,
+        corpus,
+        tmp_path / "backup",
+    )
+
+    # An unvalidated partial OCR output must never be published over valid raw.
+    assert (corpus / name).read_text() == "valid raw"
+
+
+def test_publish_documents_uses_historical_checkpoints_layout(tmp_path: Path):
+    """[12] The legacy executor wrote staging/checkpoints/ocr-complete.json.
+
+    ``ocr_dir`` is ``staging/md``, so the completion checkpoint lives at
+    ``ocr_dir.parent/checkpoints/ocr-complete.json`` (run_ocr_with_resume's
+    state_dir). publish_documents must honor that historical location and publish
+    the validated enriched OCR output, not raw.
+    """
+    corpus = tmp_path / "corpus"
+    raw_dir = tmp_path / "raw"
+    ocr_dir = tmp_path / "md"
+    for directory in (corpus, raw_dir, ocr_dir):
+        directory.mkdir()
+    name = "doc-2026-11-02-[1].md"
+    raw = raw_dir / name
+    raw.write_text("valid raw")
+    (ocr_dir / name).write_text("enriched ocr")
+    checkpoints = tmp_path / "checkpoints"
+    checkpoints.mkdir()
+    (checkpoints / "ocr-complete.json").write_text(json.dumps({"files": [name]}))
+
+    apply_sync.publish_documents(
+        [(raw, {"id": 1, "kind": "updated"})],
+        ocr_dir,
+        corpus,
+        tmp_path / "backup",
+    )
+
+    assert (corpus / name).read_text() == "enriched ocr"
+
+
+def test_publish_documents_falls_back_to_flat_checkpoint_layout(tmp_path: Path):
+    """[12] A flat ocr-complete.json remains a compatibility fallback."""
+    corpus = tmp_path / "corpus"
+    raw_dir = tmp_path / "raw"
+    ocr_dir = tmp_path / "md"
+    for directory in (corpus, raw_dir, ocr_dir):
+        directory.mkdir()
+    name = "doc-2026-11-02-[1].md"
+    raw = raw_dir / name
+    raw.write_text("valid raw")
+    (ocr_dir / name).write_text("enriched ocr")
+    # No checkpoints/ dir: the historical flat location is still honored.
+    (tmp_path / "ocr-complete.json").write_text(json.dumps({"files": [name]}))
+
+    apply_sync.publish_documents(
+        [(raw, {"id": 1, "kind": "updated"})],
+        ocr_dir,
+        corpus,
+        tmp_path / "backup",
+    )
+
+    assert (corpus / name).read_text() == "enriched ocr"
 
 
 def test_sync_state_round_trip(tmp_path: Path):
@@ -593,7 +683,7 @@ def test_get_main_writes_structure_changes_and_complete_snapshot(
 
     get_sync.main()
 
-    result_path = output / f"sync-updates-uat-{date.today():%Y%m%d}.json"
+    result_path = output / f"sync-updates-uat-{datetime.now(UTC8):%Y%m%d}.json"
     payload = json.loads(result_path.read_text())
     assert payload["snapshot"] == {
         "complete": True,

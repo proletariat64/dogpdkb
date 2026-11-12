@@ -60,6 +60,17 @@ corpora can be registered with `dogpdkb init-state --config dogpdkb.toml --book 
 knowledge capture and planning then save each completed step in the corpus
 `.sync-state.json`. See [state, UTC+8 and single-updater behavior](docs/sync-state-design.md).
 
+The unattended batch runner `dogpdkb sync --config <file> --book <key>` executes
+capture, mdcompare, plan, ocr and compile in one run, records durable results and
+anomalies outside the cleanable wash workspace, and cleans earlier finished work
+directories after each completed or partial batch. `dogpdkb status` and
+`dogpdkb anomalies` query that history read-only; `dogpdkb wash` inventories and
+migrates historical work directories without deleting them. See
+[unattended deployment](docs/unattended-sync.md) for copyable crontab and
+logrotate examples, durable locations and cleanup guarantees. The
+[bounded offline UAT record](docs/unattended-sync-uat.md) exercises the unified
+entry on retained real Markdown with external-interface shims.
+
 ## mdocr — Markdown image prepare/OCR CLI
 
 `mdocr` prepares images referenced by Markdown and can replace them with OCR
@@ -202,6 +213,16 @@ mapping and Web classification rules. It is configuration, not a sanitized publi
 template. Set `[paths].web` explicitly for a deployed Web server; the portable
 default writes to local `web-output/<book-key>/`. Set `graphify_python` when
 Graphify lives in another environment; otherwise the current interpreter is used.
+
+The unattended `dogpdkb sync` OCR stage is best-effort. `[paths].ocr_cache`
+(default `ocr-cache`) holds long-term OCR success evidence — the original image,
+its prepared JPEG and the recognized artifact — outside the cleanable wash run
+directory, so repeated syncs reuse verified results instead of re-OCR.
+`[ocr].budget_seconds` (default `1800`) bounds the whole stage; on exhaustion the
+stage keeps completed results, archives unfinished images and proceeds to
+compile. Both keys are read through the shared configuration system and appear
+in the non-secret resume snapshot; no new environment variables are introduced
+(`PADDLEOCR_TOKEN` remains environment-only).
 
 Web publication writes both JSON files into a generation under `.snapshots/`,
 then atomically switches a shared `current` symlink. The public `catalog.json`

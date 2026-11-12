@@ -60,6 +60,19 @@ dogpdkb discover -s <book-url> --config <config.toml> \
 
 本地列表被选中但详情缺失时直接失败，不会静默联网补缺。
 
+### 下载复用与历史记录导入
+
+同知识库、同文档 ID、相同远端版本瞬时且原文文件有效时复用下载，不重复调用详情接口。检查点、canonical 状态下载记录和导入记录走同一证据判定：版本按解析后的瞬时比较（字符串写法可以不同），原文必须是可读写 UTF-8 文本且不含 OCR 富化标记；缺失或失效的必需文件重新获取，已存在的有效 raw 字节不同时绝不静默覆盖。
+
+`--import-downloads <记录路径...>` 导入历史同步或 UAT 下载记录，只接受携带等价证据的记录：
+
+- `knowledge-capture-1.0` 快照：以 `book.book_id` 证明知识库，`exports` 中 `status=captured` 且带 `listing_version`、`detail_version` 和 `raw_export` 引用。
+- 旧管道 `export-progress.json`：以 `configuration.source_url` 证明知识库，`documents` 中 `status=exported` 行需要结构化 `source_version`（详情版本）或旧式 `remote_content_updated_at`（详情 `content_updated_at`），raw 位于记录同级 `raw/` 目录。
+
+仅凭文件名、日期或文件存在不能证明同版本；版本不符、证据缺失、文件缺失/损坏/富化的记录被拒绝并重新下载。历史 OCR 富化 Markdown 永远不会被标成原始导出，只能继续作为 `historical_enriched` 基线。导入复用把 raw 复制进本批 `staging/raw` 并写入检查点，成功下载仍不声称图谱更新。
+
+snapshot 合同只增不改：新增顶层 `imports` 数组（`path`、`format`、`candidates`、`rejected[{id,reason}]`、`reused`），导入复用的 `exports` 行新增 `imported_from`，`raw.adapter` 新增 `imported_capture_snapshot`、`imported_export_progress`；检查点行可带 `imported_from`，仅详情证据的导入行可省略 `listing_version`。
+
 ## 4. 生成只读正文计划
 
 ```bash

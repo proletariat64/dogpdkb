@@ -88,7 +88,12 @@ def sync_scope(
 
 
 def extract_semantic(
-    corpus: Path, graph_dir: Path, staging: Path, files: list[str]
+    corpus: Path,
+    graph_dir: Path,
+    staging: Path,
+    files: list[str],
+    *,
+    partial: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     # Graphify belongs to the configured graph interpreter, not the platform wheel.
     check_semantic_cache = import_module("graphify.cache").check_semantic_cache
@@ -142,12 +147,17 @@ def extract_semantic(
             or fresh.get("_partial_files")
         ):
             write_json(staging / "extraction-failed.json", fresh)
-            raise RuntimeError("Graphify extraction is incomplete; resume to retry")
+            if not partial:
+                raise RuntimeError("Graphify extraction is incomplete; resume to retry")
     nodes, edges, hyperedges, missing = check_semantic_cache(
         paths, root=corpus, cache_root=cache_root, prompt=prompt
     )
-    if missing:
+    if missing and not partial:
         raise RuntimeError(f"semantic cache is still missing {len(missing)} files")
+    # In partial mode the still-missing files are exactly the sources that failed
+    # extraction this run. Their old knowledge is protected by excluding them from
+    # the merge scope; the successfully cached sources are published whole.
+    failed_files = sorted({Path(name).name for name in missing}) if partial else []
     combined = {"nodes": nodes, "edges": edges, "hyperedges": hyperedges}
     external_calls = _usage_count(fresh.get("external_calls")) if uncached else 0
     token_values = list(tokens.values())
@@ -173,6 +183,8 @@ def extract_semantic(
             if any(value is not None for value in token_values)
             else "unknown"
         ),
+        "partial": bool(failed_files),
+        "failed_files": failed_files,
     }
     write_json(staging / "extraction.json", combined)
     write_json(staging / "tokens.json", tokens)
@@ -276,14 +288,57 @@ def build_candidate(
     source_urls: dict[str, str],
     *,
     base_dir: Path,
+    partial: bool = False,
 ) -> tuple[Path, dict[str, Any]]:
     assert_deletions_absent(corpus, deleted_files)
     old = load_json(base_dir / "graph.json")
+    labels_path = base_dir / ".graphify_labels.json"
+    labels = load_json(labels_path) if labels_path.exists() else {}
+    # Empty tracked documents have no concepts to extract. Treat their former
+    # graph records as removed, while retaining the empty file in the manifest.
+    empty_files = {
+        name
+        for name in current_files
+        if not (corpus / name).read_text(encoding="utf-8").strip()
+    }
+    extraction_files = [name for name in current_files if name not in empty_files]
+    if extraction_files:
+        fresh, tokens = extract_semantic(
+            corpus, graph_dir, staging, extraction_files, partial=partial
+        )
+    else:
+        fresh = {"nodes": [], "edges": [], "hyperedges": []}
+        tokens = {
+            "requested_documents": 0,
+            "cache_hits": 0,
+            "external_extractions": 0,
+            "external_calls": 0,
+            "external_calls_evidence": "not_applicable",
+            "tokens": {"input_tokens": 0, "output_tokens": 0},
+            "token_evidence": "not_applicable",
+        }
+    if "tokens" not in tokens:
+        # Preserve the existing extraction boundary for older Graphify adapters.
+        tokens = {
+            "requested_documents": len(extraction_files),
+            "cache_hits": None,
+            "external_extractions": None,
+            "external_calls": None,
+            "external_calls_evidence": "unknown",
+            "tokens": tokens,
+            "token_evidence": "legacy_adapter",
+        }
+    # Partial publication: a source that failed extraction this run is excluded
+    # from the merge scope entirely, so its old graph records and old success
+    # version are protected rather than cleared. Only whole sources that compiled
+    # successfully enter current_files.
+    failed_files = set(tokens.get("failed_files") or []) if partial else set()
+    effective_current = [name for name in current_files if name not in failed_files]
     # A rebase can introduce another filename for a document in this delta.
     # Derive ownership from the pinned baseline, not only the corpus backup.
     affected_ids = {
         identity
-        for name in [*current_files, *old_files, *deleted_files]
+        for name in [*effective_current, *old_files, *deleted_files]
         if (identity := doc_id(name)) is not None
     }
     baseline_sources = {
@@ -301,43 +356,10 @@ def build_candidate(
         | {
             name
             for name in baseline_sources
-            if doc_id(name) in affected_ids and name not in current_files
+            if doc_id(name) in affected_ids and name not in effective_current
         }
     )
-    labels_path = base_dir / ".graphify_labels.json"
-    labels = load_json(labels_path) if labels_path.exists() else {}
-    # Empty tracked documents have no concepts to extract. Treat their former
-    # graph records as removed, while retaining the empty file in the manifest.
-    empty_files = {
-        name
-        for name in current_files
-        if not (corpus / name).read_text(encoding="utf-8").strip()
-    }
-    semantic_files = [name for name in current_files if name not in empty_files]
-    if semantic_files:
-        fresh, tokens = extract_semantic(corpus, graph_dir, staging, semantic_files)
-    else:
-        fresh = {"nodes": [], "edges": [], "hyperedges": []}
-        tokens = {
-            "requested_documents": 0,
-            "cache_hits": 0,
-            "external_extractions": 0,
-            "external_calls": 0,
-            "external_calls_evidence": "not_applicable",
-            "tokens": {"input_tokens": 0, "output_tokens": 0},
-            "token_evidence": "not_applicable",
-        }
-    if "tokens" not in tokens:
-        # Preserve the existing extraction boundary for older Graphify adapters.
-        tokens = {
-            "requested_documents": len(semantic_files),
-            "cache_hits": None,
-            "external_extractions": None,
-            "external_calls": None,
-            "external_calls_evidence": "unknown",
-            "tokens": tokens,
-            "token_evidence": "legacy_adapter",
-        }
+    semantic_files = [name for name in effective_current if name not in empty_files]
     validate_extracted_records(fresh, old)
     candidate, labels, audit = merge_graph_records(
         old,
@@ -362,13 +384,13 @@ def build_candidate(
     else:
         write_json(manifest_path, {})
     save_manifest(
-        {"document": [str(corpus / name) for name in current_files]},
+        {"document": [str(corpus / name) for name in effective_current]},
         manifest_path=str(manifest_path),
         kind="semantic",
         root=corpus,
     )
     manifest = load_json(manifest_path)
-    for name in (set(old_files) | set(deleted_files)) - set(current_files):
+    for name in (set(old_files) | set(deleted_files)) - set(effective_current):
         manifest.pop(name, None)
         manifest.pop(str((corpus / name).resolve()), None)
     write_json(manifest_path, manifest)
@@ -382,6 +404,13 @@ def build_candidate(
     audit["tokens"] = tokens["tokens"]
     audit["usage"] = tokens
     audit["status"] = "candidate_validated"
+    audit["partial"] = bool(failed_files)
+    audit["failed_sources"] = sorted(failed_files)
+    audit["published_sources"] = sorted(semantic_files)
+    # Emptied sources change the real graph (their old records are removed) and stay
+    # in the manifest, but own no semantic records. Report them separately so the
+    # caller can advance their success state without requiring graph coverage.
+    audit["emptied_sources"] = sorted(empty_files & set(effective_current))
     write_json(staging / "candidate-validation.json", audit)
     return candidate_dir, audit
 
@@ -510,6 +539,11 @@ def main() -> None:
         action="store_true",
         help="rebuild the staged candidate against the current graph baseline",
     )
+    parser.add_argument(
+        "--partial",
+        action="store_true",
+        help="publish successfully extracted whole sources; protect failed sources",
+    )
     args = parser.parse_args()
     config = configure(parser, args.config)
     source = (
@@ -578,6 +612,7 @@ def main() -> None:
             "corpus": str(corpus),
             "graph_dir": str(graph_dir),
             "manifest": manifest,
+            "partial": bool(args.partial),
             "scope": [current_files, old_files, deleted_files, source_urls],
             "config": config.snapshot(),
             "sources": {
@@ -627,6 +662,7 @@ def main() -> None:
                 deleted_files,
                 source_urls,
                 base_dir=base_dir,
+                partial=bool(args.partial),
             )
             write_json(
                 ready_path,
@@ -671,8 +707,16 @@ def main() -> None:
         }
         write_json(staging / "result.json", result)
         if tracker:
+            failed_sources = set(audit.get("failed_sources") or [])
             for row in manifest.get("exported", []):
                 identity = str(row["id"])
+                if row["file"] in failed_sources:
+                    # Partial publication: a source that failed extraction keeps its
+                    # old knowledge and old success version. Record the failure and
+                    # leave GRAPH_UPDATE_REQUIRED pending rather than falsely
+                    # advancing it to covered@new_version (H4).
+                    tracker.step(identity, "graph", "failed", file=row["file"])
+                    continue
                 version = row.get("source_version") or tracker.version(
                     row.get("content_updated_at")
                 )
@@ -688,9 +732,12 @@ def main() -> None:
                         "version": version,
                         "raw": tracker.reference(
                             staging / "source-snapshots" / row["file"],
-                            "historical_cleaned",
+                            "raw_export",
                         ),
-                        "content_kind": "historical_enriched",
+                        # A newly exported source is fresh raw, not a historical
+                        # enriched baseline; mislabeling it skewed later metadata
+                        # comparison and body-reuse decisions.
+                        "content_kind": "raw",
                         "metadata": {
                             "name": row.get("title", row["file"]),
                             "logical_path": "",

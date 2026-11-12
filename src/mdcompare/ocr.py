@@ -172,6 +172,30 @@ def _verify(
     return issue or _outcome("UNCHANGED", "OCR_REUSE_VERIFIED")
 
 
+def _removed_contributions(old: Document | None, new: Document) -> list[str]:
+    """Prior OCR successes whose original image is absent from the incoming raw.
+
+    Compile replaces an image embed with its OCR block, so a removed image surfaces
+    as a dropped OCR contribution (the prepared-image link) rather than a removed
+    embed. Track the original resource URL — not the prepared-image link — so the
+    detection survives the raw-to-published representation change.
+    """
+    if old is None:
+        return []
+    try:
+        records = _records(old)
+    except InputError:
+        return []
+    if records is None:
+        return []
+    incoming = {entry.get("resource_id") for entry in new.resources}
+    return sorted(
+        identifier
+        for identifier, record in records.items()
+        if record.get("status") == "success" and identifier not in incoming
+    )
+
+
 def compare_ocr(
     old: Document | None,
     new: Document,
@@ -181,6 +205,7 @@ def compare_ocr(
     items = []
     inputs = None
     inputs_error = None
+    removed_contributions = _removed_contributions(old, new)
     for resource in resources.get("items", []):
         if resource.get("kind") != "image" or resource.get("operation") == "removed":
             continue
@@ -235,4 +260,5 @@ def compare_ocr(
             for item in items
             if item["status"] in ("NEW", "CHANGED")
         ],
+        "removed_contributions": removed_contributions,
     }

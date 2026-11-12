@@ -445,10 +445,53 @@ def _run_pipeline(
 
 @locked_main
 def main() -> None:
-    if "--knowledge" in sys.argv[1:]:
+    """The single sync entry: always the unified five-stage batch runner.
+
+    Legacy flags are deprecated compatibility forwarding into the unified
+    runner; the superseded executors are no longer a second default.
+    """
+    from dogpdkb.unified_sync import (
+        deprecation_notice,
+        legacy_flags,
+        unified_arguments,
+    )
+    from dogpdkb.unified_sync import (
+        main as unified_main,
+    )
+
+    arguments = sys.argv[1:]
+    legacy = legacy_flags(arguments)
+    if legacy:
+        print(deprecation_notice(legacy), file=sys.stderr)
+        arguments = unified_arguments(arguments)
+    raise SystemExit(unified_main(arguments))
+
+
+@locked_main
+def legacy_main() -> None:
+    """Deprecated compatibility executor, retained for migration only.
+
+    Not reachable from ``dogpdkb sync``. Kept so the superseded pipeline's
+    input-integrity and fault-recovery regressions stay exercised; the unified
+    runner is the single default sync entry.
+    """
+    from dogpdkb.unified_sync import legacy_flags
+
+    arguments = sys.argv[1:]
+    legacy = legacy_flags(arguments)
+    if not legacy:
+        from dogpdkb.unified_sync import main as unified_main
+
+        raise SystemExit(unified_main(arguments))
+    print(
+        "dogpdkb sync: deprecated legacy compatibility executor (retained for "
+        "migration only); the unified runner is the default sync entry.",
+        file=sys.stderr,
+    )
+    if "--knowledge" in arguments:
         from dogpdkb.knowledge_sync import main as knowledge_main
 
-        raise SystemExit(knowledge_main(sys.argv[1:]))
+        raise SystemExit(knowledge_main(arguments))
     parser = argparse.ArgumentParser(description=__doc__)
     config_arguments(parser, book=True)
     parser.add_argument("-i", "--input", type=cli_path)

@@ -47,6 +47,25 @@ def _instant(version: dict[str, Any]) -> datetime:
         ) from error
 
 
+def _suppressed_match(
+    doc_id: int, version: dict[str, Any], rows: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """The archived handoff for this document at this exact source version.
+
+    Version identity reuses the existing normalized instant (no new fingerprint);
+    a different remote version never matches an archived failure.
+    """
+    for row in rows:
+        if str(row.get("document_id")) != str(doc_id):
+            continue
+        try:
+            if _instant(row.get("source_version") or {}) == _instant(version):
+                return row
+        except CaptureError:
+            continue
+    return None
+
+
 def _read_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -129,6 +148,30 @@ def _load_local_listing(
     )
 
 
+def _load_observation(path: Path) -> dict[str, Any]:
+    """Load the pre-export frozen observation, or fail closed on corruption.
+
+    Written atomically before the export loop so an interrupted capture resumes
+    against the original scope/versions/selection instead of refetching the remote
+    (spec:79/112). It is NOT a snapshot: the snapshot contract stays unchanged.
+    """
+    payload = _read_json(path)
+    required = (
+        "book",
+        "documents",
+        "listing",
+        "records",
+        "changes",
+        "selected",
+        "suppressed",
+        "prior_pending",
+        "started_at",
+    )
+    if not isinstance(payload, dict) or any(key not in payload for key in required):
+        raise CaptureError("frozen capture observation is missing required fields")
+    return payload
+
+
 def _raw_inputs(snapshot_path: Path) -> set[Path]:
     """Resolve every raw input referenced by a baseline before any output write."""
     if not snapshot_path.is_file():
@@ -170,10 +213,15 @@ def _validate_capture_paths(args: Any, snapshot_path: Path, staging: Path) -> se
     }
     if args.baseline_snapshot:
         inputs |= _raw_inputs(Path(args.baseline_snapshot).expanduser().resolve())
+    for value in getattr(args, "import_downloads", None) or []:
+        import_path = Path(value).expanduser().resolve()
+        inputs.add(import_path)
+        inputs |= _import_raw_inputs(import_path)
     outputs = [
         snapshot_path,
         staging / "pages",
         staging / "capture-checkpoint.json",
+        staging / "observation.json",
         staging / "raw",
     ]
     try:
@@ -373,6 +421,292 @@ def _raw_reference(path: Path, snapshot_path: Path, captured_at: str) -> dict[st
     }
 
 
+# Direct content markers of OCR enrichment. A file carrying them is an
+# enriched Markdown, never a verified raw export (no fingerprint system).
+_ENRICHED_MARKERS = ("<!-- mdocr:ocr-begin", "这是一张图片，ocr内容为")
+
+
+def _raw_validity(path: Path) -> str | None:
+    """Return None when the file is a usable raw export, else a reason code."""
+    if not path.is_file():
+        return "raw_missing"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, ValueError):
+        return "raw_invalid"
+    if any(marker in text for marker in _ENRICHED_MARKERS):
+        return "raw_enriched"
+    return None
+
+
+def _validated_version(record: Any) -> dict[str, Any] | None:
+    """Normalize a recorded version and verify its internal consistency."""
+    if not isinstance(record, dict):
+        return None
+    field = record.get("field")
+    value = record.get("value")
+    utc = record.get("utc")
+    if (
+        not isinstance(field, str)
+        or field not in {"content_updated_at", "updated_at"}
+        or not isinstance(value, str)
+        or not isinstance(utc, str)
+    ):
+        return None
+    try:
+        rebuilt = timestamp_record(value, field)
+        if parse_timestamp(utc) != parse_timestamp(rebuilt["utc"]):
+            return None
+    except ValueError:
+        return None
+    return rebuilt
+
+
+def _import_raw_inputs(path: Path) -> set[Path]:
+    """Best-effort raw references of an import record, for output protection."""
+    try:
+        payload = _read_json(path)
+    except CaptureError:
+        return set()
+    if not isinstance(payload, dict):
+        return set()
+    if payload.get("schema_version") == SCHEMA_VERSION:
+        return _raw_inputs(path)
+    documents = payload.get("documents")
+    if not isinstance(documents, dict):
+        return set()
+    result: set[Path] = set()
+    for row in documents.values():
+        if isinstance(row, dict) and isinstance(row.get("file"), str):
+            result.add((path.parent / "raw" / row["file"]).resolve())
+    return result
+
+
+def _snapshot_import_rows(payload: dict[str, Any], path: Path) -> Any:
+    exports = payload.get("exports")
+    if not isinstance(exports, dict):
+        raise CaptureError(f"import record {path.name} has no export records")
+    for key, row in exports.items():
+        if not isinstance(row, dict) or row.get("status") != "captured":
+            continue
+        raw = row.get("raw")
+        if (
+            not isinstance(raw, dict)
+            or raw.get("stage") != "raw_export"
+            or not isinstance(raw.get("path"), str)
+        ):
+            yield key, "invalid_raw_file"
+            continue
+        if row.get("detail_version") is None or row.get("listing_version") is None:
+            yield key, "version_missing"
+            continue
+        raw_path = Path(raw["path"])
+        if not raw_path.is_absolute():
+            raw_path = path.parent / raw_path
+        captured_at = raw.get("captured_at")
+        yield (
+            key,
+            {
+                "detail": row.get("detail_version"),
+                "listing": row.get("listing_version"),
+                "raw_path": raw_path.resolve(),
+                "captured_at": captured_at if isinstance(captured_at, str) else None,
+                "adapter": "imported_capture_snapshot",
+            },
+        )
+
+
+def _progress_import_rows(payload: dict[str, Any], path: Path) -> Any:
+    for key, row in payload["documents"].items():
+        if not isinstance(row, dict) or row.get("status") != "exported":
+            continue
+        file_name = row.get("file")
+        if not isinstance(file_name, str) or Path(file_name).name != file_name:
+            yield key, "invalid_raw_file"
+            continue
+        detail = row.get("source_version")
+        if detail is None:
+            # Pre-state-baseline rows recorded the detail content_updated_at
+            # (listing fallback) as a plain string; the field name is faithful.
+            stamp = row.get("remote_content_updated_at")
+            if isinstance(stamp, str) and stamp:
+                try:
+                    detail = timestamp_record(stamp, "content_updated_at")
+                except ValueError:
+                    yield key, "version_invalid"
+                    continue
+        yield (
+            key,
+            {
+                "detail": detail,
+                "listing": row.get("listing_version"),
+                "raw_path": (path.parent / "raw" / file_name).resolve(),
+                "captured_at": None,
+                "adapter": "imported_export_progress",
+            },
+        )
+
+
+def _load_imports(
+    paths: list[str] | None, book: dict[str, Any], source_url: str
+) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]]]:
+    """Load historical download records that carry reusable version evidence.
+
+    Only records proving book identity, document identity, a remote version
+    and a valid raw file become reuse candidates; filename, date or mere
+    existence never qualify. Candidates still face the same instant-match
+    evidence decision as the live capture checkpoint before any reuse.
+    """
+    candidates: dict[int, dict[str, Any]] = {}
+    summaries: list[dict[str, Any]] = []
+    for value in paths or []:
+        path = Path(value).expanduser().resolve()
+        payload = _read_json(path)
+        if not isinstance(payload, dict):
+            raise CaptureError(f"import record {path.name} must be a JSON object")
+        if payload.get("schema_version") == SCHEMA_VERSION:
+            fmt = SCHEMA_VERSION
+            if (payload.get("book") or {}).get("book_id") != book.get("book_id"):
+                raise CaptureError(
+                    f"import record {path.name} belongs to a different book"
+                )
+            rows = _snapshot_import_rows(payload, path)
+        elif isinstance(payload.get("documents"), dict) and isinstance(
+            payload.get("configuration"), dict
+        ):
+            fmt = "export-progress"
+            recorded_url = payload["configuration"].get("source_url")
+            if not isinstance(recorded_url, str) or recorded_url.rstrip("/") != (
+                source_url or ""
+            ).rstrip("/"):
+                raise CaptureError(
+                    f"import record {path.name} belongs to a different book"
+                )
+            rows = _progress_import_rows(payload, path)
+        else:
+            raise CaptureError(f"import record {path.name} has an unsupported format")
+        rejected: list[dict[str, Any]] = []
+        accepted = 0
+        for key, item in rows:
+            try:
+                doc_id = int(key)
+            except (TypeError, ValueError):
+                rejected.append({"id": key, "reason": "invalid_document_id"})
+                continue
+            if isinstance(item, str):
+                rejected.append({"id": doc_id, "reason": item})
+                continue
+            detail_version = _validated_version(item["detail"])
+            reason = None if detail_version is not None else "version_missing"
+            listing_version = None
+            if reason is None and item["listing"] is not None:
+                listing_version = _validated_version(item["listing"])
+                if listing_version is None:
+                    reason = "version_invalid"
+            if reason is None:
+                reason = _raw_validity(item["raw_path"])
+            if reason is None and doc_id in candidates:
+                reason = "duplicate_document"
+            if reason is not None:
+                rejected.append({"id": doc_id, "reason": reason})
+                continue
+            candidates[doc_id] = {
+                "detail_version": detail_version,
+                "listing_version": listing_version,
+                "raw_path": item["raw_path"],
+                "captured_at": item["captured_at"],
+                "adapter": item["adapter"],
+                "origin": str(path),
+            }
+            accepted += 1
+        summaries.append(
+            {
+                "path": str(path),
+                "format": fmt,
+                "candidates": accepted,
+                "rejected": rejected,
+                "reused": [],
+            }
+        )
+    return candidates, summaries
+
+
+def _checkpoint_listing_matches(
+    checkpoint_row: dict[str, Any], current_version: dict[str, Any]
+) -> bool:
+    """Listing evidence matches by instant; string forms may differ.
+
+    Rows without listing evidence (imported legacy downloads) rely on the
+    detail-version instant check alone.
+    """
+    recorded = checkpoint_row.get("listing_version")
+    if recorded is None:
+        return True
+    try:
+        return _instant(recorded) == _instant(current_version)
+    except CaptureError:
+        return False
+
+
+def _try_import_reuse(
+    document: dict[str, Any],
+    candidate: dict[str, Any],
+    current_version: dict[str, Any],
+    staging: Path,
+    snapshot_path: Path,
+    protected: set[Path],
+    checkpoint: dict[str, Any],
+    book: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Materialize an imported raw only when its evidence matches this batch."""
+    current_instant = _instant(current_version)
+    if _instant(candidate["detail_version"]) != current_instant:
+        return None
+    listing_version = candidate.get("listing_version")
+    if listing_version is not None and _instant(listing_version) != current_instant:
+        return None
+    if _raw_validity(candidate["raw_path"]) is not None:
+        return None
+    try:
+        text = candidate["raw_path"].read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    detail = {
+        candidate["detail_version"]["field"]: candidate["detail_version"]["value"],
+        "body": text,
+    }
+    try:
+        detail_version, raw = _save_raw(
+            document, detail, staging, snapshot_path, protected
+        )
+    except (CaptureError, OSError):
+        # Materialization I/O (e.g. os.replace onto a non-empty directory) must
+        # not escape the per-document failure boundary: fall back to the normal
+        # export path, which archives export_failed for this document only.
+        return None
+    if candidate.get("captured_at"):
+        raw["captured_at"] = candidate["captured_at"]
+    raw["adapter"] = candidate["adapter"]
+    row: dict[str, Any] = {
+        "raw_file": Path(raw["path"]).name,
+        "captured_at": raw["captured_at"],
+        "detail_version": detail_version,
+        "adapter": raw["adapter"],
+        "imported_from": candidate["origin"],
+    }
+    if listing_version is not None:
+        row["listing_version"] = listing_version
+    checkpoint[str(document["id"])] = row
+    try:
+        _save_checkpoint(staging, book, checkpoint)
+    except OSError:
+        # A checkpoint write failure must not discard the observation either;
+        # drop the imported row and fall back to the normal export path.
+        checkpoint.pop(str(document["id"]), None)
+        return None
+    return detail_version, raw
+
+
 def _rebase_raw(
     raw: dict[str, Any], baseline_path: Path, snapshot_path: Path
 ) -> dict[str, Any] | None:
@@ -415,11 +749,15 @@ def _save_raw(
         )
     except InputError as error:
         raise CaptureError(error.reason_code) from error
-    if raw_path.exists() and raw_path.read_text(encoding="utf-8") != detail["body"]:
+    existing_reason = _raw_validity(raw_path)
+    if (
+        existing_reason is None
+        and raw_path.read_text(encoding="utf-8") != detail["body"]
+    ):
         raise CaptureError(
             f"raw export already exists with different content: {raw_path.name}"
         )
-    if not raw_path.exists():
+    if existing_reason is not None:
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{raw_path.name}.", suffix=".tmp", dir=raw_dir
         )
@@ -449,14 +787,16 @@ def _export_local(
 
 
 def _export_remote(document: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    from dogpdkb.workflows.apply_sync_updates import export_doc
+    from dogpdkb.workflows import apply_sync_updates
     from dogpdkb.workflows.get_sync_updates import SkylarkError
 
     try:
-        return export_doc(
+        return apply_sync_updates.export_doc(
             document["id"], document.get("format") or document.get("type")
         )
-    except SkylarkError as error:
+    except (SkylarkError, apply_sync_updates.SkylarkError) as error:
+        # The legacy exporter re-exports get_sync_updates under a second module
+        # identity; both must archive as a per-document failure, never escape.
         raise CaptureError(
             f"document {document['id']} export failed: {error}"
         ) from error
@@ -489,7 +829,22 @@ def run_capture(args: Any) -> int:
         progress = Progress(Path(corpus), source.key, url=source.url, name=source.name)
         progress.claim(staging, phase="capture", parent=snapshot_path)
     started_at = _utc_now()
-    if args.listing:
+    # The remote observation (scope, versions, selection) is frozen to a
+    # stage-local file BEFORE the export loop so an interrupted capture resumes
+    # against the original batch instead of refetching drifted remote input
+    # (spec:79/112). The local --listing adapter is already a fixed input.
+    observation_path = staging / "observation.json"
+    frozen = (
+        _load_observation(observation_path)
+        if not args.listing and observation_path.is_file()
+        else None
+    )
+    if frozen is not None:
+        book = frozen["book"]
+        documents = frozen["documents"]
+        listing = frozen["listing"]
+        started_at = frozen["started_at"]
+    elif args.listing:
         book, documents, listing = _load_local_listing(
             Path(args.listing).expanduser().resolve()
         )
@@ -509,17 +864,20 @@ def run_capture(args: Any) -> int:
         )
         progress.run = str(snapshot_path)
         book = {**book, "key": source.key, "url": source.url}
-    records = {
-        str(document["id"]): {
-            "id": document["id"],
-            "title": document.get("title"),
-            "slug": document.get("slug"),
-            "format": document.get("format") or document.get("type"),
-            "toc_path": document.get("toc_path") or [],
-            "version": _version(document),
+    if frozen is not None:
+        records = frozen["records"]
+    else:
+        records = {
+            str(document["id"]): {
+                "id": document["id"],
+                "title": document.get("title"),
+                "slug": document.get("slug"),
+                "format": document.get("format") or document.get("type"),
+                "toc_path": document.get("toc_path") or [],
+                "version": _version(document),
+            }
+            for document in documents
         }
-        for document in documents
-    }
     baseline_path = (
         Path(args.baseline_snapshot).expanduser().resolve()
         if args.baseline_snapshot
@@ -543,122 +901,198 @@ def run_capture(args: Any) -> int:
         progress.phase(
             "listing", "completed", pages=listing["pages"], document_count=len(records)
         )
-    if baseline and baseline_path is not None:
-        for doc_id, previous in baseline_documents.items():
-            current = records.get(doc_id)
-            if current is None or _instant(current["version"]) != _instant(
-                previous["version"]
-            ):
-                continue
-            previous_export = (baseline.get("exports") or {}).get(doc_id, {})
-            previous_raw = previous.get("raw") or previous_export.get("raw")
-            if previous_raw:
-                current_raw = _rebase_raw(previous_raw, baseline_path, snapshot_path)
-                if current_raw is not None:
-                    current["raw"] = current_raw
-    changes = {"new": [], "updated": [], "renamed": [], "moved": [], "absent": []}
-    if baseline:
-        current_ids = {document["id"] for document in documents}
-        changes["absent"] = sorted(
-            int(value)
-            for value in set(baseline_documents) - {str(item) for item in current_ids}
-        )
-        for document in documents:
-            doc_id = str(document["id"])
-            previous = baseline_documents.get(doc_id)
-            if previous is None:
-                changes["new"].append(document["id"])
-                continue
-            current_version = records[doc_id]["version"]
-            previous_version = previous["version"]
-            current_instant = _instant(current_version)
-            previous_instant = _instant(previous_version)
-            if current_instant < previous_instant:
-                raise CaptureError(
-                    f"document {document['id']} has a timestamp regression"
-                )
-            if current_instant > previous_instant:
-                changes["updated"].append(document["id"])
-            if document.get("title") != previous.get("title"):
-                changes["renamed"].append(document["id"])
-            if (document.get("toc_path") or []) != (previous.get("toc_path") or []):
-                changes["moved"].append(document["id"])
-    if progress and baseline is None:
-        cutoff = max(
-            (
-                row.get("baseline", {}).get("filename_date", "")
-                for row in canonical_documents.values()
-                if row.get("baseline")
-            ),
-            default="",
-        )
-        for document in documents:
-            doc_id = str(document["id"])
-            previous = canonical_documents.get(doc_id)
-            current = records[doc_id]["version"]
-            existing_source = previous and (
-                previous.get("baseline")
-                or (previous.get("corpus") or {}).get("raw")
-                or (previous.get("graph") or {}).get("raw")
-                or (
-                    previous.get("steps", {}).get("download", {}).get("status")
-                    == "completed"
-                    and previous["steps"]["download"].get("raw")
-                )
-            )
-            if not existing_source:
-                if _instant(current).date().isoformat() >= cutoff:
-                    changes["new"].append(document["id"])
-                continue
-            initial = previous.get("baseline") or {}
-            downloaded = previous.get("steps", {}).get("download", {})
-            prior = (
-                downloaded.get("version")
-                or (previous.get("corpus") or {}).get("version")
-                or initial.get("version")
-            )
-            if prior:
-                if _instant(current) < _instant(prior):
-                    raise CaptureError(f"document {doc_id} has a timestamp regression")
-                if _instant(current) > _instant(prior):
-                    changes["updated"].append(document["id"])
-            elif _instant(current).date().isoformat() >= initial.get(
-                "filename_date", ""
-            ):
-                changes["updated"].append(document["id"])
     current_id_set = {document["id"] for document in documents}
-    prior_pending = (
-        _load_pending(Path(args.pending_state).expanduser().resolve(), book)
-        if args.pending_state
-        else {}
-    )
-    if progress:
-        prior_pending.update(
-            {
-                int(key): row.get("pending", [])
-                for key, row in canonical_documents.items()
-                if row.get("pending")
-            }
-        )
-    known_ids = (
-        current_id_set
-        | {int(value) for value in baseline_documents}
-        | {int(value) for value in canonical_documents}
-    )
-    unknown_pending = set(prior_pending) - known_ids
-    if unknown_pending:
-        raise CaptureError(
-            f"pending state contains unknown document IDs: {sorted(unknown_pending)}"
-        )
-    selected = sorted(
-        {
-            doc_id
-            for values in changes.values()
-            for doc_id in values
-            if doc_id in current_id_set
+    if frozen is not None:
+        # Resume against the frozen scope/versions/selection; never re-observe.
+        changes = frozen["changes"]
+        selected = frozen["selected"]
+        suppressed = frozen["suppressed"]
+        prior_pending = {
+            int(key): value for key, value in frozen["prior_pending"].items()
         }
-        | (set(prior_pending) & current_id_set)
-    )
+    else:
+        if baseline and baseline_path is not None:
+            for doc_id, previous in baseline_documents.items():
+                current = records.get(doc_id)
+                if current is None or _instant(current["version"]) != _instant(
+                    previous["version"]
+                ):
+                    continue
+                previous_export = (baseline.get("exports") or {}).get(doc_id, {})
+                previous_raw = previous.get("raw") or previous_export.get("raw")
+                if previous_raw:
+                    current_raw = _rebase_raw(
+                        previous_raw, baseline_path, snapshot_path
+                    )
+                    if current_raw is not None:
+                        current["raw"] = current_raw
+        changes = {"new": [], "updated": [], "renamed": [], "moved": [], "absent": []}
+        if baseline:
+            current_ids = {document["id"] for document in documents}
+            changes["absent"] = sorted(
+                int(value)
+                for value in set(baseline_documents)
+                - {str(item) for item in current_ids}
+            )
+            for document in documents:
+                doc_id = str(document["id"])
+                previous = baseline_documents.get(doc_id)
+                if previous is None:
+                    changes["new"].append(document["id"])
+                    continue
+                current_version = records[doc_id]["version"]
+                previous_version = previous["version"]
+                current_instant = _instant(current_version)
+                previous_instant = _instant(previous_version)
+                if current_instant < previous_instant:
+                    raise CaptureError(
+                        f"document {document['id']} has a timestamp regression"
+                    )
+                if current_instant > previous_instant:
+                    changes["updated"].append(document["id"])
+                if document.get("title") != previous.get("title"):
+                    changes["renamed"].append(document["id"])
+                if (document.get("toc_path") or []) != (previous.get("toc_path") or []):
+                    changes["moved"].append(document["id"])
+        if progress and baseline is None:
+            cutoff = max(
+                (
+                    row.get("baseline", {}).get("filename_date", "")
+                    for row in canonical_documents.values()
+                    if row.get("baseline")
+                ),
+                default="",
+            )
+            for document in documents:
+                doc_id = str(document["id"])
+                previous = canonical_documents.get(doc_id)
+                current = records[doc_id]["version"]
+                existing_source = previous and (
+                    previous.get("baseline")
+                    or (previous.get("corpus") or {}).get("raw")
+                    or (previous.get("graph") or {}).get("raw")
+                    or (
+                        previous.get("steps", {}).get("download", {}).get("status")
+                        == "completed"
+                        and previous["steps"]["download"].get("raw")
+                    )
+                )
+                if not existing_source:
+                    if _instant(current).date().isoformat() >= cutoff:
+                        changes["new"].append(document["id"])
+                    continue
+                initial = previous.get("baseline") or {}
+                downloaded = previous.get("steps", {}).get("download", {})
+                prior = (
+                    downloaded.get("version")
+                    or (previous.get("corpus") or {}).get("version")
+                    or initial.get("version")
+                )
+                if prior:
+                    if _instant(current) < _instant(prior):
+                        raise CaptureError(
+                            f"document {doc_id} has a timestamp regression"
+                        )
+                    if _instant(current) > _instant(prior):
+                        changes["updated"].append(document["id"])
+                elif _instant(current).date().isoformat() >= initial.get(
+                    "filename_date", ""
+                ):
+                    changes["updated"].append(document["id"])
+        prior_pending = (
+            _load_pending(Path(args.pending_state).expanduser().resolve(), book)
+            if args.pending_state
+            else {}
+        )
+        if progress:
+            prior_pending.update(
+                {
+                    int(key): row.get("pending", [])
+                    for key, row in canonical_documents.items()
+                    if row.get("pending")
+                }
+            )
+        known_ids = (
+            current_id_set
+            | {int(value) for value in baseline_documents}
+            | {int(value) for value in canonical_documents}
+        )
+        unknown_pending = set(prior_pending) - known_ids
+        if unknown_pending:
+            raise CaptureError(
+                f"pending state contains unknown document IDs: {sorted(unknown_pending)}"
+            )
+        selected = sorted(
+            {
+                doc_id
+                for values in changes.values()
+                for doc_id in values
+                if doc_id in current_id_set
+            }
+            | (set(prior_pending) & current_id_set)
+        )
+        # Retry suppression: an archived failure handed off for this exact
+        # source version is not re-attempted by the daily batch. A new remote
+        # version never matches, so it participates normally; abandonment is
+        # version-scoped.
+        suppressed: list[dict[str, Any]] = []
+        suppression = getattr(args, "suppressed_anomalies", None) or []
+        if suppression:
+            kept = []
+            for doc_id in selected:
+                match = _suppressed_match(
+                    doc_id, records[str(doc_id)]["version"], suppression
+                )
+                if match is None:
+                    kept.append(doc_id)
+                else:
+                    suppressed.append(
+                        {
+                            "id": doc_id,
+                            "anomaly_id": match["id"],
+                            "code": match["code"],
+                            "version_stamp": match.get("version_stamp"),
+                        }
+                    )
+            selected = kept
+        # A pending compile follow-up at the observed version is real new work
+        # (a post-hoc OCR backfill), not a retry of a failed capture: re-select its
+        # document so mdcompare makes the row available and compile consumes it.
+        # Version scoping keeps stale follow-ups out; the verified same-version
+        # download reuse supplies the raw with no re-export ([14], spec:136).
+        followups = getattr(args, "pending_followups", None) or []
+        if followups:
+            from dogpdkb.sync_results import version_stamp
+
+            reselected = {
+                int(item["document_id"])
+                for item in followups
+                if int(item["document_id"]) in current_id_set
+                and version_stamp(records[str(item["document_id"])]["version"])
+                == item.get("version_stamp")
+            }
+            if reselected:
+                selected = sorted(set(selected) | reselected)
+        # Freeze the completed observation BEFORE any export so an interrupted
+        # capture resumes against this exact scope/versions/selection (spec:79/112).
+        if not args.listing:
+            _write_json(
+                observation_path,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "book": book,
+                    "documents": documents,
+                    "listing": listing,
+                    "records": records,
+                    "changes": changes,
+                    "selected": selected,
+                    "suppressed": suppressed,
+                    "prior_pending": {
+                        str(key): value for key, value in prior_pending.items()
+                    },
+                    "started_at": started_at,
+                },
+            )
     exports: dict[str, Any] = {}
     pending = []
     anomalies = []
@@ -666,6 +1100,10 @@ def run_capture(args: Any) -> int:
         Path(args.details_dir).expanduser().resolve() if args.details_dir else None
     )
     checkpoint = _load_checkpoint(staging, book)
+    import_candidates, import_summaries = _load_imports(
+        getattr(args, "import_downloads", None), book, args.skylark_url
+    )
+    import_reused: dict[int, str] = {}
     by_id = {document["id"]: document for document in documents}
     for doc_id in selected:
         document = by_id[doc_id]
@@ -703,6 +1141,7 @@ def run_capture(args: Any) -> int:
             except CaptureError:
                 detail_matches_listing = False
         reused = False
+        imported_from = None
         saved_download = (
             canonical_documents.get(str(doc_id), {})
             .get("steps", {})
@@ -716,7 +1155,7 @@ def run_capture(args: Any) -> int:
         if (
             progress
             and saved_version
-            and saved_path.is_file()
+            and _raw_validity(saved_path) is None
             and _instant(saved_version) == _instant(records[str(doc_id)]["version"])
         ):
             detail_version = saved_version
@@ -727,11 +1166,13 @@ def run_capture(args: Any) -> int:
             reused = True
         elif (
             isinstance(checkpoint_row, dict)
-            and checkpoint_row.get("listing_version") == records[str(doc_id)]["version"]
+            and _checkpoint_listing_matches(
+                checkpoint_row, records[str(doc_id)]["version"]
+            )
             and detail_matches_listing
             and isinstance(checkpoint_row.get("raw_file"), str)
             and Path(checkpoint_row["raw_file"]).name == checkpoint_row["raw_file"]
-            and (staging / "raw" / checkpoint_row["raw_file"]).is_file()
+            and _raw_validity(staging / "raw" / checkpoint_row["raw_file"]) is None
         ):
             detail_version = checkpoint_row["detail_version"]
             raw = _raw_reference(
@@ -742,48 +1183,69 @@ def run_capture(args: Any) -> int:
             raw["adapter"] = checkpoint_row["adapter"]
             reused = True
         else:
-            try:
-                if args.listing:
-                    if details_dir is None:
-                        raise CaptureError(
-                            f"document {doc_id} requires --details-dir in local adapter mode"
-                        )
-                    body, detail = _export_local(document, details_dir)
-                else:
-                    body, detail = _export_remote(document)
-                detail_version, raw = _save_raw(
+            candidate = import_candidates.get(doc_id)
+            imported = (
+                _try_import_reuse(
                     document,
-                    {**detail, "body": body},
+                    candidate,
+                    records[str(doc_id)]["version"],
                     staging,
                     snapshot_path,
                     protected_inputs,
+                    checkpoint,
+                    book,
                 )
-                raw["adapter"] = (
-                    "local_detail" if args.listing else "skylark_doc_detail"
-                )
-            except (CaptureError, OSError) as error:
-                anomalies.append({"id": doc_id, "code": "export_failed"})
-                reasons.extend(["export_failed", *prior_pending.get(doc_id, [])])
-                pending.append({"id": doc_id, "reasons": reasons})
-                exports[str(doc_id)] = {
-                    "status": "failed",
-                    "labels": labels,
+                if candidate is not None
+                else None
+            )
+            if imported is not None:
+                detail_version, raw = imported
+                reused = True
+                imported_from = candidate["origin"]
+                import_reused[doc_id] = imported_from
+            else:
+                try:
+                    if args.listing:
+                        if details_dir is None:
+                            raise CaptureError(
+                                f"document {doc_id} requires --details-dir in local adapter mode"
+                            )
+                        body, detail = _export_local(document, details_dir)
+                    else:
+                        body, detail = _export_remote(document)
+                    detail_version, raw = _save_raw(
+                        document,
+                        {**detail, "body": body},
+                        staging,
+                        snapshot_path,
+                        protected_inputs,
+                    )
+                    raw["adapter"] = (
+                        "local_detail" if args.listing else "skylark_doc_detail"
+                    )
+                except (CaptureError, OSError) as error:
+                    anomalies.append({"id": doc_id, "code": "export_failed"})
+                    reasons.extend(["export_failed", *prior_pending.get(doc_id, [])])
+                    pending.append({"id": doc_id, "reasons": reasons})
+                    exports[str(doc_id)] = {
+                        "status": "failed",
+                        "labels": labels,
+                        "listing_version": records[str(doc_id)]["version"],
+                        "original": original,
+                        "error": str(error),
+                    }
+                    if progress:
+                        progress.step(doc_id, "download", "failed", reason=str(error))
+                        progress.update(doc_id, pending=sorted(set(reasons)))
+                    continue
+                checkpoint[str(doc_id)] = {
+                    "raw_file": Path(raw["path"]).name,
+                    "captured_at": raw["captured_at"],
                     "listing_version": records[str(doc_id)]["version"],
-                    "original": original,
-                    "error": str(error),
+                    "detail_version": detail_version,
+                    "adapter": raw["adapter"],
                 }
-                if progress:
-                    progress.step(doc_id, "download", "failed", reason=str(error))
-                    progress.update(doc_id, pending=sorted(set(reasons)))
-                continue
-            checkpoint[str(doc_id)] = {
-                "raw_file": Path(raw["path"]).name,
-                "captured_at": raw["captured_at"],
-                "listing_version": records[str(doc_id)]["version"],
-                "detail_version": detail_version,
-                "adapter": raw["adapter"],
-            }
-            _save_checkpoint(staging, book, checkpoint)
+                _save_checkpoint(staging, book, checkpoint)
         if progress:
             raw_path = Path(raw["path"])
             if not raw_path.is_absolute():
@@ -831,6 +1293,7 @@ def run_capture(args: Any) -> int:
             "listing_version": records[str(doc_id)]["version"],
             "detail_version": detail_version,
             "original": original,
+            **({"imported_from": imported_from} if imported_from else {}),
         }
     for doc_id in sorted(set(prior_pending) - current_id_set):
         pending.append(
@@ -841,6 +1304,12 @@ def run_capture(args: Any) -> int:
                     *prior_pending[doc_id],
                 ],
             }
+        )
+    for summary in import_summaries:
+        summary["reused"] = sorted(
+            doc_id
+            for doc_id, origin in import_reused.items()
+            if origin == summary["path"]
         )
     snapshot = {
         "schema_version": SCHEMA_VERSION,
@@ -881,6 +1350,8 @@ def run_capture(args: Any) -> int:
         "exports": exports,
         "pending": pending,
         "anomalies": anomalies,
+        "suppressed": suppressed,
+        "imports": import_summaries,
     }
     _write_json(snapshot_path, snapshot)
     print(

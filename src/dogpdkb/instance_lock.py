@@ -83,6 +83,25 @@ def subprocess_lock_options() -> dict:
     return {"pass_fds": (_current_fd,)} if _current_fd is not None else {}
 
 
+def lock_is_held() -> bool:
+    """Read-only liveness probe for status; never grants or keeps ownership."""
+    try:
+        fd = os.open(_lock_path(), os.O_RDWR | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 def locked_main(function):
     """Guard a mutating entry point, leaving help/version available."""
 

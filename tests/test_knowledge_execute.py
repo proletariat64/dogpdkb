@@ -29,8 +29,11 @@ def sync(
     environment["PYTHONPATH"] = str(ROOT / "src")
     if env:
         environment.update(env)
+    # Ticket 08 converged `dogpdkb sync` onto the unified runner. These legacy
+    # extraction/validation/recovery regressions exercise the retained
+    # deprecated compatibility executor directly; assertions are unchanged.
     return subprocess.run(
-        [sys.executable, "-m", "dogpdkb", "sync", *arguments],
+        [sys.executable, "-m", "dogpdkb.knowledge_sync", *arguments],
         cwd=ROOT,
         env=environment,
         text=True,
@@ -231,9 +234,17 @@ def extract_corpus_parallel(files, backend, root, cache_root, **kwargs):
         state = json.loads(state_path.read_text())
         state["documents"]["1"]["observation"]["observed_at"] = "concurrent-writer"
         state_path.write_text(json.dumps(state))
+    partial_stem = os.environ.get("GRAPHIFY_STUB_PARTIAL")
+    partial_files = []
     for path in files:
         if os.environ.get("GRAPHIFY_STUB_FAIL") == path.stem:
             raise RuntimeError("injected extraction failure")
+        if partial_stem and path.stem == partial_stem:
+            # Simulate a per-chunk failure: this source yields no records and is
+            # reported as partial rather than aborting the whole extraction.
+            partial_files.append(path.name)
+            _log({"event": "partial_skip", "file": path.name})
+            continue
         body = path.read_text()
         source = path.name
         current_nodes = [
@@ -241,6 +252,10 @@ def extract_corpus_parallel(files, backend, root, cache_root, **kwargs):
             {"id": "refund-limit", "label": "Refund limit", "rationale": "Refund requires manager approval when amount exceeds 100 USD.", "source_file": source},
         ]
         current_edges = [{"source": "refund-limit", "target": "refund-approval", "relation": "requires", "rationale": "manager approval above 100 USD", "source_file": source}]
+        if os.environ.get("GRAPHIFY_STUB_DANGLING") == path.stem:
+            # Emit a structurally invalid candidate (edge to a missing node) so the
+            # artifact structure check must reject it before any publication.
+            current_edges.append({"source": "refund-limit", "target": "missing-node", "relation": "requires", "rationale": "dangling", "source_file": source})
         value = {"body": body, "nodes": current_nodes, "edges": current_edges, "hyperedges": []}
         entry = _entry(path, cache_root)
         entry.parent.mkdir(parents=True, exist_ok=True)
@@ -248,7 +263,12 @@ def extract_corpus_parallel(files, backend, root, cache_root, **kwargs):
         nodes.extend(current_nodes)
         edges.extend(current_edges)
         _log({"event": "extract", "file": source, "cache_root": str(cache_root)})
-    return {"nodes": nodes, "edges": edges, "hyperedges": [], "input_tokens": 123, "output_tokens": 45, "external_calls": len(files)}
+    result = {"nodes": nodes, "edges": edges, "hyperedges": [], "input_tokens": 123, "output_tokens": 45, "external_calls": len(files)}
+    if partial_files:
+        result["external_calls"] = len(files) - len(partial_files)
+        result["_partial_files"] = partial_files
+        result["uncovered_files"] = [str(path) for path in files if path.name in partial_files]
+    return result
 """
     )
     (package / "detect.py").write_text(

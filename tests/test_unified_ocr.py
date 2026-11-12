@@ -1,0 +1,1353 @@
+"""Unified OCR best-effort stage, through the installed CLI entry (ticket 05).
+
+These tests drive the installed ``dogpdkb sync`` black box with a temporary
+corpus, the existing local Yuque proxy double, and an OCR HTTP double injected
+through a ``sitecustomize`` shim (no real PaddleOCR call, token, or network).
+The shim doubles ``requests.Session`` so both image download and the PaddleOCR
+job API are served locally and every billable submission is recorded.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from tests.test_unified_sync import DOCUMENTS, Workspace, read_json, write_json
+
+ROOT = Path(__file__).resolve().parents[1]
+OCR_SCHEMA = "unified-ocr-1.0"
+CONTRACT = "prepared-jpeg-ocr-v1"
+IMAGE_URL = "https://cdn.example.invalid/a.png"
+SECOND_IMAGE_URL = "https://cdn.example.invalid/b.png"
+
+
+def _shim_source(log_path: Path, mode: str, image_file: Path, primary_url: str) -> str:
+    """A sitecustomize that doubles requests.Session for images + PaddleOCR."""
+    return f"""
+import io, json, time
+time.sleep = lambda seconds: None
+import requests
+from PIL import Image
+
+LOG = {str(log_path)!r}
+MODE = {mode!r}
+IMAGE_FILE = {str(image_file)!r}
+PRIMARY_URL = {primary_url!r}
+
+def _png(url):
+    if url == PRIMARY_URL:
+        with open(IMAGE_FILE, "rb") as stream:
+            return stream.read()
+    seed = sum(url.encode()) % 256
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8), (seed, 90, 90)).save(buf, format="PNG")
+    return buf.getvalue()
+
+class Resp:
+    def __init__(self, status_code=200, json_data=None, text="", content=b""):
+        self.status_code = status_code
+        self._j = json_data
+        self.text = text
+        self.content = content
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{{self.status_code}} Error", response=self)
+    def json(self):
+        return self._j
+
+def _record(kind):
+    with open(LOG, "a", encoding="utf-8") as stream:
+        stream.write(kind + "\\n")
+
+def _handle(method, url, **kwargs):
+    if url == "https://example.com/result.jsonl":
+        if MODE == "blank":
+            return Resp(text="")
+        if MODE == "garbage":
+            return Resp(text="this is not valid json")
+        text = "OCR output line"
+        if MODE == "nested":
+            text = 'transcribed <!-- mdocr:ocr-begin source="x" --> marker'
+        payload = {{"result": {{"layoutParsingResults": [
+            {{"markdown": {{"text": text}}}}]}}}}
+        return Resp(text=json.dumps(payload))
+    if "paddleocr.aistudio-app.com" in url:
+        if method == "POST" and url.endswith("/jobs"):
+            _record("POST")
+            if MODE == "auth":
+                return Resp(status_code=401, text="unauthorized")
+            if MODE == "quota":
+                return Resp(status_code=403, text="quota exhausted")
+            if MODE == "malformed_submit":
+                return Resp(json_data={{"data": {{}}}})
+            fname = kwargs.get("files", {{}}).get("file", ("job",))[0]
+            job = "job-b" if fname.startswith("b") else "job-a"
+            return Resp(json_data={{"data": {{"jobId": job}}}})
+        if method == "GET" and "/jobs/" in url:
+            if MODE == "fail" or MODE == "crash_register_fail" or (MODE == "isolation" and url.endswith("job-b")):
+                return Resp(json_data={{"data": {{"state": "failed", "errorMsg": "boom"}}}})
+            if MODE == "malformed_poll":
+                return Resp(json_data={{"data": {{"state": "done"}}}})
+            return Resp(json_data={{"data": {{"state": "done",
+                "resultUrl": {{"jsonUrl": "https://example.com/result.jsonl"}}}}}})
+        raise AssertionError(url)
+    if url.startswith("https://cdn.example.invalid/"):
+        _record("IMG " + url)
+        return Resp(content=_png(url))
+    raise AssertionError(f"unexpected {{method}} {{url}}")
+
+def _request(self, method, url, **kwargs):
+    return _handle(method, url, **kwargs)
+
+def _get(self, url, **kwargs):
+    return _handle("GET", url, **kwargs)
+
+requests.Session.request = _request
+requests.Session.get = _get
+
+if MODE in ("crash_register", "crash_register_fail"):
+    # Model an interruption AFTER persist_success + graph.ocr merge but BEFORE
+    # follow-up registration: the durable cache holds the artifact, yet no
+    # follow-up was registered. A resume must still register on the cache hit.
+    import dogpdkb.stages.ocr as _ocrmod
+
+    def _boom(*args, **kwargs):
+        raise KeyboardInterrupt("simulated interrupt before follow-up registration")
+
+    _ocrmod.register_compile_followup = _boom
+"""
+
+
+class OcrWorkspace(Workspace):
+    """A Workspace whose doc 2 carries images and whose OCR boundary is doubled."""
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        mode: str = "success",
+        image_url: str = IMAGE_URL,
+        image_urls: list[str] | None = None,
+        budget_seconds: float | None = None,
+    ):
+        super().__init__(tmp_path, DOCUMENTS)
+        self.mode = mode
+        self.image_url = image_url
+        self.image_urls = image_urls or [image_url]
+        self.ocr_log = tmp_path / "ocr-calls.log"
+        self.ocr_cache = tmp_path / "ocr-cache"
+        self.image_file = tmp_path / "serve-image.png"
+        self.write_image(200)
+        # Give doc 2 images so the plan produces OCR work items.
+        remote = read_json(tmp_path / "remote.json")
+        embeds = "\n".join(f"![img]({url})" for url in self.image_urls)
+        remote["details"]["2"]["body"] = f"body 2\n\n{embeds}\n"
+        write_json(tmp_path / "remote.json", remote)
+        # Persist the cache outside wash via the config system.
+        self.config.write_text(
+            self.config.read_text(encoding="utf-8").replace(
+                "[paths]\n", f'[paths]\nocr_cache="{self.ocr_cache}"\n', 1
+            ),
+            encoding="utf-8",
+        )
+        if budget_seconds is not None:
+            self.config.write_text(
+                self.config.read_text(encoding="utf-8")
+                + f"\n[ocr]\nbudget_seconds={budget_seconds}\n",
+                encoding="utf-8",
+            )
+        shim = tmp_path / "python-shim"
+        shim.mkdir()
+        (shim / "sitecustomize.py").write_text(
+            _shim_source(self.ocr_log, mode, self.image_file, self.image_url),
+            encoding="utf-8",
+        )
+        self.env["PYTHONPATH"] = os.pathsep.join([str(shim), str(ROOT / "src")])
+        self.env["PADDLEOCR_TOKEN"] = "test-token"
+        # The shim is re-baked between syncs (set_mode). Never cache its bytecode:
+        # a stale sitecustomize.pyc validated by (mtime, size) could silently keep
+        # the previous MODE when two mode strings share a length and a second.
+        self.env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    def write_image(self, red: int) -> None:
+        """Serve a distinct-but-valid PNG so content changes are observable."""
+        import io
+
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.new("RGB", (8, 8), (red, 30, 30)).save(buf, format="PNG")
+        self.image_file.write_bytes(buf.getvalue())
+
+    def submissions(self) -> int:
+        if not self.ocr_log.is_file():
+            return 0
+        return sum(
+            1
+            for line in self.ocr_log.read_text(encoding="utf-8").splitlines()
+            if line == "POST"
+        )
+
+    def set_mode(self, mode: str) -> None:
+        """Re-bake the shim so the next sync subprocess serves a new boundary."""
+        self.mode = mode
+        shim = self.root / "python-shim" / "sitecustomize.py"
+        shim.write_text(
+            _shim_source(self.ocr_log, mode, self.image_file, self.image_url),
+            encoding="utf-8",
+        )
+        # Drop any cached bytecode so the rewritten MODE is always recompiled.
+        cache = shim.parent / "__pycache__"
+        if cache.is_dir():
+            for compiled in cache.glob("sitecustomize.*.pyc"):
+                compiled.unlink(missing_ok=True)
+
+    def bump_version(self, doc_id: int, stamp: str) -> None:
+        """A new remote version: listing and details must agree on the instant."""
+        remote = read_json(self.root / "remote.json")
+        for document in remote["documents"]:
+            if document["id"] == doc_id:
+                document["content_updated_at"] = stamp
+        remote["details"][str(doc_id)]["content_updated_at"] = stamp
+        write_json(self.root / "remote.json", remote)
+
+    def latest_run(self) -> Path:
+        return self.runs()[-1]
+
+    def ocr_reference(self, run: Path | None = None) -> dict[str, Any]:
+        return read_json((run or self.only_run()) / "ocr" / "ocr.json")
+
+    def ocr_envelope(self, run: Path | None = None) -> dict[str, Any]:
+        return read_json((run or self.only_run()) / "ocr" / "result.json")
+
+    def registry(self) -> dict[str, Any]:
+        return read_json(self.root / "sync-results" / "fund" / "anomalies.json")
+
+
+@pytest.fixture
+def ocr_workspace(tmp_path: Path) -> OcrWorkspace:
+    return OcrWorkspace(tmp_path)
+
+
+def test_ocr_stage_processes_the_planned_image_and_persists_a_success_result(
+    ocr_workspace: OcrWorkspace,
+):
+    completed = ocr_workspace.sync("--stop-after", "ocr")
+
+    assert completed.returncode == 0, completed.stderr
+    summary = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert summary["stages"]["plan"] == "completed"
+    assert summary["stages"]["ocr"] == "completed"
+
+    envelope = ocr_workspace.ocr_envelope()
+    assert envelope["status"] == "completed"
+    assert envelope["counts"]["success"] == 1
+    assert envelope["counts"]["failed"] == 0
+    assert envelope["counts"]["unattempted"] == 0
+
+    # The OCR-result-reference (04 schema) is published for compile to consume.
+    reference = ocr_workspace.ocr_reference()
+    assert reference["schema_version"] == OCR_SCHEMA
+    row = next(r for r in reference["documents"] if r["document_id"] == 2)
+    assert row["ocr"]["contract"] == CONTRACT
+    image = row["ocr"]["images"][0]
+    assert image["resource_id"] == IMAGE_URL
+    assert image["status"] == "success"
+    assert Path(image["artifact"]).is_file()
+    assert Path(image["prepared_image"]).is_file()
+
+    # Exactly one billable submission; the success result is cached outside wash.
+    assert ocr_workspace.submissions() == 1
+    assert ocr_workspace.ocr_cache.is_dir()
+    assert not ocr_workspace.ocr_cache.is_relative_to(ocr_workspace.staging)
+
+    # Success evidence is persisted to the canonical graph record's ocr field.
+    state = read_json(ocr_workspace.corpus / ".sync-state.json")
+    graph = state["books"]["fund"]["documents"]["2"]["graph"]
+    assert graph["ocr"]["contract"] == CONTRACT
+    assert graph["ocr"]["images"][0]["status"] == "success"
+
+
+def test_repeat_sync_reuses_the_cached_success_without_a_second_submission(
+    ocr_workspace: OcrWorkspace,
+):
+    # A full sync fails at the still-unregistered compile stage, which releases
+    # the batch claim so a second batch may start. OCR runs in both batches.
+    first = ocr_workspace.sync()
+    assert first.returncode != 0
+    run1 = ocr_workspace.latest_run()
+    assert ocr_workspace.ocr_envelope(run1)["counts"]["success"] == 1
+    assert ocr_workspace.submissions() == 1
+
+    second = ocr_workspace.sync()
+    assert second.returncode != 0
+    run2 = ocr_workspace.latest_run()
+    assert run2 != run1
+    counts = ocr_workspace.ocr_envelope(run2)["counts"]
+    # Same verified content + compatible config reuses; no proactive re-OCR.
+    assert counts["reused"] == 1
+    assert counts["success"] == 0
+    assert counts["failed"] == 0
+    assert ocr_workspace.submissions() == 1
+
+    reference = ocr_workspace.ocr_reference(run2)
+    row = next(r for r in reference["documents"] if r["document_id"] == 2)
+    image = row["ocr"]["images"][0]
+    assert image["status"] == "success"
+    assert Path(image["artifact"]).is_file()
+
+
+def test_same_url_with_changed_image_content_is_recognized_again(
+    ocr_workspace: OcrWorkspace,
+):
+    ocr_workspace.sync()
+    run1 = ocr_workspace.latest_run()
+    assert ocr_workspace.ocr_envelope(run1)["counts"]["success"] == 1
+    assert ocr_workspace.submissions() == 1
+
+    # Same URL, different bytes: the URL alone must not prove the image unchanged.
+    ocr_workspace.write_image(20)
+    ocr_workspace.sync()
+    run2 = ocr_workspace.latest_run()
+    counts = ocr_workspace.ocr_envelope(run2)["counts"]
+    assert counts["success"] == 1
+    assert counts["reused"] == 0
+    assert ocr_workspace.submissions() == 2
+
+
+@pytest.mark.parametrize("invalid_mode", ["blank", "garbage"])
+def test_an_invalid_result_never_overwrites_a_cached_success(
+    ocr_workspace: OcrWorkspace, invalid_mode: str
+):
+    ocr_workspace.sync()
+    run1 = ocr_workspace.latest_run()
+    assert ocr_workspace.ocr_envelope(run1)["counts"]["success"] == 1
+    cached = sorted(ocr_workspace.ocr_cache.glob("fund/*/artifact.md"))
+    assert len(cached) == 1
+    before = cached[0].read_text(encoding="utf-8")
+    assert "OCR output line" in before
+
+    # A different image (cache miss) meets an unstable interface returning a
+    # blank or unparseable result. It must fail without clobbering the valid
+    # cached success for the first image and without minting a success of its own.
+    ocr_workspace.write_image(20)
+    ocr_workspace.set_mode(invalid_mode)
+    ocr_workspace.sync()
+    run2 = ocr_workspace.latest_run()
+    counts2 = ocr_workspace.ocr_envelope(run2)["counts"]
+    assert counts2["failed"] == 1
+    assert counts2["reused"] == 0
+    assert counts2["success"] == 0
+    still = sorted(ocr_workspace.ocr_cache.glob("fund/*/artifact.md"))
+    assert len(still) == 1
+    assert still[0].read_text(encoding="utf-8") == before
+
+
+def test_a_single_image_failure_is_recorded_and_the_others_continue(tmp_path: Path):
+    workspace = OcrWorkspace(
+        tmp_path, mode="isolation", image_urls=[IMAGE_URL, SECOND_IMAGE_URL]
+    )
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+
+    envelope = workspace.ocr_envelope()
+    assert envelope["status"] == "partial"
+    counts = envelope["counts"]
+    assert counts["total"] == 2
+    assert counts["success"] == 1
+    assert counts["failed"] == 1
+    assert counts["unattempted"] == 0
+    # Both images were attempted; the failure did not stop the batch.
+    assert workspace.submissions() == 2
+
+    reference = workspace.ocr_reference()
+    row = next(r for r in reference["documents"] if r["document_id"] == 2)
+    assert len(row["ocr"]["images"]) == 1
+    assert row["ocr"]["images"][0]["resource_id"] == IMAGE_URL
+    missing = row["execution"]["missing_items"]
+    assert [m["resource_id"] for m in missing] == [SECOND_IMAGE_URL]
+
+    failures = [
+        a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == "OCR_FAILED"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["resource_id"] == SECOND_IMAGE_URL
+
+
+def _batch_stop_assertions(workspace: OcrWorkspace, code: str) -> None:
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+    envelope = workspace.ocr_envelope()
+    assert envelope["status"] == "partial"
+    counts = envelope["counts"]
+    assert counts["total"] == 2
+    assert counts["success"] == 0
+    assert counts["reused"] == 0
+    assert counts["failed"] == 0
+    # The shared cause stops the batch: nothing executed is counted success.
+    assert counts["unattempted"] == 2
+    # Only the triggering submission was sent; the remaining image was not.
+    assert workspace.submissions() == 1
+
+    registry = workspace.registry()
+    causes = list(registry["batch_causes"].values())
+    assert len(causes) == 1
+    assert causes[0]["code"] == code
+    assert causes[0]["stage"] == "ocr"
+    assert len(causes[0]["anomaly_ids"]) == 2
+    affected = [
+        a
+        for a in registry["anomalies"].values()
+        if a.get("batch_cause") == causes[0]["id"]
+    ]
+    assert len(affected) == 2
+    assert {a["resource_id"] for a in affected} == {IMAGE_URL, SECOND_IMAGE_URL}
+
+
+def test_auth_unavailable_stops_the_whole_batch(tmp_path: Path):
+    workspace = OcrWorkspace(
+        tmp_path, mode="auth", image_urls=[IMAGE_URL, SECOND_IMAGE_URL]
+    )
+    _batch_stop_assertions(workspace, "OCR_AUTH_UNAVAILABLE")
+
+
+def test_quota_exhaustion_stops_the_whole_batch(tmp_path: Path):
+    workspace = OcrWorkspace(
+        tmp_path, mode="quota", image_urls=[IMAGE_URL, SECOND_IMAGE_URL]
+    )
+    _batch_stop_assertions(workspace, "OCR_QUOTA_EXHAUSTED")
+
+
+@pytest.mark.parametrize(
+    "mode,code",
+    [("auth", "OCR_AUTH_UNAVAILABLE"), ("quota", "OCR_QUOTA_EXHAUSTED")],
+)
+def test_batch_stop_triggering_image_preserves_recovery_bytes(
+    tmp_path: Path, mode: str, code: str
+):
+    # [19] M15 residual: the image that TRIGGERS an auth/quota stop was already
+    # downloaded+prepared, so its stop-anomaly must reference those bytes for
+    # durable recovery (cleanup would otherwise delete them). The unattempted
+    # remainder was never downloaded and correctly carries no inputs.
+    workspace = OcrWorkspace(
+        tmp_path, mode=mode, image_urls=[IMAGE_URL, SECOND_IMAGE_URL]
+    )
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+    affected = {
+        a["resource_id"]: a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == code
+    }
+    assert set(affected) == {IMAGE_URL, SECOND_IMAGE_URL}
+    triggering = affected[IMAGE_URL]
+    kinds = {row["kind"] for row in triggering["necessary_inputs"]}
+    assert {"original_image", "prepared_image"} <= kinds
+    for row in triggering["necessary_inputs"]:
+        path = Path(row["path"])
+        assert path.is_file()
+        # The durable copy lives in the results store, not the cleanable wash run.
+        assert path.is_relative_to(workspace.root / "sync-results")
+    # The second image was never attempted: no bytes to preserve.
+    assert affected[SECOND_IMAGE_URL]["necessary_inputs"] == []
+
+
+def test_budget_exhaustion_archives_unfinished_and_proceeds_to_compile(tmp_path: Path):
+    workspace = OcrWorkspace(
+        tmp_path,
+        image_urls=[IMAGE_URL, SECOND_IMAGE_URL],
+        budget_seconds=0,
+    )
+    # A full sync reaches compile (still unregistered) even though OCR ran out of
+    # budget: OCR completion is never a prerequisite for compile.
+    completed = workspace.sync()
+    summary = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert summary["stages"]["ocr"] == "partial"
+    assert summary["stages"]["compile"] == "failed"
+
+    envelope = workspace.ocr_envelope()
+    counts = envelope["counts"]
+    assert counts["total"] == 2
+    assert counts["success"] == 0
+    assert counts["reused"] == 0
+    assert counts["unattempted"] == 2
+    assert workspace.submissions() == 0
+
+    causes = list(workspace.registry()["batch_causes"].values())
+    assert len(causes) == 1
+    assert causes[0]["code"] == "OCR_BUDGET_EXHAUSTED"
+    assert len(causes[0]["anomaly_ids"]) == 2
+    # The reference still lists the document and its unrecognized images.
+    row = next(
+        r for r in workspace.ocr_reference()["documents"] if r["document_id"] == 2
+    )
+    assert len(row["execution"]["missing_items"]) == 2
+    # The budget stop breaks BEFORE download: no image has bytes, so every
+    # stop-anomaly carries empty necessary_inputs (never a prior image's paths).
+    budget_anomalies = [
+        a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == "OCR_BUDGET_EXHAUSTED"
+    ]
+    assert len(budget_anomalies) == 2
+    assert all(a["necessary_inputs"] == [] for a in budget_anomalies)
+
+
+def test_same_version_archived_ocr_failure_is_not_retried_until_new_version(
+    tmp_path: Path,
+):
+    workspace = OcrWorkspace(tmp_path, mode="fail")
+
+    # Batch 1: the image fails; the failure is archived for this source version.
+    # A full sync ends failed at the still-unregistered compile stage, which
+    # releases the batch claim so the next daily batch may start.
+    first = workspace.sync()
+    assert first.returncode != 0
+    run1 = workspace.latest_run()
+    assert workspace.ocr_envelope(run1)["counts"]["failed"] == 1
+    assert workspace.submissions() == 1
+    failures = [
+        a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == "OCR_FAILED"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["disposition"] == "pending"
+    assert failures[0]["attempts"] == 1
+
+    # Batch 2: the remote version is unchanged, so the archived failure is handed
+    # off to the post-hoc agent instead of being retried by the daily batch.
+    second = workspace.sync()
+    assert second.returncode != 0
+    run2 = workspace.latest_run()
+    assert run2 != run1
+    plan2 = read_json(run2 / "plan" / "plan.json")
+    assert 2 in {row["document_id"] for row in plan2["suppressed"]}
+    assert 2 not in {row["document_id"] for row in plan2["ocr"]}
+    counts2 = workspace.ocr_envelope(run2)["counts"]
+    assert counts2["total"] == 0
+    assert counts2["failed"] == 0
+    # No new billable submission and no re-registration of the same failure.
+    assert workspace.submissions() == 1
+    still = [
+        a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == "OCR_FAILED"
+    ]
+    assert len(still) == 1
+    assert still[0]["attempts"] == 1
+    assert still[0]["disposition"] == "pending"
+
+    # Batch 3: a new remote version participates in daily sync normally; the
+    # abandonment of the old version never bans the source.
+    workspace.bump_version(2, "2026-11-11T09:00:00+08:00")
+    workspace.set_mode("success")
+    third = workspace.sync()
+    assert third.returncode != 0
+    run3 = workspace.latest_run()
+    plan3 = read_json(run3 / "plan" / "plan.json")
+    assert 2 not in {row["document_id"] for row in plan3["suppressed"]}
+    assert 2 in {row["document_id"] for row in plan3["ocr"]}
+    counts3 = workspace.ocr_envelope(run3)["counts"]
+    assert counts3["success"] == 1
+    assert counts3["failed"] == 0
+    assert workspace.submissions() == 2
+
+
+class OcrCompileWorkspace(OcrWorkspace):
+    """The real inline OCR handler plus the deterministic Graphify stub.
+
+    OcrWorkspace doubles the OCR boundary but leaves compile unregistered; this
+    subclass adds the Graphify stub so a full batch can really publish, letting a
+    regression observe whether OCR-driven compile follow-up work reaches the
+    published knowledge. No real Graphify / OCR / network / paid call is made.
+    """
+
+    def __init__(self, tmp_path: Path, **kwargs: Any):
+        super().__init__(tmp_path, **kwargs)
+        from tests.test_knowledge_execute import install_graphify_stub
+
+        self.stub = install_graphify_stub(tmp_path)
+        self.env["PYTHONPATH"] = os.pathsep.join(
+            [str(tmp_path / "python-shim"), str(self.stub), str(ROOT / "src")]
+        )
+        self.graphify_log = tmp_path / "graphify-calls.jsonl"
+        self.env["GRAPHIFY_STUB_LOG"] = str(self.graphify_log)
+
+    def graphify_calls(self) -> list[dict[str, Any]]:
+        if not self.graphify_log.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.graphify_log.read_text(encoding="utf-8").splitlines()
+        ]
+
+    def extracts(self) -> list[str]:
+        return [
+            row["file"] for row in self.graphify_calls() if row["event"] == "extract"
+        ]
+
+    def graph(self) -> dict[str, Any]:
+        return read_json(self.corpus / "graphify-out" / "graph.json")
+
+    def state(self) -> dict[str, Any]:
+        return read_json(self.corpus / ".sync-state.json")
+
+    def compile_report(self, run: Path | None = None) -> dict[str, Any]:
+        return read_json((run or self.only_run()) / "compile" / "compile-result.json")
+
+    def followups(self) -> dict[str, Any]:
+        path = self.root / "sync-results" / "fund" / "compile-followups.json"
+        return read_json(path) if path.is_file() else {"followups": {}}
+
+    def reuse_doc_one_with_changed_image(self) -> None:
+        """Doc One: identical body, changed image (old.png -> new.png)."""
+        (self.corpus / "One-2026-11-10-[1].md").write_text(
+            "# One\n\nOld rule.\n\n![img](https://cdn.example.invalid/old.png)\n",
+            encoding="utf-8",
+        )
+        remote = read_json(self.root / "remote.json")
+        remote["details"]["1"]["body"] = (
+            "# One\n\nOld rule.\n\n![img](https://cdn.example.invalid/new.png)\n"
+        )
+        # Keep doc Two a plain new document so OCR work is focused on doc One.
+        remote["details"]["2"]["body"] = "body 2\n"
+        write_json(self.root / "remote.json", remote)
+
+
+def test_body_reuse_changed_image_successful_ocr_is_compiled_and_publishes(
+    tmp_path: Path,
+):
+    # Spec Finding 1: a body-reuse source whose image changed and was successfully
+    # OCR'd inline must recompile so the new image text reaches the graph. The
+    # plan keeps it in body_reuse (not compile); the successful OCR must register
+    # follow-up compile work that this batch's compile stage consumes.
+    workspace = OcrCompileWorkspace(tmp_path)
+    workspace.reuse_doc_one_with_changed_image()
+
+    completed = workspace.sync()
+    assert completed.returncode == 0, completed.stderr
+    run = workspace.only_run()
+    plan = read_json(run / "plan" / "plan.json")
+    # Precondition: identical body -> body_reuse; changed image -> OCR list.
+    assert 1 in {row["document_id"] for row in plan["body_reuse"]}
+    assert 1 in {row["document_id"] for row in plan["ocr"]}
+    assert 1 not in {row["document_id"] for row in plan["compile"]}
+    assert workspace.ocr_envelope(run)["counts"]["success"] == 1
+
+    # The successful inline OCR changed the compile input: doc One is compiled
+    # this batch (via the registered follow-up), not left silently stale.
+    report = workspace.compile_report(run)
+    assert 1 in {row["document_id"] for row in report["results"]}
+    assert "source-[1].md" in workspace.extracts()
+    # The new image text reaches the published whole source and the graph.
+    frozen = (run / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" in frozen
+    assert "source-[1].md" in {n["source_file"] for n in workspace.graph()["nodes"]}
+    # The follow-up was registered and consumed only after real publication.
+    doc1 = [
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    ]
+    assert len(doc1) == 1
+    assert doc1[0]["status"] == "done"
+    assert doc1[0]["run_id"] == run.name
+
+
+def test_body_reuse_reused_image_is_not_recompiled(tmp_path: Path):
+    # Contrast for Spec Finding 1 (spec:148): once the changed image has been
+    # recognized and published, a later batch with the same remote reuses the
+    # cached image. A reused (unchanged) image is not a new compile input, so the
+    # body-reuse source must NOT be recompiled and no new follow-up may register.
+    workspace = OcrCompileWorkspace(tmp_path)
+    workspace.reuse_doc_one_with_changed_image()
+
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    run1 = workspace.runs()[-1]
+    assert 1 in {
+        row["document_id"] for row in workspace.compile_report(run1)["results"]
+    }
+    first_extracts = workspace.extracts().count("source-[1].md")
+
+    # An unchanged later batch is no-work for the settled source (M16): no
+    # comparison, no OCR, no recompile and no re-billing of the reused image.
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run2 = workspace.runs()[-1]
+    plan2 = read_json(run2 / "plan" / "plan.json")
+    assert plan2["decisions"]["1"]["decision"] == "no_work"
+    assert 1 not in {row["document_id"] for row in plan2["compile"]}
+    assert read_json(run2 / "compile" / "result.json")["status"] == "skipped"
+    # No second extraction of doc One: no recompile, no re-billing.
+    assert workspace.extracts().count("source-[1].md") == first_extracts
+    assert workspace.submissions() == 1
+    # The batch-1 follow-up stays done; no new pending follow-up for doc One.
+    doc1 = [
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    ]
+    assert len(doc1) == 1
+    assert doc1[0]["status"] == "done"
+
+
+def test_body_reuse_plan_preserves_prior_ocr_evidence_and_body_scope(tmp_path: Path):
+    # Standards J14: the plan's body-reuse state update must merge into the
+    # existing graph record, not replace it. A reused source whose image is not
+    # in this batch's OCR work list never gets graph.ocr re-added by OCR, so a
+    # wholesale replace silently drops the canonical OCR reuse evidence and the
+    # generated body scope, breaking next-batch reuse proof.
+    workspace = OcrCompileWorkspace(tmp_path)
+    workspace.reuse_doc_one_with_changed_image()
+
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    doc1 = workspace.state()["books"]["fund"]["documents"]["1"]["graph"]
+    new_png = "https://cdn.example.invalid/new.png"
+    assert doc1["ocr"]["images"][0]["resource_id"] == new_png
+    assert doc1["body_scope"]["regions"]
+
+    # A later batch re-verifies the reused body. Stop after plan so OCR cannot
+    # run and re-add graph.ocr: the plan alone must preserve the prior evidence.
+    # Bump the version with identical content so the settled doc is re-compared
+    # (an unchanged batch is no-work) and the body-reuse merge path is exercised.
+    workspace.bump_version(1, "2026-11-11T10:00:00+08:00")
+    second = workspace.sync("--stop-after", "plan")
+    assert second.returncode == 0, second.stderr
+    run2 = workspace.runs()[-1]
+    plan2 = read_json(run2 / "plan" / "plan.json")
+    assert 1 in {row["document_id"] for row in plan2["body_reuse"]}
+    doc1_after = workspace.state()["books"]["fund"]["documents"]["1"]["graph"]
+    assert doc1_after["ocr"]["images"][0]["resource_id"] == new_png
+    assert doc1_after["body_scope"]["regions"]
+
+
+def test_compile_fragment_fallback_prefers_referenced_over_stale(tmp_path: Path):
+    # G3: real OCR merges a stale failed contribution (url#old) with the current
+    # successful one (url#new). The fragment-stripped compile fallback must prefer
+    # the resource the CURRENT raw references, not whichever stale key sorted first,
+    # so the recognized text reaches the published source THIS batch (the [6] prune
+    # only cleans the published evidence for the next batch).
+    workspace = OcrCompileWorkspace(tmp_path, mode="fail")
+    old_url = IMAGE_URL + "#old"
+    new_url = IMAGE_URL + "#new"
+
+    def set_body(body: str) -> None:
+        remote = read_json(workspace.root / "remote.json")
+        remote["details"]["2"]["body"] = body
+        write_json(workspace.root / "remote.json", remote)
+
+    set_body(f"# Two old\n\n![img]({old_url})\n")
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    assert doc2["graph"]["ocr"]["images"][0]["resource_id"] == old_url
+    assert doc2["graph"]["ocr"]["images"][0]["status"] == "failed"
+
+    # New version, new fragment, OCR now succeeds: real OCR MERGES the prior failed
+    # #old with the new success #new (it does not clobber), ordered #old first.
+    workspace.set_mode("success")
+    set_body(f"# Two new\n\n![img]({new_url})\n")
+    workspace.bump_version(2, "2026-11-11T11:00:00+08:00")
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run2 = workspace.runs()[-1]
+    report = workspace.compile_report(run2)
+    result2 = next(row for row in report["results"] if row["document_id"] == 2)
+    frozen = (run2 / "compile" / "execution-corpus" / "source-[2].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" in frozen
+    assert not any(
+        m.get("resource_id") in {IMAGE_URL, old_url, new_url}
+        and m.get("code") in {"OCR_FAILED", "OCR_PENDING", "OCR_UNAVAILABLE"}
+        for m in result2["execution"]["missing_items"]
+    )
+
+
+def test_posthoc_success_resolves_an_archived_ocr_failure_and_registers_compile(
+    tmp_path: Path,
+):
+    workspace = OcrWorkspace(tmp_path, mode="fail")
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+    failures = [
+        a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == "OCR_FAILED"
+    ]
+    assert len(failures) == 1
+    aid = failures[0]["id"]
+
+    # The post-hoc agent backfills the result out of band into the durable cache
+    # (outside wash) and hands the readable artifact to the disposition CLI.
+    artifact = workspace.ocr_cache / "fund" / "backfill" / "artifact.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("backfilled OCR text\n", encoding="utf-8")
+    evidence = workspace.root / "evidence.json"
+    write_json(
+        evidence,
+        {
+            "schema_version": "unified-posthoc-evidence-1.0",
+            "cache": [{"kind": "ocr", "path": str(artifact)}],
+            "completion": {"step": "ocr", "details": {"cache": str(artifact)}},
+            "input_changed": True,
+        },
+    )
+    resolved = workspace.cli(
+        "anomalies",
+        "--config",
+        str(workspace.config),
+        "--book",
+        "fund",
+        "--resolve",
+        aid,
+        "--disposition",
+        "done",
+        "--evidence",
+        str(evidence),
+    )
+    assert resolved.returncode == 0, resolved.stderr
+    record = json.loads(resolved.stdout)
+    assert record["disposition"] == "done"
+    followup_id = record["resolution"]["followup_id"]
+    assert followup_id
+
+    # Real completion is recorded in canonical state, separate from disposition.
+    state = read_json(workspace.corpus / ".sync-state.json")
+    step = state["books"]["fund"]["documents"]["2"]["steps"]["ocr"]
+    assert step["status"] == "completed"
+    # A changed published compile input explicitly registers follow-up compile
+    # work; writing the OCR cache alone is not a completed knowledge update.
+    followups = read_json(
+        workspace.root / "sync-results" / "fund" / "compile-followups.json"
+    )
+    followup = followups["followups"][followup_id]
+    assert followup["document_id"] == 2
+    assert followup["status"] == "pending"
+    assert followup["anomaly_id"] == aid
+    assert followup["version_stamp"] == failures[0]["version_stamp"]
+    # G4: inputs carry the anomaly's resource_id so a later corrected backfill can
+    # retire this superseded input per resource.
+    assert followup["inputs"] == [
+        {
+            "kind": "ocr",
+            "path": str(artifact.resolve()),
+            "resource_id": failures[0]["resource_id"],
+        }
+    ]
+
+
+# --- OCR adjudication fix regressions (WP1) ---------------------------------
+
+
+def test_nested_marker_ocr_output_is_recorded_as_failure(tmp_path: Path):
+    # MEDIUM6: an OCR artifact whose body contains a nested mdocr marker fails the
+    # canonical structural check. It must be recorded as an image failure, never
+    # minted as success nor written to the durable cache.
+    workspace = OcrWorkspace(tmp_path, mode="nested")
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+    counts = workspace.ocr_envelope()["counts"]
+    assert counts["failed"] == 1
+    assert counts["success"] == 0
+    state = read_json(workspace.corpus / ".sync-state.json")
+    graph = state["books"]["fund"]["documents"]["2"]["graph"]
+    images = graph.get("ocr", {}).get("images", [])
+    assert all(row.get("status") != "success" for row in images)
+    # No durable success entry was written for the invalid artifact.
+    assert not any(workspace.ocr_cache.glob("*/evidence.json"))
+
+
+@pytest.mark.parametrize("mode", ["malformed_submit", "malformed_poll"])
+def test_malformed_paddle_response_is_per_image_failure_not_batch_abort(
+    tmp_path: Path, mode: str
+):
+    # H12: a 200 response with a malformed schema (missing data.jobId / resultUrl)
+    # must normalize to a per-image failure, not escape as KeyError/TypeError and
+    # abort the whole batch before compile.
+    workspace = OcrWorkspace(tmp_path, mode=mode)
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+    envelope = workspace.ocr_envelope()
+    assert envelope["status"] == "partial"
+    assert envelope["counts"]["failed"] == 1
+    failures = [
+        a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == "OCR_FAILED"
+    ]
+    assert len(failures) == 1
+
+
+def test_partial_ocr_records_partial_canonical_step_status(tmp_path: Path):
+    # MEDIUM19: a document with one success and one failure must record steps.ocr
+    # partial, matching ocr.json, not disguise partial execution as completed.
+    workspace = OcrWorkspace(
+        tmp_path, mode="isolation", image_urls=[IMAGE_URL, SECOND_IMAGE_URL]
+    )
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+    counts = workspace.ocr_envelope()["counts"]
+    assert counts["success"] == 1
+    assert counts["failed"] == 1
+    state = read_json(workspace.corpus / ".sync-state.json")
+    step = state["books"]["fund"]["documents"]["2"]["steps"]["ocr"]
+    assert step["status"] == "partial"
+
+
+def test_failed_ocr_anomaly_preserves_image_bytes_for_recovery(tmp_path: Path):
+    # MEDIUM15: a recognition failure after preparation must reference the available
+    # original/prepared bytes so archive_anomalies persists them durably before wash
+    # cleanup deletes the run workspace.
+    workspace = OcrWorkspace(tmp_path, mode="fail")
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+    failures = [
+        a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == "OCR_FAILED"
+    ]
+    assert len(failures) == 1
+    inputs = failures[0]["necessary_inputs"]
+    kinds = {row["kind"] for row in inputs}
+    assert {"original_image", "prepared_image"} <= kinds
+    for row in inputs:
+        path = Path(row["path"])
+        assert path.is_file()
+        # The durable copy lives in the results store, not the cleanable wash run.
+        assert path.is_relative_to(workspace.root / "sync-results")
+
+
+def test_same_basename_originals_do_not_collide_in_recovery_inputs(tmp_path: Path):
+    # [4] M15 regression: two same-basename, different-content images in one doc.
+    # The original was stored at src/<doc>/<name>, so the second image overwrote
+    # the first's bytes before deferred archiving copied them for recovery. The
+    # first failure's durable original_image must be ITS OWN bytes, not the
+    # second image's.
+    first_url = "https://cdn.example.invalid/first/image.png"
+    second_url = "https://cdn.example.invalid/second/image.png"
+    workspace = OcrWorkspace(
+        tmp_path,
+        mode="fail",
+        image_url=first_url,
+        image_urls=[first_url, second_url],
+    )
+    completed = workspace.sync("--stop-after", "ocr")
+    assert completed.returncode == 0, completed.stderr
+    failures = {
+        a["resource_id"]: a
+        for a in workspace.registry()["anomalies"].values()
+        if a["code"] == "OCR_FAILED"
+    }
+    assert set(failures) == {first_url, second_url}
+
+    def original_bytes(anomaly: dict[str, Any]) -> bytes:
+        row = next(
+            r for r in anomaly["necessary_inputs"] if r["kind"] == "original_image"
+        )
+        path = Path(row["path"])
+        assert path.is_file()
+        # The durable copy lives in the results store, not the cleanable wash run.
+        assert path.is_relative_to(workspace.root / "sync-results")
+        return path.read_bytes()
+
+    first_original = original_bytes(failures[first_url])
+    second_original = original_bytes(failures[second_url])
+    # The first image is served from the primary image file; its durable original
+    # must equal those bytes, and distinct content must not collapse to one file.
+    assert first_original == workspace.image_file.read_bytes()
+    assert first_original != second_original
+
+
+def test_changed_image_failed_reocr_does_not_publish_stale_text(tmp_path: Path):
+    # H2/H8: a same-URL image whose content changed and whose re-OCR failed must not
+    # keep exposing its previous success. When the document enters compile (body
+    # delta), the stale text must NOT be published and a missing item is recorded.
+    workspace = OcrCompileWorkspace(tmp_path, mode="success")
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["1"]["body"] = (
+        "# One\n\nRule v1.\n\n![img](https://cdn.example.invalid/a.png)\n"
+    )
+    remote["details"]["2"]["body"] = "body 2\n"
+    write_json(workspace.root / "remote.json", remote)
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    graph1 = workspace.state()["books"]["fund"]["documents"]["1"]["graph"]
+    assert (
+        graph1["ocr"]["images"][0]["resource_id"] == "https://cdn.example.invalid/a.png"
+    )
+    assert graph1["ocr"]["images"][0]["status"] == "success"
+
+    # Same URL, changed bytes, body delta forces compile, re-OCR fails.
+    workspace.write_image(20)
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["1"]["body"] = (
+        "# One\n\nA completely different settlement policy applies now.\n\n"
+        "![img](https://cdn.example.invalid/a.png)\n"
+    )
+    write_json(workspace.root / "remote.json", remote)
+    workspace.bump_version(1, "2026-11-11T10:00:00+08:00")
+    workspace.set_mode("fail")
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run2 = workspace.latest_run()
+    assert workspace.ocr_envelope(run2)["counts"]["failed"] == 1
+    graph2 = workspace.state()["books"]["fund"]["documents"]["1"]["graph"]
+    row = next(
+        r
+        for r in graph2["ocr"]["images"]
+        if r["resource_id"] == "https://cdn.example.invalid/a.png"
+    )
+    assert row["status"] != "success"
+    report = workspace.compile_report(run2)
+    doc1 = next(r for r in report["results"] if r["document_id"] == 1)
+    missing = doc1["execution"]["missing_items"]
+    assert any(m["resource_id"] == "https://cdn.example.invalid/a.png" for m in missing)
+    frozen = (run2 / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" not in frozen
+
+
+def test_body_reuse_changed_image_failed_reocr_republishes_to_drop_stale_text(
+    tmp_path: Path,
+):
+    # [2] H2 deferred path: a body-reuse source with a single same-URL image whose
+    # content changed and whose re-OCR FAILS. The tombstone invalidates the prior
+    # published success, but no new OCR artifact exists (final_inputs empty). A
+    # whole-source compile follow-up must still register so the source recompiles
+    # and drops the stale OCR text instead of keeping it under an advanced version.
+    workspace = OcrCompileWorkspace(tmp_path, mode="success")
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["1"]["body"] = (
+        "# One\n\nRule v1.\n\n![img](https://cdn.example.invalid/a.png)\n"
+    )
+    remote["details"]["2"]["body"] = "body 2\n"
+    write_json(workspace.root / "remote.json", remote)
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    run1 = workspace.latest_run()
+    graph1 = workspace.state()["books"]["fund"]["documents"]["1"]["graph"]
+    assert (
+        graph1["ocr"]["images"][0]["resource_id"] == "https://cdn.example.invalid/a.png"
+    )
+    assert graph1["ocr"]["images"][0]["status"] == "success"
+    frozen1 = (run1 / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" in frozen1
+
+    # Batch 2: IDENTICAL body (body_reuse), same image URL, changed bytes, re-OCR
+    # fails. The prior published success is tombstoned with no replacement artifact.
+    workspace.write_image(20)
+    workspace.bump_version(1, "2026-11-11T10:00:00+08:00")
+    workspace.set_mode("fail")
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run2 = workspace.latest_run()
+    plan2 = read_json(run2 / "plan" / "plan.json")
+    # Precondition: identical body -> body_reuse; changed image -> OCR list.
+    assert 1 in {row["document_id"] for row in plan2["body_reuse"]}
+    assert 1 in {row["document_id"] for row in plan2["ocr"]}
+    assert 1 not in {row["document_id"] for row in plan2["compile"]}
+    assert workspace.ocr_envelope(run2)["counts"]["failed"] == 1
+
+    # The invalidated prior success registers a whole-source compile follow-up
+    # (no new artifact inputs) so the source recompiles rather than staying stale.
+    doc1 = [
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    ]
+    assert len(doc1) == 1
+    assert doc1[0]["status"] == "done"
+    assert doc1[0]["run_id"] == run2.name
+    report = workspace.compile_report(run2)
+    assert 1 in {row["document_id"] for row in report["results"]}
+    frozen2 = (run2 / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" not in frozen2
+
+
+def test_body_reuse_failed_reocr_crash_before_save_recovers_on_resume(tmp_path: Path):
+    # G2/[2]: the republish intent must be written BEFORE the tombstone replaces the
+    # published success. A crash after save_view but before registration (the old
+    # order) loses the invalidation: resume sees only the tombstone, cannot
+    # reconstruct prior_success, skips registration, and leaves stale OCR text
+    # published. Write-ahead registration keeps the intent (or the intact success)
+    # durable so resume still republishes and drops the stale text.
+    workspace = OcrCompileWorkspace(tmp_path, mode="success")
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["1"]["body"] = (
+        "# One\n\nRule v1.\n\n![img](https://cdn.example.invalid/a.png)\n"
+    )
+    remote["details"]["2"]["body"] = "body 2\n"
+    write_json(workspace.root / "remote.json", remote)
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    run1 = workspace.latest_run()
+    graph1 = workspace.state()["books"]["fund"]["documents"]["1"]["graph"]
+    assert graph1["ocr"]["images"][0]["status"] == "success"
+    frozen1 = (run1 / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" in frozen1
+
+    # Batch 2: identical body (body_reuse), same URL, changed bytes, re-OCR FAILS.
+    # Crash at registration entry: in the old order save_view already tombstoned the
+    # success; in the write-ahead order the tombstone has not been saved yet.
+    workspace.write_image(20)
+    workspace.bump_version(1, "2026-11-11T10:00:00+08:00")
+    workspace.set_mode("crash_register_fail")
+    second = workspace.sync()
+    assert second.returncode == 130, second.stderr
+    run2 = workspace.latest_run()
+
+    # Resume with re-OCR still failing: the invalidation must survive and the source
+    # must republish WITHOUT the stale OCR text.
+    workspace.set_mode("fail")
+    third = workspace.sync("--resume", run2.name)
+    assert third.returncode == 0, third.stderr
+    report = workspace.compile_report(run2)
+    assert 1 in {r["document_id"] for r in report["results"]}
+    frozen2 = (run2 / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" not in frozen2
+    doc1 = [
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    ]
+    assert len(doc1) == 1
+    assert doc1[0]["status"] == "done"
+
+
+def test_removed_image_with_prior_ocr_contribution_republishes(tmp_path: Path):
+    # H26: a covered source whose image was successfully OCR'd must republish when
+    # a later batch REMOVES that image, even though the body text is unchanged.
+    # Body comparison excludes image embeds, so without the fix the removal is
+    # swallowed by body_reuse and the removed image's OCR text stays published.
+    workspace = OcrCompileWorkspace(tmp_path, mode="success")
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["1"]["body"] = (
+        "# One\n\nRule v1.\n\n![img](https://cdn.example.invalid/a.png)\n"
+    )
+    remote["details"]["2"]["body"] = "body 2\n"
+    write_json(workspace.root / "remote.json", remote)
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    graph1 = workspace.state()["books"]["fund"]["documents"]["1"]["graph"]
+    assert (
+        graph1["ocr"]["images"][0]["resource_id"] == "https://cdn.example.invalid/a.png"
+    )
+    assert graph1["ocr"]["images"][0]["status"] == "success"
+
+    # Same body text, image removed: the OCR contribution is gone, so the whole
+    # source must republish rather than reuse the stale body.
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["1"]["body"] = "# One\n\nRule v1.\n"
+    write_json(workspace.root / "remote.json", remote)
+    workspace.bump_version(1, "2026-11-11T10:00:00+08:00")
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run2 = workspace.latest_run()
+    plan2 = read_json(run2 / "plan" / "plan.json")
+    assert 1 in {row["document_id"] for row in plan2["compile"]}
+    assert 1 not in {row["document_id"] for row in plan2["body_reuse"]}
+    report = workspace.compile_report(run2)
+    assert 1 in {row["document_id"] for row in report["results"]}
+    frozen = (run2 / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" not in frozen
+    assert "source-[1].md" in {n["source_file"] for n in workspace.graph()["nodes"]}
+
+
+def test_cache_hit_on_resume_registers_followup_when_published_source_lacks_artifact(
+    tmp_path: Path,
+):
+    # MEDIUM4: an interrupt AFTER persist_success + graph.ocr merge but BEFORE
+    # follow-up registration leaves the artifact in the durable cache while the
+    # published source lacks it and no follow-up exists. Resuming re-runs OCR as a
+    # cache hit (reused); the registration delta must be measured against the
+    # published input, not against whether this run made a fresh request, so the
+    # follow-up is still registered and compile republishes the new image text.
+    workspace = OcrCompileWorkspace(tmp_path, mode="crash_register")
+    workspace.reuse_doc_one_with_changed_image()
+
+    first = workspace.sync()
+    assert first.returncode == 130, first.stderr
+    run1 = workspace.latest_run()
+    # The artifact is durable and the graph holds the success, but registration
+    # never ran: no follow-up was recorded and compile never published doc One.
+    cached = sorted(workspace.ocr_cache.glob("fund/*/artifact.md"))
+    assert len(cached) == 1
+    assert "OCR output line" in cached[0].read_text(encoding="utf-8")
+    assert (
+        workspace.state()["books"]["fund"]["documents"]["1"]["graph"]["ocr"]["images"][
+            0
+        ]["status"]
+        == "success"
+    )
+    assert not [
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    ]
+
+    workspace.set_mode("success")
+    second = workspace.sync("--resume", run1.name)
+    assert second.returncode == 0, second.stderr
+    # OCR re-ran as a cache hit (no second billable submission) and the fix
+    # registered the follow-up the interrupted batch never recorded.
+    assert workspace.ocr_envelope(run1)["counts"]["reused"] == 1
+    assert workspace.submissions() == 1
+    report = workspace.compile_report(run1)
+    assert 1 in {r["document_id"] for r in report["results"]}
+    frozen = (run1 / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" in frozen
+    doc1 = [
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    ]
+    assert len(doc1) == 1
+    assert doc1[0]["status"] == "done"
+
+
+def test_failed_ocr_followup_is_not_retried_the_next_day(tmp_path: Path):
+    # H22: a body-reuse source's OCR-driven compile follow-up that fails extraction
+    # archives a same-version anomaly the daily plan suppresses. The follow-up must
+    # record the failed attempt so the next day's batch does not re-add it from the
+    # mdcompare row and endlessly retry a handed-off failure. A fresh post-hoc
+    # backfill (new evidence) still reopens it.
+    workspace = OcrCompileWorkspace(tmp_path)
+    workspace.reuse_doc_one_with_changed_image()
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = "source-[1]"
+
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    run1 = workspace.runs()[-1]
+    assert json.loads(first.stdout.strip().splitlines()[-1])["status"] == "partial"
+    followup = next(
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    )
+    assert followup["status"] == "failed"
+    assert followup["run_id"] == run1.name
+    first_extracts = workspace.extracts().count("source-[1].md")
+
+    # Next day: same version is suppressed; the attempted follow-up must not retry.
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = ""
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run2 = workspace.runs()[-1]
+    plan2 = read_json(run2 / "plan" / "plan.json")
+    assert plan2["decisions"]["1"]["decision"] == "suppressed"
+    assert workspace.extracts().count("source-[1].md") == first_extracts
+    still = next(
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    )
+    assert still["status"] == "failed"
+
+    # A genuine post-hoc backfill with new evidence reopens the follow-up.
+    from dogpdkb.sync_results import register_compile_followup
+    from mdocr.config import load_config
+
+    config = load_config(workspace.config)
+    doc1 = workspace.state()["books"]["fund"]["documents"]["1"]
+    artifact = doc1["graph"]["ocr"]["images"][0]["artifact"]
+    reopened = register_compile_followup(
+        config,
+        "fund",
+        document_id=1,
+        source_version=doc1["observation"]["version"],
+        reason="post-hoc OCR backfill changed the published compile input",
+        inputs=[{"kind": "cache", "path": artifact}],
+    )
+    assert reopened["status"] == "pending"
+
+
+def test_resume_after_followup_consumption_reuses_retained_candidate(tmp_path: Path):
+    # H25: a pending OCR follow-up adds a document to the compile set; consumption
+    # marks it done before the stage envelope commits. A crash in that window must
+    # not destabilize the merged set on resume — rebuilding from only pending
+    # follow-ups would drop the consumed document and reject the retained candidate
+    # with "candidate inputs changed".
+    from tests.test_unified_compile import CRASH_AFTER_COMPILE_ARTIFACT
+
+    workspace = OcrCompileWorkspace(tmp_path)
+    workspace.reuse_doc_one_with_changed_image()
+    shim = workspace.root / "python-shim" / "sitecustomize.py"
+    shim.write_text(
+        shim.read_text(encoding="utf-8") + "\n" + CRASH_AFTER_COMPILE_ARTIFACT,
+        encoding="utf-8",
+    )
+    workspace.env["DOGPDKB_CRASH_AFTER_COMPILE"] = "1"
+
+    crashed = workspace.sync()
+    assert crashed.returncode != 0
+    run = workspace.only_run()
+    assert (run / "compile" / "compile-result.json").is_file()
+    followup = next(
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    )
+    assert followup["status"] == "done"
+    assert followup["run_id"] == run.name
+
+    workspace.env["DOGPDKB_CRASH_AFTER_COMPILE"] = "0"
+    resumed = workspace.sync("--resume", run.name)
+    assert resumed.returncode == 0, resumed.stderr
+    assert "candidate inputs changed" not in resumed.stderr
+    recovered = read_json(run / "run.json")["stage_states"]["compile"]
+    assert recovered["status"] in {"completed", "partial", "skipped"}
+    assert 1 in {r["document_id"] for r in workspace.compile_report(run)["results"]}
+
+
+def test_html_image_ocr_success_is_recorded_unenriched_and_handed_off(tmp_path: Path):
+    # M17: an HTML <img> (or reference-style) image is recognized by OCR but the
+    # inline-only enrichment never inserts its text. The compile must record the
+    # successful-but-unconsumed OCR as a missing item and hand off the follow-up
+    # rather than falsely closing it as a fulfilled compile input.
+    workspace = OcrCompileWorkspace(tmp_path)
+    (workspace.corpus / "One-2026-11-10-[1].md").write_text(
+        '# One\n\nOld rule.\n\n<img src="https://cdn.example.invalid/old.png">\n',
+        encoding="utf-8",
+    )
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["1"]["body"] = (
+        '# One\n\nOld rule.\n\n<img src="https://cdn.example.invalid/new.png">\n'
+    )
+    remote["details"]["2"]["body"] = "body 2\n"
+    write_json(workspace.root / "remote.json", remote)
+
+    completed = workspace.sync()
+    assert completed.returncode == 0, completed.stderr
+    run = workspace.only_run()
+    plan = read_json(run / "plan" / "plan.json")
+    assert 1 in {row["document_id"] for row in plan["body_reuse"]}
+    assert 1 in {row["document_id"] for row in plan["ocr"]}
+    assert workspace.ocr_envelope(run)["counts"]["success"] == 1
+
+    report = workspace.compile_report(run)
+    result1 = next(r for r in report["results"] if r["document_id"] == 1)
+    missing = result1["execution"]["missing_items"]
+    assert any(
+        m["code"] == "OCR_NOT_ENRICHED"
+        and m["resource_id"] == "https://cdn.example.invalid/new.png"
+        for m in missing
+    )
+    # The HTML form is left unchanged; no OCR text was inserted.
+    frozen = (run / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" not in frozen
+    assert '<img src="https://cdn.example.invalid/new.png">' in frozen
+
+    followup = next(
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    )
+    assert followup["status"] == "failed"
+    assert followup["resolution"]["disposition"] == "handed_off"

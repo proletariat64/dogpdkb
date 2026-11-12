@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Apply a Yuque sync-updates delta: export, OCR (mdocr), merge into corpus.
+"""Apply a Yuque sync-updates delta: export and merge into the corpus.
 
 Reads a sync-updates JSON produced by get_sync_updates.py, selects recent
 additions plus all updates, renames and moves of tracked docs, then for each doc:
 
   1. exports the markdown body via the skylark MCP bridge
   2. rewrites SSO-gated image URLs to the public mirror
-  3. runs `mdocr ocr --download` so image text becomes queryable
-  4. merges the result into the corpus dir using the flatten-export
+  3. merges the result into the corpus dir using the flatten-export
      filename convention `<toc-path>__<title>-<YYYY-MM-DD>-[doc_id].md`
      (stale local copies of updated docs are removed first)
+
+OCR is no longer run here: it is a best-effort stage of the unified
+``dogpdkb sync`` runner, and publication proceeds with the available raw export
+when no OCR output exists. The ``run_ocr_with_resume`` utility remains for
+direct callers.
 
 Remote deletions are applied only from a complete snapshot of the same book;
 old and deleted files are backed up in the staging directory.
@@ -232,10 +236,26 @@ def publish_documents(
     backup_dir: Path,
     on_complete: Callable[[Path, dict[str, Any]], None] | None = None,
 ) -> dict[str, int]:
+    # Only a validated complete OCR output may be published; a partial md/ left
+    # by an interrupted prior OCR (no checkpoint entry) must fall back to raw.
+    # The legacy executor wrote the checkpoint in run_ocr_with_resume's state_dir
+    # (staging/checkpoints) while ocr_dir is staging/md, so honor that historical
+    # location first and keep the flat path as a compatibility fallback.
+    checkpoint = ocr_dir.parent / "checkpoints" / "ocr-complete.json"
+    if not checkpoint.is_file():
+        checkpoint = ocr_dir.parent / "ocr-complete.json"
+    completed: set[str] = set()
+    if checkpoint.is_file():
+        try:
+            completed = set(
+                json.loads(checkpoint.read_text(encoding="utf-8")).get("files", [])
+            )
+        except ValueError:
+            completed = set()
     planned: list[tuple[Path, Path, list[Path], dict[str, Any]]] = []
     for raw_path, doc in exported:
         final_source = ocr_dir / raw_path.name
-        if not final_source.is_file():
+        if raw_path.name not in completed or not final_source.is_file():
             final_source = raw_path
         if not final_source.is_file():
             raise FileNotFoundError(final_source)
@@ -771,50 +791,10 @@ def main() -> None:
         print_retry()
         raise export_cancellation
     print(
-        f"exported {len(exported)}, skipped {len(skipped)}; running mdocr ocr ...",
+        f"exported {len(exported)}, skipped {len(skipped)}; "
+        "OCR is a best-effort stage of the unified sync runner",
         file=sys.stderr,
     )
-    try:
-        by_file = {path.name: doc for path, doc in exported}
-
-        def ocr_completed(path):
-            tracker.step(
-                str(by_file[path.name]["id"]),
-                "ocr",
-                "completed",
-                file=path.name,
-                output=str(ocr_dir / path.name),
-            )
-
-        run_ocr_with_resume(
-            [p for p, _ in exported],
-            ocr_dir,
-            staging / "checkpoints",
-            on_complete=ocr_completed,
-        )
-    except (OSError, RuntimeError, KeyboardInterrupt) as error:
-        failure = {"stage": "ocr", "reason": safe_diagnostic(error) or "cancelled"}
-        if isinstance(error, OCRFailure):
-            failure["file"] = error.file
-        tracker.phase("ocr", "failed", reason=failure["reason"])
-        if failure.get("file") in by_file:
-            tracker.step(
-                str(by_file[failure["file"]]["id"]),
-                "ocr",
-                "failed",
-                reason=failure["reason"],
-            )
-        manifest["status"] = "failed"
-        manifest["failures"].append(failure)
-        _write_failure_manifest(manifest_path, manifest)
-        print(
-            f"[ocr] {failure['reason']}; staging kept at {staging}; valid checkpoints will be reused",
-            file=sys.stderr,
-        )
-        print_retry()
-        if isinstance(error, KeyboardInterrupt):
-            raise
-        raise SystemExit(1) from error
     if errors:
         tracker.phase("download", "failed", failures=len(errors))
         print(

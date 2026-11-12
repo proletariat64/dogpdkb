@@ -8,6 +8,16 @@ corpus = "corpus"
 staging = "staging"
 state = "state"
 web = "web"
+# Durable batch results, anomaly handoff and persisted inputs; survives wash cleanup.
+results = "sync-results"
+# Long-term OCR success evidence (original + prepared JPEG + artifact); survives
+# wash cleanup so repeated syncs reuse verified results without re-OCR.
+ocr_cache = "ocr-cache"
+
+[ocr]
+# Best-effort OCR stage total time budget (seconds). On exhaustion the stage
+# keeps completed results, archives unfinished images and proceeds to compile.
+budget_seconds = 1800
 
 [skylark]
 mcp_url = "https://example.invalid/mcp"

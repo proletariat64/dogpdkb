@@ -28,6 +28,44 @@ _REQUEST_RETRIES = 3
 _RETRY_DELAY = 2
 
 
+class OcrSharedError(RuntimeError):
+    """A shared cause (auth/quota) that should stop the whole batch's OCR.
+
+    Subclasses RuntimeError so existing per-image handlers keep working; the OCR
+    stage catches it specifically to stop the batch and record one batch cause
+    instead of retrying every remaining image against the same exhausted token
+    or quota. ``code`` is the stable anomaly/batch-cause code.
+    """
+
+    code = "OCR_SHARED_UNAVAILABLE"
+
+    def __init__(self, message: str, *, code: str | None = None):
+        super().__init__(message)
+        if code is not None:
+            self.code = code
+
+
+class OcrAuthError(OcrSharedError):
+    """The token is missing, rejected or expired (HTTP 401)."""
+
+    code = "OCR_AUTH_UNAVAILABLE"
+
+
+class OcrQuotaError(OcrSharedError):
+    """The shared quota/rate allowance is exhausted (HTTP 403/429)."""
+
+    code = "OCR_QUOTA_EXHAUSTED"
+
+
+def _ocr_error(status: int | None, message: str) -> RuntimeError:
+    """Classify a terminal request failure into a shared or generic error."""
+    if status == 401:
+        return OcrAuthError(message)
+    if status in (403, 429):
+        return OcrQuotaError(message)
+    return RuntimeError(message)
+
+
 def _text_only(markdown: str) -> str:
     """Remove image embeds emitted by PaddleOCR while retaining useful labels."""
 
@@ -41,6 +79,10 @@ def _text_only(markdown: str) -> str:
 
 
 def _extract_markdown(payload: dict[str, Any]) -> str:
+    if not isinstance(payload, dict):
+        # ValueError, not TypeError: the OCR per-image handler catches ValueError
+        # so a malformed result line fails one image instead of aborting the batch.
+        raise ValueError("result line was not a JSON object")  # noqa: TRY004
     blocks: list[str] = []
     result = payload.get("result", payload)
     pages = result.get("layoutParsingResults", []) if isinstance(result, dict) else []
@@ -73,7 +115,11 @@ def _parse_result_jsonl(text: str) -> str:
             continue
         try:
             blocks.append(_extract_markdown(json.loads(raw)))
-        except (json.JSONDecodeError, ValueError) as exc:
+        except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
+            # Normalize every structural failure of an untrusted result line
+            # (null pages/parsing lists, numeric text/block_content) to ValueError
+            # so the OCR per-image handler fails one image instead of aborting the
+            # whole batch on a malformed-200 nested schema (H12).
             raise ValueError(f"invalid result JSONL line {number}: {exc}") from exc
     if not blocks:
         raise ValueError("downloaded result JSONL was empty")
@@ -93,18 +139,23 @@ class PaddleClient:
         delay = _RETRY_DELAY
         retries = _REQUEST_RETRIES if max_retries is None else max_retries
         for attempt in range(retries + 1):
+            status = None
             try:
                 response = self.session.request(
                     method, url, timeout=_REQUEST_TIMEOUT, **kwargs
                 )
-                if response.status_code not in _TRANSIENT_STATUS:
+                status = response.status_code
+                if status not in _TRANSIENT_STATUS:
                     response.raise_for_status()
                     return response
-                error = f"HTTP {response.status_code}: {response.text[:300]}"
+                error = f"HTTP {status}: {response.text[:300]}"
             except requests.RequestException as exc:
                 error = str(exc)
+                resp = getattr(exc, "response", None)
+                if resp is not None:
+                    status = getattr(resp, "status_code", status)
             if attempt >= retries:
-                raise RuntimeError(error)
+                raise _ocr_error(status, error)
             time.sleep(delay * (2**attempt))
         raise AssertionError("unreachable")
 
@@ -132,17 +183,35 @@ class PaddleClient:
                 data=payload,
                 files={"file": (image_path.name, stream)},
             )
-        return response.json()["data"]["jobId"]
+        try:
+            job_id = response.json()["data"]["jobId"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "malformed PaddleOCR submit response: missing data.jobId"
+            ) from exc
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError("malformed PaddleOCR submit response: empty data.jobId")
+        return job_id
 
     def _poll(self, job_id: str) -> str:
         deadline = time.monotonic() + _JOB_TIMEOUT
         while time.monotonic() < deadline:
-            payload = self._request(
-                "GET", f"{_JOB_URL}/{job_id}", headers=self.headers
-            ).json()["data"]
-            state = payload["state"]
+            try:
+                payload = self._request(
+                    "GET", f"{_JOB_URL}/{job_id}", headers=self.headers
+                ).json()["data"]
+                state = payload["state"]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "malformed PaddleOCR job response: missing data.state"
+                ) from exc
             if state == "done":
-                url = payload["resultUrl"]["jsonUrl"]
+                try:
+                    url = payload["resultUrl"]["jsonUrl"]
+                except (KeyError, TypeError) as exc:
+                    raise ValueError(
+                        "malformed PaddleOCR job response: missing resultUrl.jsonUrl"
+                    ) from exc
                 result = self._request("GET", url).text
                 return _text_only(_parse_result_jsonl(result))
             if state == "failed":

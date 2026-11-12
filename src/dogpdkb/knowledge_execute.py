@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from dogpdkb.instance_lock import subprocess_lock_options
@@ -20,13 +21,18 @@ from dogpdkb.knowledge_plan import (
     state_lock_path,
 )
 from dogpdkb.knowledge_state import BookState, canonical_view, root_state, save_view
+from dogpdkb.sync_results import load_followups, save_followups, version_stamp
 from dogpdkb.sync_time import now_iso
 from dogpdkb.workflows.graph_sync import doc_id
 from mdcompare.io import publish_reports, validate_outputs
+from mdocr.markdown import transform_images
+from mdocr.ocr import _OCR_BLOCK_RE, _OCR_END
 
 EXECUTION_SCHEMA = "knowledge-execution-1.0"
 APPROVAL_SCHEMA = "knowledge-approvals-2.0"
 QUALITY_SCHEMA = "knowledge-quality-cases-2.0"
+COMPILE_SCHEMA = "unified-compile-1.0"
+COMPILE_JOURNAL_SCHEMA = "unified-compile-journal-1.0"
 
 
 class ExecutionError(ValueError):
@@ -212,11 +218,15 @@ def _approved_rows(
     return selected
 
 
-def _freeze_source(source: Path, destination: Path) -> None:
-    content = source.read_bytes()
+def _freeze_bytes(content: bytes, destination: Path, *, mismatch: str) -> None:
+    """Atomically freeze ``content`` at ``destination``, idempotent on resume.
+
+    A retained file with identical bytes is left untouched; differing bytes are a
+    contract violation (the frozen input changed after it was first written).
+    """
     if destination.exists():
         if destination.read_bytes() != content:
-            raise ExecutionError("execution corpus differs from the approved raw input")
+            raise ExecutionError(mismatch)
         return
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -234,8 +244,22 @@ def _freeze_source(source: Path, destination: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _freeze_source(source: Path, destination: Path) -> None:
+    _freeze_bytes(
+        source.read_bytes(),
+        destination,
+        mismatch="execution corpus differs from the approved raw input",
+    )
+
+
 def _run_graphify(
-    args: Any, phase: str, corpus: Path, manifest: Path
+    args: Any,
+    phase: str,
+    corpus: Path,
+    manifest: Path,
+    *,
+    log: Any = None,
+    partial: bool = False,
 ) -> dict[str, Any]:
     graph_dir = args.graph_dir.expanduser().resolve()
     graph_staging = args.staging.expanduser().resolve() / "graph-update"
@@ -252,25 +276,32 @@ def _run_graphify(
     # The parent executor owns canonical progress; this corpus is an isolated input.
     for name in ("DOGPDKB_RUN_CORPUS", "DOGPDKB_RUN_BOOK", "DOGPDKB_RUN_STAGING"):
         environment.pop(name, None)
+    command = [
+        str(interpreter),
+        str(script),
+        "--input",
+        str(corpus),
+        "--manifest",
+        str(manifest),
+        "--staging",
+        str(graph_staging),
+        "--graph-dir",
+        str(graph_dir),
+        phase,
+    ]
+    if partial:
+        command.append("--partial")
+    # Stream Graphify's own diagnostics straight into the stage log instead of
+    # buffering them in memory. With no log (legacy approval path) the output is
+    # captured so a failure can be reported without leaking tool noise to stdout.
+    stream_options = log.popen_kwargs() if log is not None else {"capture_output": True}
     completed = subprocess.run(
-        [
-            str(interpreter),
-            str(script),
-            "--input",
-            str(corpus),
-            "--manifest",
-            str(manifest),
-            "--staging",
-            str(graph_staging),
-            "--graph-dir",
-            str(graph_dir),
-            phase,
-        ],
+        command,
         env=environment,
         **subprocess_lock_options(),
         text=True,
-        capture_output=True,
         check=False,
+        **stream_options,
     )
     result_name = (
         "candidate-result.json" if phase == "--candidate-only" else "result.json"
@@ -284,11 +315,16 @@ def _run_graphify(
     return _read_json(result_path)
 
 
-def _validate_candidate_graph(
-    candidate_path: Path,
-    selected: list[tuple[dict[str, Any], dict[str, Any], Path]],
+def _validate_graph_records(
+    graph: dict[str, Any], current_sources: set[str], selected_ids: set[str]
 ) -> dict[str, Any]:
-    graph = _read_json(candidate_path)
+    """Artifact-level structure checks only: no semantic or quality gate.
+
+    Shared by the legacy approval path and the automatic compile stage. It proves
+    the candidate is a well-formed graph that covers every published whole source
+    and retains no stale ownership for those sources; it never judges node counts,
+    knowledge diffs or meaning.
+    """
     nodes = graph.get("nodes")
     links = graph.get("links")
     hyperedges = graph.get("hyperedges") or []
@@ -322,7 +358,6 @@ def _validate_candidate_graph(
         )
         if not isinstance(members, list) or not set(members) <= identities:
             raise ExecutionError("candidate graph contains a dangling hyperedge")
-    current_sources = {f"source-[{row['document_id']}].md" for row, _, _ in selected}
     covered = {
         str(record.get("source_file"))
         for record in [*nodes, *hyperedges]
@@ -333,7 +368,6 @@ def _validate_candidate_graph(
         raise ExecutionError(
             "candidate graph does not cover every approved full source"
         )
-    selected_ids = {str(row["document_id"]) for row, _, _ in selected}
     for record in [*nodes, *links, *hyperedges]:
         identity = doc_id(str(record.get("source_file") or ""))
         if (
@@ -344,6 +378,16 @@ def _validate_candidate_graph(
                 "candidate retained duplicate or stale source ownership"
             )
     return graph
+
+
+def _validate_candidate_graph(
+    candidate_path: Path,
+    selected: list[tuple[dict[str, Any], dict[str, Any], Path]],
+) -> dict[str, Any]:
+    graph = _read_json(candidate_path)
+    current_sources = {f"source-[{row['document_id']}].md" for row, _, _ in selected}
+    selected_ids = {str(row["document_id"]) for row, _, _ in selected}
+    return _validate_graph_records(graph, current_sources, selected_ids)
 
 
 def _record_text(record: dict[str, Any], field: str, nodes: dict[str, Any]) -> str:
@@ -971,3 +1015,832 @@ def run_execution(args: Any) -> int:
         print(f"knowledge sync: {error}", file=sys.stderr)
         return 1
     return 0
+
+
+def _compile_source_urls(old_graph: dict[str, Any]) -> dict[str, str]:
+    urls: dict[str, str] = {}
+    for record in [
+        *old_graph.get("nodes", []),
+        *old_graph.get("links", []),
+        *old_graph.get("hyperedges", []),
+    ]:
+        identity = doc_id(str(record.get("source_file") or ""))
+        url = record.get("source_url")
+        if identity and isinstance(url, str) and url:
+            urls.setdefault(identity, url)
+    return urls
+
+
+def _compile_ocr_evidence(
+    state_path: Path, book: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """Read each document's published OCR evidence from canonical state.
+
+    Ticket 05 persists ``prepared-jpeg-ocr-v1`` evidence under ``graph.ocr``. The
+    compile stage consumes it as an input contract and never re-runs OCR. Evidence
+    from this run and from prior runs is treated identically, so valid historical
+    OCR is reused and an unchanged image is not re-recognized.
+    """
+    if not state_path.is_file():
+        return {}
+    state = _load_state(state_path, book)
+    evidence: dict[str, dict[str, Any]] = {}
+    for identity, record in (state.get("documents") or {}).items():
+        if not isinstance(record, dict):
+            continue
+        graph = record.get("graph")
+        if not isinstance(graph, dict):
+            continue
+        ocr = graph.get("ocr")
+        if isinstance(ocr, dict) and ocr.get("contract") == "prepared-jpeg-ocr-v1":
+            evidence[str(identity)] = ocr
+    return evidence
+
+
+def _ocr_regions(text: str) -> list[dict[str, Any]]:
+    """Declare every mdocr block in the enriched body as a generated region.
+
+    Line numbers are 1-based and match the mdcompare ``generated-regions-v1``
+    validator: the begin marker's line and the end marker's line. Declaring them
+    lets the next batch reuse the body independently of OCR.
+    """
+    regions: list[dict[str, Any]] = []
+    for match in _OCR_BLOCK_RE.finditer(text):
+        start_line = text.count("\n", 0, match.start()) + 1
+        end_line = text.count("\n", 0, match.end() - len(_OCR_END)) + 1
+        regions.append(
+            {"kind": "mdocr_ocr", "start_line": start_line, "end_line": end_line}
+        )
+    return regions
+
+
+def _enrich_compile_body(
+    raw_text: str,
+    evidence: dict[str, Any] | None,
+    raw_path: Path,
+    state_path: Path,
+    source_version: Any,
+    referenced: set[str] | None = None,
+) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    """Layer successful OCR onto the prepared body; keep unrecognized references.
+
+    The compile input is the prepared body plus every image's valid OCR artifact
+    (this run's or historical). A successful artifact replaces the image embed with
+    its mdocr block; a failed, pending, or unavailable image keeps its original
+    reference verbatim and is recorded as a missing item. Incomplete OCR never
+    blocks the body compile. Returns ``(enriched_text, regions, execution)``.
+    """
+    images: dict[str, dict[str, Any]] = {}
+    normalized: dict[str, str] = {}
+    for image in (evidence or {}).get("images") or []:
+        if isinstance(image, dict) and isinstance(image.get("resource_id"), str):
+            resource_id = image["resource_id"]
+            images[resource_id] = image
+            # OCR evidence is keyed by the verbatim image URL (Yuque paste images
+            # carry a #fragment), but the inline enricher's ref.target is
+            # fragment-stripped. Index the normalized form as a fallback so a
+            # successfully recognized image is still compiled ([21]). Only images
+            # the CURRENT raw references may supply that fallback: a stale fragment
+            # of the same base must not provide OCR text for the live image, which
+            # would insert old text when the live image has no evidence (G3).
+            base = resource_id.split("#", 1)[0]
+            if referenced is not None and resource_id not in referenced:
+                continue
+            prev = normalized.get(base)
+            if prev is None or (
+                referenced is not None
+                and resource_id in referenced
+                and prev not in referenced
+            ):
+                normalized[base] = resource_id
+    final_inputs: list[dict[str, Any]] = [
+        {
+            "kind": "raw",
+            "path": _relative_raw(raw_path, state_path)["path"],
+            "source_version": source_version,
+        }
+    ]
+    missing_items: list[dict[str, Any]] = []
+    consumed: set[str] = set()
+
+    def missing(resource_id: str, code: str, reason: str) -> None:
+        missing_items.append(
+            {
+                "kind": "ocr_artifact",
+                "resource_id": resource_id,
+                "code": code,
+                "reason": reason,
+            }
+        )
+
+    def transform(ref: Any) -> str | None:
+        resource_id = ref.target
+        record = images.get(resource_id)
+        if record is None:
+            # Fall back to the fragment-stripped evidence key, keeping the
+            # canonical (verbatim) resource id for inputs/missing/consumed ([21]).
+            resource_id = normalized.get(ref.target, ref.target)
+            record = images.get(resource_id)
+        if record is None:
+            missing(ref.target, "OCR_UNAVAILABLE", "no OCR evidence for this image")
+            return None
+        status = record.get("status")
+        if status != "success":
+            missing(
+                resource_id,
+                "OCR_FAILED" if status == "failed" else "OCR_PENDING",
+                f"OCR status is {status}; original reference retained",
+            )
+            return None
+        artifact = record.get("artifact")
+        if not isinstance(artifact, str):
+            missing(resource_id, "OCR_ARTIFACT_UNAVAILABLE", "no OCR artifact path")
+            return None
+        try:
+            block = Path(artifact).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            missing(
+                resource_id, "OCR_ARTIFACT_UNAVAILABLE", "OCR artifact is unreadable"
+            )
+            return None
+        final_inputs.append(
+            {"kind": "ocr_artifact", "resource_id": resource_id, "path": artifact}
+        )
+        prepared = record.get("prepared_image") or record.get("source_path")
+        if isinstance(prepared, str):
+            final_inputs.append(
+                {"kind": "prepared_image", "resource_id": resource_id, "path": prepared}
+            )
+        consumed.add(resource_id)
+        return block
+
+    enriched, _warnings, _errors = transform_images(raw_text, transform, warn=False)
+    # transform_images only rewrites inline embeds. A successfully recognized image
+    # in HTML <img> or reference-style form is never inserted; record it as an
+    # unconsumed missing item rather than disguising it as a completed OCR input,
+    # so the follow-up is not falsely closed as fulfilled (M17). Scope this to
+    # images the CURRENT raw still references: a historical success for an image
+    # that was removed is absent, not an un-inserted form, and must not be reported
+    # un-enriched (which would wrongly fail its compile follow-up) ([23]).
+    for resource_id, record in images.items():
+        if referenced is not None and resource_id not in referenced:
+            continue
+        if record.get("status") == "success" and resource_id not in consumed:
+            missing(
+                resource_id,
+                "OCR_NOT_ENRICHED",
+                "successful OCR not inserted (HTML/reference-style image form)",
+            )
+    execution = {
+        "final_inputs": final_inputs,
+        "missing_items": missing_items,
+        "completed_at": now_iso(),
+        "status": "completed",
+    }
+    return enriched, _ocr_regions(enriched), execution
+
+
+def _freeze_compile_sources(
+    items: list[dict[str, Any]],
+    raw_base: Path,
+    staging: Path,
+    source_urls: dict[str, str],
+    evidence_by_id: dict[str, dict[str, Any]],
+    state_path: Path,
+    referenced_by_id: dict[str, set[str]],
+) -> tuple[Path, dict[str, Path], list[dict[str, Any]], dict[str, Any]]:
+    """Freeze each compile item's OCR-enriched whole source into the corpus.
+
+    The body is the batch's actually-prepared markdown plus its valid OCR
+    artifacts. Graphify updates by complete source, so each document
+    becomes one ``source-[id].md`` whole source, never a diff fragment. Returns the
+    corpus, frozen paths, export manifest rows, and per-document preparation
+    records carrying the ``execution`` contract and the generated ``regions``.
+    """
+    corpus = staging / "execution-corpus"
+    frozen: dict[str, Path] = {}
+    exported: list[dict[str, Any]] = []
+    prepared_by_id: dict[str, Any] = {}
+    for item in items:
+        identity = str(item["document_id"])
+        raw = _resolve_raw(item.get("raw"), raw_base)
+        if raw is None or not raw.is_file():
+            raise ExecutionError(
+                f"compile source is unavailable for document {identity}"
+            )
+        enriched, regions, execution = _enrich_compile_body(
+            raw.read_text(encoding="utf-8"),
+            evidence_by_id.get(identity),
+            raw,
+            state_path,
+            item["source_version"],
+            referenced_by_id.get(identity),
+        )
+        name = f"source-[{identity}].md"
+        _freeze_bytes(
+            enriched.encode("utf-8"),
+            corpus / name,
+            mismatch="compile corpus differs from the enriched whole source",
+        )
+        frozen[identity] = corpus / name
+        prepared_by_id[identity] = {"execution": execution, "regions": regions}
+        row: dict[str, Any] = {"id": item["document_id"], "file": name}
+        url = source_urls.get(identity)
+        if url:
+            row["url"] = url
+        exported.append(row)
+    return corpus, frozen, exported, prepared_by_id
+
+
+def _pending_followup_items(
+    context: Any, plan: dict[str, Any], items: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Add pending post-hoc followup documents to this run's compile set.
+
+    A backfill that changed a published compile input registers followup work the
+    daily plan suppresses (the archived version is handed off, not retried). The
+    compile stage is the consumer: it recompiles those documents at the registered
+    version using this batch's prepared body and the updated OCR evidence. A
+    followup whose document is absent from this batch, unavailable, or observed at
+    a different version is left pending for a later batch — never fabricated.
+    """
+    registry = load_followups(context.config, context.book.key)
+    run_id = context.layout.run_id
+    # Fresh pending followups are real work (daily OCR follow-up or post-hoc
+    # backfill). Also re-include followups this same run already consumed/attempted
+    # so a crash after consumption rebuilds the identical merged set on resume
+    # (H25); a prior run's failed followup stays handed off, never auto-retried (H22).
+    pending = [
+        record
+        for record in registry["followups"].values()
+        if record.get("status") == "pending"
+        or (
+            record.get("status") in {"done", "failed"}
+            and record.get("run_id") == run_id
+        )
+    ]
+    if not pending:
+        return items, []
+    report = _read_json(context.require("mdcompare", "report"))
+    by_id = {str(row["document_id"]): row for row in report.get("documents", [])}
+    existing = {str(item["document_id"]) for item in items}
+    book_id = plan["book"]["book_id"]
+    merged = list(items)
+    added: list[str] = []
+    for record in pending:
+        identity = str(record["document_id"])
+        if identity in existing:
+            continue
+        row = by_id.get(identity)
+        if row is None or not row.get("input_available") or row.get("raw") is None:
+            continue
+        if version_stamp(row.get("source_version")) != record.get("version_stamp"):
+            continue
+        merged.append(
+            {
+                "book_id": book_id,
+                "document_id": record["document_id"],
+                "source_version": row["source_version"],
+                "raw": row["raw"],
+            }
+        )
+        existing.add(identity)
+        added.append(record["id"])
+    return merged, added
+
+
+def _consume_followups(context: Any, results: list[dict[str, Any]]) -> list[str]:
+    """Mark pending followups done after compile really published their source.
+
+    Called only after the canonical success version is recorded, so a followup is
+    never closed on cached OCR alone. Matching is by document + source version;
+    consumption is idempotent and a crash before this point leaves the followup
+    pending for the next batch to redo.
+    """
+    registry = load_followups(context.config, context.book.key)
+    published = {
+        (str(row["document_id"]), version_stamp(row["source_version"]))
+        for row in results
+    }
+    execution_by_doc = {
+        str(row["document_id"]): row.get("execution") or {} for row in results
+    }
+    consumed: list[str] = []
+    changed = False
+    now = now_iso()
+    for record in registry["followups"].values():
+        if record.get("status") != "pending":
+            continue
+        key = (str(record["document_id"]), record.get("version_stamp"))
+        if key not in published:
+            continue
+        execution = execution_by_doc.get(str(record["document_id"]), {})
+        unenriched = any(
+            item.get("code") == "OCR_NOT_ENRICHED"
+            for item in execution.get("missing_items") or []
+        )
+        # Generalize the M17 guard: a follow-up is fulfilled only when the inputs
+        # it registered were actually consumed by the published compile. A post-hoc
+        # backfill whose artifact never reached the canonical graph.ocr compile reads
+        # publishes without it; closing done there would claim a knowledge update
+        # that only wrote OCR cache ([15]). Match by durable path.
+        final_paths = {item.get("path") for item in execution.get("final_inputs") or []}
+        registered = {item.get("path") for item in record.get("inputs") or []}
+        unconsumed = registered - final_paths
+        record["run_id"] = context.layout.run_id
+        record["updated_at"] = now
+        if unenriched or unconsumed:
+            # The source published, but a registered OCR input was not inserted
+            # (HTML/reference form) or not consumed at all (stale canonical
+            # evidence). Do not close the follow-up as fulfilled; hand it off so the
+            # daily batch does not endlessly retry it (M17, [15]).
+            record["status"] = "failed"
+            record["resolution"] = {
+                "disposition": "handed_off",
+                "run_id": context.layout.run_id,
+                "recorded_at": now,
+                "reason": (
+                    "published source omitted an un-enriched OCR input"
+                    if unenriched
+                    else "published source did not consume the registered backfill input"
+                ),
+            }
+        else:
+            record["status"] = "done"
+            record["resolution"] = {
+                "disposition": "done",
+                "run_id": context.layout.run_id,
+                "recorded_at": now,
+                "reason": "compile published the source with the updated input",
+            }
+            consumed.append(record["id"])
+        changed = True
+    if changed:
+        save_followups(context.config, context.book.key, registry)
+    return consumed
+
+
+def _fail_followups(
+    context: Any, failed_ids: set[str], items: list[dict[str, Any]]
+) -> list[str]:
+    """Record a failed compile attempt on followups whose source failed extraction.
+
+    A followup attempted-and-failed at a version the daily plan suppresses must not
+    be auto-retried (H22). Mark it failed (handed off) so later batches skip it;
+    ``register_compile_followup`` reopens it when fresh post-hoc evidence arrives.
+    """
+    if not failed_ids:
+        return []
+    registry = load_followups(context.config, context.book.key)
+    by_id = {str(item["document_id"]): item for item in items}
+    failed_keys = {
+        (identity, version_stamp(by_id[identity]["source_version"]))
+        for identity in failed_ids
+        if identity in by_id
+    }
+    marked: list[str] = []
+    now = now_iso()
+    for record in registry["followups"].values():
+        if record.get("status") != "pending":
+            continue
+        key = (str(record["document_id"]), record.get("version_stamp"))
+        if key not in failed_keys:
+            continue
+        record["status"] = "failed"
+        record["run_id"] = context.layout.run_id
+        record["updated_at"] = now
+        record["resolution"] = {
+            "disposition": "handed_off",
+            "run_id": context.layout.run_id,
+            "recorded_at": now,
+            "reason": "compile extraction failed; handed off to post-hoc recovery",
+        }
+        marked.append(record["id"])
+    if marked:
+        save_followups(context.config, context.book.key, registry)
+    return marked
+
+
+def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
+    """Automatic whole-source compile for the unified batch.
+
+    No human approval and no semantic quality gate: publication is bounded by
+    artifact checks (input readable, output parseable, graph structure, write
+    success). Successfully compiled whole sources are published and their success
+    version advances only after a real successful write; a source that fails
+    extraction keeps its old knowledge and old success version (partial
+    publication). Graphify's own output streams into the stage log.
+    """
+    items = plan.get("compile") or []
+    staging = context.directory
+    state_path = context.corpus / ".sync-state.json"
+    graph_dir = context.graph_dir
+    # The plan preserves the mdcompare raw references verbatim; they resolve
+    # against the mdcompare report that froze them, not against plan.json.
+    raw_base = context.require("mdcompare", "report")
+    report_path = staging / "compile-result.json"
+    args = SimpleNamespace(
+        graph_dir=graph_dir,
+        staging=staging,
+        graphify_python=context.config.graphify_python,
+    )
+    metadata_by_id = _compile_metadata(context)
+    referenced_by_id = _compile_referenced_images(context)
+    metadata_items = plan.get("metadata") or []
+    # Consume pending post-hoc followups: a backfill that changed a published
+    # compile input registers work the daily plan suppresses. Merge those
+    # documents into this run's compile set before deciding there is no body work.
+    items, followup_added = _pending_followup_items(context, plan, items)
+    if followup_added:
+        context.log.write(
+            f"consuming {len(followup_added)} pending compile followup(s)"
+        )
+    if not items:
+        # No body compile work, but the plan may still schedule metadata
+        # maintenance (rename/move/source-ref) for reused sources. Execute it
+        # rather than dropping it just because nothing entered the compile list.
+        metadata_results: list[dict[str, Any]] = []
+        if metadata_items and state_path.is_file():
+            state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with state_lock(state_path):
+                state = _load_state(state_path, plan["book"])
+                metadata_results = _apply_metadata_maintenance(
+                    state, metadata_items, metadata_by_id
+                )
+                if metadata_results:
+                    save_view(state_path, state)
+        report = _compile_report(
+            plan, items, [], [], {}, metadata_by_id, None, metadata_results
+        )
+        publish_reports(
+            [(report_path, json.dumps(report, ensure_ascii=False, indent=1) + "\n")]
+        )
+        return report
+    if not (graph_dir / "graph.json").is_file():
+        raise ExecutionError("an existing graph baseline is required")
+    old_graph = _read_json(graph_dir / "graph.json")
+    source_urls = _compile_source_urls(old_graph)
+    state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with state_lock(state_path):
+        # OCR evidence is an input contract published by the OCR stage. Read it under
+        # the same lock that guards the canonical update, then freeze the enriched
+        # whole sources before Graphify consumes them.
+        evidence_by_id = _compile_ocr_evidence(state_path, plan["book"])
+        corpus, frozen, exported, prepared_by_id = _freeze_compile_sources(
+            items,
+            raw_base,
+            staging,
+            source_urls,
+            evidence_by_id,
+            state_path,
+            referenced_by_id,
+        )
+        manifest_path = staging / "execution-manifest.json"
+        publish_reports(
+            [
+                (
+                    manifest_path,
+                    json.dumps(
+                        {"exported": exported, "deleted": []},
+                        ensure_ascii=False,
+                        indent=1,
+                    )
+                    + "\n",
+                )
+            ]
+        )
+        return _execute_compile_locked(
+            context,
+            args,
+            plan,
+            items,
+            corpus,
+            frozen,
+            manifest_path,
+            state_path,
+            graph_dir,
+            metadata_by_id,
+            report_path,
+            metadata_items,
+            prepared_by_id,
+            referenced_by_id,
+        )
+
+
+def _compile_metadata(context: Any) -> dict[str, dict[str, Any]]:
+    """Incoming metadata per document, from the mdcompare batch report."""
+    report_path = context.artifact("mdcompare", "report")
+    if report_path is None:
+        return {}
+    report = _read_json(report_path)
+    return {
+        str(row["document_id"]): row.get("metadata")
+        for row in report.get("documents", [])
+        if isinstance(row.get("metadata"), dict)
+    }
+
+
+def _compile_referenced_images(context: Any) -> dict[str, set[str]]:
+    """Image resource ids each document's CURRENT raw references.
+
+    Read from the mdcompare row's pre-enrichment resource catalog, never from the
+    enriched text: a successful inline embed is replaced by an mdocr block whose
+    footer links the prepared image, not the original URL. Used to reconcile the
+    published OCR evidence with the source actually compiled ([6]) and to scope
+    the un-enriched report to referenced images ([23]).
+    """
+    report_path = context.artifact("mdcompare", "report")
+    if report_path is None:
+        return {}
+    report = _read_json(report_path)
+    referenced: dict[str, set[str]] = {}
+    for row in report.get("documents", []):
+        referenced[str(row["document_id"])] = {
+            entry["resource_id"]
+            for entry in row.get("resources") or []
+            if isinstance(entry, dict)
+            and entry.get("kind") == "image"
+            and isinstance(entry.get("resource_id"), str)
+        }
+    return referenced
+
+
+def _apply_metadata_maintenance(
+    state: dict[str, Any],
+    metadata_items: list[dict[str, Any]],
+    metadata_by_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Execute the plan's rename / move / source-ref maintenance.
+
+    Applies the incoming metadata to each planned document's canonical graph
+    record and records the execution. This runs for every ``metadata[].tasks``
+    item the plan scheduled, including documents whose body was reused, so
+    maintenance is never dropped just because the body did not change. It is
+    independent of the body success version: a source whose extraction failed
+    keeps its old knowledge and version while its incoming name/path/source-ref
+    are still maintained.
+    """
+    results: list[dict[str, Any]] = []
+    for item in metadata_items:
+        identity = str(item["document_id"])
+        record = state["documents"].get(identity)
+        if not isinstance(record, dict):
+            continue
+        graph = record.get("graph")
+        if not isinstance(graph, dict) or not graph.get("status"):
+            continue
+        incoming = metadata_by_id.get(identity) or {
+            "name": f"source-[{identity}].md",
+            "logical_path": "",
+            "source_ref": f"{item['book_id']}:{identity}",
+        }
+        graph["metadata"] = incoming
+        tasks = item.get("tasks") or []
+        record.setdefault("steps", {})["metadata_maintenance"] = {
+            "status": "completed",
+            "recorded_at": now_iso(),
+            "version": item["source_version"],
+            "tasks": tasks,
+        }
+        results.append(
+            {
+                "book_id": item["book_id"],
+                "document_id": item["document_id"],
+                "source_version": item["source_version"],
+                "tasks": tasks,
+                "status": "executed",
+            }
+        )
+    return results
+
+
+def _execute_compile_locked(
+    context: Any,
+    args: Any,
+    plan: dict[str, Any],
+    items: list[dict[str, Any]],
+    corpus: Path,
+    frozen: dict[str, Path],
+    manifest_path: Path,
+    state_path: Path,
+    graph_dir: Path,
+    metadata_by_id: dict[str, dict[str, Any]],
+    report_path: Path,
+    metadata_items: list[dict[str, Any]],
+    prepared_by_id: dict[str, Any],
+    referenced_by_id: dict[str, set[str]],
+) -> dict[str, Any]:
+    candidate_result = _run_graphify(
+        args, "--candidate-only", corpus, manifest_path, log=context.log, partial=True
+    )
+    if candidate_result.get("status") != "candidate_ready":
+        raise ExecutionError("Graphify did not retain a validated candidate")
+    candidate = Path(candidate_result["candidate"])
+    published_sources = candidate_result.get("published_sources") or []
+    failed_sources = candidate_result.get("failed_sources") or []
+    emptied_sources = candidate_result.get("emptied_sources") or []
+    published_ids = {doc_id(name) for name in published_sources} - {None}
+    failed_ids = {doc_id(name) for name in failed_sources} - {None}
+    emptied_ids = {doc_id(name) for name in emptied_sources} - {None}
+    # Coverage is required only for semantic sources; an emptied source owns no
+    # records by design, so it stays out of current_sources but still advances.
+    current_sources = {f"source-[{identity}].md" for identity in published_ids}
+    # Artifact check only: a well-formed graph covering every published source.
+    _validate_graph_records(
+        _read_json(candidate / "graph.json"), current_sources, published_ids
+    )
+    published = _run_graphify(
+        args,
+        "--publish-validated",
+        corpus,
+        manifest_path,
+        log=context.log,
+        partial=True,
+    )
+    if published.get("status") != "completed":
+        raise ExecutionError("Graphify publication did not complete")
+    if (graph_dir / "graph.json").read_bytes() != (
+        candidate / "graph.json"
+    ).read_bytes():
+        raise ExecutionError("published graph differs from the retained candidate")
+    state = _load_state(state_path, plan["book"])
+    by_id = {str(item["document_id"]): item for item in items}
+    results: list[dict[str, Any]] = []
+    # Emptied sources published successfully too: their old records were removed
+    # and the manifest keeps the empty file, so advance their success state and
+    # record a result row exactly like a semantic source (H9 / MEDIUM7).
+    for identity in sorted(published_ids | emptied_ids):
+        item = by_id.get(identity)
+        if item is None:
+            continue
+        record = state["documents"].setdefault(
+            identity,
+            {
+                "observation": None,
+                "corpus": {"status": "not_captured", "version": None, "raw": None},
+                "graph": {},
+                "pending": [],
+            },
+        )
+        metadata = metadata_by_id.get(identity) or {
+            "name": f"source-[{identity}].md",
+            "logical_path": "",
+            "source_ref": f"{item['book_id']}:{identity}",
+        }
+        prepared = prepared_by_id.get(identity) or {}
+        previous_graph = record.get("graph")
+        previous_ocr = (
+            previous_graph.get("ocr") if isinstance(previous_graph, dict) else None
+        )
+        graph_record = {
+            "status": "covered",
+            "coverage": "compiled_whole_document",
+            "version": item["source_version"],
+            "raw": _relative_raw(frozen[identity], state_path),
+            "content_kind": "raw",
+            "metadata": metadata,
+            "body_scope": {
+                "version": "generated-regions-v1",
+                "regions": prepared.get("regions") or [],
+            },
+        }
+        # Preserve the OCR evidence contract published by the OCR stage: compile
+        # consumes it as an input and must not wipe it when advancing the graph.
+        # Reconcile it with the source actually published: keep only images the
+        # current raw still references, so a removed image stops counting as a
+        # published success and is not re-flagged on every later change ([6]).
+        # The durable OCR cache is untouched; a returning image reuses by content.
+        if isinstance(previous_ocr, dict):
+            referenced = referenced_by_id.get(identity)
+            if referenced is None:
+                graph_record["ocr"] = previous_ocr
+            else:
+                pruned = dict(previous_ocr)
+                images = previous_ocr.get("images")
+                if isinstance(images, list):
+                    pruned["images"] = [
+                        image
+                        for image in images
+                        if isinstance(image, dict)
+                        and image.get("resource_id") in referenced
+                    ]
+                graph_record["ocr"] = pruned
+        record["graph"] = graph_record
+        record.setdefault("steps", {})["graph_publish"] = {
+            "status": "completed",
+            "recorded_at": now_iso(),
+            "version": item["source_version"],
+        }
+        record["pending"] = [
+            reason
+            for reason in record.get("pending", [])
+            if reason
+            not in {
+                "GRAPH_UPDATE_REQUIRED",
+                "GRAPH_SOURCE_NOT_REGISTERED",
+                # The plan clears COMPARISON_PENDING only for body_reuse; a compile
+                # decision is terminal only once published here, so clear it now (M16).
+                "COMPARISON_PENDING",
+            }
+        ]
+        results.append(
+            {
+                "book_id": item["book_id"],
+                "document_id": item["document_id"],
+                "status": "published",
+                "source_scope": "whole_document",
+                "source_version": item["source_version"],
+                "execution": prepared.get("execution"),
+            }
+        )
+    # Execute the plan's metadata maintenance for every scheduled document
+    # (including reused bodies), then persist state once.
+    metadata_results = _apply_metadata_maintenance(
+        state, metadata_items, metadata_by_id
+    )
+    save_view(state_path, state)
+    # Real completion is recorded; only now close pending post-hoc followups whose
+    # source this run published. Never closed on cached OCR alone.
+    followups = _consume_followups(context, results)
+    _fail_followups(context, failed_ids, items)
+    usage = candidate_result.get("usage") or {}
+    report = _compile_report(
+        plan,
+        items,
+        results,
+        sorted(failed_ids),
+        usage,
+        metadata_by_id,
+        candidate_result,
+        metadata_results,
+        followups,
+        frozen,
+    )
+    publish_reports(
+        [(report_path, json.dumps(report, ensure_ascii=False, indent=1) + "\n")]
+    )
+    return report
+
+
+def _compile_report(
+    plan: dict[str, Any],
+    items: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    failed_ids: list[str],
+    usage: dict[str, Any],
+    metadata_by_id: dict[str, dict[str, Any]],
+    candidate_result: dict[str, Any] | None,
+    metadata_results: list[dict[str, Any]] | None = None,
+    followups: list[str] | None = None,
+    frozen: dict[str, Path] | None = None,
+) -> dict[str, Any]:
+    by_id = {str(item["document_id"]): item for item in items}
+    frozen = frozen or {}
+    failed = [
+        {
+            "book_id": by_id[identity]["book_id"],
+            "document_id": by_id[identity]["document_id"],
+            "source_version": by_id[identity]["source_version"],
+            "code": "COMPILE_EXTRACTION_FAILED",
+            "reason": "Graphify extraction failed; old knowledge and version retained",
+            # Reference the actual frozen enriched compile input so reference-based
+            # wash cleanup preserves the recovery input instead of deleting it (M21).
+            "necessary_inputs": (
+                [{"kind": "compiled_source", "path": str(frozen[identity])}]
+                if identity in frozen
+                else []
+            ),
+        }
+        for identity in failed_ids
+        if identity in by_id
+    ]
+    tokens = usage.get("tokens") or {}
+    metadata_results = metadata_results or []
+    return {
+        "schema_version": COMPILE_SCHEMA,
+        "status": "partial" if failed else "completed",
+        "book": plan["book"],
+        "counts": {
+            "compile": len(items),
+            "published": len(results),
+            "failed": len(failed),
+            "metadata": len(metadata_results),
+            "external_calls": usage.get("external_calls"),
+            "cache_hits": usage.get("cache_hits", 0),
+        },
+        "results": results,
+        "failed": failed,
+        "metadata": metadata_results,
+        "followups": followups or [],
+        "tokens": {**tokens, "evidence": usage.get("token_evidence", "unknown")},
+        "usage": usage,
+        "transaction": (
+            {
+                "candidate": candidate_result.get("candidate"),
+                "backup": candidate_result.get("backup"),
+                "resume": "reuse_retained_candidate",
+            }
+            if candidate_result
+            else None
+        ),
+    }

@@ -52,7 +52,7 @@ def graph_job(tmp_path, monkeypatch):
     )
     builds = []
 
-    def build(corpus, graph_dir, staging, *args, base_dir=None):
+    def build(corpus, graph_dir, staging, *args, base_dir=None, partial=False):
         builds.append(1)
         candidate = staging / "candidate"
         candidate.mkdir(exist_ok=True)
@@ -198,7 +198,7 @@ def test_rejects_base_changes_before_first_publication(
         else {"1": "external"}
     )
 
-    def build(_corpus, graph_dir, stage, *args, base_dir=None):
+    def build(_corpus, graph_dir, stage, *args, base_dir=None, partial=False):
         assert update_graph.load_json(base_dir / "graph.json") == original
         assert update_graph.load_json(base_dir / ".graphify_labels.json") == labels
         candidate = stage / "candidate"
@@ -307,6 +307,84 @@ def test_explicit_rebase_keeps_corpus_manifest_and_rebuilds_candidate(
     assert (corpus / "a-[1].md").read_text() == "source"
 
 
+def test_partial_publication_does_not_advance_failed_sources(tmp_path, monkeypatch):
+    # H4: the standalone --partial CLI publishes successfully extracted sources but
+    # must not advance a failed source's canonical success version or clear its
+    # GRAPH_UPDATE_REQUIRED. The graph protects the failed source; the tracker loop
+    # must mirror that split instead of marking every exported row covered.
+    from dogpdkb.sync_progress import Progress
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "a-[1].md").write_text("failed source body")
+    (corpus / "b-[2].md").write_text("successful source body")
+    graph = corpus / "graphify-out"
+    graph.mkdir()
+    update_graph.write_json(graph / "graph.json", {"nodes": [], "links": []})
+    version = {
+        "field": "updated_at",
+        "value": "2026-11-10T10:00:00+08:00",
+        "utc": "2026-11-10T10:00:00+08:00",
+    }
+    manifest = tmp_path / "manifest.json"
+    update_graph.write_json(
+        manifest,
+        {
+            "exported": [
+                {"id": 1, "file": "a-[1].md", "source_version": version},
+                {"id": 2, "file": "b-[2].md", "source_version": version},
+            ]
+        },
+    )
+    staging = tmp_path / "graph-update"
+    seed = Progress(corpus, "adhoc")
+    seed.update(
+        1,
+        pending=["GRAPH_UPDATE_REQUIRED"],
+        graph={"status": "covered", "version": None},
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "update_graph",
+            "--input",
+            str(corpus),
+            "--manifest",
+            str(manifest),
+            "--staging",
+            str(staging),
+            "--partial",
+        ],
+    )
+
+    def build(corpus, graph_dir, staging, *args, base_dir=None, partial=False):
+        candidate = staging / "candidate"
+        candidate.mkdir(exist_ok=True)
+        update_graph.write_json(
+            candidate / "graph.json",
+            {"nodes": [{"id": "b", "source_file": "b-[2].md"}], "links": []},
+        )
+        return candidate, {
+            "status": "candidate_validated",
+            "failed_sources": ["a-[1].md"],
+            "published_sources": ["b-[2].md"],
+        }
+
+    monkeypatch.setattr(update_graph, "build_candidate", build)
+
+    update_graph.main()
+
+    docs = json.loads((corpus / ".sync-state.json").read_text())["books"]["adhoc"][
+        "documents"
+    ]
+    assert docs["2"]["graph"]["status"] == "covered"
+    assert docs["2"]["graph"]["version"]["utc"] == "2026-11-10T10:00:00+08:00"
+    assert docs["1"]["steps"]["graph"]["status"] == "failed"
+    assert docs["1"]["graph"]["version"] is None
+    assert "GRAPH_UPDATE_REQUIRED" in docs["1"]["pending"]
+
+
 @pytest.mark.parametrize("body", ["", " \n\t"])
 def test_blank_document_removes_old_semantics_without_extraction(
     tmp_path, monkeypatch, body
@@ -341,7 +419,7 @@ def test_blank_document_removes_old_semantics_without_extraction(
     staging.mkdir()
     base_dir = update_graph.prepare_base(graph_dir, staging)
 
-    def unexpected_extract(*args):
+    def unexpected_extract(*args, **kwargs):
         pytest.fail("blank sources must not invoke semantic extraction")
 
     monkeypatch.setattr(update_graph, "extract_semantic", unexpected_extract)
@@ -413,7 +491,7 @@ def test_rebased_delta_removes_third_filename_for_same_document(
     monkeypatch.setattr(
         update_graph,
         "extract_semantic",
-        lambda *args: (
+        lambda *args, **kwargs: (
             {
                 "nodes": [
                     {"id": "new", "label": "New concept", "source_file": current}

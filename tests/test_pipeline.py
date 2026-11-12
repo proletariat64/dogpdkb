@@ -321,7 +321,6 @@ def test_pipeline_resumes_real_apply_without_repeating_plan_or_successful_export
     assert json.loads((corpus / ".sync-state.json").read_text())["active_run"] is None
     assert calls == ["apply_sync_updates.py", "update_graph.py", "publish_web.py"]
     assert exports == [2]
-    assert ocr == ["Doc-2-2026-11-01-[2].md"]
     assert (corpus / "Doc-1-2026-11-01-[1].md").read_text() == "new 1"
     assert (corpus / "Doc-2-2026-11-01-[2].md").read_text() == "new 2"
     assert not (corpus / "Old-3-2026-01-01-[3].md").exists()
@@ -387,7 +386,7 @@ def test_emitted_resume_command_preserves_named_book_config_and_original_cutoff(
         ],
     )
     with pytest.raises(SystemExit) as error:
-        pipeline.main()
+        pipeline.legacy_main()
     assert error.value.code == 1
     output = capsys.readouterr().err
     command = shlex.split(
@@ -405,7 +404,7 @@ def test_emitted_resume_command_preserves_named_book_config_and_original_cutoff(
     calls.clear()
     monkeypatch.setattr(sys, "argv", command[1:])
 
-    pipeline.main()
+    pipeline.legacy_main()
 
     assert observed[1].book_name == "Selected book"
     assert observed[1].cutoff is None
@@ -416,7 +415,7 @@ def test_emitted_resume_command_preserves_named_book_config_and_original_cutoff(
     )
 
 
-@pytest.mark.parametrize("failure", ["ocr", "publish", "cancel"])
+@pytest.mark.parametrize("failure", ["publish", "cancel"])
 def test_pipeline_blocks_downstream_after_real_apply_failure(
     apply_run, tmp_path, monkeypatch, capsys, failure
 ):
@@ -427,9 +426,7 @@ def test_pipeline_blocks_downstream_after_real_apply_failure(
     before = recovery.snapshot(corpus)
     calls = []
     original = fake_runner(staging, calls)
-    if failure == "ocr":
-        monkeypatch.setattr(apply_sync, "run_mdocr", lambda files, out_dir: 1)
-    elif failure == "publish":
+    if failure == "publish":
         copy = apply_sync.shutil.copy2
 
         def fail_copy(source, destination):
@@ -547,12 +544,14 @@ def test_sync_cli_listing_exhaustion_reports_page_budget_and_retained_resume(tmp
         [str(shim), str(Path(__file__).resolve().parents[1] / "src")]
     )
 
+    # Ticket 08 converged `dogpdkb sync` onto the unified runner. This legacy
+    # listing-exhaustion recovery regression exercises the retained deprecated
+    # compatibility executor directly; its assertions are unchanged.
     result = subprocess.run(
         [
             sys.executable,
-            "-m",
-            "dogpdkb",
-            "sync",
+            "-c",
+            "from dogpdkb.workflows.sync_knowledge_base import legacy_main; legacy_main()",
             "--config",
             str(settings),
             "--skylark-url",
