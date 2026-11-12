@@ -38,3 +38,11 @@ missing ID filtered on first discovery stays filtered until its source changes.
 An eligible but unattempted version stays eligible on the next discovery even
 when its observation is unchanged; stage-specific failed/unknown suppression
 remains apply's responsibility, so OCR failure cannot suppress graph compilation.
+
+## Document subscriptions
+
+A source may specify a nonempty unique string `document_ids` list. The complete
+Skylark listing is validated before filtering; its advertised count and artifact
+are never rewritten. Only subscribed IDs enter observation/selection/state;
+missing subscribed IDs appear as absence evidence. Omission means the whole book.
+State and paused-run targets pin the scope. Changing it requires a new key/state.

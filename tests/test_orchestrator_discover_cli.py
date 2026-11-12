@@ -305,3 +305,60 @@ def test_saved_tool_log_keeps_recoverable_command_with_credential_values_redacte
     assert "[redacted]" in log
     assert "fixture-private-token" not in log
     assert "fixture-private-password" not in log
+
+
+def test_document_subscription_filters_after_complete_listing_and_pins_scope(tmp_path):
+    config = tmp_path / "instance.toml"
+    config.write_text(
+        '[source]\nbooks_file="books.json"\n[paths]\nstate="state"\nstaging="runs"\n'
+    )
+    books = tmp_path / "books.json"
+    source = {
+        "key": "funds",
+        "name": "Small subscription",
+        "url": "https://example.invalid/book",
+        "corpus": "corpus",
+        "document_ids": ["2"],
+    }
+    books.write_text(json.dumps([source]))
+    path = listing(
+        tmp_path,
+        [{"document_id": str(i), "title": str(i), "version": "v1"} for i in (1, 2, 3)],
+    )
+    result = cli("discover", "--config", config, "--listing", path)
+    diff = difference(result)
+    assert [r["document_id"] for r in diff["documents"]] == ["2"]
+    # The full remote observation is not forged into a pretend one-document book.
+    frozen = json.loads(Path(diff["listing"]).read_text())
+    assert frozen["book"]["items_count"] == len(frozen["documents"]) == 3
+    state_path = tmp_path / "state/funds/state.json"
+    before = state_path.read_bytes()
+    state = json.loads(before)
+    assert set(state["documents"]) == {"2"}
+    assert state["book"]["document_ids"] == ["2"]
+    source["document_ids"] = ["1", "2"]
+    books.write_text(json.dumps([source]))
+    changed = cli("discover", "--config", config, "--listing", path)
+    assert changed.returncode == 1
+    assert "scope changed" in changed.stderr
+    assert state_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("scope", [[], ["2", "2"], [2], "2"])
+def test_invalid_subscription_cannot_expand_to_entire_book(tmp_path, scope):
+    config = tmp_path / "instance.toml"
+    config.write_text('[source]\nbooks_file="books.json"\n')
+    (tmp_path / "books.json").write_text(
+        json.dumps(
+            [
+                {
+                    "key": "funds",
+                    "url": "https://example.invalid/book",
+                    "document_ids": scope,
+                }
+            ]
+        )
+    )
+    result = cli("discover", "--config", config)
+    assert result.returncode == 1
+    assert "document_ids" in result.stderr

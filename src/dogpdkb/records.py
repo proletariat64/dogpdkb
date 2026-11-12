@@ -111,6 +111,9 @@ class Store:
                 raise ValueError(
                     "unsupported orchestrator state; initialize a new state"
                 )
+            scope = list(book.document_ids) if book.document_ids is not None else None
+            if self.data["book"].get("document_ids") != scope:
+                raise ValueError("subscription scope changed; use a new book key/state")
             if self.data["book"].get("url") != book.url:
                 raise ValueError("durable state belongs to a different source book")
         else:
@@ -120,6 +123,9 @@ class Store:
                 "observation": None,
                 "documents": {},
             }
+
+        if book.document_ids is not None:
+            self.data["book"]["document_ids"] = list(book.document_ids)
 
     def save(self) -> None:
         atomic_json(self.path, self.data)
@@ -288,6 +294,8 @@ class Run:
             "artifacts": {},
             "failures": [],
         }
+        if store.book.document_ids is not None:
+            data["targets"]["document_ids"] = list(store.book.document_ids)
         run = cls(store, directory, data)
         run.save()
         return run
@@ -311,6 +319,8 @@ class Run:
             "corpus": str(store.book.corpus.resolve()),
             "graph": str(store.settings.graph_for(store.book).resolve()),
         }
+        if store.book.document_ids is not None:
+            expected["document_ids"] = list(store.book.document_ids)
         if data.get("targets") != expected:
             raise ValueError("run source or write targets changed; generate a new plan")
         return cls(store, path.resolve(), data)

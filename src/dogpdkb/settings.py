@@ -28,6 +28,7 @@ class Book:
     name: str
     url: str
     corpus: Path
+    document_ids: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -209,12 +210,28 @@ def select_book(settings: Settings, key: str | None = None) -> Book:
             corpus = settings.books_file.parent / Path(row["corpus"]).expanduser()
         if "DOGPDKB_CORPUS" in os.environ:
             corpus = settings.corpus
+        document_ids = row.get("document_ids")
+        if document_ids is not None:
+            if (
+                not isinstance(document_ids, list)
+                or not document_ids
+                or any(
+                    not isinstance(value, str) or not value.strip()
+                    for value in document_ids
+                )
+                or len(set(document_ids)) != len(document_ids)
+            ):
+                raise ConfigError(
+                    "book document_ids: expected nonempty unique string IDs"
+                )
+            document_ids = tuple(sorted(document_ids))
         books.append(
             Book(
                 name,
                 str(row.get("name", "")),
                 _url(row.get("url"), name),
                 corpus.resolve(),
+                document_ids,
             )
         )
     matches = [book for book in books if key is None or book.key == key]

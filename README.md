@@ -38,6 +38,18 @@ Markdown 语料；`update-graph --input MANIFEST` 编译。`sync` 共用这套�
 新版本仍正常处理；OCR 失败不阻断可用正文编译。缺席只记录，不自动删除既有语料
 或图谱。失败图谱不回滚已更新语料；Graphify 编译按目录整批成功后发布；失败保留旧图。
 
+## 小订阅
+
+在独立 `books.json` 来源中设置 `document_ids`，并使用独立 key 和目标目录：
+
+```json
+[{"key":"small","url":"https://yuque.antfin.com/group/book","document_ids":["123","456"]}]
+```
+
+省略该字段订阅整本；显式列表必须非空且 ID 唯一。仍完整读取列表以验证来源，
+随后仅选择指定文档。已建立状态后变更 ID 范围需要新的 key/state，避免旧计划
+跨订阅恢复。小订阅同样使用普通 `sync`、`--stop-after plan` 和 `--resume`。
+
 ## 配置与工具边界
 
 显式 `--config` 优先于 `DOGPDKB_CONFIG`；源码 checkout 默认读取 `default.toml`，
