@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .catalog import catalog_manifest
 from .comparison import compare_documents
 from .io import (
     InputError,
@@ -123,7 +124,19 @@ def main(argv=None) -> int:
         default=CompareOptions.max_evidence_chars,
         help="Maximum body evidence characters per document (default: 8000)",
     )
+    catalog = sub.add_parser(
+        "catalog", help="Build an offline resource manifest from Markdown"
+    )
+    catalog.add_argument("--input", type=Path, required=True)
+    catalog.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.command == "catalog":
+        try:
+            catalog_manifest(args.input, args.output)
+        except (InputError, ManifestError, OSError, ValueError) as exc:
+            print(f"mdcompare: {exc}", file=sys.stderr)
+            return 1
+        return 0
     options = CompareOptions(
         include_evidence=args.include_evidence,
         max_file_bytes=args.max_file_bytes,

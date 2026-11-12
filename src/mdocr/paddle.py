@@ -129,7 +129,14 @@ def _parse_result_jsonl(text: str) -> str:
 class PaddleClient:
     """Convert local images to Markdown through PaddleOCR."""
 
-    def __init__(self, token: str, *, session: HttpClient | None = None):
+    def __init__(
+        self,
+        token: str,
+        *,
+        session: HttpClient | None = None,
+        endpoint: str | None = None,
+    ):
+        self.endpoint = (endpoint or _JOB_URL).rstrip("/")
         self.headers = {"Authorization": f"bearer {token}"}
         self.session = session or requests.Session()
 
@@ -177,7 +184,7 @@ class PaddleClient:
             # have created a billable job, and POST is not idempotent.
             response = self._request(
                 "POST",
-                _JOB_URL,
+                self.endpoint,
                 max_retries=0,
                 headers=self.headers,
                 data=payload,
@@ -198,7 +205,7 @@ class PaddleClient:
         while time.monotonic() < deadline:
             try:
                 payload = self._request(
-                    "GET", f"{_JOB_URL}/{job_id}", headers=self.headers
+                    "GET", f"{self.endpoint}/{job_id}", headers=self.headers
                 ).json()["data"]
                 state = payload["state"]
             except (KeyError, TypeError, ValueError) as exc:
