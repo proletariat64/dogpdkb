@@ -864,6 +864,49 @@ def test_compile_consumes_pending_posthoc_followup_for_suppressed_version(
     assert doc2["graph"]["version"]["utc"] == version["utc"]
 
 
+def test_unchanged_batch_consumes_followup_at_settled_published_version(
+    workspace: CompileWorkspace,
+):
+    # [14] A follow-up registered at an already-published, settled version must
+    # still be consumed by a later UNCHANGED batch. The first compile succeeds
+    # (no COMPARISON_PENDING), so change detection neither selects the document
+    # nor carries it pending; without re-selection the mdcompare row is NO_WORK
+    # and the follow-up is a dead letter. Capture must re-select pending follow-up
+    # documents at the observed version, reusing the verified same-version raw.
+    from dogpdkb.sync_results import load_followups, register_compile_followup
+    from mdocr.config import load_config
+
+    _set_detail(workspace, 2, body=f"# Two\n\n![diagram]({IMAGE_A})\n")
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    config = load_config(workspace.config)
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    assert doc2["graph"]["status"] == "covered"
+    assert not (doc2.get("pending") or [])
+    version = doc2["observation"]["version"]
+    artifact = doc2["graph"]["ocr"]["images"][0]["artifact"]
+    followup = register_compile_followup(
+        config,
+        "fund",
+        document_id=2,
+        source_version=version,
+        reason="post-hoc OCR backfill changed the published compile input",
+        inputs=[{"kind": "cache", "path": artifact}],
+    )
+    assert followup["status"] == "pending"
+
+    # Unchanged remote: the settled document is not selected by change detection.
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run_dir = workspace.runs()[-1]
+    registry = load_followups(config, "fund")
+    consumed = registry["followups"][followup["id"]]
+    assert consumed["status"] == "done", consumed
+    assert consumed["run_id"] == run_dir.name
+    report = read_json(run_dir / "compile" / "compile-result.json")
+    assert 2 in {row["document_id"] for row in report["results"]}
+
+
 def test_removed_ocr_contribution_is_pruned_so_later_version_bump_reuses_body(
     workspace: CompileWorkspace,
 ):

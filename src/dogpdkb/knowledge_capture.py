@@ -1055,6 +1055,24 @@ def run_capture(args: Any) -> int:
                         }
                     )
             selected = kept
+        # A pending compile follow-up at the observed version is real new work
+        # (a post-hoc OCR backfill), not a retry of a failed capture: re-select its
+        # document so mdcompare makes the row available and compile consumes it.
+        # Version scoping keeps stale follow-ups out; the verified same-version
+        # download reuse supplies the raw with no re-export ([14], spec:136).
+        followups = getattr(args, "pending_followups", None) or []
+        if followups:
+            from dogpdkb.sync_results import version_stamp
+
+            reselected = {
+                int(item["document_id"])
+                for item in followups
+                if int(item["document_id"]) in current_id_set
+                and version_stamp(records[str(item["document_id"])]["version"])
+                == item.get("version_stamp")
+            }
+            if reselected:
+                selected = sorted(set(selected) | reselected)
         # Freeze the completed observation BEFORE any export so an interrupted
         # capture resumes against this exact scope/versions/selection (spec:79/112).
         if not args.listing:

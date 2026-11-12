@@ -22,6 +22,7 @@ from dogpdkb.knowledge_capture import (
 )
 from dogpdkb.sync_results import (
     archive_anomalies,
+    load_followups,
     load_registry,
     results_root,
     suppressing_anomalies,
@@ -187,9 +188,7 @@ def _revalidate_reused_raws(
     documents = snapshot.get("documents") or {}
     anomalies = snapshot.setdefault("anomalies", [])
     known = {
-        (row.get("id"), row.get("code"))
-        for row in anomalies
-        if isinstance(row, dict)
+        (row.get("id"), row.get("code")) for row in anomalies if isinstance(row, dict)
     }
     invalidated = 0
     for doc_id, export in exports.items():
@@ -327,6 +326,16 @@ def handle(context: StageContext) -> StageResult:
         suppressed_anomalies=suppressing_anomalies(
             context.config, context.book.key, stage="capture"
         ),
+        pending_followups=[
+            {
+                "document_id": row["document_id"],
+                "version_stamp": row["version_stamp"],
+            }
+            for row in load_followups(context.config, context.book.key)[
+                "followups"
+            ].values()
+            if row.get("status") == "pending"
+        ],
     )
     context.log.write(
         f"capture started book={context.book.key} baseline={baseline or 'none'}"

@@ -147,9 +147,11 @@ def unified_arguments(arguments: list[str]) -> list[str]:
         if dry_run and name == "--stop-after":
             # Drop the explicit stage (both --stop-after=X and --stop-after X)
             # so the dry-run plan cap below is the only --stop-after forwarded.
-            if not separator and index + 1 < len(arguments) and not arguments[
-                index + 1
-            ].startswith("-"):
+            if (
+                not separator
+                and index + 1 < len(arguments)
+                and not arguments[index + 1].startswith("-")
+            ):
                 index += 2
             else:
                 index += 1
