@@ -208,7 +208,8 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
         doc_id = row["document_id"]
         source_id = f"{book.key}:{doc_id}"
         source_file = str(Path(row["path"]).resolve().relative_to(book.corpus))
-        graph = store.document(doc_id).get("graph", {})
+        document = store.document(doc_id)
+        graph = document.get("graph", {})
         old = [graph["source_file"]] if graph.get("source_file") else []
         for source in sources:
             match = re.search(r"-\[(\d+)\]\.md$", Path(source["source_file"]).name)
@@ -219,7 +220,6 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
                 old.append(source["source_file"])
         if source_file not in old:
             old.append(source_file)
-        graph = store.document(doc_id).get("graph", {})
         known_version = (
             graph.get("version") if graph.get("status") == "completed" else None
         )
@@ -229,6 +229,22 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
             if row.get("baseline_version")
             else None,
         }
+        baseline = document.get("baseline", {})
+        if (
+            graph.get("status") == "unknown"
+            and baseline.get("precision") == "day"
+            and baseline.get("path")
+            and row.get("baseline_version")
+            and version_key(row["baseline_version"]) == baseline.get("filename_date")
+        ):
+            # init-state registered the existing corpus/graph starting point.
+            # Reuse proves equivalence only to that exact registered source.
+            reusable = any(
+                source.get("source_id", source_id) == source_id
+                and (book.corpus / source["source_file"]).resolve()
+                == Path(baseline["path"]).resolve()
+                for source in sources
+            )
         action = (
             "metadata"
             if row["action"] in {"metadata", "reuse"} and reusable

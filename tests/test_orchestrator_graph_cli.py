@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = {
     "utc": "2026-11-12T10:00:00+00:00",
@@ -247,6 +249,48 @@ def test_reuse_without_successful_graph_version_compiles_complete_source(tmp_pat
     assert result.returncode == 0, result.stdout + result.stderr
     request = json.loads((manifest.parent / "graph/0/request.json").read_text())
     assert request["sources"][0]["action"] == "compile"
+    assert request["sources"][0]["path"] == str(source)
+
+
+@pytest.mark.parametrize(
+    ("inventory_name", "baseline_version", "expected"),
+    [
+        ("Title-2026-11-12-[42].md", "2026-11-12", "metadata"),
+        ("Title-2026-11-11-[42].md", "2026-11-12", "compile"),
+        ("Title-2026-11-12-[42].md", "2026-11-12T09:00:00Z", "compile"),
+    ],
+)
+def test_registered_baseline_reuse_requires_exact_inventory_and_version(
+    tmp_path, inventory_name, baseline_version, expected
+):
+    config, manifest, source = fixture(tmp_path)
+    state_path = tmp_path / "state/funds/state.json"
+    state = json.loads(state_path.read_text())
+    state["documents"]["42"].update(
+        baseline={
+            "path": str(source),
+            "filename_date": "2026-11-12",
+            "precision": "day",
+        },
+        graph={"status": "unknown"},
+    )
+    write(state_path, state)
+    data = json.loads(manifest.read_text())
+    data["documents"][0].update(
+        action="reuse", baseline_version={"value": baseline_version}
+    )
+    write(manifest, data)
+    write(
+        tmp_path / "inventory-fixture.json",
+        {
+            "schema": "graphify-source-inventory-1.0",
+            "sources": [{"source_file": inventory_name}],
+        },
+    )
+    result = cli(config, manifest)
+    assert result.returncode == 0, result.stdout + result.stderr
+    request = json.loads((manifest.parent / "graph/0/request.json").read_text())
+    assert request["sources"][0]["action"] == expected
     assert request["sources"][0]["path"] == str(source)
 
 
