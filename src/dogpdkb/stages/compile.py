@@ -39,7 +39,7 @@ def _anomalies(report: dict[str, Any]) -> list[dict[str, Any]]:
             "code": row["code"],
             "reason": row["reason"],
             "source_version": row["source_version"],
-            "necessary_inputs": [],
+            "necessary_inputs": row.get("necessary_inputs") or [],
         }
         for row in report.get("failed", [])
     ]

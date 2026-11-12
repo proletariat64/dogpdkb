@@ -338,14 +338,15 @@ def smoke_unified_sync(
     assert row["graph"]["status"] == "covered"
     assert row["graph"]["version"]["utc"] == version
 
-    # An unchanged remote converges by reuse: no re-download, no repeat compile.
+    # An unchanged remote converges to no-work: the settled source is not
+    # re-selected, so nothing is re-downloaded and nothing recompiles.
     second = parse_json(run(sync).strip().splitlines()[-1])
     assert second["status"] == "completed", second
     assert second["stages"]["compile"] == "skipped"
     run2 = max((root / "wash/fund").glob("run-*"))
     assert run2 != run1
     capture2 = parse_json((run2 / "capture/result.json").read_text())["counts"]
-    assert capture2["reused"] == 1
+    assert capture2["total"] == 0 and capture2["reused"] == 0
     assert parse_json((run2 / "plan/plan.json").read_text())["compile"] == []
     assert parse_json((run2 / "compile/result.json").read_text())["status"] == "skipped"
 

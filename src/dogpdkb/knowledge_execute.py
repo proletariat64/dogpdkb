@@ -1101,6 +1101,7 @@ def _enrich_compile_body(
         }
     ]
     missing_items: list[dict[str, Any]] = []
+    consumed: set[str] = set()
 
     def missing(resource_id: str, code: str, reason: str) -> None:
         missing_items.append(
@@ -1144,9 +1145,21 @@ def _enrich_compile_body(
             final_inputs.append(
                 {"kind": "prepared_image", "resource_id": ref.target, "path": prepared}
             )
+        consumed.add(ref.target)
         return block
 
     enriched, _warnings, _errors = transform_images(raw_text, transform, warn=False)
+    # transform_images only rewrites inline embeds. A successfully recognized image
+    # in HTML <img> or reference-style form is never inserted; record it as an
+    # unconsumed missing item rather than disguising it as a completed OCR input,
+    # so the follow-up is not falsely closed as fulfilled (M17).
+    for resource_id, record in images.items():
+        if record.get("status") == "success" and resource_id not in consumed:
+            missing(
+                resource_id,
+                "OCR_NOT_ENRICHED",
+                "successful OCR not inserted (HTML/reference-style image form)",
+            )
     execution = {
         "final_inputs": final_inputs,
         "missing_items": missing_items,
@@ -1219,10 +1232,19 @@ def _pending_followup_items(
     a different version is left pending for a later batch — never fabricated.
     """
     registry = load_followups(context.config, context.book.key)
+    run_id = context.layout.run_id
+    # Fresh pending followups are real work (daily OCR follow-up or post-hoc
+    # backfill). Also re-include followups this same run already consumed/attempted
+    # so a crash after consumption rebuilds the identical merged set on resume
+    # (H25); a prior run's failed followup stays handed off, never auto-retried (H22).
     pending = [
         record
         for record in registry["followups"].values()
         if record.get("status") == "pending"
+        or (
+            record.get("status") in {"done", "failed"}
+            and record.get("run_id") == run_id
+        )
     ]
     if not pending:
         return items, []
@@ -1267,7 +1289,11 @@ def _consume_followups(context: Any, results: list[dict[str, Any]]) -> list[str]
         (str(row["document_id"]), version_stamp(row["source_version"]))
         for row in results
     }
+    execution_by_doc = {
+        str(row["document_id"]): row.get("execution") or {} for row in results
+    }
     consumed: list[str] = []
+    changed = False
     now = now_iso()
     for record in registry["followups"].values():
         if record.get("status") != "pending":
@@ -1275,19 +1301,78 @@ def _consume_followups(context: Any, results: list[dict[str, Any]]) -> list[str]
         key = (str(record["document_id"]), record.get("version_stamp"))
         if key not in published:
             continue
-        record["status"] = "done"
+        execution = execution_by_doc.get(str(record["document_id"]), {})
+        unenriched = any(
+            item.get("code") == "OCR_NOT_ENRICHED"
+            for item in execution.get("missing_items") or []
+        )
+        record["run_id"] = context.layout.run_id
+        record["updated_at"] = now
+        if unenriched:
+            # The source published, but a successful OCR input was not inserted
+            # (HTML/reference form). Do not close the follow-up as fulfilled; hand
+            # it off so the daily batch does not endlessly retry it (M17).
+            record["status"] = "failed"
+            record["resolution"] = {
+                "disposition": "handed_off",
+                "run_id": context.layout.run_id,
+                "recorded_at": now,
+                "reason": "published source omitted an un-enriched OCR input",
+            }
+        else:
+            record["status"] = "done"
+            record["resolution"] = {
+                "disposition": "done",
+                "run_id": context.layout.run_id,
+                "recorded_at": now,
+                "reason": "compile published the source with the updated input",
+            }
+            consumed.append(record["id"])
+        changed = True
+    if changed:
+        save_followups(context.config, context.book.key, registry)
+    return consumed
+
+
+def _fail_followups(
+    context: Any, failed_ids: set[str], items: list[dict[str, Any]]
+) -> list[str]:
+    """Record a failed compile attempt on followups whose source failed extraction.
+
+    A followup attempted-and-failed at a version the daily plan suppresses must not
+    be auto-retried (H22). Mark it failed (handed off) so later batches skip it;
+    ``register_compile_followup`` reopens it when fresh post-hoc evidence arrives.
+    """
+    if not failed_ids:
+        return []
+    registry = load_followups(context.config, context.book.key)
+    by_id = {str(item["document_id"]): item for item in items}
+    failed_keys = {
+        (identity, version_stamp(by_id[identity]["source_version"]))
+        for identity in failed_ids
+        if identity in by_id
+    }
+    marked: list[str] = []
+    now = now_iso()
+    for record in registry["followups"].values():
+        if record.get("status") != "pending":
+            continue
+        key = (str(record["document_id"]), record.get("version_stamp"))
+        if key not in failed_keys:
+            continue
+        record["status"] = "failed"
         record["run_id"] = context.layout.run_id
         record["updated_at"] = now
         record["resolution"] = {
-            "disposition": "done",
+            "disposition": "handed_off",
             "run_id": context.layout.run_id,
             "recorded_at": now,
-            "reason": "compile published the source with the updated input",
+            "reason": "compile extraction failed; handed off to post-hoc recovery",
         }
-        consumed.append(record["id"])
-    if consumed:
+        marked.append(record["id"])
+    if marked:
         save_followups(context.config, context.book.key, registry)
-    return consumed
+    return marked
 
 
 def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
@@ -1473,8 +1558,12 @@ def _execute_compile_locked(
     candidate = Path(candidate_result["candidate"])
     published_sources = candidate_result.get("published_sources") or []
     failed_sources = candidate_result.get("failed_sources") or []
+    emptied_sources = candidate_result.get("emptied_sources") or []
     published_ids = {doc_id(name) for name in published_sources} - {None}
     failed_ids = {doc_id(name) for name in failed_sources} - {None}
+    emptied_ids = {doc_id(name) for name in emptied_sources} - {None}
+    # Coverage is required only for semantic sources; an emptied source owns no
+    # records by design, so it stays out of current_sources but still advances.
     current_sources = {f"source-[{identity}].md" for identity in published_ids}
     # Artifact check only: a well-formed graph covering every published source.
     _validate_graph_records(
@@ -1497,7 +1586,10 @@ def _execute_compile_locked(
     state = _load_state(state_path, plan["book"])
     by_id = {str(item["document_id"]): item for item in items}
     results: list[dict[str, Any]] = []
-    for identity in sorted(published_ids):
+    # Emptied sources published successfully too: their old records were removed
+    # and the manifest keeps the empty file, so advance their success state and
+    # record a result row exactly like a semantic source (H9 / MEDIUM7).
+    for identity in sorted(published_ids | emptied_ids):
         item = by_id.get(identity)
         if item is None:
             continue
@@ -1545,7 +1637,14 @@ def _execute_compile_locked(
         record["pending"] = [
             reason
             for reason in record.get("pending", [])
-            if reason not in {"GRAPH_UPDATE_REQUIRED", "GRAPH_SOURCE_NOT_REGISTERED"}
+            if reason
+            not in {
+                "GRAPH_UPDATE_REQUIRED",
+                "GRAPH_SOURCE_NOT_REGISTERED",
+                # The plan clears COMPARISON_PENDING only for body_reuse; a compile
+                # decision is terminal only once published here, so clear it now (M16).
+                "COMPARISON_PENDING",
+            }
         ]
         results.append(
             {
@@ -1566,6 +1665,7 @@ def _execute_compile_locked(
     # Real completion is recorded; only now close pending post-hoc followups whose
     # source this run published. Never closed on cached OCR alone.
     followups = _consume_followups(context, results)
+    _fail_followups(context, failed_ids, items)
     usage = candidate_result.get("usage") or {}
     report = _compile_report(
         plan,
@@ -1577,6 +1677,7 @@ def _execute_compile_locked(
         candidate_result,
         metadata_results,
         followups,
+        frozen,
     )
     publish_reports(
         [(report_path, json.dumps(report, ensure_ascii=False, indent=1) + "\n")]
@@ -1594,8 +1695,10 @@ def _compile_report(
     candidate_result: dict[str, Any] | None,
     metadata_results: list[dict[str, Any]] | None = None,
     followups: list[str] | None = None,
+    frozen: dict[str, Path] | None = None,
 ) -> dict[str, Any]:
     by_id = {str(item["document_id"]): item for item in items}
+    frozen = frozen or {}
     failed = [
         {
             "book_id": by_id[identity]["book_id"],
@@ -1603,6 +1706,13 @@ def _compile_report(
             "source_version": by_id[identity]["source_version"],
             "code": "COMPILE_EXTRACTION_FAILED",
             "reason": "Graphify extraction failed; old knowledge and version retained",
+            # Reference the actual frozen enriched compile input so reference-based
+            # wash cleanup preserves the recovery input instead of deleting it (M21).
+            "necessary_inputs": (
+                [{"kind": "compiled_source", "path": str(frozen[identity])}]
+                if identity in frozen
+                else []
+            ),
         }
         for identity in failed_ids
         if identity in by_id

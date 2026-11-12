@@ -42,18 +42,21 @@ no-token/auth contract targets API credentials only).
 - [x] H24: body-reuse requires row graph_status=="covered"; else whole_document compile.
 - [x] H26: removed OCR contribution → whole_document compile. compare_ocr surfaces removed_contributions (prior success URLs absent from incoming raw — representation-independent across raw/published); plan blocks body_reuse + reason OCR_CONTRIBUTION_REMOVED_FULL_RECOMPILE.
 - [x] M11: _incoming/_baseline resolve resources against ORIGINAL base dir; markdown bytes still read from frozen path.
-- [x] M16-plan: clear COMPARISON_PENDING in plan._update_state for body_reuse/compile decisions.
+- [x] M16-plan: clear COMPARISON_PENDING in plan._update_state for body_reuse only (terminal in plan); compile decisions clear it in the compile success loop (M16-compile). Clearing compile in plan stranded sources whose compile later failed → spurious CAPTURE_RAW_UNAVAILABLE next batch (regression fixed in WP3).
 - Regressions (red→green verified): test_unified_compile.py settled→no_work / unresolved-handed-off stays partial / resolved-handed-off completes / uncovered-baseline compiles (H7,M16,H21,H24); test_unified_ocr.py removed_image_with_prior_ocr_contribution_republishes (H26); test_unified_plan.py incoming_relative_image_resolves_against_original_raw_dir (M11). M16 coupling: acceptance no-update + status tests assert no-work convergence; two reused-image OCR contrast tests updated (unchanged batch→no_work; version-bump identical content→body_reuse merge). 187 unified+comparator tests green; ruff clean.
 
-### WP3 — compile/graph (knowledge_execute.py, workflows/update_graph.py, stages/compile.py)
-- [ ] H8-read: compile trusts graph.ocr only on success status (tombstone from WP1 drives this).
-- [ ] H9/M7: report emptied_sources; advance their success state (covered/version/raw) but keep out of current_sources validation.
-- [ ] H22: followup attempt-failure suppression at same version; preserve backfill test_unified_compile.py:582.
-- [ ] H25: followup consumption crash-safety (pin merged set / defer consume / include same-run consumed on resume).
-- [ ] M16-compile: clear COMPARISON_PENDING in compile success loop filter.
-- [ ] M17: enrich HTML/ref-style planned images OR record unconsumed missing items (don't falsely close followup).
-- [ ] M21: compile-failure anomaly necessary_inputs reference frozen execution-corpus source.
-- [ ] H4: update_graph.main() --partial post-publish loop skip audit failed_sources.
+### WP3 — compile/graph (knowledge_execute.py, workflows/update_graph.py, stages/compile.py) — DONE
+- [x] H8-read: confirmed no-change — compile already trusts graph.ocr only on success status (WP1 tombstone drives this).
+- [x] H9/M7: report emptied_sources; advance their success state (covered/version/raw) but keep out of current_sources validation.
+- [x] H22: followup attempt-failure suppression at same version; preserve backfill test_unified_compile.py:582.
+- [x] H25: followup consumption crash-safety (include same-run done/failed on resume; retained candidate reused).
+- [x] M16-compile: clear COMPARISON_PENDING (+GRAPH_UPDATE_REQUIRED/GRAPH_SOURCE_NOT_REGISTERED) in compile success loop filter.
+- [x] M17: record unconsumed successful OCR as OCR_NOT_ENRICHED missing items + hand off followup (failed) for HTML/ref-style images; don't falsely close.
+- [x] M21: compile-failure anomaly necessary_inputs reference frozen execution-corpus source (durable copy via archive_anomalies).
+- [x] H4: update_graph.main() --partial post-publish loop skip audit failed_sources (no version advance / graph step failed).
+- [x] M16-plan regression: plan clears COMPARISON_PENDING for body_reuse only, not compile (compile loop settles it). Fixes 2 test_sync_results failures (spurious batch-2 CAPTURE_RAW_UNAVAILABLE).
+- Regressions (red→green verified): test_unified_compile.py emptied_document_advances_success_state_and_becomes_no_work (H9), compile_failure_anomaly_references_the_frozen_compile_input (M21); test_update_graph.py partial_publication_does_not_advance_failed_sources (H4); test_unified_ocr.py failed_ocr_followup_is_not_retried_the_next_day (H22), resume_after_followup_consumption_reuses_retained_candidate (H25), html_image_ocr_success_is_recorded_unenriched_and_handed_off (M17); test_unified_plan.py compile_decision_retains_comparison_pending_until_compile_publishes + body-reuse pending-clear assertion (M16-plan). Full gate green.
+- Pre-existing test assertions corrected (both encoded pre-M16 re-selection of settled docs; confirmed failing at WP2 HEAD e2b7c02): test_unified_sync.py status test now expects the failed-compile batch to re-select (total=2); scripts/smoke_install.py second batch now asserts no-work convergence (total=0/reused=0) instead of reused=1. make check 1158 passed + make smoke PASS.
 
 ### WP4 — runner/status/lock (unified_sync.py, sync_run.py, sync_status.py, instance_lock.py, sync_knowledge_base.py, stages/capture.py)
 - [ ] H5: preserve -h/--help through unified_arguments (no unlocked write).

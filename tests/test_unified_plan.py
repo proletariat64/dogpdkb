@@ -119,6 +119,29 @@ def test_identical_body_reuses_existing_knowledge(workspace: Workspace):
     assert graph["status"] == "covered"
     assert graph["coverage"] == "body_reuse"
     assert graph["version"]["utc"] == "2026-11-10T10:00:00+08:00"
+    # Body reuse is terminal in the plan, so its transient comparison pending is
+    # cleared here (unlike a compile decision, which the compile loop settles).
+    record = state["books"]["fund"]["documents"]["1"]
+    assert "COMPARISON_PENDING" not in record["pending"]
+
+
+def test_compile_decision_retains_comparison_pending_until_compile_publishes(
+    workspace: Workspace,
+):
+    # A compile decision is not terminal in the plan stage: compile runs later and
+    # may fail. Clearing COMPARISON_PENDING here would strand a source whose compile
+    # fails (version unadvanced) yet is no longer re-selected, surfacing a spurious
+    # CAPTURE_RAW_UNAVAILABLE on the next batch. Only body reuse (terminal in plan)
+    # clears it; the compile success loop clears it for published sources.
+    completed = workspace.sync("--stop-after", "plan")
+    assert completed.returncode == 0, completed.stderr
+    plan = _plan(workspace)
+    assert {row["document_id"] for row in plan["compile"]} == {1, 2}
+    state = read_json(workspace.corpus / ".sync-state.json")
+    for doc_id in ("1", "2"):
+        record = state["books"]["fund"]["documents"][doc_id]
+        assert record["steps"]["plan"]["decision"] == "compile"
+        assert "COMPARISON_PENDING" in record["pending"]
 
 
 def test_changed_image_with_reused_body_still_goes_to_ocr(workspace: Workspace):

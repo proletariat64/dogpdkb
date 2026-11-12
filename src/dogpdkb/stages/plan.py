@@ -312,13 +312,13 @@ def _update_state(
                 "version": row["source_version"],
                 "raw": raw_reference,
             }
-        if row.get("input_available") and decision["decision"] in {
-            "body_reuse",
-            "compile",
-        }:
-            # COMPARISON_PENDING is transient: the comparison happened and a
-            # terminal decision is recorded, so a settled document must not be
-            # re-selected by every later batch (it becomes no-work when unchanged).
+        if row.get("input_available") and decision["decision"] == "body_reuse":
+            # COMPARISON_PENDING is transient: body reuse is a terminal decision
+            # recorded here, so a settled reused document must not be re-selected
+            # by every later batch. A compile decision is NOT terminal until the
+            # compile stage actually publishes, so its COMPARISON_PENDING is cleared
+            # in the compile success loop instead — clearing it here would strand a
+            # source whose compile later fails (version unadvanced, yet unselected).
             record["pending"] = [
                 reason
                 for reason in (record.get("pending") or [])

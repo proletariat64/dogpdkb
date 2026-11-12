@@ -262,6 +262,35 @@ def test_partial_publication_keeps_failed_source_knowledge_and_version(
     assert state["active_run"] is None
 
 
+def test_compile_failure_anomaly_references_the_frozen_compile_input(
+    workspace: CompileWorkspace,
+):
+    # M21: a failed source's anomaly must reference its actual frozen enriched
+    # compile input, so reference-based wash cleanup preserves the recovery input
+    # rather than deleting the exact source that failed extraction.
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = "source-[1]"
+
+    completed = workspace.sync()
+    assert completed.returncode == 0, completed.stderr
+    run_dir = workspace.only_run()
+    envelope = workspace.compile_envelope()
+    anomaly = next(row for row in envelope["anomalies"] if row["document_id"] == 1)
+    inputs = anomaly["necessary_inputs"]
+    assert inputs, "failed source must reference its frozen compile input"
+    frozen = run_dir / "compile" / "execution-corpus" / "source-[1].md"
+    # archive_anomalies persists the referenced input durably: ``source`` is the
+    # original frozen compile input, ``path`` is the preserved durable copy.
+    assert any(Path(row["source"]) == frozen for row in inputs)
+    assert all(Path(row["path"]).is_file() for row in inputs)
+
+    # The durable registry carries the same reference for post-hoc recovery.
+    registry = read_json(workspace.root / "sync-results" / "fund" / "anomalies.json")
+    durable = next(
+        row for row in registry["anomalies"].values() if row["document_id"] == 1
+    )
+    assert any(Path(row["source"]) == frozen for row in durable["necessary_inputs"])
+
+
 def _set_detail(workspace: CompileWorkspace, doc_id: int, **fields: Any) -> None:
     remote = read_json(workspace.root / "remote.json")
     remote["details"][str(doc_id)].update(fields)
@@ -420,6 +449,47 @@ def test_a_new_source_version_is_compiled_normally_after_a_failure(
     doc1 = state["books"]["fund"]["documents"]["1"]
     assert doc1["graph"]["status"] == "covered"
     assert doc1["graph"]["version"]["utc"] == "2026-11-11T10:00:00+08:00"
+
+
+def test_emptied_document_advances_success_state_and_becomes_no_work(
+    workspace: CompileWorkspace,
+):
+    # H9 / MEDIUM7: a previously covered document emptied remotely changes the real
+    # graph (its old records are removed) but must still advance its canonical
+    # success version/raw and get a result row. Otherwise the run reports completed
+    # while the source is silently unadvanced and re-compiles every later batch.
+    remote = read_json(workspace.root / "remote.json")
+    for row in remote["documents"]:
+        if row["id"] == 1:
+            row["content_updated_at"] = "2026-11-11T10:00:00+08:00"
+    remote["details"]["1"]["content_updated_at"] = "2026-11-11T10:00:00+08:00"
+    remote["details"]["1"]["body"] = ""
+    write_json(workspace.root / "remote.json", remote)
+
+    completed = workspace.sync()
+    assert completed.returncode == 0, completed.stderr
+    run_dir = workspace.only_run()
+
+    # The emptied source owns no graph records, and its old baseline is removed.
+    sources = {node["source_file"] for node in workspace.graph()["nodes"]}
+    assert "source-[1].md" not in sources
+    assert "One-2026-11-10-[1].md" not in sources
+    # The empty file is still tracked in the published manifest.
+    manifest = read_json(workspace.corpus / "graphify-out" / "manifest.json")
+    assert any("source-[1].md" in key for key in manifest)
+
+    # Canonical success state advanced to the emptied version, with a result row.
+    doc1 = workspace.state()["books"]["fund"]["documents"]["1"]
+    assert doc1["graph"]["status"] == "covered"
+    assert doc1["graph"]["version"]["utc"] == "2026-11-11T10:00:00+08:00"
+    report = read_json(run_dir / "compile" / "compile-result.json")
+    assert 1 in {row["document_id"] for row in report["results"]}
+
+    # A second unchanged batch is no-work for the emptied document, not a recompile.
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    plan = read_json(workspace.runs()[-1] / "plan" / "plan.json")
+    assert plan["decisions"]["1"]["decision"] == "no_work"
 
 
 def test_settled_document_becomes_no_work_on_the_next_unchanged_batch(

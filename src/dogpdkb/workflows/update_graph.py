@@ -407,6 +407,10 @@ def build_candidate(
     audit["partial"] = bool(failed_files)
     audit["failed_sources"] = sorted(failed_files)
     audit["published_sources"] = sorted(semantic_files)
+    # Emptied sources change the real graph (their old records are removed) and stay
+    # in the manifest, but own no semantic records. Report them separately so the
+    # caller can advance their success state without requiring graph coverage.
+    audit["emptied_sources"] = sorted(empty_files & set(effective_current))
     write_json(staging / "candidate-validation.json", audit)
     return candidate_dir, audit
 
@@ -703,8 +707,16 @@ def main() -> None:
         }
         write_json(staging / "result.json", result)
         if tracker:
+            failed_sources = set(audit.get("failed_sources") or [])
             for row in manifest.get("exported", []):
                 identity = str(row["id"])
+                if row["file"] in failed_sources:
+                    # Partial publication: a source that failed extraction keeps its
+                    # old knowledge and old success version. Record the failure and
+                    # leave GRAPH_UPDATE_REQUIRED pending rather than falsely
+                    # advancing it to covered@new_version (H4).
+                    tracker.step(identity, "graph", "failed", file=row["file"])
+                    continue
                 version = row.get("source_version") or tracker.version(
                     row.get("content_updated_at")
                 )

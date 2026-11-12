@@ -533,7 +533,7 @@ def register_compile_followup(
         existing["updated_at"] = now
         if anomaly_id is not None:
             existing["anomaly_id"] = anomaly_id
-        if existing["status"] == "done":
+        if existing["status"] in {"done", "failed"}:
             existing["status"] = "pending"
             existing["resolution"] = None
         record = existing

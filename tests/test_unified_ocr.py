@@ -970,3 +970,138 @@ def test_cache_hit_on_resume_registers_followup_when_published_source_lacks_arti
     ]
     assert len(doc1) == 1
     assert doc1[0]["status"] == "done"
+
+
+def test_failed_ocr_followup_is_not_retried_the_next_day(tmp_path: Path):
+    # H22: a body-reuse source's OCR-driven compile follow-up that fails extraction
+    # archives a same-version anomaly the daily plan suppresses. The follow-up must
+    # record the failed attempt so the next day's batch does not re-add it from the
+    # mdcompare row and endlessly retry a handed-off failure. A fresh post-hoc
+    # backfill (new evidence) still reopens it.
+    workspace = OcrCompileWorkspace(tmp_path)
+    workspace.reuse_doc_one_with_changed_image()
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = "source-[1]"
+
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    run1 = workspace.runs()[-1]
+    assert json.loads(first.stdout.strip().splitlines()[-1])["status"] == "partial"
+    followup = next(
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    )
+    assert followup["status"] == "failed"
+    assert followup["run_id"] == run1.name
+    first_extracts = workspace.extracts().count("source-[1].md")
+
+    # Next day: same version is suppressed; the attempted follow-up must not retry.
+    workspace.env["GRAPHIFY_STUB_PARTIAL"] = ""
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run2 = workspace.runs()[-1]
+    plan2 = read_json(run2 / "plan" / "plan.json")
+    assert plan2["decisions"]["1"]["decision"] == "suppressed"
+    assert workspace.extracts().count("source-[1].md") == first_extracts
+    still = next(
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    )
+    assert still["status"] == "failed"
+
+    # A genuine post-hoc backfill with new evidence reopens the follow-up.
+    from dogpdkb.sync_results import register_compile_followup
+    from mdocr.config import load_config
+
+    config = load_config(workspace.config)
+    doc1 = workspace.state()["books"]["fund"]["documents"]["1"]
+    artifact = doc1["graph"]["ocr"]["images"][0]["artifact"]
+    reopened = register_compile_followup(
+        config,
+        "fund",
+        document_id=1,
+        source_version=doc1["observation"]["version"],
+        reason="post-hoc OCR backfill changed the published compile input",
+        inputs=[{"kind": "cache", "path": artifact}],
+    )
+    assert reopened["status"] == "pending"
+
+
+def test_resume_after_followup_consumption_reuses_retained_candidate(tmp_path: Path):
+    # H25: a pending OCR follow-up adds a document to the compile set; consumption
+    # marks it done before the stage envelope commits. A crash in that window must
+    # not destabilize the merged set on resume — rebuilding from only pending
+    # follow-ups would drop the consumed document and reject the retained candidate
+    # with "candidate inputs changed".
+    from tests.test_unified_compile import CRASH_AFTER_COMPILE_ARTIFACT
+
+    workspace = OcrCompileWorkspace(tmp_path)
+    workspace.reuse_doc_one_with_changed_image()
+    shim = workspace.root / "python-shim" / "sitecustomize.py"
+    shim.write_text(
+        shim.read_text(encoding="utf-8") + "\n" + CRASH_AFTER_COMPILE_ARTIFACT,
+        encoding="utf-8",
+    )
+    workspace.env["DOGPDKB_CRASH_AFTER_COMPILE"] = "1"
+
+    crashed = workspace.sync()
+    assert crashed.returncode != 0
+    run = workspace.only_run()
+    assert (run / "compile" / "compile-result.json").is_file()
+    followup = next(
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    )
+    assert followup["status"] == "done"
+    assert followup["run_id"] == run.name
+
+    workspace.env["DOGPDKB_CRASH_AFTER_COMPILE"] = "0"
+    resumed = workspace.sync("--resume", run.name)
+    assert resumed.returncode == 0, resumed.stderr
+    assert "candidate inputs changed" not in resumed.stderr
+    recovered = read_json(run / "run.json")["stage_states"]["compile"]
+    assert recovered["status"] in {"completed", "partial", "skipped"}
+    assert 1 in {r["document_id"] for r in workspace.compile_report(run)["results"]}
+
+
+def test_html_image_ocr_success_is_recorded_unenriched_and_handed_off(tmp_path: Path):
+    # M17: an HTML <img> (or reference-style) image is recognized by OCR but the
+    # inline-only enrichment never inserts its text. The compile must record the
+    # successful-but-unconsumed OCR as a missing item and hand off the follow-up
+    # rather than falsely closing it as a fulfilled compile input.
+    workspace = OcrCompileWorkspace(tmp_path)
+    (workspace.corpus / "One-2026-11-10-[1].md").write_text(
+        '# One\n\nOld rule.\n\n<img src="https://cdn.example.invalid/old.png">\n',
+        encoding="utf-8",
+    )
+    remote = read_json(workspace.root / "remote.json")
+    remote["details"]["1"]["body"] = (
+        '# One\n\nOld rule.\n\n<img src="https://cdn.example.invalid/new.png">\n'
+    )
+    remote["details"]["2"]["body"] = "body 2\n"
+    write_json(workspace.root / "remote.json", remote)
+
+    completed = workspace.sync()
+    assert completed.returncode == 0, completed.stderr
+    run = workspace.only_run()
+    plan = read_json(run / "plan" / "plan.json")
+    assert 1 in {row["document_id"] for row in plan["body_reuse"]}
+    assert 1 in {row["document_id"] for row in plan["ocr"]}
+    assert workspace.ocr_envelope(run)["counts"]["success"] == 1
+
+    report = workspace.compile_report(run)
+    result1 = next(r for r in report["results"] if r["document_id"] == 1)
+    missing = result1["execution"]["missing_items"]
+    assert any(
+        m["code"] == "OCR_NOT_ENRICHED"
+        and m["resource_id"] == "https://cdn.example.invalid/new.png"
+        for m in missing
+    )
+    # The HTML form is left unchanged; no OCR text was inserted.
+    frozen = (run / "compile" / "execution-corpus" / "source-[1].md").read_text(
+        encoding="utf-8"
+    )
+    assert "OCR output line" not in frozen
+    assert '<img src="https://cdn.example.invalid/new.png">' in frozen
+
+    followup = next(
+        f for f in workspace.followups()["followups"].values() if f["document_id"] == 1
+    )
+    assert followup["status"] == "failed"
+    assert followup["resolution"]["disposition"] == "handed_off"
