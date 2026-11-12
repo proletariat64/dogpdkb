@@ -1,22 +1,14 @@
-"""Installed entry points for the complete knowledge synchronization platform."""
+"""Public commands for serial knowledge synchronization and independent Web publication."""
 
 from __future__ import annotations
 
 import argparse
 import importlib.metadata
-import subprocess
 import sys
 from pathlib import Path
 
-from dogpdkb.instance_lock import locked_main, subprocess_lock_options
+from dogpdkb.instance_lock import locked_main
 
-WORKFLOWS = {
-    "sync": "sync_knowledge_base.py",
-    "discover": "get_sync_updates.py",
-    "apply": "apply_sync_updates.py",
-    "update-graph": "update_graph.py",
-    "publish-web": "publish_web.py",
-}
 RESOURCES = Path(__file__).resolve().parent / "resources"
 
 
@@ -59,23 +51,15 @@ def _main(argv: list[str] | None = None) -> int:
         from dogpdkb.apply import main as apply_main
 
         return apply_main(arguments[1:])
-    if arguments and arguments[0] in WORKFLOWS:
-        script = Path(__file__).resolve().parent / "workflows" / WORKFLOWS[arguments[0]]
-        return subprocess.call(
-            [sys.executable, str(script), *arguments[1:]], **subprocess_lock_options()
-        )
+    if arguments and arguments[0] == "publish-web":
+        from dogpdkb.workflows.publish_web import main as web_main
+
+        web_main(arguments[1:])
+        return 0
     if arguments and arguments[0] == "status":
         from dogpdkb.observe import main as status_main
 
         return status_main(arguments[1:])
-    if arguments and arguments[0] == "anomalies":
-        from dogpdkb.sync_anomalies import main as anomalies_main
-
-        return anomalies_main(arguments[1:])
-    if arguments and arguments[0] == "wash":
-        from dogpdkb.sync_wash import main as wash_main
-
-        return wash_main(arguments[1:])
     parser = argparse.ArgumentParser(description=__doc__, prog="dogpdkb")
     try:
         version = importlib.metadata.version("dogpdkb")
@@ -83,27 +67,16 @@ def _main(argv: list[str] | None = None) -> int:
         version = "uninstalled"
     parser.add_argument("--version", action="version", version=f"dogpdkb {version}")
     commands = parser.add_subparsers(dest="command")
-    for name in WORKFLOWS:
+    for name in ("discover", "apply", "update-graph", "sync", "publish-web"):
         commands.add_parser(name, help=f"run {name}; use {name} --help for options")
     commands.add_parser(
         "status", help="read-only sync batch status; use status --help for options"
-    )
-    commands.add_parser(
-        "anomalies",
-        help="scan durable results/anomalies and record dispositions; use anomalies --help",
-    )
-    commands.add_parser(
-        "wash",
-        help="inventory historical wash workspaces and migrate necessary artifacts; use wash --help",
     )
     doctor = commands.add_parser("doctor", help="read-only, offline preflight checks")
     doctor.add_argument("--config", type=Path)
     doctor.add_argument("--book")
     doctor.add_argument(
         "--package", action="store_true", help="check installed package only"
-    )
-    doctor.add_argument(
-        "--require-ocr", action="store_true", help="require an OCR token"
     )
     doctor.add_argument("--json", action="store_true", help="machine-readable report")
     initialize = commands.add_parser(
@@ -157,7 +130,7 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         from dogpdkb.preflight import diagnose, print_report
 
-        report = diagnose(args.config, args.book, args.package, args.require_ocr)
+        report = diagnose(args.config, args.book, args.package)
         print_report(report, json_output=args.json)
         for row in report:
             if row.get("exit_code") in {130, 143}:
@@ -178,9 +151,6 @@ def _main(argv: list[str] | None = None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] in (
-        {*WORKFLOWS, "update", "uninstall"}
-        - {"apply", "sync", "update-graph", "discover"}
-    ):
+    if arguments and arguments[0] in {"update", "uninstall"}:
         return locked_main(_main)(arguments)
     return _main(arguments)
