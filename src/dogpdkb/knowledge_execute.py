@@ -1080,6 +1080,7 @@ def _enrich_compile_body(
     raw_path: Path,
     state_path: Path,
     source_version: Any,
+    referenced: set[str] | None = None,
 ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
     """Layer successful OCR onto the prepared body; keep unrecognized references.
 
@@ -1165,8 +1166,13 @@ def _enrich_compile_body(
     # transform_images only rewrites inline embeds. A successfully recognized image
     # in HTML <img> or reference-style form is never inserted; record it as an
     # unconsumed missing item rather than disguising it as a completed OCR input,
-    # so the follow-up is not falsely closed as fulfilled (M17).
+    # so the follow-up is not falsely closed as fulfilled (M17). Scope this to
+    # images the CURRENT raw still references: a historical success for an image
+    # that was removed is absent, not an un-inserted form, and must not be reported
+    # un-enriched (which would wrongly fail its compile follow-up) ([23]).
     for resource_id, record in images.items():
+        if referenced is not None and resource_id not in referenced:
+            continue
         if record.get("status") == "success" and resource_id not in consumed:
             missing(
                 resource_id,
@@ -1189,6 +1195,7 @@ def _freeze_compile_sources(
     source_urls: dict[str, str],
     evidence_by_id: dict[str, dict[str, Any]],
     state_path: Path,
+    referenced_by_id: dict[str, set[str]],
 ) -> tuple[Path, dict[str, Path], list[dict[str, Any]], dict[str, Any]]:
     """Freeze each compile item's OCR-enriched whole source into the corpus.
 
@@ -1215,6 +1222,7 @@ def _freeze_compile_sources(
             raw,
             state_path,
             item["source_version"],
+            referenced_by_id.get(identity),
         )
         name = f"source-[{identity}].md"
         _freeze_bytes(
@@ -1412,6 +1420,7 @@ def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
         graphify_python=context.config.graphify_python,
     )
     metadata_by_id = _compile_metadata(context)
+    referenced_by_id = _compile_referenced_images(context)
     metadata_items = plan.get("metadata") or []
     # Consume pending post-hoc followups: a backfill that changed a published
     # compile input registers work the daily plan suppresses. Merge those
@@ -1453,7 +1462,13 @@ def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
         # whole sources before Graphify consumes them.
         evidence_by_id = _compile_ocr_evidence(state_path, plan["book"])
         corpus, frozen, exported, prepared_by_id = _freeze_compile_sources(
-            items, raw_base, staging, source_urls, evidence_by_id, state_path
+            items,
+            raw_base,
+            staging,
+            source_urls,
+            evidence_by_id,
+            state_path,
+            referenced_by_id,
         )
         manifest_path = staging / "execution-manifest.json"
         publish_reports(
@@ -1483,6 +1498,7 @@ def execute_compile(context: Any, plan: dict[str, Any]) -> dict[str, Any]:
             report_path,
             metadata_items,
             prepared_by_id,
+            referenced_by_id,
         )
 
 
@@ -1497,6 +1513,31 @@ def _compile_metadata(context: Any) -> dict[str, dict[str, Any]]:
         for row in report.get("documents", [])
         if isinstance(row.get("metadata"), dict)
     }
+
+
+def _compile_referenced_images(context: Any) -> dict[str, set[str]]:
+    """Image resource ids each document's CURRENT raw references.
+
+    Read from the mdcompare row's pre-enrichment resource catalog, never from the
+    enriched text: a successful inline embed is replaced by an mdocr block whose
+    footer links the prepared image, not the original URL. Used to reconcile the
+    published OCR evidence with the source actually compiled ([6]) and to scope
+    the un-enriched report to referenced images ([23]).
+    """
+    report_path = context.artifact("mdcompare", "report")
+    if report_path is None:
+        return {}
+    report = _read_json(report_path)
+    referenced: dict[str, set[str]] = {}
+    for row in report.get("documents", []):
+        referenced[str(row["document_id"])] = {
+            entry["resource_id"]
+            for entry in row.get("resources") or []
+            if isinstance(entry, dict)
+            and entry.get("kind") == "image"
+            and isinstance(entry.get("resource_id"), str)
+        }
+    return referenced
 
 
 def _apply_metadata_maintenance(
@@ -1562,6 +1603,7 @@ def _execute_compile_locked(
     report_path: Path,
     metadata_items: list[dict[str, Any]],
     prepared_by_id: dict[str, Any],
+    referenced_by_id: dict[str, set[str]],
 ) -> dict[str, Any]:
     candidate_result = _run_graphify(
         args, "--candidate-only", corpus, manifest_path, log=context.log, partial=True
@@ -1639,8 +1681,25 @@ def _execute_compile_locked(
         }
         # Preserve the OCR evidence contract published by the OCR stage: compile
         # consumes it as an input and must not wipe it when advancing the graph.
+        # Reconcile it with the source actually published: keep only images the
+        # current raw still references, so a removed image stops counting as a
+        # published success and is not re-flagged on every later change ([6]).
+        # The durable OCR cache is untouched; a returning image reuses by content.
         if isinstance(previous_ocr, dict):
-            graph_record["ocr"] = previous_ocr
+            referenced = referenced_by_id.get(identity)
+            if referenced is None:
+                graph_record["ocr"] = previous_ocr
+            else:
+                pruned = dict(previous_ocr)
+                images = previous_ocr.get("images")
+                if isinstance(images, list):
+                    pruned["images"] = [
+                        image
+                        for image in images
+                        if isinstance(image, dict)
+                        and image.get("resource_id") in referenced
+                    ]
+                graph_record["ocr"] = pruned
         record["graph"] = graph_record
         record.setdefault("steps", {})["graph_publish"] = {
             "status": "completed",

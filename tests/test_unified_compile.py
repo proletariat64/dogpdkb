@@ -342,6 +342,16 @@ def _bump_remote_version(
     write_json(workspace.root / "remote.json", remote)
 
 
+def _bump_version_only(workspace: CompileWorkspace, doc_id: int, version: str) -> None:
+    """Advance the remote version without touching the body (isolates reuse)."""
+    remote = read_json(workspace.root / "remote.json")
+    for row in remote["documents"]:
+        if row["id"] == doc_id:
+            row["content_updated_at"] = version
+    remote["details"][str(doc_id)]["content_updated_at"] = version
+    write_json(workspace.root / "remote.json", remote)
+
+
 def test_same_version_compile_failure_is_not_retried_the_next_day(
     workspace: CompileWorkspace,
 ):
@@ -852,3 +862,84 @@ def test_compile_consumes_pending_posthoc_followup_for_suppressed_version(
     doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
     assert doc2["graph"]["status"] == "covered"
     assert doc2["graph"]["version"]["utc"] == version["utc"]
+
+
+def test_removed_ocr_contribution_is_pruned_so_later_version_bump_reuses_body(
+    workspace: CompileWorkspace,
+):
+    # [6] Compile carried previous OCR evidence verbatim, so a removed image kept
+    # counting as a published success and re-flagged the same removal on every
+    # later change, permanently losing body reuse. Prune the published evidence to
+    # images the current raw still references; the durable OCR cache is untouched.
+    _set_detail(workspace, 2, body=f"# Two\n\n![diagram]({IMAGE_A})\n")
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    assert doc2["graph"]["ocr"]["images"][0]["resource_id"] == IMAGE_A
+
+    # Remove the image; body text otherwise unchanged -> whole-source republish (H26).
+    _set_detail(workspace, 2, body="# Two\n\n")
+    _bump_version_only(workspace, 2, "2026-11-11T11:00:00+08:00")
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    assert IMAGE_A not in {
+        image["resource_id"] for image in doc2["graph"]["ocr"]["images"]
+    }
+
+    # A later version-only bump (identical body) must reuse the body, not recompile.
+    _bump_version_only(workspace, 2, "2026-11-12T11:00:00+08:00")
+    third = workspace.sync()
+    assert third.returncode == 0, third.stderr
+    plan = read_json(workspace.runs()[-1] / "plan" / "plan.json")
+    assert plan["decisions"]["2"]["decision"] == "body_reuse"
+
+
+def test_removed_image_is_not_reported_unenriched(workspace: CompileWorkspace):
+    # [23] A historical OCR success whose image is no longer referenced by the
+    # current raw is ABSENT, not an un-inserted HTML/reference form. It must not be
+    # reported OCR_NOT_ENRICHED (which would wrongly fail a compile follow-up).
+    _set_detail(workspace, 2, body=f"# Two\n\n![a]({IMAGE_A})\n")
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    assert doc2["graph"]["ocr"]["images"][0]["resource_id"] == IMAGE_A
+
+    # Remove the image; body text otherwise unchanged, version bumped -> the whole
+    # source republishes (H26). The removed image is no longer planned for OCR, so
+    # its prior success still sits in the published evidence compile reads.
+    _set_detail(workspace, 2, body="# Two\n\n")
+    _bump_version_only(workspace, 2, "2026-11-11T11:00:00+08:00")
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run2 = workspace.runs()[-1]
+    report = read_json(run2 / "compile" / "compile-result.json")
+    result2 = next(row for row in report["results"] if row["document_id"] == 2)
+    missing = result2["execution"]["missing_items"]
+    assert not any(
+        item["resource_id"] == IMAGE_A and item["code"] == "OCR_NOT_ENRICHED"
+        for item in missing
+    )
+    assert not any(
+        item.get("resource_id") == IMAGE_A
+        for item in result2["execution"]["final_inputs"]
+    )
+
+
+def test_referenced_html_image_ocr_success_is_still_reported_unenriched(
+    workspace: CompileWorkspace,
+):
+    # [23] preserves M17: a REFERENCED HTML <img> whose OCR succeeded but was not
+    # inserted (inline-only enrichment) is still reported OCR_NOT_ENRICHED.
+    _set_detail(workspace, 2, body=f'# Two\n\n<img src="{IMAGE_A}">\n')
+
+    completed = workspace.sync()
+
+    assert completed.returncode == 0, completed.stderr
+    run_dir = workspace.only_run()
+    report = read_json(run_dir / "compile" / "compile-result.json")
+    result2 = next(row for row in report["results"] if row["document_id"] == 2)
+    assert any(
+        item["code"] == "OCR_NOT_ENRICHED" and item["resource_id"] == IMAGE_A
+        for item in result2["execution"]["missing_items"]
+    )
