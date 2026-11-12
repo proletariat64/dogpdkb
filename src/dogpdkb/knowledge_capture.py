@@ -148,6 +148,30 @@ def _load_local_listing(
     )
 
 
+def _load_observation(path: Path) -> dict[str, Any]:
+    """Load the pre-export frozen observation, or fail closed on corruption.
+
+    Written atomically before the export loop so an interrupted capture resumes
+    against the original scope/versions/selection instead of refetching the remote
+    (spec:79/112). It is NOT a snapshot: the snapshot contract stays unchanged.
+    """
+    payload = _read_json(path)
+    required = (
+        "book",
+        "documents",
+        "listing",
+        "records",
+        "changes",
+        "selected",
+        "suppressed",
+        "prior_pending",
+        "started_at",
+    )
+    if not isinstance(payload, dict) or any(key not in payload for key in required):
+        raise CaptureError("frozen capture observation is missing required fields")
+    return payload
+
+
 def _raw_inputs(snapshot_path: Path) -> set[Path]:
     """Resolve every raw input referenced by a baseline before any output write."""
     if not snapshot_path.is_file():
@@ -197,6 +221,7 @@ def _validate_capture_paths(args: Any, snapshot_path: Path, staging: Path) -> se
         snapshot_path,
         staging / "pages",
         staging / "capture-checkpoint.json",
+        staging / "observation.json",
         staging / "raw",
     ]
     try:
@@ -654,7 +679,10 @@ def _try_import_reuse(
         detail_version, raw = _save_raw(
             document, detail, staging, snapshot_path, protected
         )
-    except CaptureError:
+    except (CaptureError, OSError):
+        # Materialization I/O (e.g. os.replace onto a non-empty directory) must
+        # not escape the per-document failure boundary: fall back to the normal
+        # export path, which archives export_failed for this document only.
         return None
     if candidate.get("captured_at"):
         raw["captured_at"] = candidate["captured_at"]
@@ -669,7 +697,13 @@ def _try_import_reuse(
     if listing_version is not None:
         row["listing_version"] = listing_version
     checkpoint[str(document["id"])] = row
-    _save_checkpoint(staging, book, checkpoint)
+    try:
+        _save_checkpoint(staging, book, checkpoint)
+    except OSError:
+        # A checkpoint write failure must not discard the observation either;
+        # drop the imported row and fall back to the normal export path.
+        checkpoint.pop(str(document["id"]), None)
+        return None
     return detail_version, raw
 
 
@@ -795,7 +829,22 @@ def run_capture(args: Any) -> int:
         progress = Progress(Path(corpus), source.key, url=source.url, name=source.name)
         progress.claim(staging, phase="capture", parent=snapshot_path)
     started_at = _utc_now()
-    if args.listing:
+    # The remote observation (scope, versions, selection) is frozen to a
+    # stage-local file BEFORE the export loop so an interrupted capture resumes
+    # against the original batch instead of refetching drifted remote input
+    # (spec:79/112). The local --listing adapter is already a fixed input.
+    observation_path = staging / "observation.json"
+    frozen = (
+        _load_observation(observation_path)
+        if not args.listing and observation_path.is_file()
+        else None
+    )
+    if frozen is not None:
+        book = frozen["book"]
+        documents = frozen["documents"]
+        listing = frozen["listing"]
+        started_at = frozen["started_at"]
+    elif args.listing:
         book, documents, listing = _load_local_listing(
             Path(args.listing).expanduser().resolve()
         )
@@ -815,17 +864,20 @@ def run_capture(args: Any) -> int:
         )
         progress.run = str(snapshot_path)
         book = {**book, "key": source.key, "url": source.url}
-    records = {
-        str(document["id"]): {
-            "id": document["id"],
-            "title": document.get("title"),
-            "slug": document.get("slug"),
-            "format": document.get("format") or document.get("type"),
-            "toc_path": document.get("toc_path") or [],
-            "version": _version(document),
+    if frozen is not None:
+        records = frozen["records"]
+    else:
+        records = {
+            str(document["id"]): {
+                "id": document["id"],
+                "title": document.get("title"),
+                "slug": document.get("slug"),
+                "format": document.get("format") or document.get("type"),
+                "toc_path": document.get("toc_path") or [],
+                "version": _version(document),
+            }
+            for document in documents
         }
-        for document in documents
-    }
     baseline_path = (
         Path(args.baseline_snapshot).expanduser().resolve()
         if args.baseline_snapshot
@@ -849,145 +901,180 @@ def run_capture(args: Any) -> int:
         progress.phase(
             "listing", "completed", pages=listing["pages"], document_count=len(records)
         )
-    if baseline and baseline_path is not None:
-        for doc_id, previous in baseline_documents.items():
-            current = records.get(doc_id)
-            if current is None or _instant(current["version"]) != _instant(
-                previous["version"]
-            ):
-                continue
-            previous_export = (baseline.get("exports") or {}).get(doc_id, {})
-            previous_raw = previous.get("raw") or previous_export.get("raw")
-            if previous_raw:
-                current_raw = _rebase_raw(previous_raw, baseline_path, snapshot_path)
-                if current_raw is not None:
-                    current["raw"] = current_raw
-    changes = {"new": [], "updated": [], "renamed": [], "moved": [], "absent": []}
-    if baseline:
-        current_ids = {document["id"] for document in documents}
-        changes["absent"] = sorted(
-            int(value)
-            for value in set(baseline_documents) - {str(item) for item in current_ids}
-        )
-        for document in documents:
-            doc_id = str(document["id"])
-            previous = baseline_documents.get(doc_id)
-            if previous is None:
-                changes["new"].append(document["id"])
-                continue
-            current_version = records[doc_id]["version"]
-            previous_version = previous["version"]
-            current_instant = _instant(current_version)
-            previous_instant = _instant(previous_version)
-            if current_instant < previous_instant:
-                raise CaptureError(
-                    f"document {document['id']} has a timestamp regression"
-                )
-            if current_instant > previous_instant:
-                changes["updated"].append(document["id"])
-            if document.get("title") != previous.get("title"):
-                changes["renamed"].append(document["id"])
-            if (document.get("toc_path") or []) != (previous.get("toc_path") or []):
-                changes["moved"].append(document["id"])
-    if progress and baseline is None:
-        cutoff = max(
-            (
-                row.get("baseline", {}).get("filename_date", "")
-                for row in canonical_documents.values()
-                if row.get("baseline")
-            ),
-            default="",
-        )
-        for document in documents:
-            doc_id = str(document["id"])
-            previous = canonical_documents.get(doc_id)
-            current = records[doc_id]["version"]
-            existing_source = previous and (
-                previous.get("baseline")
-                or (previous.get("corpus") or {}).get("raw")
-                or (previous.get("graph") or {}).get("raw")
-                or (
-                    previous.get("steps", {}).get("download", {}).get("status")
-                    == "completed"
-                    and previous["steps"]["download"].get("raw")
-                )
-            )
-            if not existing_source:
-                if _instant(current).date().isoformat() >= cutoff:
-                    changes["new"].append(document["id"])
-                continue
-            initial = previous.get("baseline") or {}
-            downloaded = previous.get("steps", {}).get("download", {})
-            prior = (
-                downloaded.get("version")
-                or (previous.get("corpus") or {}).get("version")
-                or initial.get("version")
-            )
-            if prior:
-                if _instant(current) < _instant(prior):
-                    raise CaptureError(f"document {doc_id} has a timestamp regression")
-                if _instant(current) > _instant(prior):
-                    changes["updated"].append(document["id"])
-            elif _instant(current).date().isoformat() >= initial.get(
-                "filename_date", ""
-            ):
-                changes["updated"].append(document["id"])
     current_id_set = {document["id"] for document in documents}
-    prior_pending = (
-        _load_pending(Path(args.pending_state).expanduser().resolve(), book)
-        if args.pending_state
-        else {}
-    )
-    if progress:
-        prior_pending.update(
-            {
-                int(key): row.get("pending", [])
-                for key, row in canonical_documents.items()
-                if row.get("pending")
-            }
-        )
-    known_ids = (
-        current_id_set
-        | {int(value) for value in baseline_documents}
-        | {int(value) for value in canonical_documents}
-    )
-    unknown_pending = set(prior_pending) - known_ids
-    if unknown_pending:
-        raise CaptureError(
-            f"pending state contains unknown document IDs: {sorted(unknown_pending)}"
-        )
-    selected = sorted(
-        {
-            doc_id
-            for values in changes.values()
-            for doc_id in values
-            if doc_id in current_id_set
+    if frozen is not None:
+        # Resume against the frozen scope/versions/selection; never re-observe.
+        changes = frozen["changes"]
+        selected = frozen["selected"]
+        suppressed = frozen["suppressed"]
+        prior_pending = {
+            int(key): value for key, value in frozen["prior_pending"].items()
         }
-        | (set(prior_pending) & current_id_set)
-    )
-    # Retry suppression: an archived failure handed off for this exact
-    # source version is not re-attempted by the daily batch. A new remote version
-    # never matches, so it participates normally; abandonment is version-scoped.
-    suppressed: list[dict[str, Any]] = []
-    suppression = getattr(args, "suppressed_anomalies", None) or []
-    if suppression:
-        kept = []
-        for doc_id in selected:
-            match = _suppressed_match(
-                doc_id, records[str(doc_id)]["version"], suppression
+    else:
+        if baseline and baseline_path is not None:
+            for doc_id, previous in baseline_documents.items():
+                current = records.get(doc_id)
+                if current is None or _instant(current["version"]) != _instant(
+                    previous["version"]
+                ):
+                    continue
+                previous_export = (baseline.get("exports") or {}).get(doc_id, {})
+                previous_raw = previous.get("raw") or previous_export.get("raw")
+                if previous_raw:
+                    current_raw = _rebase_raw(
+                        previous_raw, baseline_path, snapshot_path
+                    )
+                    if current_raw is not None:
+                        current["raw"] = current_raw
+        changes = {"new": [], "updated": [], "renamed": [], "moved": [], "absent": []}
+        if baseline:
+            current_ids = {document["id"] for document in documents}
+            changes["absent"] = sorted(
+                int(value)
+                for value in set(baseline_documents)
+                - {str(item) for item in current_ids}
             )
-            if match is None:
-                kept.append(doc_id)
-            else:
-                suppressed.append(
-                    {
-                        "id": doc_id,
-                        "anomaly_id": match["id"],
-                        "code": match["code"],
-                        "version_stamp": match.get("version_stamp"),
-                    }
+            for document in documents:
+                doc_id = str(document["id"])
+                previous = baseline_documents.get(doc_id)
+                if previous is None:
+                    changes["new"].append(document["id"])
+                    continue
+                current_version = records[doc_id]["version"]
+                previous_version = previous["version"]
+                current_instant = _instant(current_version)
+                previous_instant = _instant(previous_version)
+                if current_instant < previous_instant:
+                    raise CaptureError(
+                        f"document {document['id']} has a timestamp regression"
+                    )
+                if current_instant > previous_instant:
+                    changes["updated"].append(document["id"])
+                if document.get("title") != previous.get("title"):
+                    changes["renamed"].append(document["id"])
+                if (document.get("toc_path") or []) != (previous.get("toc_path") or []):
+                    changes["moved"].append(document["id"])
+        if progress and baseline is None:
+            cutoff = max(
+                (
+                    row.get("baseline", {}).get("filename_date", "")
+                    for row in canonical_documents.values()
+                    if row.get("baseline")
+                ),
+                default="",
+            )
+            for document in documents:
+                doc_id = str(document["id"])
+                previous = canonical_documents.get(doc_id)
+                current = records[doc_id]["version"]
+                existing_source = previous and (
+                    previous.get("baseline")
+                    or (previous.get("corpus") or {}).get("raw")
+                    or (previous.get("graph") or {}).get("raw")
+                    or (
+                        previous.get("steps", {}).get("download", {}).get("status")
+                        == "completed"
+                        and previous["steps"]["download"].get("raw")
+                    )
                 )
-        selected = kept
+                if not existing_source:
+                    if _instant(current).date().isoformat() >= cutoff:
+                        changes["new"].append(document["id"])
+                    continue
+                initial = previous.get("baseline") or {}
+                downloaded = previous.get("steps", {}).get("download", {})
+                prior = (
+                    downloaded.get("version")
+                    or (previous.get("corpus") or {}).get("version")
+                    or initial.get("version")
+                )
+                if prior:
+                    if _instant(current) < _instant(prior):
+                        raise CaptureError(
+                            f"document {doc_id} has a timestamp regression"
+                        )
+                    if _instant(current) > _instant(prior):
+                        changes["updated"].append(document["id"])
+                elif _instant(current).date().isoformat() >= initial.get(
+                    "filename_date", ""
+                ):
+                    changes["updated"].append(document["id"])
+        prior_pending = (
+            _load_pending(Path(args.pending_state).expanduser().resolve(), book)
+            if args.pending_state
+            else {}
+        )
+        if progress:
+            prior_pending.update(
+                {
+                    int(key): row.get("pending", [])
+                    for key, row in canonical_documents.items()
+                    if row.get("pending")
+                }
+            )
+        known_ids = (
+            current_id_set
+            | {int(value) for value in baseline_documents}
+            | {int(value) for value in canonical_documents}
+        )
+        unknown_pending = set(prior_pending) - known_ids
+        if unknown_pending:
+            raise CaptureError(
+                f"pending state contains unknown document IDs: {sorted(unknown_pending)}"
+            )
+        selected = sorted(
+            {
+                doc_id
+                for values in changes.values()
+                for doc_id in values
+                if doc_id in current_id_set
+            }
+            | (set(prior_pending) & current_id_set)
+        )
+        # Retry suppression: an archived failure handed off for this exact
+        # source version is not re-attempted by the daily batch. A new remote
+        # version never matches, so it participates normally; abandonment is
+        # version-scoped.
+        suppressed: list[dict[str, Any]] = []
+        suppression = getattr(args, "suppressed_anomalies", None) or []
+        if suppression:
+            kept = []
+            for doc_id in selected:
+                match = _suppressed_match(
+                    doc_id, records[str(doc_id)]["version"], suppression
+                )
+                if match is None:
+                    kept.append(doc_id)
+                else:
+                    suppressed.append(
+                        {
+                            "id": doc_id,
+                            "anomaly_id": match["id"],
+                            "code": match["code"],
+                            "version_stamp": match.get("version_stamp"),
+                        }
+                    )
+            selected = kept
+        # Freeze the completed observation BEFORE any export so an interrupted
+        # capture resumes against this exact scope/versions/selection (spec:79/112).
+        if not args.listing:
+            _write_json(
+                observation_path,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "book": book,
+                    "documents": documents,
+                    "listing": listing,
+                    "records": records,
+                    "changes": changes,
+                    "selected": selected,
+                    "suppressed": suppressed,
+                    "prior_pending": {
+                        str(key): value for key, value in prior_pending.items()
+                    },
+                    "started_at": started_at,
+                },
+            )
     exports: dict[str, Any] = {}
     pending = []
     anomalies = []

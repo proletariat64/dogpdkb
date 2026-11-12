@@ -917,6 +917,80 @@ def test_import_conflict_never_overwrites_valid_raw(tmp_path: Path):
     assert conflicting.read_text(encoding="utf-8") == "different valid body\n"
 
 
+def test_import_oserror_archives_one_document_and_keeps_the_other(tmp_path: Path):
+    # [17] ticket-02: _save_raw can raise OSError (here the destination raw name
+    # is a non-empty directory, so os.replace fails). The import-reuse call sits
+    # OUTSIDE the per-document export try/except, so an OSError used to escape
+    # and discard the whole observation (no snapshot). It must degrade to
+    # export_failed for that one document while the other document's import
+    # still succeeds and the snapshot is written (spec:84, issue-02 #5).
+    observe_baseline(
+        tmp_path,
+        [
+            {"id": 1, "title": "One", "content_updated_at": OLD},
+            {"id": 2, "title": "Two", "content_updated_at": OLD},
+        ],
+    )
+    history = tmp_path / "history"
+    raw_dir = history / "raw"
+    raw_dir.mkdir(parents=True)
+    rows: dict[str, dict[str, Any]] = {}
+    for i in (1, 2):
+        name = f"{i}-20261109T080000+0800.md"
+        (raw_dir / name).write_text(f"imported body {i}\n", encoding="utf-8")
+        rows[str(i)] = exported_row(name)
+    progress = write_export_progress(history / "export-progress.json", rows)
+    current_listing = (
+        write_json(
+            tmp_path / "current-listing.json",
+            listing(
+                [
+                    {"id": 1, "title": "One", "content_updated_at": NEW},
+                    {"id": 2, "title": "Two", "content_updated_at": NEW},
+                ]
+            ),
+        )
+        or tmp_path / "current-listing.json"
+    )
+    details = tmp_path / "details"
+    details.mkdir()  # Empty: doc 1's fallback fresh export must fail too.
+    staging = tmp_path / "staging"
+    # doc 1's destination raw name is a NON-EMPTY DIRECTORY -> os.replace OSError.
+    blocked = staging / "raw" / "1-20261109T080000+0800.md"
+    blocked.mkdir(parents=True)
+    (blocked / "occupant.txt").write_text("not a raw\n", encoding="utf-8")
+    snapshot = tmp_path / "current.json"
+
+    discover(
+        "--snapshot",
+        str(snapshot),
+        "--baseline-snapshot",
+        str(tmp_path / "baseline.json"),
+        "--staging",
+        str(staging),
+        "--listing",
+        str(current_listing),
+        "--details-dir",
+        str(details),
+        "--import-downloads",
+        str(progress),
+        "-s",
+        URL,
+    )
+
+    assert snapshot.is_file(), "OSError discarded the whole observation"
+    capture = json.loads(snapshot.read_text())
+    assert capture["status"] == "incomplete"
+    assert capture["exports"]["1"]["status"] == "failed"
+    assert {"id": 1, "code": "export_failed"} in capture["anomalies"]
+    row2 = capture["exports"]["2"]
+    assert row2["status"] == "captured"
+    assert row2["reused"] is True
+    assert (snapshot.parent / row2["raw"]["path"]).read_text(
+        encoding="utf-8"
+    ) == "imported body 2\n"
+
+
 def test_duplicate_import_sources_and_unsupported_format(tmp_path: Path):
     observe_baseline(tmp_path, [{"id": 1, "title": "One", "content_updated_at": OLD}])
     history = tmp_path / "history"
