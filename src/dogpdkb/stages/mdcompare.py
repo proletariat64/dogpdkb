@@ -197,11 +197,17 @@ def _rows(context: StageContext, snapshot: dict[str, Any]) -> list[dict[str, Any
             for reason in (previous.get("pending") or [])
             if reason != "GRAPH_SOURCE_NOT_REGISTERED"
         ]
-        work = (
-            numeric_id in selected
-            or bool(previous_pending)
-            or graph_needs_comparison
-            or (graph.get("status") != "covered" and raw_path is not None)
+        # Capture's selection is the batch scope. An unselected document (e.g.
+        # deferred by --max-select) is only rechecked when its raw is actually
+        # available; without input it is deferred to a later batch, never an
+        # unavailable-input anomaly (plan: a healthy unselected doc is NO_WORK).
+        work = numeric_id in selected or (
+            raw_path is not None
+            and (
+                bool(previous_pending)
+                or graph_needs_comparison
+                or graph.get("status") != "covered"
+            )
         )
         row: dict[str, Any] = {
             "book_id": book_id,

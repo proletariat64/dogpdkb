@@ -910,6 +910,8 @@ def run_capture(args: Any) -> int:
         prior_pending = {
             int(key): value for key, value in frozen["prior_pending"].items()
         }
+        selection_limit = frozen.get("selection_limit")
+        selected_before_limit = frozen.get("selected_before_limit", len(selected))
     else:
         if baseline and baseline_path is not None:
             for doc_id, previous in baseline_documents.items():
@@ -1073,6 +1075,25 @@ def run_capture(args: Any) -> int:
             }
             if reselected:
                 selected = sorted(set(selected) | reselected)
+        # Optional bounded batch: keep only the N newest selected documents so a
+        # smoke/first run stays affordable on a large book. The cap is a batch
+        # input frozen with the observation; the audit counts keep it visible.
+        selection_limit = getattr(args, "max_select", None)
+        selected_before_limit = len(selected)
+        if selection_limit is not None and len(selected) > selection_limit:
+            newest = sorted(
+                selected,
+                key=lambda doc_id: (
+                    _instant(records[str(doc_id)]["version"]),
+                    doc_id,
+                ),
+                reverse=True,
+            )
+            selected = sorted(newest[:selection_limit])
+            print(
+                f"selection capped: {selected_before_limit} -> {len(selected)} "
+                f"(max-select {selection_limit})"
+            )
         # Freeze the completed observation BEFORE any export so an interrupted
         # capture resumes against this exact scope/versions/selection (spec:79/112).
         if not args.listing:
@@ -1086,6 +1107,8 @@ def run_capture(args: Any) -> int:
                     "records": records,
                     "changes": changes,
                     "selected": selected,
+                    "selection_limit": selection_limit,
+                    "selected_before_limit": selected_before_limit,
                     "suppressed": suppressed,
                     "prior_pending": {
                         str(key): value for key, value in prior_pending.items()
@@ -1337,6 +1360,8 @@ def run_capture(args: Any) -> int:
         ),
         "changes": changes,
         "selected": selected,
+        "selection_limit": selection_limit,
+        "selected_before_limit": selected_before_limit,
         "counts": {
             "documents": len(records),
             **{label: len(values) for label, values in changes.items()},

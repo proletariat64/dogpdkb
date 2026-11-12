@@ -323,6 +323,7 @@ def handle(context: StageContext) -> StageResult:
         sync_source=context.book,
         sync_corpus=context.corpus,
         sync_config=context.config,
+        max_select=context.state.data.get("max_select"),
         suppressed_anomalies=suppressing_anomalies(
             context.config, context.book.key, stage="capture"
         ),

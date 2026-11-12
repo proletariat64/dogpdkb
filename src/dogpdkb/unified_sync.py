@@ -187,6 +187,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="RUN",
         help="resume a recorded run id or run directory with its original inputs",
     )
+    parser.add_argument(
+        "--max-select",
+        type=int,
+        metavar="N",
+        help="cap this batch's capture selection to the N newest documents",
+    )
     return parser
 
 
@@ -474,6 +480,8 @@ def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(arguments)
+    if args.max_select is not None and args.max_select < 1:
+        parser.error("--max-select must be a positive integer")
     config = configure(parser, args.config)
     book = configured_book(parser, config, args)
     corpus = book.corpus
@@ -497,6 +505,15 @@ def main(argv: list[str] | None = None) -> int:
                 raise RunError(
                     f"run {layout.run_id} was recorded with different configuration; "
                     "start a new run instead of resuming"
+                )
+            if (
+                args.max_select is not None
+                and args.max_select != state.data.get("max_select")
+            ):
+                raise RunError(
+                    f"run {layout.run_id} was recorded with max_select="
+                    f"{state.data.get('max_select')}; the selection cap is a batch "
+                    "input, start a new run instead of changing it on resume"
                 )
             _validate_resume(layout, state, config, book.key)
             recorded, _ = observed_status(state.data)
@@ -531,6 +548,7 @@ def main(argv: list[str] | None = None) -> int:
                 identity=identity,
                 stop_after=args.stop_after,
             )
+            state.data["max_select"] = args.max_select
         try:
             progress = Progress(corpus, book.key, url=book.url, name=book.name)
             # Clear a claim orphaned by a crash after a prior run finished, so it
