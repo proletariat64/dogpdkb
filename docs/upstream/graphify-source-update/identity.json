@@ -1,0 +1,26 @@
+{
+  "distribution": "graphifyy",
+  "baseline_version": "0.9.45",
+  "source_origin": "installed wheel source; no original Git revision available",
+  "upstream_repository": "https://github.com/Graphify-Labs/graphify",
+  "observed_remote_head_not_used": "06aa51be050170675912781ad8a2be2b20439d39",
+  "baseline_snapshot_commit": "99063934772a5649d626b108b06776fe1ab0e694",
+  "patch_commit": "ffd2eafef6b161d8c72a03dcdf1574d3439d3d8b",
+  "patch_sha256": "d4a6d79cf3160cf59f507c5f97c19f1455308b4cd4a4b3899fbd993aba3c95ae",
+  "baseline_metadata_sha256": "49d6d3af8f493cffeb30efd9aad670c3cf1694c2e9c5f4be3d884d2f3d013130",
+  "baseline_modified_files": {
+    "graphify/__main__.py": "6b32d8f55a2cea173d8650d3ef17537f6486a4183ae5f5dedebcb9166e7656cb",
+    "graphify/cli.py": "ad9d9101a8223d08bb54c34aa075dbec945df73e62bf813a94dda0ed257a64ee"
+  },
+  "tested_source": "/tmp/graphify-0.9.45-cli-source",
+  "tested_python": "/home/ubuntu/.local/share/uv/tools/graphifyy/bin/python3",
+  "public_cli": "/tmp/graphify-source-update-bin/graphify",
+  "tests": {
+    "passed": 14,
+    "command": "python -m unittest discover -s tests -p test_source_update_cli.py -v",
+    "paid_calls": 0,
+    "production_graph_writes": 0
+  },
+  "installed_usersite_mutated": false,
+  "upstream_release_published": false
+}
