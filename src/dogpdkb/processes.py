@@ -42,6 +42,7 @@ def run_command(
     log: Path | None = None,
     cwd: Path | None = None,
     timeout: float | None = None,
+    env: dict[str, str] | None = None,
 ) -> int:
     """Stream both child streams to stderr; return 124 timeout, 130/143 signals."""
     if not argv or any(not isinstance(arg, str) for arg in argv):
@@ -58,6 +59,7 @@ def run_command(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 pass_fds=lock_fds(),
+                env={**os.environ, **(env or {})},
             )
         except OSError as error:
             message = f"cannot start {argv[0]}: {error}\n"

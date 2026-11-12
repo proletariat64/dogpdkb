@@ -1,0 +1,609 @@
+From ffd2eafef6b161d8c72a03dcdf1574d3439d3d8b Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Thu, 12 Nov 2026 22:40:24 +0800
+Subject: [PATCH] feat: expose whole-source updates through public CLI
+
+---
+ docs/source-update-cli.md       |  49 ++++++
+ graphify/__main__.py            |   2 +
+ graphify/cli.py                 |   5 +-
+ graphify/source_update.py       | 267 ++++++++++++++++++++++++++++++++
+ tests/test_source_update_cli.py | 227 +++++++++++++++++++++++++++
+ 5 files changed, 549 insertions(+), 1 deletion(-)
+ create mode 100644 docs/source-update-cli.md
+ create mode 100644 graphify/source_update.py
+ create mode 100644 tests/test_source_update_cli.py
+
+diff --git a/docs/source-update-cli.md b/docs/source-update-cli.md
+new file mode 100644
+index 0000000..1e2933b
+--- /dev/null
++++ b/docs/source-update-cli.md
+@@ -0,0 +1,49 @@
++# Graphify source-update CLI contract
++
++Status: tested local upstream patch
++Upstream package baseline: graphifyy 0.9.45; Graphify-Labs/graphify.
++
++## Public invocation
++
++- `graphify source-inventory --graph-dir DIR --output INVENTORY.json` reads only the public graph and writes a source inventory.
++- `graphify update-sources --graph-dir DIR --request REQUEST.json --output RESULT.json` extracts changed complete sources and publishes successful replacements.
++- `graphify update-sources ... --extraction EXTRACTION.json` consumes an already-produced public Graphify extraction artifact; useful for offline delivery/UAT and extraction reuse, never a dogpdkb internal call.
++
++## Request
++
++Schema: `graphify-source-update-1.0`. Top-level `sources` is a list. Each item contains caller `source_id`, `source_file` (desired public provenance filename), `path` (complete Markdown input), `replace` (list of previous public source_file names; defaults to source_file), optional `metadata` (public provenance fields), and `action` (`compile` default; `metadata` requires no extraction). Paths resolve against request directory. No deletions occur merely because a source is absent from the request.
++
++## Result
++
++Schema: `graphify-source-result-1.0`; `status` is completed/partial/failed, `graph` is the published graph path, `sources` contains source_id/source_file/action/status/error, and `counts` contains total/completed/failed. Report is written even for documented source failures. Exit 0 completed or no work, 2 partial with successful sources published, 1 request/publication failure. Individual extraction failure preserves that source old graph contribution. Caller versions remain opaque metadata, not a tool-side business scheduling policy.
++
++Inventory schema: `graphify-source-inventory-1.0`; `sources` contains each public source_file plus available source_id and metadata. This requires no semantic extraction.
++
++## Boundary
++
++Graphify owns extraction, cache, record identity, graph merging, complete-source replacement and atomic graph publication. dogpdkb only invokes this CLI and consumes its documented report/inventory. This document is a target contract until upstream implementation/tests and install identity below are complete.
++
++## Extraction artifact
++
++`--extraction` accepts schema `graphify-source-extraction-1.0` with `sources` rows:
++`{"source_id":"a","status":"completed","extraction":{"nodes":[],"edges":[],"hyperedges":[]}}`.
++Failed rows use `status: failed` and `error`. Omitted rows fail individually. This
++public seam never contacts a provider. Duplicate same-ID chunk nodes are accepted
++and deduplicated by Graphify. Empty completed extractions remove the old source.
++
++Without this flag, complete Markdown inputs are extracted one source at a time
++with Graphify's own content cache and extraction pipeline. `--backend`, `--model`,
++and `--max-concurrency` configure that pipeline; existing provider environment
++variables apply. Missing files, failed/truncated chunks and uncovered inputs fail
++the source and preserve its old contribution. Successful sources publish together.
++Exit 2 also applies when every source failed (nothing is published).
++
++Metadata actions need neither input files nor extraction results. They update
++provenance fields while retaining graph record identities. Structural fields such
++as id/label/source/target cannot be metadata. Overlapping replacement requests are
++rejected. This command does not extract unrequested historical documents or run
++clustering/paid labeling; existing unrelated graph attributes are retained.
++
++Offline verification: `python -m unittest discover -s tests -p test_source_update_cli.py -v`.
++Tests run the public subprocess CLI, including an ephemeral localhost provider;
++no model service, credentials, corpus, or production graph is used.
+diff --git a/graphify/__main__.py b/graphify/__main__.py
+index 155501a..f3ab877 100644
+--- a/graphify/__main__.py
++++ b/graphify/__main__.py
+@@ -525,6 +525,8 @@ def _run_cli() -> None:
+         print("    --extract-path PATH     extractor source for suppression scan")
+         print("  clone <github-url>      clone a GitHub repo locally and print its path for /graphify")
+         print("  merge-driver <base> <current> <other>  git merge driver: union-merge two graph.json files (set up via hook install)")
++        print("  update-sources     Replace complete sources via a JSON request/report")
++        print("  source-inventory   Export graph source provenance as JSON")
+         print("  merge-graphs <g1> <g2>  merge two or more graph.json files into one cross-repo graph")
+         print("    --out <path>            output path (default: graphify-out/merged-graph.json)")
+         print("    --branch <branch>       checkout a specific branch (default: repo default)")
+diff --git a/graphify/cli.py b/graphify/cli.py
+index 95adad4..65dacd5 100644
+--- a/graphify/cli.py
++++ b/graphify/cli.py
+@@ -803,7 +803,10 @@ def _reenter_main() -> None:
+ 
+ 
+ def dispatch_command(cmd: str) -> None:
+-    if cmd == "provider":
++    if cmd in ("update-sources", "source-inventory"):
++        from graphify.source_update import main
++        sys.exit(main(cmd, sys.argv[2:]))
++    elif cmd == "provider":
+         from graphify.llm import _custom_providers_path, BACKENDS
+         import json as _json
+         subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
+diff --git a/graphify/source_update.py b/graphify/source_update.py
+new file mode 100644
+index 0000000..4c7e466
+--- /dev/null
++++ b/graphify/source_update.py
+@@ -0,0 +1,267 @@
++"""Explicit whole-source updates for external process orchestrators.
++
++This module is part of Graphify, not a client-side graph adapter. Publication
++uses Graphify's existing raw merge, deduplication, and atomic artifact writer.
++"""
++from __future__ import annotations
++
++import argparse
++from copy import deepcopy
++import json
++from pathlib import Path
++import sys
++import tempfile
++
++from graphify.paths import write_json_atomic
++
++
++def _load(path: Path) -> dict:
++    value = json.loads(path.read_text(encoding="utf-8"))
++    if not isinstance(value, dict):
++        raise ValueError(f"expected JSON object: {path}")
++    return value
++
++
++def _inventory(graph: dict) -> list[dict]:
++    rows = {item["source_file"]: dict(item)
++            for item in graph.get("graph", {}).get("source_inventory", [])}
++    for key in ("nodes", "links", "edges", "hyperedges"):
++        for item in graph.get(key, []):
++            source = item.get("source_file")
++            if source:
++                row = rows.setdefault(source, {"source_file": source})
++                if item.get("source_id"):
++                    row.setdefault("source_id", item["source_id"])
++    return [rows[key] for key in sorted(rows)]
++
++
++def _sources(request: dict) -> list[dict]:
++    if request.get("schema") != "graphify-source-update-1.0":
++        raise ValueError("unsupported request schema")
++    rows = request.get("sources")
++    if not isinstance(rows, list):
++        raise ValueError("sources must be a list")
++    seen = set()
++    names = set()
++    owned = set()
++    for row in rows:
++        if not isinstance(row, dict):
++            raise ValueError("source must be an object")
++        for key in ("source_id", "source_file"):
++            if not isinstance(row.get(key), str) or not row[key].strip():
++                raise ValueError(f"source requires nonempty {key}")
++        if row["source_id"] in seen or row["source_file"] in names:
++            raise ValueError("duplicate source_id or source_file")
++        seen.add(row["source_id"])
++        names.add(row["source_file"])
++        if row.get("action", "compile") not in ("compile", "metadata"):
++            raise ValueError("action must be compile or metadata")
++        if not isinstance(row.get("metadata", {}), dict):
++            raise ValueError("metadata must be an object")
++        reserved = {"id", "label", "file_type", "source", "target", "relation", "nodes", "edges", "hyperedges", "source_file", "source_id", "_origin"}
++        if reserved.intersection(row.get("metadata", {})):
++            raise ValueError("metadata cannot override graph identity or structure")
++        replacements = row.get("replace", [row["source_file"]])
++        if not isinstance(replacements, list) or not all(isinstance(x, str) and x for x in replacements):
++            raise ValueError("replace must be a list of nonempty source_file names")
++        affected = set(replacements) | {row["source_file"]}
++        if owned.intersection(affected):
++            raise ValueError("overlapping source replacements")
++        owned.update(affected)
++    return rows
++
++
++def _publish(graph_path: Path, current: dict, sources: list[tuple[dict, dict]]) -> None:
++    from graphify.build import dedupe_nodes, dedupe_edges, merge_raw_extraction
++
++    current = deepcopy(current)
++    inventory = {r["source_file"]: r for r in _inventory(current)}
++    compiled = []
++    for row, extraction in sources:
++        old_names = row.get("replace", [row["source_file"]])
++        if row.get("action") == "metadata":
++            metadata = deepcopy(row.get("metadata", {}))
++            metadata.update(source_file=row["source_file"], source_id=row["source_id"])
++            for key in ("nodes", "links", "edges", "hyperedges"):
++                for item in current.get(key, []):
++                    if item.get("source_file") in old_names:
++                        item.update(metadata)
++        else:
++            compiled.append((row, extraction))
++        previous = {}
++        for old in old_names:
++            previous.update(inventory.pop(old, {}).get("metadata", {}))
++        previous.update(row.get("metadata", {}))
++        inventory[row["source_file"]] = {"source_file": row["source_file"],
++            "source_id": row["source_id"], "metadata": previous}
++    if not compiled:
++        attrs = current.setdefault("graph", {})
++        attrs["source_inventory"] = list(inventory.values())
++        if "hyperedges" in attrs:
++            attrs["hyperedges"] = current.get("hyperedges", [])
++        write_json_atomic(graph_path, current, indent=2)
++        return
++    # Explicit whole-source pruning also handles a successful EMPTY extraction;
++    # ordinary incremental replacement intentionally affects emitted tiers only.
++    prune = [old for row, _ in compiled for old in row.get("replace", [row["source_file"]])]
++    with tempfile.TemporaryDirectory(prefix="graphify-source-update-") as scratch:
++        baseline = Path(scratch) / "graph.json"
++        write_json_atomic(baseline, current)
++        merged = merge_raw_extraction({"nodes": [], "edges": [], "hyperedges": []},
++            graph_path=baseline, prune_sources=prune, root=graph_path.parent.parent)
++    for row, extraction in compiled:
++        metadata = deepcopy(row.get("metadata", {}))
++        metadata.update(source_file=row["source_file"], source_id=row["source_id"])
++        for key in ("nodes", "edges", "hyperedges"):
++            for item in extraction.get(key, []):
++                item = dict(item)
++                item.update(metadata)
++                merged[key].append(item)
++        inventory[row["source_file"]] = {"source_file": row["source_file"],
++            "source_id": row["source_id"], "metadata": row.get("metadata", {})}
++    # Match the existing extract --no-cluster artifact path, while preserving
++    # untouched record identities and attributes (the loader may add origin).
++    published = deepcopy(current)
++    published.setdefault("directed", False)
++    published.setdefault("multigraph", False)
++    published["nodes"] = dedupe_nodes(merged["nodes"])
++    node_ids = {node["id"] for node in published["nodes"]}
++    published["links"] = [edge for edge in dedupe_edges(merged["edges"])
++        if edge.get("source") in node_ids and edge.get("target") in node_ids]
++    published.pop("edges", None)
++    published["hyperedges"] = [item for item in merged["hyperedges"]
++        if all(member in node_ids for member in item.get("nodes", []))]
++    attrs = published.setdefault("graph", {})
++    if "hyperedges" in attrs:
++        attrs["hyperedges"] = published["hyperedges"]
++    attrs["source_inventory"] = list(inventory.values())
++    write_json_atomic(graph_path, published, indent=2)
++
++
++def _extract(row: dict, args: argparse.Namespace) -> dict:
++    path = (args.request.resolve().parent / row.get("path", "")).resolve()
++    if not row.get("path") or not path.is_file():
++        raise ValueError(f"source input not found: {path}")
++    if not path.read_text(encoding="utf-8").strip():
++        return {"nodes": [], "edges": [], "hyperedges": []}
++    from graphify.cache import check_semantic_cache, save_semantic_cache
++    from graphify.llm import (detect_backend, extract_corpus_parallel,
++        _extraction_system, _partial_source_files)
++    prompt = _extraction_system()
++    nodes, edges, hyperedges, missing = check_semantic_cache(
++        [str(path)], root=path.parent, cache_root=args.graph_dir.parent, prompt=prompt)
++    if not missing:
++        print(f"[graphify update-sources] cache hit: {row['source_id']}", flush=True)
++        return {"nodes": nodes, "edges": edges, "hyperedges": hyperedges}
++    backend = args.backend or detect_backend()
++    if not backend:
++        raise ValueError("no semantic backend configured; pass --backend or configure a provider")
++    def progress(index, total, result):
++        print(f"[graphify update-sources] {row['source_id']} chunk {index + 1}/{total}", flush=True)
++    result = extract_corpus_parallel([path], backend=backend, model=args.model,
++        root=path.parent, cache_root=args.graph_dir.parent,
++        max_concurrency=args.max_concurrency, on_chunk_done=progress)
++    if result.get("failed_chunks") or _partial_source_files(result) or result.get("uncovered_files"):
++        raise ValueError("incomplete semantic extraction; prior source contribution retained")
++    save_semantic_cache(result.get("nodes", []), result.get("edges", []),
++        result.get("hyperedges", []), root=path.parent, cache_root=args.graph_dir.parent,
++        allowed_source_files=[path], prompt=prompt)
++    return result
++
++
++def main(command: str, argv: list[str]) -> int:
++    parser = argparse.ArgumentParser(prog=f"graphify {command}")
++    parser.add_argument("--graph-dir", required=True, type=Path)
++    parser.add_argument("--output", required=True, type=Path)
++    if command == "update-sources":
++        parser.add_argument("--request", required=True, type=Path)
++        parser.add_argument("--extraction", type=Path)
++        parser.add_argument("--backend")
++        parser.add_argument("--model")
++        parser.add_argument("--max-concurrency", type=int, default=4)
++    args = parser.parse_args(argv)
++    args.graph_dir = args.graph_dir.resolve()
++    graph_path = args.graph_dir / "graph.json"
++    inputs = [graph_path]
++    if command == "update-sources":
++        inputs.append(args.request.resolve())
++        if args.extraction:
++            inputs.append(args.extraction.resolve())
++        if args.max_concurrency < 1:
++            print("--max-concurrency must be positive", file=sys.stderr)
++            return 1
++    if args.output.resolve() in inputs:
++        print("output must differ from graph/request/extraction inputs", file=sys.stderr)
++        return 1
++    try:
++        current = _load(graph_path) if graph_path.exists() else {}
++        if command == "source-inventory":
++            write_json_atomic(args.output, {"schema": "graphify-source-inventory-1.0",
++                "sources": _inventory(current)}, indent=2)
++            return 0
++        rows = _sources(_load(args.request))
++        extracted = {}
++        if args.extraction:
++            artifact = _load(args.extraction)
++            if artifact.get("schema") != "graphify-source-extraction-1.0":
++                raise ValueError("unsupported extraction schema")
++            artifact_rows = artifact.get("sources")
++            if not isinstance(artifact_rows, list):
++                raise ValueError("extraction sources must be a list")
++            for item in artifact_rows:
++                if not isinstance(item, dict) or not isinstance(item.get("source_id"), str):
++                    raise ValueError("extraction source requires source_id")
++                if item["source_id"] in extracted:
++                    raise ValueError("duplicate extraction source_id")
++                if item.get("status") not in ("completed", "failed"):
++                    raise ValueError("extraction status must be completed or failed")
++                if item["status"] == "completed":
++                    extraction = item.get("extraction")
++                    if not isinstance(extraction, dict):
++                        raise ValueError("completed source requires extraction object")
++                    for key in ("nodes", "edges", "hyperedges"):
++                        if not isinstance(extraction.get(key, []), list) or not all(
++                                isinstance(value, dict) for value in extraction.get(key, [])):
++                            raise ValueError(f"extraction {key} must be a list of objects")
++                extracted[item["source_id"]] = item
++        completed = []
++        reports = []
++        known_sources = {item["source_file"] for item in _inventory(current)}
++        for row in rows:
++            result = extracted.get(row["source_id"], {})
++            if not args.extraction and row.get("action", "compile") == "compile":
++                try:
++                    result = {"status": "completed", "extraction": _extract(row, args)}
++                except Exception as exc:
++                    print(f"[graphify update-sources] {row['source_id']}: {exc}", file=sys.stderr)
++                    result = {"status": "failed", "error": str(exc)}
++            report = {key: row[key] for key in ("source_id", "source_file")}
++            report["action"] = row.get("action", "compile")
++            if row.get("action") == "metadata":
++                if known_sources.intersection(row.get("replace", [row["source_file"]])):
++                    completed.append((row, {}))
++                    report["status"] = "completed"
++                else:
++                    report.update(status="failed", error="metadata source not present in graph inventory")
++            elif result.get("status") == "completed":
++                completed.append((row, result["extraction"]))
++                report["status"] = "completed"
++            else:
++                report.update(status="failed", error=result.get("error", "extraction result missing"))
++            reports.append(report)
++        if completed:
++            _publish(graph_path, current, completed)
++        failed = len(rows) - len(completed)
++        status = "partial" if failed and completed else "failed" if failed else "completed"
++        write_json_atomic(args.output, {"schema": "graphify-source-result-1.0",
++            "status": status, "graph": str(graph_path.resolve()), "sources": reports,
++            "counts": {"total": len(rows), "completed": len(completed), "failed": failed}}, indent=2)
++        return 2 if failed else 0
++    except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
++        print(f"graphify {command}: {exc}", file=sys.stderr)
++        try:
++            write_json_atomic(args.output, {"schema": "graphify-source-result-1.0",
++                "status": "failed", "error": str(exc), "sources": []}, indent=2)
++        except OSError as report_error:
++            print(f"could not write result: {report_error}", file=sys.stderr)
++        return 1
+diff --git a/tests/test_source_update_cli.py b/tests/test_source_update_cli.py
+new file mode 100644
+index 0000000..86ef556
+--- /dev/null
++++ b/tests/test_source_update_cli.py
+@@ -0,0 +1,227 @@
++"""Public subprocess contracts: no model calls or private helper mocks."""
++import json
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++import threading
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[1]
++
++class SourceUpdateCLI(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name)
++        self.graph_dir = self.root / "graphify-out"
++        self.graph_dir.mkdir()
++        self.graph = self.graph_dir / "graph.json"
++        self.graph.write_text(json.dumps({"directed": False, "multigraph": False,
++            "graph": {}, "nodes": [self.node("old", "a.md"), self.node("kept", "b.md")],
++            "links": [], "hyperedges": []}))
++
++    def node(self, label, source):
++        return {"id": label, "label": label, "file_type": "concept", "source_file": source}
++
++    def cli(self, *args, environment=None):
++        env = dict(os.environ, PYTHONPATH=str(ROOT))
++        env.update(environment or {})
++        return subprocess.run([sys.executable, "-m", "graphify", *args], cwd=self.root,
++            env=env, text=True, capture_output=True)
++
++    def update(self, sources, extracted):
++        request = self.root / "request.json"
++        request.write_text(json.dumps({"schema": "graphify-source-update-1.0", "sources": sources}))
++        fixture = self.root / "extraction.json"
++        fixture.write_text(json.dumps({"schema": "graphify-source-extraction-1.0", "sources": extracted}))
++        report = self.root / "result.json"
++        proc = self.cli("update-sources", "--graph-dir", str(self.graph_dir),
++            "--request", str(request), "--extraction", str(fixture), "--output", str(report))
++        self.assertTrue(report.exists(), proc.stdout + proc.stderr)
++        return proc, json.loads(report.read_text()), json.loads(self.graph.read_text())
++
++    def source(self, ident, filename, **extra):
++        return {"source_id": ident, "source_file": filename, "path": filename, **extra}
++
++    def extraction(self, ident, nodes):
++        return {"source_id": ident, "status": "completed", "extraction": {"nodes": nodes, "edges": [], "hyperedges": []}}
++
++    def test_complete_source_replaces_prior_and_keeps_unrequested_sources(self):
++        proc, report, graph = self.update([self.source("a", "a.md")],
++            [self.extraction("a", [self.node("fresh", "untrusted.md")])])
++        self.assertEqual(proc.returncode, 0, proc.stderr)
++        self.assertEqual(report["status"], "completed")
++        self.assertEqual({n["label"] for n in graph["nodes"]}, {"fresh", "kept"})
++        self.assertEqual(next(n for n in graph["nodes"] if n["label"] == "fresh")["source_file"], "a.md")
++
++    def test_partial_failure_keeps_prior_contribution_exactly(self):
++        original = json.loads(self.graph.read_text())["nodes"][0]
++        proc, report, graph = self.update([self.source("a", "a.md"), self.source("b", "b.md")],
++            [{"source_id": "a", "status": "failed", "error": "fixture timeout"},
++             self.extraction("b", [self.node("fresh", "b.md")])])
++        self.assertEqual(proc.returncode, 2, proc.stderr)
++        self.assertEqual(report["status"], "partial")
++        self.assertEqual(report["counts"], {"total": 2, "completed": 1, "failed": 1})
++        survivor = next(n for n in graph["nodes"] if n["id"] == original["id"])
++        self.assertEqual({k: survivor[k] for k in original}, original)
++        self.assertNotIn("kept", {n["label"] for n in graph["nodes"]})
++
++    def test_metadata_rename_requires_no_extraction_and_preserves_identity(self):
++        proc, report, graph = self.update([self.source("a", "renamed.md", action="metadata",
++            replace=["a.md"], metadata={"source_url": "https://example.test/a", "version": 9})], [])
++        self.assertEqual(proc.returncode, 0, proc.stderr)
++        node = next(n for n in graph["nodes"] if n["id"] == "old")
++        self.assertEqual(node["source_file"], "renamed.md")
++        self.assertEqual(node["version"], 9)
++        inventory = self.root / "inventory.json"
++        proc = self.cli("source-inventory", "--graph-dir", str(self.graph_dir), "--output", str(inventory))
++        self.assertEqual(proc.returncode, 0, proc.stderr)
++        rows = json.loads(inventory.read_text())["sources"]
++        self.assertEqual({r["source_file"] for r in rows}, {"renamed.md", "b.md"})
++        renamed = next(r for r in rows if r["source_file"] == "renamed.md")
++        self.assertEqual(renamed["source_id"], "a")
++        self.assertEqual(renamed["metadata"]["version"], 9)
++
++    def test_normal_update_missing_input_reports_failure_and_leaves_graph(self):
++        before = self.graph.read_bytes()
++        request = self.root / "request.json"
++        request.write_text(json.dumps({"schema": "graphify-source-update-1.0",
++            "sources": [self.source("a", "missing.md")]}))
++        report = self.root / "result.json"
++        proc = self.cli("update-sources", "--graph-dir", str(self.graph_dir),
++            "--request", str(request), "--output", str(report))
++        self.assertEqual(proc.returncode, 2, proc.stderr)
++        result = json.loads(report.read_text())
++        self.assertEqual(result["sources"][0]["status"], "failed")
++        self.assertEqual(self.graph.read_bytes(), before)
++
++    def test_normal_extraction_uses_local_provider_and_reuses_tool_cache(self):
++        calls = []
++        reject = []
++        node = self.node("fresh", "a.md")
++        class Handler(BaseHTTPRequestHandler):
++            def log_message(self, *_):
++                pass
++            def do_POST(self):
++                calls.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
++                if reject:
++                    self.send_response(400)
++                    self.send_header("Content-Length", "0")
++                    self.end_headers()
++                    return
++                payload = json.dumps({"id": "fixture", "object": "chat.completion", "created": 0,
++                    "model": "fixture", "choices": [{"index": 0, "finish_reason": "stop",
++                    "message": {"role": "assistant", "content": json.dumps({"nodes": [node], "edges": []})}}],
++                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}).encode()
++                self.send_response(200)
++                self.send_header("Content-Type", "application/json")
++                self.send_header("Content-Length", str(len(payload)))
++                self.end_headers()
++                self.wfile.write(payload)
++        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++        thread = threading.Thread(target=server.serve_forever, daemon=True)
++        thread.start()
++        self.addCleanup(server.server_close)
++        self.addCleanup(server.shutdown)
++        (self.root / "a.md").write_text("# fresh\nA fresh concept in this source.\n")
++        request = self.root / "request.json"
++        request.write_text(json.dumps({"schema": "graphify-source-update-1.0",
++            "sources": [self.source("a", "a.md")]}))
++        report = self.root / "result.json"
++        env = {"OPENAI_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
++            "OPENAI_API_KEY": "offline-fixture", "NO_PROXY": "127.0.0.1,localhost",
++            "GRAPHIFY_API_TIMEOUT": "5", "GRAPHIFY_MAX_RETRIES": "0"}
++        args = ("update-sources", "--graph-dir", str(self.graph_dir), "--request", str(request),
++            "--backend", "openai", "--model", "fixture", "--output", str(report))
++        first = self.cli(*args, environment=env)
++        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
++        self.assertEqual(len(calls), 1)
++        second = self.cli(*args, environment=env)
++        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
++        self.assertEqual(len(calls), 1, "second public update should reuse Graphify cache")
++        graph = json.loads(self.graph.read_text())
++        self.assertEqual({n["label"] for n in graph["nodes"]}, {"fresh", "kept"})
++        reject.append(True)
++        (self.root / "a.md").write_text("# changed fresh\nThis changed body forces semantic extraction.\n")
++        before = self.graph.read_bytes()
++        failed = self.cli(*args, environment=env)
++        self.assertEqual(failed.returncode, 2, failed.stdout + failed.stderr)
++        self.assertEqual(json.loads(report.read_text())["sources"][0]["status"], "failed")
++        self.assertEqual(self.graph.read_bytes(), before)
++        self.assertEqual(len(calls), 2)
++
++    def test_empty_complete_source_removes_old_and_remains_in_inventory(self):
++        proc, report, graph = self.update([self.source("a", "a.md")], [self.extraction("a", [])])
++        self.assertEqual(proc.returncode, 0, proc.stderr)
++        self.assertEqual({n["label"] for n in graph["nodes"]}, {"kept"})
++        self.assertIn("a.md", {r["source_file"] for r in graph["graph"]["source_inventory"]})
++
++    def test_duplicate_chunk_nodes_are_accepted_by_graphify(self):
++        node = self.node("fresh", "a.md")
++        proc, report, graph = self.update([self.source("a", "a.md")],
++            [self.extraction("a", [node, node])])
++        self.assertEqual(proc.returncode, 0, proc.stderr)
++        self.assertEqual([n["label"] for n in graph["nodes"]].count("fresh"), 1)
++
++    def test_metadata_cannot_override_graph_identity(self):
++        before = self.graph.read_bytes()
++        proc, report, graph = self.update([self.source("a", "a.md", metadata={"id": "clobbered"})],
++            [self.extraction("a", [self.node("fresh", "a.md")])])
++        self.assertEqual(proc.returncode, 1, proc.stderr)
++        self.assertEqual(self.graph.read_bytes(), before)
++
++    def test_overlapping_replacement_requests_are_rejected_before_publication(self):
++        before = self.graph.read_bytes()
++        proc, report, graph = self.update([self.source("a", "one.md", replace=["a.md"]),
++            self.source("b", "two.md", replace=["a.md"])],
++            [self.extraction("a", []), self.extraction("b", [])])
++        self.assertEqual(proc.returncode, 1, proc.stderr)
++        self.assertEqual(self.graph.read_bytes(), before)
++
++    def test_missing_metadata_source_is_reported_failed(self):
++        before = self.graph.read_bytes()
++        proc, report, graph = self.update([self.source("x", "x.md", action="metadata")], [])
++        self.assertEqual(proc.returncode, 2, proc.stderr)
++        self.assertEqual(self.graph.read_bytes(), before)
++
++    def test_inventory_output_cannot_overwrite_its_graph_input(self):
++        before = self.graph.read_bytes()
++        proc = self.cli("source-inventory", "--graph-dir", str(self.graph_dir), "--output", str(self.graph))
++        self.assertEqual(proc.returncode, 1, proc.stderr)
++        self.assertEqual(self.graph.read_bytes(), before)
++
++    def test_malformed_extraction_artifact_never_overwrites_graph(self):
++        before = self.graph.read_bytes()
++        proc, report, graph = self.update([self.source("a", "a.md")],
++            [{"source_id": "a", "status": "completed", "extraction": {"nodes": "wrong", "edges": []}}])
++        self.assertEqual(proc.returncode, 1, proc.stderr)
++        self.assertEqual(self.graph.read_bytes(), before)
++
++    def test_replacement_removes_owned_graph_records_and_dangling_references(self):
++        current = json.loads(self.graph.read_text())
++        current["links"] = [
++            {"source": "old", "target": "kept", "relation": "related", "source_file": "a.md"},
++            {"source": "kept", "target": "old", "relation": "mentions", "source_file": "b.md"}]
++        current["hyperedges"] = [{"id": "h", "nodes": ["old", "kept"], "source_file": "b.md"}]
++        self.graph.write_text(json.dumps(current))
++        proc, report, graph = self.update([self.source("a", "a.md")],
++            [self.extraction("a", [self.node("fresh", "a.md")])])
++        self.assertEqual(proc.returncode, 0, proc.stderr)
++        self.assertEqual(graph["links"], [])
++        self.assertEqual(graph["hyperedges"], [])
++        self.assertEqual({n["label"] for n in graph["nodes"]}, {"fresh", "kept"})
++
++    def test_metadata_and_compile_can_publish_together(self):
++        proc, report, graph = self.update([
++            self.source("a", "renamed.md", action="metadata", replace=["a.md"], metadata={"version": 2}),
++            self.source("b", "b.md")], [self.extraction("b", [self.node("fresh", "b.md")])])
++        self.assertEqual(proc.returncode, 0, proc.stderr)
++        old = next(n for n in graph["nodes"] if n["id"] == "old")
++        self.assertEqual((old["source_file"], old["version"]), ("renamed.md", 2))
++        self.assertEqual({n["label"] for n in graph["nodes"]}, {"old", "fresh"})
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.54.0
+
