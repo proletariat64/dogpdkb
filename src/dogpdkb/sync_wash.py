@@ -359,6 +359,33 @@ def _finished_order(layout: RunLayout) -> tuple[str, str]:
     )
 
 
+def _result_is_current_final(
+    config: Any, book_key: str, layout: RunLayout, status: str
+) -> bool:
+    """The durable result must be a current FINAL archive of this finished run.
+
+    Mere existence is not enough: a stale paused result archived before the run
+    finished does not capture the finished run's evidence, so removing the work
+    directory would lose run-dir-only evidence. Require the archived status and
+    ended_at to match the run state (spec: complete result archiving before
+    cleanup). An unreadable or absent result is never a current final archive.
+    """
+    try:
+        result = read_json(run_result_path(config, book_key, layout.run_id))
+        state = read_json(layout.state_path)
+    except RunError:
+        return False
+    if not isinstance(result, dict) or not isinstance(state, dict):
+        return False
+    ended = state.get("ended_at")
+    return (
+        status in FINISHED_STATUSES
+        and result.get("status") == status
+        and ended is not None
+        and result.get("ended_at") == ended
+    )
+
+
 def cleanup_wash(
     config: Any,
     book_key: str,
@@ -401,6 +428,9 @@ def cleanup_wash(
             sweep.runs.append(row)
         elif not run_result_path(config, book_key, layout.run_id).is_file():
             row["reason"] = "batch result is not archived yet"
+            sweep.runs.append(row)
+        elif not _result_is_current_final(config, book_key, layout, status):
+            row["reason"] = "batch result archive is stale; not a current final result"
             sweep.runs.append(row)
         else:
             removable.append(layout)
