@@ -68,7 +68,13 @@ def snapshot(store: Store, reference: str | None = None) -> dict:
     if not views:
         return {"schema": "dogpdkb-status-1", "status": "no-runs", "runs": 0}
     running = [view for view in views if view["alive"]]
-    return max(running or views, key=lambda view: view.get("started_at", ""))
+    return max(
+        running or views,
+        key=lambda view: (
+            view.get("started_at", ""),
+            (Path(view["run_directory"]) / "run.json").stat().st_mtime_ns,
+        ),
+    )
 
 
 def report(data: dict) -> str:

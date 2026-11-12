@@ -156,26 +156,37 @@ class Store:
 
     @contextmanager
     def lock(self):
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(
-            self.lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
+        paths = sorted(
+            {self.lock_path, self.settings.graph_for(self.book) / ".dogpdkb.lock"}
         )
+        descriptors = []
         try:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise ValueError(
-                    f"another writer is running for {self.book.key}"
-                ) from error
-            os.ftruncate(descriptor, 0)
-            os.write(descriptor, str(os.getpid()).encode())
-            _LOCK_FDS.append(descriptor)
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                descriptor = os.open(
+                    path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
+                )
+                descriptors.append(descriptor)
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise ValueError(
+                        f"another writer is running for target {path.parent}"
+                    ) from error
+            if self.path.exists():
+                self.data = Store(self.settings, self.book).data
+            for descriptor in descriptors:
+                os.ftruncate(descriptor, 0)
+                os.write(descriptor, str(os.getpid()).encode())
+            _LOCK_FDS.extend(descriptors)
             try:
                 yield self
             finally:
-                _LOCK_FDS.remove(descriptor)
+                for descriptor in descriptors:
+                    _LOCK_FDS.remove(descriptor)
         finally:
-            os.close(descriptor)
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
 
 
 def initialize(settings: Settings, book: Book) -> dict:

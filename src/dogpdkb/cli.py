@@ -43,6 +43,10 @@ def init_config(directory: Path) -> None:
 
 def _main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "discover":
+        from dogpdkb.discover import main as discover_main
+
+        return discover_main(arguments[1:])
     if arguments and arguments[0] in WORKFLOWS:
         script = Path(__file__).resolve().parent / "workflows" / WORKFLOWS[arguments[0]]
         return subprocess.call(
@@ -162,6 +166,6 @@ def _main(argv: list[str] | None = None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] in {*WORKFLOWS, "update", "uninstall"}:
+    if arguments and arguments[0] in {*WORKFLOWS, "update", "uninstall"} - {"discover"}:
         return locked_main(_main)(arguments)
     return _main(arguments)
