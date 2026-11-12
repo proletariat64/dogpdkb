@@ -572,6 +572,42 @@ def _evidence_refs(evidence: dict[str, Any]) -> list[dict[str, Any]]:
     return verified
 
 
+def _materialize_ocr_backfill(
+    book: Any, record: dict[str, Any], cache: list[dict[str, Any]]
+) -> None:
+    """Write a post-hoc OCR backfill into the canonical graph.ocr compile reads.
+
+    compile enriches only ``status == "success"`` graph.ocr images; a backfill that
+    lives solely in the evidence cache never reaches the published source. Match
+    the failed image by the anomaly's resource_id and flip it to success with the
+    backfill artifact, preserving its durable prepared/source paths.
+    """
+    resource_id = record.get("resource_id")
+    if not isinstance(resource_id, str):
+        return
+    artifact = next(
+        (row["path"] for row in cache if row.get("kind") in {"ocr", "ocr_artifact"}),
+        None,
+    )
+    if artifact is None and len(cache) == 1:
+        artifact = cache[0]["path"]
+    if artifact is None:
+        return
+    from dogpdkb.sync_state import document_record, load_state, save_state
+
+    state = load_state(book.corpus, book.key)
+    doc = document_record(state, book.key, str(record["document_id"]))
+    ocr = (doc.get("graph") or {}).get("ocr")
+    if not isinstance(ocr, dict) or not isinstance(ocr.get("images"), list):
+        return
+    for image in ocr["images"]:
+        if isinstance(image, dict) and image.get("resource_id") == resource_id:
+            image["status"] = "success"
+            image["artifact"] = artifact
+            save_state(book.corpus, state)
+            return
+
+
 def record_posthoc_success(
     config: Any,
     book: Any,
@@ -625,6 +661,8 @@ def record_posthoc_success(
     # Real completion first: canonical state, never the disposition alone.
     progress = Progress(book.corpus, book.key)
     progress.step(record["document_id"], completion["step"], "completed", **details)
+    if evidence.get("input_changed") and completion["step"] == "ocr":
+        _materialize_ocr_backfill(book, record, cache)
 
     followup = None
     if evidence.get("input_changed"):

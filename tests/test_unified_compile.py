@@ -1041,3 +1041,103 @@ def test_posthoc_backfill_not_consumed_hands_off_instead_of_false_done(
     assert backfill_path not in final_paths
     frozen = run_dir / "compile" / "execution-corpus" / "source-[2].md"
     assert "BACKFILL TEXT NOT IN GRAPH" not in frozen.read_text(encoding="utf-8")
+
+
+def test_posthoc_ocr_backfill_materializes_into_graph_and_reaches_compile(
+    workspace: CompileWorkspace,
+):
+    # Greptile Issue 2(a): a post-hoc OCR backfill for a FAILED image must reach
+    # the published source. record_posthoc_success materializes the backfill into
+    # canonical graph.ocr (status->success, artifact->backfill) — the only contract
+    # compile reads — so the text is enriched and the follow-up closes done, rather
+    # than living only in the evidence cache and handing off forever.
+    from dogpdkb.sync_results import (
+        load_followups,
+        load_registry,
+        register_anomaly,
+        save_registry,
+    )
+    from mdocr.config import load_config
+
+    _set_detail(workspace, 2, body=f"# Two\n\n![diagram]({IMAGE_A})\n")
+    # Daily OCR fails for this image: that is WHY the agent backfills. Keep the
+    # fail flag set so the backfill is the only OCR text source across batches.
+    workspace.env["DOGPDKB_OCR_DOUBLE_FAIL"] = IMAGE_A
+    first = workspace.sync()
+    assert first.returncode == 0, first.stderr
+    config = load_config(workspace.config)
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    assert doc2["graph"]["ocr"]["images"][0]["status"] == "failed"
+
+    # The OCR double writes graph.ocr but does not archive; the real OCR stage
+    # archives an OCR_FAILED anomaly carrying the image resource_id. Model that
+    # durable precondition so the post-hoc resolution has a real anomaly to close.
+    registry = load_registry(config, "fund")
+    anomaly = register_anomaly(
+        registry,
+        config,
+        "fund",
+        {
+            "stage": "ocr",
+            "document_id": 2,
+            "source_version": doc2["observation"]["version"],
+            "code": "OCR_FAILED",
+            "reason": "OCR result was blank",
+            "resource_id": IMAGE_A,
+            "image": {"resource_id": IMAGE_A, "url": IMAGE_A},
+            "necessary_inputs": [],
+        },
+        run_id=workspace.runs()[-1].name,
+    )
+    save_registry(config, "fund", registry)
+    aid = anomaly["id"]
+
+    backfill = workspace.root / "backfill-artifact.md"
+    backfill.write_text("BACKFILL OCR TEXT\n", encoding="utf-8")
+    backfill_path = str(backfill.resolve())
+    evidence = workspace.root / "evidence.json"
+    write_json(
+        evidence,
+        {
+            "schema_version": "unified-posthoc-evidence-1.0",
+            "cache": [{"kind": "ocr", "path": backfill_path}],
+            "completion": {"step": "ocr", "details": {"cache": backfill_path}},
+            "input_changed": True,
+        },
+    )
+    resolved = workspace.cli(
+        "anomalies",
+        "--config",
+        str(workspace.config),
+        "--book",
+        "fund",
+        "--resolve",
+        aid,
+        "--disposition",
+        "done",
+        "--evidence",
+        str(evidence),
+    )
+    assert resolved.returncode == 0, resolved.stderr
+    out = json.loads(resolved.stdout)
+    followup_id = out["resolution"]["followup_id"]
+    assert followup_id
+
+    # The backfill is materialized into canonical graph.ocr, not left only in the
+    # evidence cache: compile reads graph.ocr alone.
+    doc2 = workspace.state()["books"]["fund"]["documents"]["2"]
+    image = next(
+        img for img in doc2["graph"]["ocr"]["images"] if img["resource_id"] == IMAGE_A
+    )
+    assert image["status"] == "success"
+    assert image["artifact"] == backfill_path
+
+    # Unchanged batch: daily OCR still fails, but compile reads the materialized
+    # backfill, enriches the published source, and consumes the follow-up to done.
+    second = workspace.sync()
+    assert second.returncode == 0, second.stderr
+    run_dir = workspace.runs()[-1]
+    consumed = load_followups(config, "fund")["followups"][followup_id]
+    assert consumed["status"] == "done", consumed
+    frozen = run_dir / "compile" / "execution-corpus" / "source-[2].md"
+    assert "BACKFILL OCR TEXT" in frozen.read_text(encoding="utf-8")

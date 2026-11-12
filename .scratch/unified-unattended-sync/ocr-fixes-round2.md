@@ -49,9 +49,8 @@ integration branch; only test files could have collided (they did not).
   `<img>` whose OCR succeeded but was not inserted is still reported unenriched.
 - [x] [15] `_consume_followups` closes done only when every registered backfill
   input was consumed by the published source; an unconsumed input hands off
-  (failed), never a false done. (Greptile's wider graph.ocr wiring expansion is
-  deferred: post-hoc evidence is {kind,path} with no resource_id, so the full
-  image record cannot be reconstructed — tracked separately.)
+  (failed), never a false done. (The wider Greptile Issue2 graph.ocr wiring is
+  implemented separately below — see "Greptile Issue 2(a)".)
 - Regressions: test_compile_enriches_fragment_image_via_normalized_fallback,
   test_link_before_embed_of_same_url_still_reaches_ocr,
   test_removed_ocr_contribution_is_pruned_so_later_version_bump_reuses_body,
@@ -114,6 +113,30 @@ integration branch; only test files could have collided (they did not).
 - Regression: test_unchanged_batch_consumes_followup_at_settled_published_version
   (first compile succeeds → settled published version → post-hoc follow-up →
   unchanged batch consumes it done; red→green verified).
+
+### Greptile Issue 2(a) — post-hoc OCR backfill reaches compile (inline) — DONE
+
+- [x] `record_posthoc_success` now materializes an OCR backfill into canonical
+  `graph.ocr` when `input_changed` and `completion.step == "ocr"`. The earlier
+  "deferred" note was wrong about the blocker: the evidence cache is `{kind,path}`
+  with no resource_id, but the **anomaly record carries `resource_id`** (top-level
+  + `image.resource_id`, stages/ocr.py `_anomaly`). `_materialize_ocr_backfill`
+  matches the failed image by that resource_id and flips `status → success`,
+  `artifact → backfill path`, preserving durable prepared/source paths. No
+  evidence-schema change needed.
+- Why it matters (probe-verified): compile enriches ONLY `graph.ocr` images with
+  `status == "success"`. Before the fix a failed-image backfill lived only in the
+  evidence cache, so the published source never gained the text and the follow-up
+  handed off forever — a dead end. [15] only made that failure honest; this makes
+  the backfill actually work.
+- Scope: OCR image anomalies only. Capture anomalies (no resource_id) and
+  non-OCR steps are untouched; [15]'s direct `register_compile_followup` path
+  (stale artifact, no materialization) still hands off correctly.
+- Regression: test_posthoc_ocr_backfill_materializes_into_graph_and_reaches_compile
+  (daily OCR fails → body publishes → resolve the OCR_FAILED anomaly via the
+  anomalies CLI with input_changed evidence → graph.ocr image becomes success →
+  unchanged batch enriches the backfill text into the published source and closes
+  the follow-up done; red→green verified).
 
 ## Gate
 
