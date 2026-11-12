@@ -1,6 +1,6 @@
 # Skylark 独立 listing/export CLI
 
-Status: claimed
+Status: resolved
 Type: task
 Blocked by: none
 Spec: ../spec.md
@@ -16,3 +16,9 @@ CLI 黑盒TDD + 假MCP/真实Markdown；完整listing失败不宣告完整；导
 ## Comments
 
 调查发现本机 pi_skylark 是工具源码但只提供 extension，需先补独立CLI供cron调用。
+
+Implemented upstream commit `ee9f2dbaecd639ca51960e9e0fbd29d7fb6ee714` in isolated
+`/tmp/pi-skylark-orchestrator-cli`. `npm test` passes eight existing gateway
+scenarios plus the CLI contract scenarios; `npm run build` and diff-check pass.
+Contract and reproducible patch are in `docs/orchestrator-skylark-contract.md`.
+No global installation or production calls were performed.
