@@ -27,7 +27,8 @@ def managed(tmp_path, monkeypatch):
     return installer
 
 
-def test_uninstall_keeps_config_data_and_unrelated_paths(managed):
+@pytest.mark.parametrize("foreign_command", ["mdocr", "mdcompare", "skylark"])
+def test_uninstall_keeps_config_data_and_unrelated_paths(managed, foreign_command):
     active = (managed.prefix / "current").resolve()
     unrelated = managed.prefix / "versions/unrelated"
     unrelated.mkdir()
@@ -35,14 +36,16 @@ def test_uninstall_keeps_config_data_and_unrelated_paths(managed):
     data = managed.prefix / "corpus"
     data.mkdir()
     (data / "user.md").write_text("keep")
-    mdocr = managed.binary.parent / "mdocr"
-    mdocr.unlink()
-    mdocr.symlink_to("/other/tool")
+    foreign = managed.binary.parent / foreign_command
+    foreign.unlink(missing_ok=True)
+    foreign.symlink_to("/other/tool")
     assert lifecycle.uninstall(yes=True) == 0
     assert not active.exists()
     assert not (managed.prefix / "current").is_symlink()
     assert not managed.binary.is_symlink()
-    assert mdocr.readlink() == Path("/other/tool")
+    assert foreign.readlink() == Path("/other/tool")
+    for name in {"mdocr", "mdcompare", "skylark"} - {foreign_command}:
+        assert not (managed.binary.parent / name).is_symlink()
     assert (managed.config / "books.json").is_file()
     assert (data / "user.md").read_text() == "keep"
     assert (unrelated / "user.md").read_text() == "keep"
@@ -54,6 +57,22 @@ def test_uninstall_requires_confirmation(managed, monkeypatch):
     with pytest.raises(ValueError, match="--yes"):
         lifecycle.uninstall()
     assert managed.binary.exists()
+
+
+def test_uninstall_removes_owned_mdcompare_link(managed):
+    compare = managed.binary.parent / "mdcompare"
+    if not compare.is_symlink():
+        compare.symlink_to(managed.prefix / "current/bin/mdcompare")
+    assert lifecycle.uninstall(yes=True) == 0
+    assert not compare.is_symlink()
+
+
+def test_legacy_install_without_mdcompare_remains_manageable(managed):
+    compare = managed.binary.parent / "mdcompare"
+    compare.unlink(missing_ok=True)
+    (lifecycle.locate().environment / "bin/mdcompare").unlink()
+    assert lifecycle.uninstall(yes=True) == 0
+    assert not managed.binary.is_symlink()
 
 
 def test_lock_blocks_uninstall_and_installer(managed):

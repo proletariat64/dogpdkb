@@ -12,7 +12,7 @@ fail() { printf 'dogpdkb install: %s\n' "$*" >&2; exit 1; }
 [[ "$WHEEL_SHA256" =~ ^[a-f0-9]{64}$ ]] || fail 'Invalid release checksum.'
 [[ "$RELEASE_BASE_URL" == https://* ]] || fail 'Release downloads require HTTPS.'
 [[ "$(uname -s)" == Linux ]] || fail 'This installer supports Linux.'
-for tool in curl sha256sum mktemp readlink flock; do
+for tool in curl sha256sum mktemp readlink flock node npm; do
     command -v "$tool" >/dev/null || fail "Missing prerequisite: $tool"
 done
 
@@ -74,7 +74,7 @@ check_links() {
         validate_environment "$selected"
         OLD_ENV="$selected"
     fi
-    for name in dogpdkb mdocr; do
+    for name in dogpdkb mdocr mdcompare skylark; do
         if [[ -e "$BIN_DIR/$name" || -L "$BIN_DIR/$name" ]]; then
             [[ -L "$BIN_DIR/$name" && "$(readlink "$BIN_DIR/$name")" == "$PREFIX/current/bin/$name" ]] || fail "Refusing to overwrite $BIN_DIR/$name"
         fi
@@ -124,6 +124,10 @@ ENV_DIR=$(mktemp -d "$PREFIX/versions/$VERSION.XXXXXX")
 "$UV" venv --no-config --no-project --no-python-downloads --python "${DOGPDKB_PYTHON:-3.12}" "$ENV_DIR"
 "$UV" pip install --no-config --python "$ENV_DIR/bin/python" --default-index "$INDEX" "$TMP/$WHEEL"
 [[ "$("$ENV_DIR/bin/dogpdkb" --version)" == "dogpdkb $VERSION" ]] || fail 'Installed version does not match the Release.'
+"$ENV_DIR/bin/mdcompare" --version
+npm install --prefix "$ENV_DIR/skylark" --omit=dev --ignore-scripts --no-audit --no-fund pi-skylark@latest
+ln -s ../skylark/node_modules/.bin/skylark "$ENV_DIR/bin/skylark"
+"$ENV_DIR/bin/skylark" --help
 "$ENV_DIR/bin/dogpdkb" doctor --package
 # This marker records paths, not authority to remove arbitrary directories.
 printf '1\n%s\n%s\n%s\n' "$PREFIX" "$BIN_DIR" "$CONFIG_DIR" > "$ENV_DIR/.dogpdkb-managed"
@@ -134,7 +138,7 @@ if [[ ! -e "$CONFIG_DIR/dogpdkb.toml" && ! -L "$CONFIG_DIR/dogpdkb.toml" && \
     "$ENV_DIR/bin/dogpdkb" init-config -o "$CONFIG_DIR"
 fi
 check_links
-for name in dogpdkb mdocr; do
+for name in dogpdkb mdocr mdcompare skylark; do
     ln -s "$PREFIX/current/bin/$name" "$TMP/$name"
     mv -Tf -- "$TMP/$name" "$BIN_DIR/$name"
 done
@@ -148,7 +152,7 @@ if [[ -n "$OLD_ENV" && "$OLD_ENV" != "$ENV_DIR" ]]; then
     validate_environment "$OLD_ENV"
     rm -rf -- "$OLD_ENV"
 fi
-printf 'Installed dogpdkb %s\nCommands: %s/dogpdkb and %s/mdocr\nConfiguration: %s\n' "$VERSION" "$BIN_DIR" "$BIN_DIR" "$CONFIG_DIR"
+printf 'Installed dogpdkb %s\nCommands in %s: dogpdkb, mdocr, mdcompare, skylark\nConfiguration: %s\n' "$VERSION" "$BIN_DIR" "$CONFIG_DIR"
 printf 'Edit the disabled examples before syncing; Graphify and gateway setup remain separate.\n'
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;

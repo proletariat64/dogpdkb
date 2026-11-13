@@ -11,7 +11,7 @@ curl -fsSL https://code.alipay.com/pd.pt/dogpdkb/releases/download/v0.1.1/instal
 
 The Release and its attachments are anonymous. The server does not need an
 AntCode CLI, account, token, Git checkout or sudo. Linux, Bash, curl, sha256sum,
-flock and standard GNU file utilities are required. As with any curl-to-shell installer,
+flock, Node.js, npm and standard GNU file utilities are required. As with any curl-to-shell installer,
 trust the HTTPS origin and inspect the script first if required by your policy.
 Use `bash -o pipefail -c 'curl -fsSL <URL> | bash'` in automation when download
 failure must also determine the enclosing shell's exit status.
@@ -34,11 +34,19 @@ Only the published version-bound script has a package URL and checksum.
 Defaults:
 
 - Programs and versioned virtual environments: `~/.local/share/dogpdkb/`.
-- Command links: `~/.local/bin/dogpdkb` and `~/.local/bin/mdocr`.
+- Command links: `~/.local/bin/dogpdkb`, `~/.local/bin/mdocr` and
+  `~/.local/bin/mdcompare` and `~/.local/bin/skylark` (or the selected
+  `DOGPDKB_BIN_DIR`). Installing or upgrading adds the missing command links.
 - Example configuration: `~/.config/dogpdkb/dogpdkb.toml` and `books.json`.
 
 The installer prints a PATH command if `~/.local/bin` is not already on PATH;
 it never edits your shell startup files. Package-only doctor runs before activation.
+Each install, upgrade or same-version reinstall runs `npm install pi-skylark@latest`
+inside the candidate managed environment. npm uses its configured registry; no
+Skylark version is pinned. The command is checked before activation. A download,
+installation or startup failure preserves the previous active environment.
+Uninstall removes this managed Skylark copy and its owned link; Node.js, npm and
+unrelated global npm installations remain untouched. Gateway/SSO setup is separate.
 Source examples are disabled. Edit the gateway, source selection and data paths
 before syncing, then run:
 
