@@ -27,14 +27,25 @@ else:
 ROOT = Path(__file__).resolve().parents[1]
 
 HELP_OBSERVER = """import os, sys
+audit_log = os.environ['DOGPDKB_HELP_AUDIT_LOG']
+write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 def observe(event, args):
-    if event.startswith('socket.') or event in {
+    if event == 'open' and args[0] == audit_log:
+        return  # Only the observer's diagnostic sink may be opened for writing.
+    writing = event == 'open' and (
+        isinstance(args[2], int) and args[2] & write_flags
+        or isinstance(args[1], str) and any(mode in args[1] for mode in 'wax+')
+    )
+    if writing or event.startswith('socket.') or event in {
         'subprocess.Popen', 'os.system', 'os.posix_spawn', 'os.spawn',
         'os.fork', 'os.forkpty', 'os.exec', 'pty.spawn',
+        'os.mkdir', 'os.remove', 'os.rmdir', 'os.rename', 'os.link', 'os.symlink',
+        'os.chmod', 'os.chown', 'os.utime', 'os.truncate', 'os.ftruncate',
+        'os.setxattr', 'os.removexattr', 'fcntl.flock', 'fcntl.lockf',
     }:
-        with open(os.environ['DOGPDKB_HELP_AUDIT_LOG'], 'a') as log:
+        with open(audit_log, 'a') as log:
             log.write(event + '\\n')
-        raise RuntimeError('help attempted external activity: ' + event)
+        raise RuntimeError('help attempted a side effect: ' + event)
 sys.addaudithook(observe)
 """
 
@@ -242,12 +253,12 @@ def smoke(dist: Path) -> None:
             help_checks += 1
         after_help = {path.relative_to(work) for path in work.rglob("*")}
         assert not audit_log.exists(), (
-            "installed help attempted network or child-process activity"
+            "installed help attempted filesystem, network or child-process activity"
         )
         assert before_help == after_help, "installed help created runtime files"
         print(
             f"Installed offline help: {help_checks} flag/version checks passed; "
-            "no runtime files, socket activity, or child processes."
+            "no runtime writes, socket activity, or child processes."
         )
         run([command, "doctor", "--package"])
         run([command, "init-config", "-o", work / "portable"])
