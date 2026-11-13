@@ -108,3 +108,24 @@ def test_usage_errors_keep_detail_without_creating_artifacts(
     assert "--help" in result.stderr
     assert not result.stdout
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("command", ["catalog", "compare", "knowledge"])
+def test_full_before_command_is_rejected_with_correct_placement(tmp_path, command):
+    result = invoke(tmp_path, "--full", command, "--help")
+    assert result.returncode == 1
+    assert not result.stdout
+    assert f"mdcompare {command} --help --full" in result.stderr
+    assert "after the command" in result.stderr
+    assert not list(tmp_path.iterdir())
+
+
+def test_abbreviated_full_is_not_an_execution_option(tmp_path):
+    result = invoke(
+        tmp_path, "catalog", "--ful", "--input", "input.json", "--output", "out.json"
+    )
+    assert result.returncode == 1
+    assert "INVALID_ARGUMENTS" in result.stderr
+    assert "unrecognized arguments: --ful" in result.stderr
+    assert not result.stdout
+    assert not list(tmp_path.iterdir())

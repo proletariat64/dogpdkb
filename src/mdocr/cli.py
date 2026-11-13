@@ -9,17 +9,8 @@ import uuid
 from pathlib import Path
 from typing import NoReturn
 
-import requests
-
 from . import __version__
 from . import help as contracts
-from .ocr import ocr_document
-from .paddle import PaddleClient
-from .prepare import (
-    DEFAULT_ENABLED_EXTENSIONS,
-    prepare_document,
-    readable_extensions,
-)
 
 
 class CliError(Exception):
@@ -29,6 +20,10 @@ class CliError(Exception):
 class _HelpfulParser(argparse.ArgumentParser):
     """Print the full help of the failing command on argument errors, so a
     misuse teaches the user how to use mdocr instead of a bare usage line."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
 
     def error(self, message: str) -> NoReturn:
         self.print_help(sys.stderr)
@@ -194,6 +189,8 @@ def _validate(args: argparse.Namespace) -> list[Path]:
 
 def _enabled_extensions(values: list[str]) -> frozenset[str]:
     """Normalize and validate user-requested Pillow image extensions."""
+    from .prepare import DEFAULT_ENABLED_EXTENSIONS, readable_extensions
+
     requested: set[str] = set()
     for value in values:
         for item in value.split(","):
@@ -238,6 +235,12 @@ def _check_output_collisions(files: list[Path], args: argparse.Namespace) -> Non
 
 
 def run_command(args: argparse.Namespace) -> int:
+    import requests
+
+    from .ocr import ocr_document
+    from .paddle import PaddleClient
+    from .prepare import prepare_document
+
     files = _validate(args)
     enabled_extensions = _enabled_extensions(args.format)
     _check_output_collisions(files, args)

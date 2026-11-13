@@ -13,7 +13,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run_cli(tmp_path, *arguments):
+def run_cli(tmp_path, *arguments, env_overrides=None):
     env = os.environ.copy()
     env.pop("PADDLEOCR_TOKEN", None)
     env["PYTHONPATH"] = str(ROOT / "src")
@@ -21,6 +21,7 @@ def run_cli(tmp_path, *arguments):
     env["HOME"] = str(tmp_path / "home")
     env["XDG_CONFIG_HOME"] = str(tmp_path / "config")
     env["XDG_CACHE_HOME"] = str(tmp_path / "cache")
+    env.update(env_overrides or {})
     return subprocess.run(
         [sys.executable, "-m", "mdocr.cli", *arguments],
         cwd=tmp_path,
@@ -210,3 +211,43 @@ def test_batch_partial_and_usage_both_exit_two_with_distinct_evidence(tmp_path):
     assert "--manifest" in usage.stderr
     assert not (tmp_path / "new.json").exists()
     assert not (tmp_path / "elsewhere").exists()
+
+
+def test_help_and_version_never_create_sockets(tmp_path):
+    observer = tmp_path / "observer"
+    observer.mkdir()
+    audit_log = tmp_path / "socket-events.txt"
+    (observer / "sitecustomize.py").write_text(
+        "import os, sys\n"
+        "def observe(event, args):\n"
+        "    if event.startswith('socket.'):\n"
+        "        with open(os.environ['MDOCR_HELP_AUDIT_LOG'], 'a') as log:\n"
+        "            log.write(event + '\\n')\n"
+        "sys.addaudithook(observe)\n",
+        encoding="utf-8",
+    )
+    environment = {
+        "PYTHONPATH": os.pathsep.join([str(observer), str(ROOT / "src")]),
+        "MDOCR_HELP_AUDIT_LOG": str(audit_log),
+    }
+    matrix = [["--version"]]
+    for scope in ([], ["prepare"], ["ocr"], ["batch"]):
+        matrix.extend(
+            scope + flags
+            for flags in (["-h"], ["--help"], ["-h", "--full"], ["--help", "--full"])
+        )
+    for arguments in matrix:
+        result = run_cli(tmp_path, *arguments, env_overrides=environment)
+        assert result.returncode == 0, result.stderr
+        assert not audit_log.exists(), (
+            f"{' '.join(arguments)} produced socket activity: {audit_log.read_text()}"
+        )
+
+
+def test_abbreviated_full_is_rejected_before_preparation(tmp_path):
+    (tmp_path / "doc.md").write_text("# No writes allowed\n", encoding="utf-8")
+    result = run_cli(tmp_path, "prepare", "--ful", "-f", "doc.md", "-o", "out")
+    assert result.returncode == 2
+    assert "unrecognized arguments: --ful" in result.stderr
+    assert not result.stdout
+    assert not (tmp_path / "out").exists()

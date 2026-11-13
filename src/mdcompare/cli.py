@@ -24,6 +24,7 @@ from .model import CompareOptions
 class ArgumentParser(argparse.ArgumentParser):
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("formatter_class", argparse.RawDescriptionHelpFormatter)
+        kwargs.setdefault("allow_abbrev", False)
         super().__init__(*args, **kwargs)
         self.full_help = False
         self.add_argument(
@@ -35,6 +36,15 @@ class ArgumentParser(argparse.ArgumentParser):
     def parse_known_args(self, args=None, namespace=None):
         arguments = list(sys.argv[1:] if args is None else args)
         self.full_help = "--full" in arguments
+        if self.full_help and self.prog == "mdcompare":
+            command = next(
+                (arg for arg in arguments if arg in NORMAL and arg != "mdcompare"),
+                None,
+            )
+            if command and arguments.index("--full") < arguments.index(command):
+                self.error(
+                    f"place --full after the command: mdcompare {command} --help --full"
+                )
         if self.full_help and not any(flag in arguments for flag in ("-h", "--help")):
             self.error("--full requires -h or --help")
         return super().parse_known_args(arguments, namespace)

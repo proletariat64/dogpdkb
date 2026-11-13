@@ -79,10 +79,17 @@ Do not put credentials into saved plans, manifests or command examples.
 ## Run and result schemas
 
 Run JSON (dogpdkb-run-1) is an observational record, not a request to edit manually:
-schema, run_id, command, book (key/name/url), pid, status, stage, counts object,
+schema, run_id, command, book (key/name/url), pid, lock (absolute corpus-lock path
+string), status, stage (string or null before the first stage), counts object,
 started_at, updated_at, ended_at (string or null), exit_code (integer or null),
 reason (string or null), artifacts (names mapped to absolute paths), failures
-(evidence objects), targets (frozen book URL and absolute corpus/graph paths).
+(evidence objects), targets (object with book_url string and absolute corpus and
+graph path strings). targets.document_ids is an optional nonempty unique string
+array, present only for an explicitly pinned subscription; omission means the
+whole book. Loading a saved run compares the whole frozen targets object with
+the selected book, including document_ids, so changing or removing a pinned
+subscription invalidates resume. lock is the recorded corpus-lock path used by
+status for liveness observation; its presence does not itself prove a held lock.
 Optional stage/checkpoint fields are added as work progresses. Statuses include
 running, paused, completed, partial, failed and interrupted. A recorded running
 run with no active owner is observed as interrupted. Run references accept an
