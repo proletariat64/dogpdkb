@@ -73,7 +73,10 @@ Duplicate IDs fail before any durable registration.
 - `run.stage(name, **counts)` records current stage and publicly known counters.
 - `run.failure(**details)` appends a failure/evidence row.
 - `run.finish(status, exit_code=0, reason=None)` records paused/completed/partial/
-  failed/interrupted; no automatic cleanup or retry.
+  failed/interrupted; it does not itself clean up or retry. The sync owner cleans
+  its current completed/partial run while holding the write locks, keeping failed
+  Markdown/images/reports and a compact observable record. Paused/failed/interrupted
+  runs are retained. Necessary latest inputs live outside wash; no historical migration.
 - `run.data['artifacts']` maps public artifact names to paths. Other product
   metadata such as selected inputs, stop-after and plan paths stays in this record.
 
@@ -83,6 +86,9 @@ failures. Status is observationally interrupted when `running` has no live owner
 `targets` freezes the source book URL and absolute corpus/graph targets. Loading
 a run for execution rejects changed targets before any tool call or publication;
 use a newly generated plan for a different source or target.
+Cleaned completed/partial runs are not resumable. Manual `purge` deletes only
+selected wash; force permits discarding unfinished runs but never bypasses locks
+or clears durable facts, corpus, graphs, persistent inputs or tool caches.
 
 ## Processes and observation
 

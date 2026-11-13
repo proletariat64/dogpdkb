@@ -20,8 +20,10 @@
 公开结果确认后才完成；无法确认则保持 unknown/未决以便排查。
 
 `paths.staging/<book>/run-*/` 保存 run.json、固定计划、输入与工具报告。
-清理 agent 可以管理这些旧目录，程序不自动扫描、搬迁或重写引用。
-state 必须独立保留；清理 run 不会让同版本失败重新自动执行。
+成功或 partial 的 sync 自动清理本次成功临时副本，留下失败 Markdown、相关图片、
+报告和简要运行记录；不自动扫描或迁移旧 run。最新比较基线及有效复用输入独立
+保存在持久区，后续同步不依赖已清理的成功副本。state 必须独立保留；清理或
+purge run 不会让同版本失败重新自动执行。purge 的范围仅限所选 book 的 wash。
 
 ## 失败与恢复
 
@@ -32,6 +34,7 @@ state 必须独立保留；清理 run 不会让同版本失败重新自动执行
 显式 resume 使用原范围与成功产物。缺失或改变的计划输入需重新生成，不偷偷
 抓取远端新版本；旧计划/manifest 不允许回退已成功的新版本。图谱失败不回滚语料。
 没有跨 corpus/graph 事务，也不编造成功补账。
+完成并清理的 run 不再承诺恢复；partial 留下的输入用于后续 agent 排查并创建新 run。
 
 [核心 API 合同](orchestrator-core-contracts.md)、[apply 合同](orchestrator-apply-contracts.md)、
 [当前操作说明](unattended-sync.md)。
