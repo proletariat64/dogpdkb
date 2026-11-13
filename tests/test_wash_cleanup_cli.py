@@ -143,6 +143,18 @@ def test_failed_graph_keeps_input_and_report_without_candidate_graph(tmp_path):
         assert Path(failure["input"]).is_file()
         report = json.loads(Path(failure["report"]).read_text())
         assert report["candidate"] is None
+        expected = [
+            sys.executable,
+            str(tool),
+            "graphify",
+            "extract",
+            str(tmp_path / "corpus"),
+            "--out",
+            str(Path(failure["report"]).parent),
+            "--no-cluster",
+        ]
+        assert failure["argv"] == expected
+        assert report["argv"] == expected
     assert not list(run.parent.glob("graphify-*/graphify-out"))
 
 
@@ -200,7 +212,11 @@ def test_whole_batch_failure_or_interruption_keeps_run_untouched(
     assert list(run.parent.glob("graphify-*"))
 
 
-def test_failed_export_keeps_existing_markdown_picture_and_report(tmp_path):
+@pytest.mark.parametrize("image_target", ["2.png", "../images/2.png"])
+@pytest.mark.parametrize("catalog_mode", ["available", "unavailable", "interrupted"])
+def test_failed_export_keeps_existing_markdown_picture_and_report(
+    tmp_path, image_target, catalog_mode
+):
     from PIL import Image
 
     config, tool = instance(tmp_path)
@@ -208,8 +224,8 @@ def test_failed_export_keeps_existing_markdown_picture_and_report(tmp_path):
     script = tool.read_text().replace(
         "        rows.append({**doc,",
         """        if doc['document_id']=='2':
-            (path.parent/'2.png').write_bytes((root/'fixture.png').read_bytes())
-            path.write_text(path.read_text()+'\\n![failed](2.png)\\n')
+            image=path.parent/IMAGE_TARGET; image.parent.mkdir(parents=True,exist_ok=True); image.write_bytes((root/'fixture.png').read_bytes())
+            path.write_text(path.read_text()+'\\n![failed]('+IMAGE_TARGET+')\\n')
         rows.append({**doc,""",
     )
     script = script.replace(
@@ -217,13 +233,37 @@ def test_failed_export_keeps_existing_markdown_picture_and_report(tmp_path):
         """    if rows[0]['document_id']=='2': rows[0]['status']='failed'
     write(flag('--output'), {'schema':'skylark-export-result-1'""",
     )
+    script = script.replace("IMAGE_TARGET", repr(image_target))
+    if catalog_mode != "available":
+        script = script.replace(
+            "if tool in ('mdcompare', 'mdocr'):",
+            "if tool == 'mdcompare' and args[0] == 'catalog' and any('failed-export-descriptors' in arg for arg in args): raise SystemExit(EXIT_CODE)\nif tool in ('mdcompare', 'mdocr'):",
+        )
+    script = script.replace(
+        "EXIT_CODE", "130" if catalog_mode == "interrupted" else "1"
+    )
     tool.write_text(script)
     result = cli("sync", "--config", config)
-    assert result.returncode == 2, result.stderr
-    run = Path(json.loads(result.stdout)["run"])
+    assert result.returncode == (130 if catalog_mode == "interrupted" else 2), (
+        result.stderr
+    )
+    run = (
+        Path(json.loads(result.stdout)["run"])
+        if result.stdout.strip()
+        else next((tmp_path / "runs/funds").glob("run-*/run.json"))
+    )
     record = json.loads(run.read_text())
     failure = next(row for row in record["failures"] if row["step"] == "export")
     assert Path(failure["input"]).is_file()
     assert Path(failure["report"]).is_file()
-    assert Path(failure["input"]).with_name("2.png").is_file()
-    assert not (run.parent / "raw/0.md").exists()
+    assert (Path(failure["input"]).parent / image_target).is_file()
+    if catalog_mode == "interrupted":
+        assert record["status"] == "interrupted"
+        assert "cleanup" not in record
+    elif catalog_mode == "available":
+        assert not (run.parent / "raw/0.md").exists()
+        assert record["cleanup"]["status"] == "completed"
+    else:
+        assert record["cleanup"]["status"] == "failed"
+        assert (run.parent / "raw/0.md").exists()
+        assert "cleanup" in result.stderr

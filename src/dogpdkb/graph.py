@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from dogpdkb.planning import reject_rollback
-from dogpdkb.processes import run_command
+from dogpdkb.processes import diagnostic_argv, run_command
 from dogpdkb.records import Run, Store, atomic_json, read_json, version_key
 from dogpdkb.settings import load_config, select_book
 
@@ -151,15 +151,16 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
             report=str(report),
         )
     run.stage("graphify", total=len(pending), completed=0, failed=0)
+    argv = [
+        *settings.command("graphify"),
+        "extract",
+        str(book.corpus),
+        "--out",
+        str(workspace),
+        "--no-cluster",
+    ]
     code = run_command(
-        [
-            *settings.command("graphify"),
-            "extract",
-            str(book.corpus),
-            "--out",
-            str(workspace),
-            "--no-cluster",
-        ],
+        argv,
         log=run.directory / "graphify.log",
         env={"GRAPHIFY_OUT": "graphify-out", "GRAPHIFY_FORCE": "0"},
     )
@@ -199,6 +200,7 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
             "schema": "dogpdkb-graph-result-1",
             "status": status,
             "exit_code": code,
+            "argv": diagnostic_argv(argv),
             "graph": str(graph_path),
             "candidate": str(candidate),
             "reason": reason,
@@ -257,6 +259,7 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
                 message=reason,
                 report=str(report),
                 exit_code=code,
+                argv=diagnostic_argv(argv),
             )
     complete = len(pending) if status == "completed" else 0
     run.stage(

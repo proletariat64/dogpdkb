@@ -233,8 +233,61 @@ def prepare_inputs(settings, book, store, run, differences):
                 )
             if code not in {0, 2}:
                 raise ValueError(f"Skylark export unavailable ({code}); see {report}")
+        catalog_failed_exports(settings, book, run, by_id)
         rows = [row for row in rows if row["document_id"] in kept]
     return rows
+
+
+def catalog_failed_exports(settings, book, run, rows):
+    failures = [
+        item
+        for item in run.data["failures"]
+        if item["step"] == "export" and Path(item.get("input") or "").is_file()
+    ]
+    if not failures:
+        return
+    source = run.directory / "failed-export-descriptors.json"
+    report = run.directory / "failed-export-resources.json"
+    try:
+        atomic_json(
+            source,
+            {
+                "schema_version": "1.0",
+                "documents": [
+                    descriptor(book, rows[item["document_id"]], item["input"])
+                    for item in failures
+                ],
+            },
+        )
+        code = call_tool(
+            settings,
+            run,
+            "mdcompare",
+            ["catalog", "--input", source, "--output", report],
+        )
+        if code:
+            raise ValueError("failed export resource catalog unavailable")
+        payload = read_json(report)
+        if not isinstance(payload, dict) or payload.get("schema_version") != "1.0":
+            raise ValueError("invalid failed export resource catalog")
+        documents = {item["document_id"]: item for item in payload["documents"]}
+        for item in failures:
+            document = documents[item["document_id"]]
+            if document.get("resource_warnings"):
+                raise ValueError("failed export resource catalog is uncertain")
+            resources = document.get("resources", [])
+            if not isinstance(resources, list) or not all(
+                isinstance(resource, dict) for resource in resources
+            ):
+                raise ValueError("invalid failed export resource entries")
+            item["resources"] = resources
+            item.setdefault("reports", []).append(str(report))
+    except InterruptedError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        for item in failures:
+            item["resource_catalog_error"] = str(error)
+    run.save()
 
 
 def compare_inputs(settings, book, store, run, rows):

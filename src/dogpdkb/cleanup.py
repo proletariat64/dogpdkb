@@ -22,6 +22,8 @@ def failure_files(store, run):
     rows = read_json(Path(plan_path))["documents"] if plan_path else []
     by_id = {row["document_id"]: row for row in rows}
     for failure in run.data["failures"]:
+        if failure.get("resource_catalog_error"):
+            raise ValueError(failure["resource_catalog_error"])
         row = by_id.get(str(failure.get("document_id")), {})
         if failure.get("step") == "graph" and row:
             corpus = store.document(row["document_id"]).get("corpus", {}).get("path")
@@ -37,14 +39,8 @@ def failure_files(store, run):
             else:
                 failure["input"] = raw
         retain(failure.get("input"))
-        # A rejected export never entered the catalog/plan. Preserve its local
-        # bundle, excluding the other documents' known successful raw files.
-        source = Path(failure.get("input") or "")
-        if not row and source.is_file() and source.is_relative_to(root):
-            other_sources = {Path(item["raw_path"]) for item in rows}
-            for path in source.parent.rglob("*"):
-                if path not in other_sources:
-                    retain(str(path))
+        for resource in failure.get("resources", []):
+            retain(resource.get("path"))
         for value in [
             failure.get("report"),
             *failure.get("reports", []),
