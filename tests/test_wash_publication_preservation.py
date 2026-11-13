@@ -237,6 +237,7 @@ def test_resumed_run_uses_new_publication_generation(tmp_path):
         "<img src=ABSOLUTE_IMAGE>",
         '![diagram][image]\n[image]: ../images/diagram.png "Original"',
         '![diagram][image]\n[image]: <../images/diagram.png> "Original"',
+        "![diagram][`sample`]\n\n[`sample`]: ../images/diagram.png",
         '<img srcset="ABSOLUTE_IMAGE 1x, ../images/diagram.png 2x">',
         "<img alt=\"literal src='../images/diagram.png'\" src='../images/diagram.png'>",
         '<img alt="literal ![example](../images/diagram.png)" src="../images/diagram.png">',
@@ -343,6 +344,7 @@ def test_catalogued_noninline_resource_survives_wash_purge(tmp_path, markup):
         '```html\n<img src="../images/diagram.png">\n![example](../images/diagram.png)\n[example]: ../images/diagram.png\n```',
         '~~~html\n<img src="../images/diagram.png">\n![example](../images/diagram.png)\n[example]: ../images/diagram.png\n~~~',
         '`<img src="../images/diagram.png">` and `![example](../images/diagram.png)`',
+        "```![example](../images/diagram.png)```",
         '<!--\n<img src="../images/diagram.png">\n![example](../images/diagram.png)\n[example]: ../images/diagram.png\n-->',
     ],
 )
@@ -383,3 +385,39 @@ def test_resource_relocation_preserves_literal_examples(tmp_path, literal):
     assert removed.returncode == 0, removed.stderr
     assert target.is_file()
     assert literal in Path(document["path"]).read_text()
+
+
+def test_unmatched_backtick_does_not_hide_image_in_later_paragraph(tmp_path):
+    import re
+    from urllib.parse import unquote
+
+    config, differences = enriched_instance(tmp_path)
+    remote_path = tmp_path / "remote.json"
+    remote = json.loads(remote_path.read_text())
+    remote["42"]["body"] += (
+        "\n`unfinished\n\n![live](../images/diagram.png)\n\n`example`\n"
+    )
+    remote_path.write_text(json.dumps(remote))
+    exporter = tmp_path / "skylark.py"
+    exporter.write_text(
+        exporter.read_text().replace(
+            "path.write_text(doc['body'])",
+            "image=path.parent.parent/'images'/'diagram.png'; "
+            "image.parent.mkdir(parents=True,exist_ok=True); "
+            "__import__('PIL.Image',fromlist=['Image']).new('RGB',(2,2),'red').save(image); "
+            "path.write_text(doc['body'])",
+        )
+    )
+    result = cli("apply", "--config", config, "--input", differences)
+    assert result.returncode in {0, 2}, result.stderr
+    output = json.loads(result.stdout)
+    document = json.loads(Path(output["manifest"]).read_text())["documents"][0]
+    published = Path(document["path"]).read_text()
+    assert "`unfinished" in published and "`example`" in published
+    live = re.search(r"!\[live\]\(([^)]+)\)", published)
+    assert live
+    image = Path(unquote(live.group(1)))
+    assert image.is_absolute(), "an unmatched code delimiter hid a live destination"
+    removed = cli("purge", "--config", config, "--run", output["run"])
+    assert removed.returncode == 0, removed.stderr
+    assert image.is_file()
