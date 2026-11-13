@@ -34,6 +34,9 @@ def sync_run(settings, book, store, run, *, stop_after=None, resume=False):
         return {**result, "exit_code": graph_code}
     code = 1 if graph_code == 1 else 2 if 2 in {graph_code, result["exit_code"]} else 0
     run.finish("failed" if code == 1 else "partial" if code == 2 else "completed", code)
+    from dogpdkb.cleanup import clean_run
+
+    clean_run(store, run)
     return {**result, "exit_code": code}
 
 
@@ -49,11 +52,13 @@ def main(argv=None):
         book = select_book(settings, args.book)
         store = Store(settings, book)
         with store.lock():
-            run = (
-                Run.load(store, args.resume)
-                if args.resume
-                else Run.create(store, "sync")
-            )
+            if args.resume:
+                previous = Run.load(store, args.resume)
+                if previous.data.get("cleanup"):
+                    raise ValueError("run has been cleaned; start a new run")
+                run = previous
+            else:
+                run = Run.create(store, "sync")
             run.data.update(
                 status="running",
                 pid=os.getpid(),
