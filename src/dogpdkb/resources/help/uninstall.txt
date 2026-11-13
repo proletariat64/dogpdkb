@@ -1,0 +1,18 @@
+# Managed program removal
+
+Default requires an interactive terminal and explicit y confirmation (case-insensitive).
+--yes permits noninteractive removal. Requires the active installer-managed
+environment with verified ownership; arbitrary pip/uv environments and source
+checkouts are refused. No network, remote authentication or model calls occur.
+
+After acquiring the exclusive lifecycle lock, removes matching owned dogpdkb
+and mdocr command symlinks, the current environment pointer and the active
+environment directory. Configuration and all external data remain. The shared
+lifecycle lock inode remains. Unrelated links and environments are untouched.
+Cancellation returns 1, successful removal 0, refusal or I/O failure 1, invalid
+CLI usage 64. A deletion error may leave partial program files: inspect the
+printed paths and use the original installation method for recovery.
+
+stdout lists what will be removed and retained; stderr carries failures.
+Once removed, this command cannot be repeated through the removed executable.
+Help/version access never acquires lifecycle locks or removes program files.

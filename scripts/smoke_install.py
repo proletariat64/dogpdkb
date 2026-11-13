@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import tarfile
@@ -83,6 +84,11 @@ def inspect_artifacts(wheel: Path, sdist: Path) -> None:
         "mdcompare/catalog.py",
         "mdocr/cli.py",
         "mdocr/batch.py",
+        "mdocr/help.py",
+        "mdcompare/help.py",
+        "dogpdkb/help.py",
+        "dogpdkb/resources/help/configuration.txt",
+        "dogpdkb/resources/help/root.txt",
     }
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
@@ -134,9 +140,14 @@ def smoke(dist: Path) -> None:
     }
     env["UV_OFFLINE"] = os.environ.get("UV_OFFLINE", "1")
     env["UV_PYTHON_DOWNLOADS"] = "never"
+    env["UV_CACHE_DIR"] = os.environ.get("UV_CACHE_DIR", str(Path.home() / ".cache/uv"))
     with tempfile.TemporaryDirectory(prefix="dogpdkb-installed-cli-") as temporary:
         work = Path(temporary)
         env["XDG_STATE_HOME"] = str(work / "user-state")
+        env["XDG_CONFIG_HOME"] = str(work / "user-config")
+        env["XDG_CACHE_HOME"] = str(work / "user-cache")
+        env["HOME"] = str(work / "home")
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
 
         def run(args, expected=0):
             result = run_process(
@@ -182,6 +193,34 @@ def smoke(dist: Path) -> None:
             ]
         )
         run([command, "--version"])
+        help_checks = 0
+        before_help = {path.relative_to(work) for path in work.rglob("*")}
+        for tool in ("dogpdkb", "mdcompare", "mdocr"):
+            executable = environment / "bin" / tool
+            root_help = run([executable, "--help"])
+            # Commands are discovered from the public root help, so a new leaf
+            # cannot silently remain outside the installed acceptance matrix.
+            commands = re.findall(
+                r"^    ([a-z][a-z0-9-]*)\s{2,}",
+                root_help.split("options:", 1)[0],
+                re.MULTILINE,
+            )
+            assert commands, f"no public commands discoverable for {tool}"
+            for scope in ([], *([name] for name in commands)):
+                ordinary = run([executable, *scope, "--help"])
+                assert ordinary == run([executable, *scope, "-h"])
+                full = run([executable, *scope, "--help", "--full"])
+                assert full == run([executable, *scope, "-h", "--full"])
+                assert len(full) > len(ordinary)
+                assert "--full" in ordinary
+                help_checks += 4
+            run([executable, "--version"])
+            help_checks += 1
+        after_help = {path.relative_to(work) for path in work.rglob("*")}
+        assert before_help == after_help, "installed help created runtime files"
+        print(
+            f"Installed offline help: {help_checks} flag/version checks passed; no runtime files created."
+        )
         run([command, "doctor", "--package"])
         run([command, "init-config", "-o", work / "portable"])
         assert not json.loads((work / "portable/books.json").read_text())[0]["enabled"]

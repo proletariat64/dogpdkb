@@ -1,0 +1,38 @@
+# Apply manifest and recovery contract
+
+Choose exactly one of --input DIFFERENCES and --resume RUN. Input is the frozen
+dogpdkb-differences-1 JSON emitted by discover, not Markdown. Use discover's saved
+artifact rather than assembling production selections manually. Its fields are
+schema, book, run_id, captured_at, listing, documents, absent, ignored and cutoff;
+selected document fields include document_id, observed version, title, remote
+path, source_url, format, metadata, reasons and prior local facts. Run/book and
+frozen targets must agree. Read discover --help --full for the complete listing
+and difference field contract.
+
+apply exports, catalogs, compares, freezes a plan, performs best-effort OCR and
+publishes complete usable corpus Markdown. It does not compile the graph.
+--stop-after plan saves all raw/comparison inputs and exits 0 before OCR or
+corpus publication. Resume checks saved inputs/witnesses and cannot repair
+deleted/changed plan inputs by downloading them again. A source change or
+intervening incompatible publication requires a fresh discovery and plan.
+
+The dogpdkb-compile-1 JSON contains schema, book (key), run_id, documents and
+failures. Minimal shape (paths and witnesses must actually be produced by apply):
+
+```json
+{"schema":"dogpdkb-compile-1","book":"funds","run_id":"run-example","documents":[{"document_id":"42","version":{"value":"2026-11-13T00:00:00Z","precision":"instant","utc":"2026-11-13T00:00:00+00:00"},"path":"/absolute/corpus/source.md","input_copy":"/absolute/state/funds/inputs/42/source.md","metadata":{"name":"Example","logical_path":"folder","source_ref":"https://example.invalid/source"},"action":"compile","reason_codes":["BODY_CHANGED"]}],"failures":[]}
+```
+
+Document actions: compile (complete current source), metadata (source metadata
+maintenance only), reuse (no graph content work). Paths identify full published
+Markdown; input_copy is its exact durable witness. baseline_version identifies
+the body comparison baseline. previous_graph freezes prior graph facts when
+known; optional prior facts may be absent. Version is observed, never synthesized.
+Failures carry step/document/version/reason and evidence when available; they
+remain separate from usable documents and can cause exit 2.
+
+stdout fields are exit_code, paused, manifest (path or null), run (run.json
+path). stderr carries live diagnostics. OCR partial can still publish usable
+bodies; source/graph facts advance only after their actual success. Same-version
+failed/unknown steps stay suppressed. A repeated invocation may perform downloads
+or model calls only for eligible work; do not blindly repeat to fix a failed step.

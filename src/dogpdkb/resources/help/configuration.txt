@@ -1,0 +1,114 @@
+# Configuration and common contracts
+
+Help and root --version require no configuration, authentication, optional tool,
+runtime lock or writable instance. Commands requiring an instance select TOML by
+explicit --config, then DOGPDKB_CONFIG, then checkout default.toml if present,
+otherwise dogpdkb.toml in the caller's current directory. CLI path arguments are
+relative to cwd and support ~ where the command resolves it. TOML paths are
+relative to the selected file; explicit book corpus paths use the books file.
+
+Minimal instance/dogpdkb.toml (create examples with init-config first):
+
+```toml
+[source]
+books_file = "books.json"
+[paths]
+corpus = "corpus"
+staging = "runs"
+state = "state"
+web = "web"
+results = "results"
+ocr_cache = "ocr-cache"
+[tools]
+skylark = "skylark"
+mdcompare = "mdcompare"
+mdocr = "mdocr"
+graphify = "graphify"
+```
+
+Minimal books.json:
+
+```json
+[{"key":"funds","name":"Funds","url":"https://example.invalid/team/book","enabled":true}]
+```
+
+The example URL is a placeholder: replace it with your authorized book URL.
+The books file is a JSON array of objects. Each key is unique and matches
+[A-Za-z0-9][A-Za-z0-9_-]*. enabled defaults true and must be boolean; disabled
+sources are skipped. Enabled sources require an HTTP(S) url without credentials,
+query or fragment; name defaults to the empty string. corpus, when omitted,
+defaults to paths.corpus/key; an explicit nonempty string is relative to the
+books file. Optional document_ids is a nonempty unique list of nonblank string
+IDs; omission subscribes to the whole book. A complete source listing is still
+validated before subscription filtering. Changing a pinned subscription/source
+or target requires a new key/state or a fresh plan, not silent resume.
+--book selects the key, not name or URL; omission must match exactly one enabled
+source. Reusing a key for a different source URL is refused.
+
+TOML sections are tables. Recognized settings and fallback values:
+
+- source.books_file: nonempty path, books.json.
+- paths.corpus: corpus; paths.staging: runs; paths.state: state;
+  paths.web: web; paths.results: results; paths.ocr_cache: ocr-cache.
+- paths.graph_dir: optional path, otherwise corpus/graphify-out per book.
+- DOGPDKB_CORPUS, DOGPDKB_STAGING, DOGPDKB_STATE, DOGPDKB_WEB and
+  DOGPDKB_GRAPH_DIR override corresponding paths relative to cwd. A corpus
+  override is the exact book corpus, without the usual key suffix.
+- skylark.proxy_bin: executable, utoo-proxy; UTOO_PROXY_BIN overrides it.
+  Executable paths containing / or beginning with ~ use the TOML directory.
+- skylark.mcp_url: optional HTTP(S) gateway URL without credentials/query/fragment;
+  SKYLARK_MCP_URL overrides it. Empty means retain the tool's gateway default.
+- skylark.timeout_seconds: positive finite number, default 60 seconds; passed
+  to Skylark as SKYLARK_TIMEOUT_MS. Existing retry/SSO behavior belongs to Skylark.
+- ocr.budget_seconds: positive finite number, default 1800 seconds shared across
+  serial document OCR calls; in-flight tool deadlines remain tool-owned.
+- tools.skylark/mdcompare/mdocr/graphify: nonempty executable string or nonempty
+  string argv array, default the tool name. This is not shell command text.
+  Only argv[0] containing / or starting with ~ is resolved against the TOML;
+  subsequent argv elements are literal. Use absolute script arguments when
+  portability between working directories is required.
+- web.groups and web.group_prefixes: display grouping maps; web.topics: topic
+  definitions; web.community_limit: maximum featured communities (default 120).
+  Publication consumes these optional display settings without changing sync.
+
+Tools are independent public CLIs. Skylark uses existing SSO and gateway settings;
+mdocr uses PADDLEOCR_TOKEN for new batch OCR, while its standalone ocr command
+requires the token at validation. Graphify retains its own provider configuration.
+Do not put credentials into saved plans, manifests or command examples.
+
+## Run and result schemas
+
+Run JSON (dogpdkb-run-1) is an observational record, not a request to edit manually:
+schema, run_id, command, book (key/name/url), pid, status, stage, counts object,
+started_at, updated_at, ended_at (string or null), exit_code (integer or null),
+reason (string or null), artifacts (names mapped to absolute paths), failures
+(evidence objects), targets (frozen book URL and absolute corpus/graph paths).
+Optional stage/checkpoint fields are added as work progresses. Statuses include
+running, paused, completed, partial, failed and interrupted. A recorded running
+run with no active owner is observed as interrupted. Run references accept an
+ID, directory or run.json path; persisted paths are absolute. Modified targets,
+missing or changed frozen inputs and intervening publications invalidate resume.
+
+Durable state is separate from wash and keeps observed, raw, corpus and graph
+facts distinct. A normalized version has value and precision (day, instant or opaque),
+optionally utc; unknown remains null and is not a successful version. Failed,
+unknown or in-flight attempts suppress the same version/step; unstarted work and
+new versions are different. Deleting wash does not remove suppression.
+
+Exit codes for sync/apply/graph operations: 0 completed/no work/plan pause;
+2 recorded failures/blocked steps (a graph stage may publish nothing); 1 batch failure; 64 CLI usage;
+130 SIGINT; 143 SIGTERM. Other commands list their own applicable exits.
+stdout is the command result; stderr is progress and diagnostics. Child tool
+output is streamed as diagnostics, never parsed into invented business counts.
+
+## Recovery and side effects
+
+Inspect status and the referenced reports before choosing a next action. A plan
+pause has exit 0 and is eligible for explicit resume with intact frozen inputs.
+Completed/partial sync cleans successful wash copies, retaining failure evidence
+and compact records; cleaned runs cannot resume. An external agent diagnoses
+failed/unknown work and creates new work subject to durable suppression. An
+ordinary repeat is not an automatic retry mechanism. A failed graph does not
+roll back already published corpus; absent remote IDs do not delete local data.
+Write commands hold corpus/graph locks, and active subprocesses retain them.
+Neither --force nor recorded stale runs bypass an active lock.

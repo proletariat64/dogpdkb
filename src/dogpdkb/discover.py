@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import re
 import sys
@@ -10,6 +9,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
+from dogpdkb.help import HelpParser
 from dogpdkb.processes import diagnostic_argv, run_command
 from dogpdkb.records import UTC8, Run, Store, atomic_json, read_json
 from dogpdkb.settings import load_config, select_book
@@ -295,7 +295,7 @@ def discover(settings, book, store, run, listing=None):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="dogpdkb discover")
+    parser = HelpParser(prog="dogpdkb discover")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--book")
     parser.add_argument("--listing", type=Path)

@@ -31,7 +31,8 @@ include = ["dogpdkb*", "mdocr*", "mdcompare*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-dogpdkb = ["resources/*.toml", "resources/*.json"]
+dogpdkb = ["resources/*.toml", "resources/*.json", "resources/help/*.txt"]
+mdcompare = ["help/*.txt"]
 
 [[tool.uv.index]]
 name = "pypi"

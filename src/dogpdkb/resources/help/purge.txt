@@ -1,0 +1,19 @@
+# Explicit wash deletion
+
+Specify exactly one of --run RUN and --all. An ID must identify a direct run-*
+directory inside this selected book's wash; directory and run.json references
+must resolve to the same permitted scope. Parent traversal, symlink wash/run
+paths, symlink run metadata, and overlap with protected state/corpus/graph/cache
+are rejected. All candidates are checked before deletion starts.
+
+Default permits completed/partial runs only. --force also permits discarding
+paused, failed or interrupted work, permanently losing that run's saved plan,
+failure Markdown, local images, reports and status evidence. It never permits
+deleting a still-running run or bypassing the held corpus/graph locks. Deletion
+can fail partway due to filesystem errors; no rollback or automatic retry exists.
+
+stdout schema is an object with book (selected key) and purged (absolute directory
+path array). An empty --all selection succeeds with []. --run for a missing
+directory fails; a repeated --all returns remaining candidates only. No remote
+tools or model calls occur. Persistent inputs, durable facts/suppression, corpus,
+published graph and tool caches remain. Purge is not failure recovery or reset.

@@ -1,0 +1,23 @@
+# Local Web publication
+
+Requires a readable TOML instance. --input/-i overrides corpus, --graph selects
+graph JSON, --output/-o overrides Web output, --book-name/--book-url override
+source display metadata. Explicit path arguments expand ~ and use cwd. Source
+selection is skipped only when input, output and book-url are all provided;
+otherwise --book selection must resolve exactly one enabled source.
+
+Default graph file: configured paths.graph_dir/graph.json or
+input/graphify-out/graph.json. Default output: paths.web/book-key. The input must
+be a directory and graph JSON readable. This renders existing facts, not a sync,
+graph compile, remote upload, deployment or live data refresh.
+
+stdout JSON has status:completed; documents/nodes/edges/communities (integer
+counts); catalog (output/catalog.json) and map (output/map/map-data.json).
+Builds complete catalog and featured-community map, writes a versioned snapshot
+under .snapshots and switches current outputs/pointers atomically where supported.
+Catalog contains source book, document metadata, graph/community statistics and
+document references; map contains layered nodes/edges and featured-community
+statistics. Files are Web presentation artifacts, not sync state or an editable
+tool input schema. Repeating writes a new snapshot; no automatic historical
+snapshot deletion is part of this operation. Inspect stdout output paths after
+success. Parser/input errors exit 2 and do not mean a sync partial result.

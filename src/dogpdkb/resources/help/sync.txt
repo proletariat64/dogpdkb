@@ -1,0 +1,34 @@
+# Serial sync contract
+
+sync needs no manifest argument: it validates the complete source listing and
+executes whole-batch discovery, downloads, comparison, fixed planning, OCR,
+corpus publication and native Graphify compilation. It never publishes the Web.
+--resume accepts the same saved run instead of starting discovery again; the
+source, subscription, corpus and graph targets must still match. --stop-after
+plan pauses after complete raw inputs/comparisons and the fixed plan, before
+OCR, corpus and graph writes. Remove that option on resume to continue.
+
+```text
+dogpdkb sync --config instance/dogpdkb.toml --book funds --stop-after plan
+dogpdkb status --config instance/dogpdkb.toml --book funds --run RUN --json
+dogpdkb sync --config instance/dogpdkb.toml --book funds --resume RUN
+```
+
+stdout JSON has exit_code (0/1/2/130/143), paused (boolean), manifest (absolute
+dogpdkb-compile-1 JSON path or null), and run (absolute run.json path). Reports
+are reached through run.artifacts. Inputs and full-source witnesses required
+after cleanup live outside wash. A failure before a result can emit stderr only.
+--help --full on discover, apply and update-graph describes their stage schemas.
+
+Only successful OCR is reused by its tool. Downloaded raw versions, published
+corpus and successful graph versions remain separate facts. Source export and
+OCR failures are isolated where possible; usable bodies may still compile and
+produce exit 2. A shared graph failure can make the entire batch exit 1. Inspect
+failures and per-document reports; numeric exits alone do not grant retry.
+
+Stopped plans and interrupted/failed runs retain evidence. Saved input copies
+are checked before and after OCR and again before publication. Missing/changed
+inputs require a fresh plan, not automatic redownload. Completed/partial sync
+cleans successful wash copies; it cannot be resumed after cleanup. Durable
+failure/unknown suppression remains after purge. An agent must diagnose failures
+before arranging new work; ordinary repeated sync does not repair them.

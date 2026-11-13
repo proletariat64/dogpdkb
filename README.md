@@ -4,6 +4,27 @@ dogpdkb 是供 crontab 调用的知识库 CLI 编排器：选择增量、生成�
 Skylark、mdcompare、mdocr 和 Graphify，保存真实结果，并提供只读状态观察。
 Web 发布与软件生命周期独立。
 
+## Local help
+
+All installed CLI help is in English and works offline without configuration or
+authentication. Use root help to choose a command, command help for a first
+invocation, and `--help --full` for the complete local contract:
+
+```bash
+dogpdkb --help
+dogpdkb sync --help
+dogpdkb sync --help --full
+mdcompare knowledge -h --full
+mdocr batch -h --full
+skylark export -h --full
+```
+
+`-h` and `--help` are equivalent at each scope; `--full` requires a help flag.
+Each tool supports root `--version`. Help describes its actual input schemas,
+path rules, output files, side effects, exit meanings and recovery steps. Skylark
+remains a separate installation; its source delivery is recorded in the CLI-help
+acceptance notes, not bundled into the Python distribution.
+
 ## 日常使用
 
 ```bash

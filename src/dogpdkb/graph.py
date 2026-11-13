@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import argparse
 import os
 import shutil
 import sys
 from pathlib import Path
 
+from dogpdkb.help import HelpParser
 from dogpdkb.planning import reject_rollback
 from dogpdkb.processes import diagnostic_argv, run_command
 from dogpdkb.records import Run, Store, atomic_json, read_json, version_key
@@ -280,7 +280,7 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="dogpdkb update-graph", description=__doc__)
+    parser = HelpParser(prog="dogpdkb update-graph", description=__doc__)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--book")
     parser.add_argument(

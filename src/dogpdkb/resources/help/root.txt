@@ -1,0 +1,20 @@
+# Local command contracts
+
+Use dogpdkb COMMAND --help for a first invocation and COMMAND --help --full for
+complete inputs, outputs and boundary behavior at that command scope. Both -h
+and --help succeed without a configured instance; --full modifies help only.
+Root --version identifies the installed distribution and exits successfully.
+No business work is started by these requests.
+
+The serial path is discover -> apply -> update-graph, or sync for that complete
+chain in one held lock. status is read-only. init-state registers existing files
+before discovery; it does not certify a historical graph or rebuild it. Use
+init-config for disabled portable examples and doctor to check tool entry points.
+purge explicitly discards wash evidence. publish-web is independent local Web
+publication; update and uninstall manage only an active installer-owned program.
+
+All current public commands have scoped full local manuals. Authentication,
+configuration and write scopes are command-specific. root help/version exit 0;
+unknown command/option exits 64 with a concrete stderr diagnostic and help hint.
+Root invocation without arguments displays help and exits 0. Global installed
+configuration and data are neither migrated nor repaired by documentation access.

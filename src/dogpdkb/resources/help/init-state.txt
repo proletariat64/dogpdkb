@@ -1,0 +1,16 @@
+# Existing corpus registration
+
+Reads selected book corpus files named title-YYYY-MM-DD-[ID].md. Duplicate
+document IDs fail before durable registration. Registers baseline path,
+filename_date and precision:day, corpus path and day-precision version; graph
+status stays unknown. It does not invent raw/graph success from filenames,
+rewrite Markdown/graph, import legacy state/runs, download sources or extract.
+Already registered records remain intact on repeat.
+
+The output JSON reports book, registered (new count), graph_unknown (registered records
+whose graph status is unknown), ignored (unmatched or unsubscribed files),
+and state (absolute state.json path). Writes only durable state under source/
+graph write locks. This is not proof that the existing graph's native manifest
+exists: update-graph checks that prerequisite independently. Following successful
+registration, discover selects recent deltas; intentionally filtered historical
+missing documents are not backfilled.

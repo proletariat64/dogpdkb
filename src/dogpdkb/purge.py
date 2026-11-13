@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import shutil
 import sys
 from pathlib import Path
 
+from dogpdkb.help import HelpParser
 from dogpdkb.records import Run, Store, process_alive
 from dogpdkb.settings import load_config, select_book
 
@@ -62,7 +62,7 @@ def purge_runs(store, reference=None, *, all_runs=False, force=False):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, prog="dogpdkb purge")
+    parser = HelpParser(description=__doc__, prog="dogpdkb purge")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--book")
     target = parser.add_mutually_exclusive_group(required=True)

@@ -1,0 +1,35 @@
+# Graph compilation manifest
+
+--input/-i is required dogpdkb-compile-1 JSON emitted by apply. It contains schema,
+book (key), run_id, documents and failures. Each document contains document_id,
+version, path to complete published Markdown, input_copy (durable byte witness),
+metadata (name/logical_path/source_ref), action (compile/metadata/reuse), and
+reason_codes. Optional baseline_version/previous_graph freeze prior facts.
+Read apply --help --full for the full manifest example. Graph inputs require known nonempty
+normalized versions; null or empty versions are rejected.
+The run must exist, belong to the source, and retain matching frozen targets.
+Only actual corpus paths are accepted; fragments and changed witnesses fail.
+
+Graphify is an independent unmodified tool. An existing graph must retain its
+native manifest.json; missing native baseline stops before extraction. New graphs
+cannot silently pull unselected historical Markdown into extraction. A graph
+attempt failed/unknown at a current version blocks subsequent directory scans
+until an external agent resolves it or a new version arrives.
+
+Compilation scans the complete book corpus in a run-owned workspace copied from
+the existing graph/manifest/cache. Frozen inputs are rechecked after extraction.
+Only exit-zero valid graph+manifest output is published; native graph identities,
+relations, metadata and auxiliary cache are preserved. Public graph and native
+manifest remain unchanged on extraction failure. Publication interruption is
+unknown evidence, not success. Already published corpus is never rolled back.
+
+stdout has run_id, exit_code, status and report (absolute execution-report path
+or null). The report fields are schema (dogpdkb-graph-result-1), status, exit_code
+(native child exit), argv (sanitized strings), graph (published target), candidate
+(workspace path) and reason when applicable. Its native exit_code differs from
+stdout orchestration exit_code: native 0 can still yield status unknown and CLI 1
+when required output validation fails. This is not a Graphify-specific result
+protocol. Native graph JSON must contain nodes and links (or edges) arrays; the
+separate native manifest.json must be an object. There is no per-source success claim from a failed whole-directory run.
+Repeat only after inspecting failure/suppression and ensuring frozen inputs are
+still valid. A normal new sync uses this same graph stage automatically.

@@ -1,0 +1,21 @@
+# Managed software update
+
+--version requires the target stable MAJOR.MINOR.PATCH release; it is not the
+root version-display flag. Example: dogpdkb update --version 0.2.0, only if that
+release exists. Root dogpdkb --version reads the installed version without work.
+
+Only the active Linux installer-managed environment with verified ownership and
+matching current link is eligible. Direct pip/uv/source installs are refused.
+The target must not be older than the installed stable version. Same-version
+update is a complete reinstall. Existing jobs must stop; lifecycle locks protect
+activation and removal. The fixed source is AntCode HTTPS Releases, even for a
+GitHub-origin installation; use that provider's installer for GitHub-only targets.
+Downloads are bounded and redirects/incorrect release payloads are rejected.
+
+The verified installer replaces the disposable environment and matching owned
+command links, retaining external configuration, corpus, graph, state, caches
+and user data. Previous environment cleanup follows the existing installer
+contract; this command creates no rollback archive or version history.
+stdout/stderr are installer output, not a JSON success envelope. Native installer
+failures propagate. Read diagnostics before retrying; a failed update is not
+proof that the target is active. Documentation requests never contact Releases.

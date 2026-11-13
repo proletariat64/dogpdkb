@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
@@ -11,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 
+from dogpdkb.help import HelpParser
 from dogpdkb.planning import (
     descriptor,
     load_plan,
@@ -762,7 +762,7 @@ def record_interruption(store, run, code):
 
 
 def parser_for(command="apply"):
-    parser = argparse.ArgumentParser(prog=f"dogpdkb {command}")
+    parser = HelpParser(prog=f"dogpdkb {command}")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--book")
     selection = parser.add_mutually_exclusive_group(required=command == "apply")

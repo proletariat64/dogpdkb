@@ -1,0 +1,18 @@
+# Portable example creation
+
+--output/-o defaults to cwd, expands ~ and resolves to an absolute directory.
+Creates parents as needed and writes dogpdkb.toml and books.json exclusively.
+If either destination already exists or is a symlink, refuses before writing
+either example. An I/O error removes files created by this attempt; existing
+user files are never replaced. The directory can remain after a failed attempt.
+
+The TOML includes source/books, output paths, OCR budget and tool/gateway examples;
+books.json is an array with a disabled example source. No source is enabled by
+creating configuration. Replace placeholder URL, gateway, tool executables and
+paths, then explicitly enable a source. Authentication belongs in the selected
+tools' environments. Run doctor for offline entry-point checks and init-state
+before discovering changes to an existing corpus.
+
+stdout is a creation message, not JSON. Repeating in the same configured
+directory refuses; choose an empty directory for another instance. This command
+does not install tools, authenticate, synchronize, or initialize corpus state.
