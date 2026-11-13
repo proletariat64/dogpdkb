@@ -267,3 +267,30 @@ def test_failed_export_keeps_existing_markdown_picture_and_report(
         assert record["cleanup"]["status"] == "failed"
         assert (run.parent / "raw/0.md").exists()
         assert "cleanup" in result.stderr
+
+
+def test_failed_catalog_preserves_uncertain_image_bundle_and_original_exit(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("PADDLEOCR_TOKEN", raising=False)
+    from PIL import Image
+
+    config, tool = instance(tmp_path)
+    Image.new("RGB", (8, 8), "red").save(tmp_path / "fixture.png")
+    script = tool.read_text().replace(
+        "        rows.append({**doc,",
+        "        if doc['document_id']=='2':\n            image=path.parent.parent/'images'/'2.png';image.parent.mkdir(parents=True,exist_ok=True);image.write_bytes((root/'fixture.png').read_bytes());path.write_text(path.read_text()+'\\n![failed](../images/2.png)\\n')\n        rows.append({**doc,",
+    )
+    script = script.replace(
+        "if tool in ('mdcompare', 'mdocr'):",
+        "if tool == 'mdcompare' and args[0] == 'catalog' and any('incoming-descriptors' in arg for arg in args): raise SystemExit(1)\nif tool in ('mdcompare', 'mdocr'):",
+    )
+    tool.write_text(script)
+    result = cli("sync", "--config", config)
+    assert result.returncode == 2, result.stderr
+    run = Path(json.loads(result.stdout)["run"])
+    record = json.loads(run.read_text())
+    assert record["cleanup"]["status"] == "failed"
+    assert "resource catalog unavailable" in record["cleanup"]["reason"]
+    assert (run.parent / "raw/1.md").is_file()
+    assert (run.parent / "images/2.png").is_file()

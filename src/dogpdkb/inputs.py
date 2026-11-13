@@ -58,7 +58,7 @@ def retain_raw(directory, source, resources):
             shutil.rmtree(staging)
 
 
-def retain_ocr_files(directory, run, result, output, resources):
+def retain_ocr_files(directory, run, result, output, resources, original_paths):
     """Relocate only file paths declared by the public OCR result contract."""
     mappings = {}
     records = [*result.get("resources", []), *result.get("ocr", {}).get("images", [])]
@@ -87,7 +87,8 @@ def retain_ocr_files(directory, run, result, output, resources):
     def relocate(text):
         text = relocate_targets(
             text,
-            {
+            original_paths
+            | {
                 r["resource_id"]: r["path"]
                 for r in resources
                 if r.get("path") and Path(r["path"]).is_file()
@@ -114,11 +115,17 @@ def retain_inputs(store, run, rows, results):
         identifier = row["document_id"]
         directory = store.input_directory(identifier)
         raw = store.document(identifier)["raw"]
+        original_resources = [dict(r) for r in raw.get("resources") or []]
         target, resources = retain_raw(
             directory,
             Path(row["raw_path"]),
-            [dict(r) for r in raw.get("resources", [])],
+            [dict(r) for r in original_resources],
         )
+        original_paths = {
+            before["path"]: after["path"]
+            for before, after in zip(original_resources, resources)
+            if before.get("path") and after.get("path")
+        }
         raw.update(path=str(target), resources=resources)
         row["resources"] = resources
         result = results.setdefault(identifier, {})
@@ -157,7 +164,9 @@ def retain_inputs(store, run, rows, results):
         output = Path(result.get("output") or "")
         if not output.is_file():
             continue
-        retained = retain_ocr_files(directory, run, result, output, resources)
+        retained = retain_ocr_files(
+            directory, run, result, output, resources, original_paths
+        )
         report["documents"] = [result]
         for item in request["documents"]:
             if str(item["document_id"]) == identifier:
@@ -203,11 +212,13 @@ def ocr_request_input(row, run):
         for target, retained in local.items()
     ):
         return str(source), row["ocr_resources"], {}
-    # A tool-facing copy has a different parent: relocate known relative uses too.
-    replacements = {before: after for before, after in local.items() if before != after}
+    copy = run.directory / "ocr-inputs" / f"{row['slot']}.md"
+    # mdocr accepts relative local targets; keep selections in the same spelling.
+    replacements = {
+        before: os.path.relpath(after, copy.parent) for before, after in local.items()
+    }
     text = source.read_text(encoding="utf-8")
     text = relocate_targets(text, replacements)
-    copy = run.directory / "ocr-inputs" / f"{row['slot']}.md"
     copy.parent.mkdir(parents=True, exist_ok=True)
     copy.write_text(text, encoding="utf-8")
     selected = row["ocr_resources"]

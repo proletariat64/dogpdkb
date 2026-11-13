@@ -25,7 +25,7 @@ def purge_runs(store, reference=None, *, all_runs=False, force=False):
             path = path.parent
         if ".." in path.parts:
             raise ValueError("run must be directly inside the selected book wash")
-        candidates = [path if path.is_absolute() else root / path]
+        candidates = [root / path if len(path.parts) == 1 else path.absolute()]
     protected = [
         store.settings.state,
         store.book.corpus,

@@ -48,6 +48,10 @@ def failure_files(store, run):
         ]:
             retain(value)
         if row:
+            if row.get("resources") is None:
+                raise ValueError(
+                    "failed source resource catalog unavailable; keeping wash"
+                )
             if failure.get("step") != "graph" or failure.get("input") == row.get(
                 "raw_path"
             ):

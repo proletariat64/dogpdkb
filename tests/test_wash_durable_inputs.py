@@ -192,7 +192,7 @@ if not Path(__file__).with_name('allow').exists():
  option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','causes':['OCR_AUTH_UNAVAILABLE'],'documents':[{'document_id':doc['document_id'],'status':'partial','output':None,'resources':[]}]}));raise SystemExit(2)
 if doc['document_id']=='43':
  target=body.split('](')[1].split(')')[0]
- assert Path(target).is_file(),target
+ assert (Path(doc['path']).parent/target).is_file(),target
  with Path(__file__).with_name('valid-images').open('a') as log:log.write('43\\n')
 output=option('--output-dir')/'enriched.md';output.parent.mkdir(parents=True,exist_ok=True);output.write_text(body)
 option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[]}]}))
@@ -287,3 +287,113 @@ def test_partial_relative_image_is_readable_in_formal_corpus_after_wash_deleted(
     resource = json.loads(catalog.read_text())["documents"][0]["resources"][0]
     assert resource.get("path"), resource
     assert Path(resource["path"]).is_file()
+
+
+def test_real_mdocr_partial_keeps_formal_image_after_wash_deletion(
+    tmp_path, monkeypatch
+):
+    import os
+    import subprocess
+
+    monkeypatch.delenv("PADDLEOCR_TOKEN", raising=False)
+    config, differences = instance(tmp_path)
+    remote = json.loads((tmp_path / "remote.json").read_text())
+    remote["42"]["body"] += "\n![diagram](../images/diagram.png)\n"
+    (tmp_path / "remote.json").write_text(json.dumps(remote))
+    tool = tmp_path / "skylark.py"
+    tool.write_text(
+        tool.read_text().replace(
+            "path.write_text(doc['body'])",
+            "path.write_text(doc['body']); image=path.parent.parent/'images'/'diagram.png'; image.parent.mkdir(parents=True,exist_ok=True); __import__('PIL.Image',fromlist=['Image']).new('RGB',(8,8),'red').save(image)",
+        )
+    )
+    result = cli("apply", "--config", config, "--input", differences)
+    assert result.returncode == 2, result.stderr
+    document = json.loads(Path(json.loads(result.stdout)["manifest"]).read_text())[
+        "documents"
+    ][0]
+    shutil.rmtree(Path(json.loads(result.stdout)["run"]).parent)
+    source = tmp_path / "published-input.json"
+    source.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "documents": [
+                    {
+                        "knowledge_base": "funds",
+                        "document_id": "42",
+                        "path": document["path"],
+                        "content_kind": "raw",
+                        "metadata": document["metadata"],
+                    }
+                ],
+            }
+        )
+    )
+    catalog = tmp_path / "published-catalog.json"
+    checked = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mdcompare",
+            "catalog",
+            "--input",
+            str(source),
+            "--output",
+            str(catalog),
+        ],
+        env={
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert checked.returncode == 0, checked.stderr
+    resource = json.loads(catalog.read_text())["documents"][0]["resources"][0]
+    assert resource.get("path") and Path(resource["path"]).is_file(), resource
+
+
+@pytest.mark.parametrize("remove_old_wash", [False, True])
+def test_real_mdocr_retained_mixed_image_targets_remain_supported(
+    tmp_path, monkeypatch, remove_old_wash
+):
+    from tests.test_orchestrator_apply_cli import two_sources
+
+    monkeypatch.delenv("PADDLEOCR_TOKEN", raising=False)
+    config, differences = instance(tmp_path)
+    two_sources(tmp_path, differences)
+    remote = json.loads((tmp_path / "remote.json").read_text())
+    if remove_old_wash:
+        remote["42"]["body"] += "\n![stop](../images/relative-42.png)\n"
+    remote["43"]["body"] += (
+        "\n![absolute](ABSOLUTE_IMAGE)\n![relative](../images/relative-43.png)\n"
+    )
+    (tmp_path / "remote.json").write_text(json.dumps(remote))
+    tool = tmp_path / "skylark.py"
+    tool.write_text(
+        tool.read_text().replace(
+            "path.write_text(doc['body'])",
+            "images=path.parent.parent/'images'; images.mkdir(parents=True,exist_ok=True); image=__import__('PIL.Image',fromlist=['Image']).new('RGB',(8,8),'red'); absolute=images/('absolute-'+item['document_id']+'.png'); image.save(absolute); image.save(images/('relative-'+item['document_id']+'.png')); path.write_text(doc['body'].replace('ABSOLUTE_IMAGE',str(absolute)))",
+        )
+    )
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 2, first.stderr
+    if remove_old_wash:
+        shutil.rmtree(Path(json.loads(first.stdout)["run"]).parent)
+        second = cli("apply", "--config", config, "--input", differences)
+        assert second.returncode == 2, second.stderr
+    else:
+        second = first
+    directory = Path(json.loads(second.stdout)["run"]).parent
+    report = next(
+        json.loads(p.read_text())
+        for p in directory.glob("ocr-*-report.json")
+        if json.loads(p.read_text())["documents"][0]["document_id"] == "43"
+    )
+    assert report.get("causes"), report
+    resources = report["documents"][0]["resources"]
+    assert resources and not any(
+        "UNSUPPORTED" in r.get("reason", "") for r in resources
+    ), resources

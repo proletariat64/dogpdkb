@@ -232,3 +232,18 @@ def test_purge_reports_deletion_error_as_nonzero(tmp_path):
         directory.chmod(0o755)
     assert result.returncode == 1
     assert "dogpdkb purge:" in result.stderr
+
+
+@pytest.mark.parametrize("metadata", [False, True])
+def test_purge_accepts_working_directory_relative_run_path(
+    tmp_path, monkeypatch, metadata
+):
+    config = instance(tmp_path)
+    selected = run_directory(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    reference = selected.relative_to(tmp_path)
+    if metadata:
+        reference /= "run.json"
+    result = cli(config, "--book", "funds", "--run", reference)
+    assert result.returncode == 0, result.stderr
+    assert not selected.exists()
