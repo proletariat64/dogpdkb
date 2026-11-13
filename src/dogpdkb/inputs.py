@@ -1,8 +1,10 @@
-"""Keep latest successful inputs outside disposable run directories."""
+"""Keep immutable publication inputs outside disposable run directories."""
 
 import os
+import re
 import shutil
 import tempfile
+from html import unescape
 from pathlib import Path
 from urllib.parse import quote
 
@@ -62,13 +64,6 @@ def retain_ocr_files(directory, run, result, output, resources, original_paths):
     """Relocate only file paths declared by the public OCR result contract."""
     mappings = {}
     records = [*result.get("resources", []), *result.get("ocr", {}).get("images", [])]
-    files = directory / "ocr-files"
-    if files.exists() and not any(
-        isinstance(item.get(field), str) and Path(item[field]).is_relative_to(files)
-        for item in records
-        for field in ("source_path", "prepared_image", "artifact")
-    ):
-        shutil.rmtree(files)
     for item in records:
         for field in ("source_path", "prepared_image", "artifact"):
             value = item.get(field)
@@ -113,7 +108,11 @@ def retain_ocr_files(directory, run, result, output, resources, original_paths):
 def retain_inputs(store, run, rows, results):
     for row in rows:
         identifier = row["document_id"]
-        directory = store.input_directory(identifier)
+        parent = store.input_directory(identifier)
+        parent.mkdir(parents=True, exist_ok=True)
+        # Published Markdown can still refer to any earlier retained generation.
+        # A resume may publish twice in one run, so the run ID is not sufficient.
+        directory = Path(tempfile.mkdtemp(prefix="retained-", dir=parent))
         raw = store.document(identifier)["raw"]
         original_resources = [dict(r) for r in raw.get("resources") or []]
         target, resources = retain_raw(
@@ -184,9 +183,11 @@ def retain_inputs(store, run, rows, results):
 
 
 def relocate_targets(text, replacements):
-    """Replace declared inline destinations without changing unrelated prose."""
+    """Relocate declared destinations in published copies, leaving prose intact."""
+    targets = {}
     for before, after in replacements.items():
         for spelling in {before, quote(before, safe="/:")}:
+            targets[spelling] = quote(after, safe="/:")
             for ending in (")", " ", "\t", "\n"):
                 text = text.replace(
                     "](" + spelling + ending, "](" + quote(after, safe="/:") + ending
@@ -194,6 +195,51 @@ def relocate_targets(text, replacements):
             text = text.replace(
                 "](<" + spelling + ">", "](<" + quote(after, safe="/:") + ">"
             )
+
+    def definition(match):
+        angle, plain = match.group("angle", "plain")
+        value = angle if angle is not None else plain
+        replacement = targets.get(value, value)
+        return match.group("prefix") + (
+            "<" + replacement + ">" if angle is not None else replacement
+        )
+
+    text = re.sub(
+        r"(?m)(?P<prefix>^ {0,3}\[[^\]\r\n]+\]:[ \t]*)"
+        r"(?:<(?P<angle>[^>\r\n]+)>|(?P<plain>\S+))",
+        definition,
+        text,
+    )
+
+    def attribute(match):
+        quoted, bare = match.group("quoted", "bare")
+        value = quoted if quoted is not None else bare
+        if match.group("name").lower() == "srcset":
+            replacement = re.sub(
+                r"(^|[\s,])([^\s,]+)",
+                lambda token: (
+                    token.group(1)
+                    + targets.get(unescape(token.group(2)), token.group(2))
+                ),
+                value,
+            )
+        else:
+            replacement = targets.get(unescape(value), value)
+        if replacement == value:
+            return match.group()
+        marker = match.group("quote") or ""
+        return match.group("prefix") + marker + replacement + marker
+
+    def tag(match):
+        return re.sub(
+            r"(?P<prefix>\s(?P<name>srcset|src|poster|data|xlink:href|href)\s*=\s*)"
+            r"(?:(?P<quote>[\"'])(?P<quoted>.*?)(?P=quote)|(?P<bare>[^\s>]+))",
+            attribute,
+            match.group(),
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+    text = re.sub(r"<[A-Za-z](?:[^>\"']|\"[^\"]*\"|'[^']*')*>", tag, text)
     return text
 
 

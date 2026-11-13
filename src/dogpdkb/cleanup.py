@@ -58,9 +58,14 @@ def failure_files(store, run):
                 retain(row.get("raw_path"))
             for resource in row.get("resources", []):
                 retain(resource.get("path"))
-        request = root / f"ocr-{row['slot']}-request.json" if row else None
+        ocr = store.step(row["document_id"], "ocr") if row else None
+        request = (
+            Path(ocr["input"])
+            if ocr and ocr.get("run_id") == run.id and isinstance(ocr.get("input"), str)
+            else None
+        )
         if request and request.is_file():
-            keep.add(request)
+            retain(str(request))
             for document in read_json(request).get("documents", []):
                 retain(document.get("path"))
         report = failure.get("report")
