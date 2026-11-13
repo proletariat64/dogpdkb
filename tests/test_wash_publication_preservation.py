@@ -238,6 +238,9 @@ def test_resumed_run_uses_new_publication_generation(tmp_path):
         '![diagram][image]\n[image]: ../images/diagram.png "Original"',
         '![diagram][image]\n[image]: <../images/diagram.png> "Original"',
         '<img srcset="ABSOLUTE_IMAGE 1x, ../images/diagram.png 2x">',
+        "<img alt=\"literal src='../images/diagram.png'\" src='../images/diagram.png'>",
+        '<img alt="literal ![example](../images/diagram.png)" src="../images/diagram.png">',
+        '<img srcset="1x 1x, ../images/diagram.png 2x">',
     ],
 )
 def test_catalogued_noninline_resource_survives_wash_purge(tmp_path, markup):
@@ -253,6 +256,7 @@ def test_catalogued_noninline_resource_survives_wash_purge(tmp_path, markup):
             "image=path.parent.parent/'images'/'diagram.png'; "
             "image.parent.mkdir(parents=True,exist_ok=True); "
             "__import__('PIL.Image',fromlist=['Image']).new('RGB',(2,2),'red').save(image); "
+            "__import__('PIL.Image',fromlist=['Image']).new('RGB',(2,2),'red').save(path.parent/'1x',format='PNG'); "
             "path.write_text(doc['body'].replace('ABSOLUTE_IMAGE',str(image)))",
         )
     )
@@ -266,7 +270,17 @@ def test_catalogued_noninline_resource_survives_wash_purge(tmp_path, markup):
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
     assert Path(state["documents"]["42"]["raw"]["path"]).read_bytes() == raw_source
     original_image = run.parent / "images/diagram.png"
-    assert f"literal target: {original_image}" in Path(document["path"]).read_text()
+    published = Path(document["path"]).read_text()
+    assert f"literal target: {original_image}" in published
+    if "literal src=" in markup:
+        assert "alt=\"literal src='../images/diagram.png'\"" in published
+    if "literal ![example]" in markup:
+        assert 'alt="literal ![example](../images/diagram.png)"' in published
+    if 'srcset="1x 1x,' in markup:
+        import re
+
+        srcset = re.search(r'srcset="([^"]+)"', published).group(1)
+        assert [candidate.split()[1] for candidate in srcset.split(",")] == ["1x", "2x"]
     removed = cli("purge", "--config", config, "--run", run)
     assert removed.returncode == 0, removed.stderr
     assert not run.parent.exists()
@@ -308,7 +322,64 @@ def test_catalogued_noninline_resource_survives_wash_purge(tmp_path, markup):
     assert checked.returncode == 0, checked.stderr
     resources = json.loads(catalog.read_text())["documents"][0]["resources"]
     assert resources
-    assert all(
-        resource.get("path") and Path(resource["path"]).is_file()
-        for resource in resources
+    if "literal ![example]" in markup:
+        # The catalog conservatively also reports Markdown-looking alt text.
+        # The HTML destination itself must survive; the literal stays literal.
+        import re
+        from urllib.parse import unquote
+
+        live = re.search(r'\bsrc="([^"]+)"', published)
+        assert live and Path(unquote(live.group(1))).is_file()
+    else:
+        assert all(
+            resource.get("path") and Path(resource["path"]).is_file()
+            for resource in resources
+        )
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        '```html\n<img src="../images/diagram.png">\n![example](../images/diagram.png)\n[example]: ../images/diagram.png\n```',
+        '~~~html\n<img src="../images/diagram.png">\n![example](../images/diagram.png)\n[example]: ../images/diagram.png\n~~~',
+        '`<img src="../images/diagram.png">` and `![example](../images/diagram.png)`',
+        '<!--\n<img src="../images/diagram.png">\n![example](../images/diagram.png)\n[example]: ../images/diagram.png\n-->',
+    ],
+)
+def test_resource_relocation_preserves_literal_examples(tmp_path, literal):
+    import re
+    from urllib.parse import unquote
+
+    config, differences = enriched_instance(tmp_path)
+    remote_path = tmp_path / "remote.json"
+    remote = json.loads(remote_path.read_text())
+    remote["42"]["body"] += (
+        '\n<img alt="live" src="../images/diagram.png">\n\n' + literal + "\n"
     )
+    remote_path.write_text(json.dumps(remote))
+    exporter = tmp_path / "skylark.py"
+    exporter.write_text(
+        exporter.read_text().replace(
+            "path.write_text(doc['body'])",
+            "image=path.parent.parent/'images'/'diagram.png'; "
+            "image.parent.mkdir(parents=True,exist_ok=True); "
+            "__import__('PIL.Image',fromlist=['Image']).new('RGB',(2,2),'red').save(image); "
+            "path.write_text(doc['body'])",
+        )
+    )
+    result = cli("apply", "--config", config, "--input", differences)
+    assert result.returncode in {0, 2}, result.stderr
+    run = Path(json.loads(result.stdout)["run"])
+    document = json.loads(Path(json.loads(result.stdout)["manifest"]).read_text())[
+        "documents"
+    ][0]
+    published = Path(document["path"]).read_text()
+    assert literal in published, "relocation changed a literal example"
+    live = re.search(r'<img alt="live" src="([^"]+)">', published)
+    assert live
+    target = Path(unquote(live.group(1)))
+    assert target.is_absolute()
+    removed = cli("purge", "--config", config, "--run", run)
+    assert removed.returncode == 0, removed.stderr
+    assert target.is_file()
+    assert literal in Path(document["path"]).read_text()

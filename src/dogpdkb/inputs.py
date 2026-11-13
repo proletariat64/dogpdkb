@@ -183,20 +183,99 @@ def retain_inputs(store, run, rows, results):
 
 
 def relocate_targets(text, replacements):
-    """Relocate declared destinations in published copies, leaving prose intact."""
-    targets = {}
-    for before, after in replacements.items():
-        for spelling in {before, quote(before, safe="/:")}:
-            targets[spelling] = quote(after, safe="/:")
-            for ending in (")", " ", "\t", "\n"):
-                text = text.replace(
-                    "](" + spelling + ending, "](" + quote(after, safe="/:") + ending
-                )
-            text = text.replace(
-                "](<" + spelling + ">", "](<" + quote(after, safe="/:") + ">"
+    """Relocate destinations without changing explicit literal examples."""
+    targets = {
+        spelling: quote(after, safe="/:")
+        for before, after in replacements.items()
+        for spelling in {before, quote(before, safe="/:")}
+    }
+    parts, start = [], 0
+    for left, right, html in _relocation_regions(text):
+        parts.append(
+            _relocate_markdown(
+                text[start:left],
+                targets,
+                line_start=start == 0 or text[start - 1] == "\n",
             )
+        )
+        parts.append(
+            _relocate_html(text[left:right], targets) if html else text[left:right]
+        )
+        start = right
+    parts.append(
+        _relocate_markdown(
+            text[start:],
+            targets,
+            line_start=start == 0 or text[start - 1] == "\n",
+        )
+    )
+    return "".join(parts)
+
+
+def _relocation_regions(text):
+    """Separate HTML tags from explicit fences, comments and code spans."""
+    tokens = re.compile(
+        r"(?m)^ {0,3}(?P<fence>`{3,}|~{3,})[^\r\n]*(?:\r?\n|$)"
+        r"|(?P<comment><!--)"
+        r"|(?P<tag><[A-Za-z][A-Za-z0-9:-]*(?=[\s>]|/>)(?:[^>\"']|\"[^\"]*\"|'[^']*')*>)"
+        r"|(?P<ticks>`+)"
+    )
+    following, closers = {}, {}
+    for run in reversed(list(re.finditer(r"`+", text))):
+        length = len(run.group())
+        closers[run.start()] = following.get(length)
+        following[length] = run
+    position = 0
+    while match := tokens.search(text, position):
+        position = match.end()
+        if match.group("tag"):
+            line = text[text.rfind("\n", 0, match.start()) + 1 : match.start()]
+            if text[max(0, match.start() - 2) : match.start()] == "](" or re.fullmatch(
+                r" {0,3}\[[^\]\r\n]+\]:[ \t]*", line
+            ):
+                continue  # Angle-wrapped Markdown targets are not HTML tags.
+            yield match.start(), position, True
+            continue
+        fence = match.group("fence")
+        if fence:
+            if (
+                fence[0] == "`"
+                and "`" in match.group()[match.group().index(fence) + len(fence) :]
+            ):
+                continue
+            closing = re.compile(
+                r"(?m)^ {0,3}"
+                + re.escape(fence[0])
+                + "{"
+                + str(len(fence))
+                + r",}[ \t]*(?:\r?\n|$)",
+            ).search(text, match.end())
+            end = closing.end() if closing else len(text)
+        elif match.group("comment"):
+            closing = text.find("-->", match.end())
+            end = closing + 3 if closing >= 0 else len(text)
+        else:
+            before = match.start()
+            while before and text[before - 1] == "\\":
+                before -= 1
+            closing = closers[match.start()]
+            if (match.start() - before) % 2 or closing is None:
+                continue
+            end = closing.end()
+        yield match.start(), end, False
+        position = end
+
+
+def _relocate_markdown(text, targets, *, line_start=True):
+    """Rewrite declared Markdown destinations outside literal regions and HTML."""
+    for before, after in targets.items():
+        for ending in (")", " ", "\t", "\n"):
+            text = text.replace("](" + before + ending, "](" + after + ending)
+        text = text.replace("](<" + before + ">", "](<" + after + ">")
 
     def definition(match):
+        if match.start() == 0 and not line_start:
+            return match.group()
         angle, plain = match.group("angle", "plain")
         value = angle if angle is not None else plain
         replacement = targets.get(value, value)
@@ -204,22 +283,30 @@ def relocate_targets(text, replacements):
             "<" + replacement + ">" if angle is not None else replacement
         )
 
-    text = re.sub(
+    return re.sub(
         r"(?m)(?P<prefix>^ {0,3}\[[^\]\r\n]+\]:[ \t]*)"
         r"(?:<(?P<angle>[^>\r\n]+)>|(?P<plain>\S+))",
         definition,
         text,
     )
 
+
+def _relocate_html(text, targets):
+    """Consume whole attributes before selecting destination value tokens."""
+
     def attribute(match):
+        name = match.group("name").lower()
+        if name not in {"srcset", "src", "poster", "data", "xlink:href", "href"}:
+            return match.group()
         quoted, bare = match.group("quoted", "bare")
         value = quoted if quoted is not None else bare
-        if match.group("name").lower() == "srcset":
+        if name == "srcset":
             replacement = re.sub(
-                r"(^|[\s,])([^\s,]+)",
+                r"(^|,)(\s*)([^\s,]+)",
                 lambda token: (
                     token.group(1)
-                    + targets.get(unescape(token.group(2)), token.group(2))
+                    + token.group(2)
+                    + targets.get(unescape(token.group(3)), token.group(3))
                 ),
                 value,
             )
@@ -230,17 +317,13 @@ def relocate_targets(text, replacements):
         marker = match.group("quote") or ""
         return match.group("prefix") + marker + replacement + marker
 
-    def tag(match):
-        return re.sub(
-            r"(?P<prefix>\s(?P<name>srcset|src|poster|data|xlink:href|href)\s*=\s*)"
-            r"(?:(?P<quote>[\"'])(?P<quoted>.*?)(?P=quote)|(?P<bare>[^\s>]+))",
-            attribute,
-            match.group(),
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-
-    text = re.sub(r"<[A-Za-z](?:[^>\"']|\"[^\"]*\"|'[^']*')*>", tag, text)
-    return text
+    return re.sub(
+        r"(?P<prefix>\s(?P<name>[^\s/>=]+)\s*=\s*)"
+        r"(?:(?P<quote>[\"'])(?P<quoted>.*?)(?P=quote)|(?P<bare>[^\s>]+))",
+        attribute,
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
 
 def ocr_request_input(row, run):
