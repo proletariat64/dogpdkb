@@ -70,6 +70,10 @@ def prepare_inputs(settings, book, store, run, differences):
         or len(set(identifiers)) != len(identifiers)
     ):
         raise ValueError("difference source IDs must be unique and nonempty")
+    if book.document_ids is not None and not set(identifiers).issubset(
+        book.document_ids
+    ):
+        raise ValueError("difference source IDs outside subscription")
     atomic_json(run.directory / "differences.json", differences)
     run.data["artifacts"]["differences"] = str(run.directory / "differences.json")
     prepared_path = run.directory / "prepared-inputs.json"

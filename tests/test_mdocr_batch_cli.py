@@ -5,6 +5,9 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import quote
+
+import pytest
 
 
 def invoke(tmp_path, documents, *extra, token=None):
@@ -336,3 +339,26 @@ def test_batch_evidence_is_consumable_by_mdcompare_cli(tmp_path):
     comparison = json.loads(output.read_text())["results"][0]
     assert comparison["ocr"]["status"] == "UNCHANGED"
     assert comparison["action"] == "SKIP_VERIFIED"
+
+
+@pytest.mark.parametrize("filename", ["image%20.png", "image%23.png", "image#tag.png"])
+@pytest.mark.parametrize("absolute", [False, True])
+def test_report_cannot_overwrite_encoded_local_image(tmp_path, filename, absolute):
+    image = tmp_path / filename
+    Image.new("RGB", (8, 8), "red").save(image)
+    original = image.read_bytes()
+    raw = tmp_path / "raw.md"
+    target = str(image) if absolute else filename
+    raw.write_text(f"Body\n![image]({quote(target, safe='/')})\n")
+    original_markdown = raw.read_bytes()
+    result, _ = invoke(
+        tmp_path,
+        [{"document_id": "doc", "path": "raw.md", "resources": []}],
+        "--report",
+        str(image),
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "OUTPUT_OVERLAPS_INPUT" in result.stderr
+    assert image.read_bytes() == original
+    assert raw.read_bytes() == original_markdown
+    assert not (tmp_path / "out").exists()

@@ -24,7 +24,7 @@ from .prepare import JPEG_QUALITY, ImageError, ImageSkip, prepare_one
 def _local_image_path(target, source):
     parsed = urlsplit(target)
     if not parsed.scheme and not parsed.netloc:
-        return (source.parent / unquote(parsed.path)).resolve()
+        return (source.parent / target).resolve()
     return None
 
 
@@ -250,7 +250,14 @@ def run_batch(args) -> int:
         except (OSError, UnicodeError):
             continue
         for _match, ref in iter_image_matches(text):
-            image = _local_image_path(ref.target, source)
+            # Supported local targets are decoded by the parser: match
+            # prepare_one's exact read path. Other local URL forms remain
+            # encoded and need one decode for input protection only.
+            image = (
+                (source.parent / ref.target).resolve()
+                if not ref.is_remote and not ref.unsupported
+                else _local_image_path(unquote(ref.target), source)
+            )
             if image is not None:
                 protected.add(image)
         for block in _OCR_BLOCK_RE.finditer(text):

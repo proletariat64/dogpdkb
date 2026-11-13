@@ -892,3 +892,32 @@ def test_imported_difference_rejects_another_source_book_before_export(tmp_path)
     assert "book mismatch" in result.stderr
     assert not (tmp_path / "events").exists()
     assert not list((tmp_path / "corpus").glob("*.md"))
+
+
+@pytest.mark.parametrize("include_subscribed", [False, True])
+def test_apply_rejects_unsubscribed_difference_before_export_or_saved_inputs(
+    tmp_path, include_subscribed
+):
+    config, differences = instance(tmp_path)
+    books_path = tmp_path / "books.json"
+    books = json.loads(books_path.read_text())
+    books[0]["document_ids"] = ["43"]
+    books_path.write_text(json.dumps(books))
+    data = json.loads(differences.read_text())
+    if include_subscribed:
+        subscribed = {**data["documents"][0], "document_id": "43"}
+        data["documents"].insert(0, subscribed)
+        remote_path = tmp_path / "remote.json"
+        remote = json.loads(remote_path.read_text())
+        remote["43"] = {**remote["42"], "body": "# Subscribed source\n"}
+        remote_path.write_text(json.dumps(remote))
+    differences.write_text(json.dumps(data))
+    result = cli("apply", "--config", config, "--input", differences)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "outside subscription" in result.stderr
+    assert not (tmp_path / "events").exists()
+    assert not (tmp_path / "state/funds/state.json").exists()
+    assert not list((tmp_path / "corpus").glob("*.md"))
+    assert not list((tmp_path / "runs").rglob("differences.json"))
+    assert not list((tmp_path / "runs").rglob("prepared-inputs.json"))
+    assert not list((tmp_path / "runs").rglob("export-*-request.json"))
