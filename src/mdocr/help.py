@@ -87,14 +87,19 @@ Eligible images become Prepared image JPEGs, then model calls produce a marked
 OCR block containing Markdown and its original-image link. Nested model images
 are replaced with textual placeholders. Remote downloads require --download.
 Existing OCR blocks are preserved unless --force requests fresh re-OCR from
-their local Prepared image. There is no persistent OCR-result cache here;
+their local Prepared image. For re-OCR, existing block sources must be canonical
+relative assets/...jpg paths already present under the destination output
+directory, not merely beside the input Markdown. Copy that prepared assets tree
+when moving an existing OCR document to a new destination before using --force.
+There is no persistent OCR-result cache here;
 batch has a separate successful-result cache. New work can incur model charges.
 """
     + FILE_CONTRACT
     + """
 After partial processing, preserve successful OCR blocks and repair failed image
-sources. A fresh output directory avoids overwrites; --force may also repeat
-successful model work, so do not use it as a blanket retry instruction.
+sources. A fresh output directory avoids overwrites for raw inputs; existing
+OCR blocks need their prepared assets copied into that destination for re-OCR.
+--force may repeat successful model work; do not use it as a blanket retry.
 Full local contract: mdocr ocr --help --full
 """
 )
@@ -141,7 +146,12 @@ OCR_FULL = (
   mdocr:ocr-end HTML comments. The begin marker's source points at the Prepared
   image; the block ends with an Original image Markdown link to the same JPEG.
   --force permits both existing output replacement and new OCR of existing
-  blocks using their source JPEG. A failed replacement preserves the old block.
+  blocks using their source JPEG. Unlike raw Markdown references, an existing
+  OCR block's source must be a canonical relative assets/...jpg path resolved
+  under --output-dir, not the input Markdown directory. Re-OCR to a new output
+  directory requires copying its prepared assets tree there first. Absolute,
+  escaping, or noncanonical sources are rejected. A failed replacement preserves
+  the old block and yields a processing error; it does not fetch a missing JPEG.
   Without --force, existing OCR block contents and source links are protected.
   Transport, polling, result parsing and individual image errors go to stderr;
   later images/files continue, and retained partial output exits 1.
@@ -156,6 +166,8 @@ Minimal input.json (place doc.md next to it):
     {"document_id":"doc-1","path":"doc.md","resources":[]}
   ]}
 Omit resources to select all supported inline images; [] selects no new OCR.
+Selection strings match parsed image targets exactly and are not normalized:
+local a%20b.png#preview matches a b.png; HTTP(S) targets keep percent-encoding.
 Document IDs must be unique, nonempty strings. Document paths resolve relative
 to the manifest; image references resolve from each source Markdown directory.
 All CLI paths are relative to cwd. This command needs no configuration file.
@@ -205,8 +217,14 @@ Input JSON schema:
   unique nonempty string), path (required nonempty string; absolute or relative
   to the manifest), and resources (optional array of nonempty image targets).
   Omitted or null resources selects every supported inline Markdown image;
-  [] selects none. Targets are decoded and have URL fragments removed; matching
-  is exact. A selected target absent from the document is RESOURCE_NOT_FOUND.
+  [] selects none. Selection entries are compared verbatim against parsed
+  Markdown targets; the selection strings themselves are not normalized. Parsed
+  local targets are percent-decoded and have fragments removed: the Markdown
+  target a%20b.png#preview needs selection "a b.png", not "a%20b.png#preview".
+  Parsed HTTP(S) targets lose fragments but retain percent-encoding, so an image
+  https://example.invalid/a%20b.png#preview needs that URL without #preview,
+  preserving %20. A selected string absent from parsed targets is reported as
+  RESOURCE_NOT_FOUND and does not select a different target implicitly.
   Additional object fields are ignored; document_id/path cannot be null.
   Unsupported/reference/HTML syntax is retained with warnings. Supported image
   defaults are .png .webp .gif .jpg .jpeg .tif .tiff; batch has no --format option.
@@ -226,12 +244,16 @@ Report JSON schema (mdocr-batch-1.0):
     error: "DOCUMENT_READ_FAILED" on document read/UTF-8 failure; otherwise absent.
     ocr: successful evidence object described below, including an empty images
       array when no new or reused successful evidence was produced.
-  counts: object mapping resource status strings to integer occurrence counts;
-    absent status keys have zero resources. These are not document counts.
+  counts: object mapping resource status strings to integer counts of per-document
+    resource records. Repeated references to one target within a document share
+    one record, while the same target in another document has its own record.
+    Absent status keys have zero records. These are not reference-occurrence or
+    document counts.
   causes: array, empty or containing the shared stop reason for this batch.
 
 Resource record schema:
-  resource_id: decoded target string (URL fragment removed).
+  resource_id: parsed Markdown target string without a URL fragment; local paths
+    are percent-decoded, while HTTP(S) targets preserve percent-encoding.
   status: "success" (new OCR), "reused" (validated cache), "failed",
     "unattempted", or "unselected" (no selected new call and no cache hit).
   reason: optional code: IMAGE_PROCESSING_FAILED, RESOURCE_NOT_FOUND,

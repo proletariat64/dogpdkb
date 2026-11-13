@@ -79,6 +79,7 @@ class HelpParser(argparse.ArgumentParser):
 
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("formatter_class", argparse.RawDescriptionHelpFormatter)
+        kwargs.setdefault("allow_abbrev", False)
         super().__init__(*args, **kwargs)
         self.scope = self.prog.removeprefix("dogpdkb").strip()
         self.description = SUMMARIES.get(self.scope, self.description)
@@ -92,6 +93,12 @@ class HelpParser(argparse.ArgumentParser):
     def parse_known_args(self, args=None, namespace=None):
         arguments = list(sys.argv[1:] if args is None else args)
         self.full_help = "--full" in arguments
+        if self.full_help and not self.scope:
+            command = next((arg for arg in arguments if arg in EXAMPLES), None)
+            if command and arguments.index("--full") < arguments.index(command):
+                self.error(
+                    f"place --full after the command: dogpdkb {command} --help --full"
+                )
         if self.full_help and not any(flag in arguments for flag in ("-h", "--help")):
             self.error("--full requires -h or --help")
         for action in self._actions:

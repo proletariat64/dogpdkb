@@ -10,8 +10,6 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from mdocr import cli
-
 
 def make_image(fmt: str = "PNG", color=(200, 30, 30), size=(8, 8)) -> bytes:
     buf = io.BytesIO()
@@ -89,8 +87,10 @@ class StubClient:
 @pytest.fixture
 def patch_client(monkeypatch):
     def apply(*, fail=None):
+        from mdocr import paddle
+
         stub = StubClient("test-token", fail=fail)
-        monkeypatch.setattr(cli, "PaddleClient", lambda token, session=None: stub)
+        monkeypatch.setattr(paddle, "PaddleClient", lambda token, session=None: stub)
         return stub
 
     return apply

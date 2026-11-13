@@ -106,3 +106,20 @@ def test_update_target_version_does_not_become_global_version(tmp_path):
     assert result.returncode == 0
     assert "MAJOR.MINOR.PATCH" in result.stdout
     assert "usage: dogpdkb update" in result.stdout
+
+
+def test_full_before_command_is_rejected_with_correct_placement(tmp_path):
+    result = invoke(tmp_path, "--full", "sync", "--help")
+    assert result.returncode == 64
+    assert not result.stdout
+    assert "dogpdkb sync --help --full" in result.stderr
+    assert "after the command" in result.stderr
+    assert not list(tmp_path.iterdir())
+
+
+def test_abbreviated_full_cannot_create_configuration(tmp_path):
+    result = invoke(tmp_path, "init-config", "--ful", "--output", "out")
+    assert result.returncode == 64
+    assert "unrecognized arguments: --ful" in result.stderr
+    assert not result.stdout
+    assert not list(tmp_path.iterdir())

@@ -5,6 +5,14 @@ book (key), run_id, documents and failures. Each document contains document_id,
 version, path to complete published Markdown, input_copy (durable byte witness),
 metadata (name/logical_path/source_ref), action (compile/metadata/reuse), and
 reason_codes. Optional baseline_version/previous_graph freeze prior facts.
+The emitted manifest also carries resources (resource-object array, empty when
+none), optional prepared-jpeg-ocr-v1 ocr evidence, pending_metadata (source
+metadata object), and pending_steps ([] or ["ocr"] for a never-started OCR call).
+These preserve source evidence and pending-observation acknowledgement, not a
+request for Graphify to perform OCR. On graph success, nonempty pending_steps
+keeps the pending observation; clearing also requires matching version and
+pending_metadata (falling back to metadata if absent). Missing pending_steps is
+treated as empty. Do not remove these fields to force acknowledgement or retries.
 Read apply --help --full for the full manifest example. Graph inputs require known nonempty
 normalized versions; null or empty versions are rejected.
 The run must exist, belong to the source, and retain matching frozen targets.

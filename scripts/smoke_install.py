@@ -26,6 +26,18 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 
+HELP_OBSERVER = """import os, sys
+def observe(event, args):
+    if event.startswith('socket.') or event in {
+        'subprocess.Popen', 'os.system', 'os.posix_spawn', 'os.spawn',
+        'os.fork', 'os.forkpty', 'os.exec', 'pty.spawn',
+    }:
+        with open(os.environ['DOGPDKB_HELP_AUDIT_LOG'], 'a') as log:
+            log.write(event + '\\n')
+        raise RuntimeError('help attempted external activity: ' + event)
+sys.addaudithook(observe)
+"""
+
 # Fake only external remote/graph processes. Comparison and image-less OCR use
 # the installed public CLIs, with no replacement packages or tool runtime imports.
 REMOTE_CLI = r"""
@@ -140,7 +152,10 @@ def smoke(dist: Path) -> None:
     }
     env["UV_OFFLINE"] = os.environ.get("UV_OFFLINE", "1")
     env["UV_PYTHON_DOWNLOADS"] = "never"
-    env["UV_CACHE_DIR"] = os.environ.get("UV_CACHE_DIR", str(Path.home() / ".cache/uv"))
+    caller_cache = os.environ.get("UV_CACHE_DIR") or str(
+        Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "uv"
+    )
+    env["UV_CACHE_DIR"] = str(Path(caller_cache).expanduser().resolve())
     with tempfile.TemporaryDirectory(prefix="dogpdkb-installed-cli-") as temporary:
         work = Path(temporary)
         env["XDG_STATE_HOME"] = str(work / "user-state")
@@ -149,11 +164,11 @@ def smoke(dist: Path) -> None:
         env["HOME"] = str(work / "home")
         env["PYTHONDONTWRITEBYTECODE"] = "1"
 
-        def run(args, expected=0):
+        def run(args, expected=0, *, extra_env=None):
             result = run_process(
                 list(map(str, args)),
                 cwd=work,
-                env=env,
+                env=env | (extra_env or {}),
                 text=True,
                 stdout=PIPE,
                 stderr=PIPE,
@@ -192,12 +207,19 @@ def smoke(dist: Path) -> None:
                 ),
             ]
         )
-        run([command, "--version"])
+        observer = work / "help-observer"
+        observer.mkdir()
+        (observer / "sitecustomize.py").write_text(HELP_OBSERVER, encoding="utf-8")
+        audit_log = work / "help-external-activity.txt"
+        help_env = {
+            "PYTHONPATH": str(observer),
+            "DOGPDKB_HELP_AUDIT_LOG": str(audit_log),
+        }
         help_checks = 0
         before_help = {path.relative_to(work) for path in work.rglob("*")}
         for tool in ("dogpdkb", "mdcompare", "mdocr"):
             executable = environment / "bin" / tool
-            root_help = run([executable, "--help"])
+            root_help = run([executable, "--help"], extra_env=help_env)
             # Commands are discovered from the public root help, so a new leaf
             # cannot silently remain outside the installed acceptance matrix.
             commands = re.findall(
@@ -207,19 +229,25 @@ def smoke(dist: Path) -> None:
             )
             assert commands, f"no public commands discoverable for {tool}"
             for scope in ([], *([name] for name in commands)):
-                ordinary = run([executable, *scope, "--help"])
-                assert ordinary == run([executable, *scope, "-h"])
-                full = run([executable, *scope, "--help", "--full"])
-                assert full == run([executable, *scope, "-h", "--full"])
+                ordinary = run([executable, *scope, "--help"], extra_env=help_env)
+                assert ordinary == run([executable, *scope, "-h"], extra_env=help_env)
+                full = run([executable, *scope, "--help", "--full"], extra_env=help_env)
+                assert full == run(
+                    [executable, *scope, "-h", "--full"], extra_env=help_env
+                )
                 assert len(full) > len(ordinary)
                 assert "--full" in ordinary
                 help_checks += 4
-            run([executable, "--version"])
+            run([executable, "--version"], extra_env=help_env)
             help_checks += 1
         after_help = {path.relative_to(work) for path in work.rglob("*")}
+        assert not audit_log.exists(), (
+            "installed help attempted network or child-process activity"
+        )
         assert before_help == after_help, "installed help created runtime files"
         print(
-            f"Installed offline help: {help_checks} flag/version checks passed; no runtime files created."
+            f"Installed offline help: {help_checks} flag/version checks passed; "
+            "no runtime files, socket activity, or child processes."
         )
         run([command, "doctor", "--package"])
         run([command, "init-config", "-o", work / "portable"])
