@@ -60,6 +60,10 @@ def _main(argv: list[str] | None = None) -> int:
         from dogpdkb.observe import main as status_main
 
         return status_main(arguments[1:])
+    if arguments and arguments[0] == "purge":
+        from dogpdkb.purge import main as purge_main
+
+        return purge_main(arguments[1:])
     parser = argparse.ArgumentParser(description=__doc__, prog="dogpdkb")
     try:
         version = importlib.metadata.version("dogpdkb")
@@ -71,6 +75,9 @@ def _main(argv: list[str] | None = None) -> int:
         commands.add_parser(name, help=f"run {name}; use {name} --help for options")
     commands.add_parser(
         "status", help="read-only sync batch status; use status --help for options"
+    )
+    commands.add_parser(
+        "purge", help="delete selected wash runs; use purge --help for options"
     )
     doctor = commands.add_parser("doctor", help="read-only, offline preflight checks")
     doctor.add_argument("--config", type=Path)
