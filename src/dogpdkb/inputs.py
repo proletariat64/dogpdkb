@@ -217,17 +217,23 @@ def _relocation_regions(text):
     tokens = re.compile(
         r"(?m)^ {0,3}(?P<fence>`{3,}|~{3,})[^\r\n]*(?:\r?\n|$)"
         r"|(?P<comment><!--)"
+        r"|(?P<definition>^ {0,3}\[[^\]\r\n]+\]:[^\r\n]*(?:\r?\n|$))"
         r"|(?P<tag><[A-Za-z][A-Za-z0-9:-]*(?=[\s>]|/>)(?:[^>\"']|\"[^\"]*\"|'[^']*')*>)"
         r"|(?P<ticks>`+)"
     )
     following, closers = {}, {}
-    for run in reversed(list(re.finditer(r"`+", text))):
+    for run in reversed(list(re.finditer(r"`+|^[ \t]*\r?$", text, re.MULTILINE))):
+        if not run.group().startswith("`"):
+            following.clear()  # Inline code cannot cross a blank paragraph.
+            continue
         length = len(run.group())
         closers[run.start()] = following.get(length)
         following[length] = run
     position = 0
     while match := tokens.search(text, position):
         position = match.end()
+        if match.group("definition"):
+            continue  # Backticks in a reference label are literal label text.
         if match.group("tag"):
             line = text[text.rfind("\n", 0, match.start()) + 1 : match.start()]
             if text[max(0, match.start() - 2) : match.start()] == "](" or re.fullmatch(
@@ -237,12 +243,17 @@ def _relocation_regions(text):
             yield match.start(), position, True
             continue
         fence = match.group("fence")
+        left = match.start()
+        if (
+            fence
+            and fence[0] == "`"
+            and "`" in match.group()[match.group().index(fence) + len(fence) :]
+        ):
+            # An invalid fence may instead be a same-line code span.
+            left = match.start("fence")
+            position = left + len(fence)
+            fence = None
         if fence:
-            if (
-                fence[0] == "`"
-                and "`" in match.group()[match.group().index(fence) + len(fence) :]
-            ):
-                continue
             closing = re.compile(
                 r"(?m)^ {0,3}"
                 + re.escape(fence[0])
@@ -255,14 +266,14 @@ def _relocation_regions(text):
             closing = text.find("-->", match.end())
             end = closing + 3 if closing >= 0 else len(text)
         else:
-            before = match.start()
+            before = left
             while before and text[before - 1] == "\\":
                 before -= 1
-            closing = closers[match.start()]
-            if (match.start() - before) % 2 or closing is None:
+            closing = closers[left]
+            if (left - before) % 2 or closing is None:
                 continue
             end = closing.end()
-        yield match.start(), end, False
+        yield left, end, False
         position = end
 
 
