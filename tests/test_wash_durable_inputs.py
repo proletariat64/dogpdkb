@@ -5,6 +5,8 @@ import shutil
 import sys
 from pathlib import Path
 
+import pytest
+
 from tests.test_orchestrator_apply_cli import cli, instance
 
 
@@ -210,3 +212,78 @@ option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','do
     item = next(row for row in comparison["results"] if row["document_id"] == "43")
     assert item["resources"]["status"] == "UNCHANGED"
     assert item["resources"]["items"][0]["resource_id"] == identifier
+
+
+@pytest.mark.parametrize("has_ocr_output", [True, False])
+def test_partial_relative_image_is_readable_in_formal_corpus_after_wash_deleted(
+    tmp_path,
+    has_ocr_output,
+):
+    config, differences = enriched_instance(tmp_path)
+    remote = json.loads((tmp_path / "remote.json").read_text())
+    remote["42"]["body"] += "\n![diagram](../images/diagram.png)\n"
+    (tmp_path / "remote.json").write_text(json.dumps(remote))
+    tool = tmp_path / "skylark.py"
+    tool.write_text(
+        tool.read_text().replace(
+            "path.write_text(doc['body'])",
+            "path.write_text(doc['body']); image=path.parent.parent/'images'/'diagram.png'; image.parent.mkdir(parents=True,exist_ok=True); __import__('PIL.Image',fromlist=['Image']).new('RGB',(2,2),'red').save(image)",
+        )
+    )
+    ocr = tmp_path / "enrich.py"
+    ocr.write_text(
+        ocr.read_text().replace("'status':'completed'", "'status':'partial'")
+        + "\nraise SystemExit(2)\n"
+    )
+    if not has_ocr_output:
+        ocr.write_text(ocr.read_text().replace("'output':str(output)", "'output':None"))
+    result = cli("apply", "--config", config, "--input", differences)
+    assert result.returncode == 2, result.stderr
+    document = json.loads(Path(json.loads(result.stdout)["manifest"]).read_text())[
+        "documents"
+    ][0]
+    shutil.rmtree(Path(json.loads(result.stdout)["run"]).parent)
+    descriptors = tmp_path / "published-input.json"
+    descriptors.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "documents": [
+                    {
+                        "knowledge_base": "funds",
+                        "document_id": "42",
+                        "path": document["path"],
+                        "content_kind": "raw",
+                        "metadata": document["metadata"],
+                    }
+                ],
+            }
+        )
+    )
+    import os
+    import subprocess
+
+    catalog = tmp_path / "published-catalog.json"
+    checked = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mdcompare",
+            "catalog",
+            "--input",
+            str(descriptors),
+            "--output",
+            str(catalog),
+        ],
+        env={
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert checked.returncode == 0, checked.stderr
+    resource = json.loads(catalog.read_text())["documents"][0]["resources"][0]
+    assert resource.get("path"), resource
+    assert Path(resource["path"]).is_file()

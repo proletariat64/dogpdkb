@@ -58,7 +58,7 @@ def retain_raw(directory, source, resources):
             shutil.rmtree(staging)
 
 
-def retain_ocr_files(directory, run, result, output):
+def retain_ocr_files(directory, run, result, output, resources):
     """Relocate only file paths declared by the public OCR result contract."""
     mappings = {}
     records = [*result.get("resources", []), *result.get("ocr", {}).get("images", [])]
@@ -85,6 +85,14 @@ def retain_ocr_files(directory, run, result, output):
             item[field] = mappings[value]
 
     def relocate(text):
+        text = relocate_targets(
+            text,
+            {
+                r["resource_id"]: r["path"]
+                for r in resources
+                if r.get("path") and Path(r["path"]).is_file()
+            },
+        )
         for before, after in mappings.items():
             text = text.replace(quote(before, safe="/:"), quote(after, safe="/:"))
             text = text.replace(before, after)
@@ -113,6 +121,19 @@ def retain_inputs(store, run, rows, results):
         )
         raw.update(path=str(target), resources=resources)
         row["resources"] = resources
+        result = results.setdefault(identifier, {})
+        if not Path(result.get("output") or "").is_file():
+            fallback = directory / "corpus-input.md"
+            targets = {
+                r["resource_id"]: r["path"]
+                for r in resources
+                if r.get("path") and Path(r["path"]).is_file()
+            }
+            fallback.write_text(
+                relocate_targets(target.read_text(encoding="utf-8"), targets),
+                encoding="utf-8",
+            )
+            result["output"] = str(fallback)
         previous = store.step(identifier, "ocr") or {}
         if (
             previous.get("run_id") != run.id
@@ -136,7 +157,7 @@ def retain_inputs(store, run, rows, results):
         output = Path(result.get("output") or "")
         if not output.is_file():
             continue
-        retained = retain_ocr_files(directory, run, result, output)
+        retained = retain_ocr_files(directory, run, result, output, resources)
         report["documents"] = [result]
         for item in request["documents"]:
             if str(item["document_id"]) == identifier:
@@ -151,6 +172,20 @@ def retain_inputs(store, run, rows, results):
             report=str(directory / "ocr-report.json"),
         )
     store.save()
+
+
+def relocate_targets(text, replacements):
+    """Replace declared inline destinations without changing unrelated prose."""
+    for before, after in replacements.items():
+        for spelling in {before, quote(before, safe="/:")}:
+            for ending in (")", " ", "\t", "\n"):
+                text = text.replace(
+                    "](" + spelling + ending, "](" + quote(after, safe="/:") + ending
+                )
+            text = text.replace(
+                "](<" + spelling + ">", "](<" + quote(after, safe="/:") + ">"
+            )
+    return text
 
 
 def ocr_request_input(row, run):
@@ -171,15 +206,7 @@ def ocr_request_input(row, run):
     # A tool-facing copy has a different parent: relocate known relative uses too.
     replacements = {before: after for before, after in local.items() if before != after}
     text = source.read_text(encoding="utf-8")
-    for before, after in replacements.items():
-        for spelling in {before, quote(before, safe="/:")}:
-            for ending in (")", " ", "\t", "\n"):
-                text = text.replace(
-                    "](" + spelling + ending, "](" + quote(after, safe="/:") + ending
-                )
-            text = text.replace(
-                "](<" + spelling + ">)", "](<" + quote(after, safe="/:") + ">)"
-            )
+    text = relocate_targets(text, replacements)
     copy = run.directory / "ocr-inputs" / f"{row['slot']}.md"
     copy.parent.mkdir(parents=True, exist_ok=True)
     copy.write_text(text, encoding="utf-8")
