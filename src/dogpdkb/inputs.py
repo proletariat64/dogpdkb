@@ -123,7 +123,7 @@ def retain_inputs(store, run, rows, results):
         request_path, report_path = Path(previous["input"]), Path(previous["report"])
         try:
             request, report = read_json(request_path), read_json(report_path)
-            result = next(
+            result = results.get(identifier) or next(
                 (
                     r
                     for r in report.get("documents", [])
@@ -137,6 +137,7 @@ def retain_inputs(store, run, rows, results):
         if not output.is_file():
             continue
         retained = retain_ocr_files(directory, run, result, output)
+        report["documents"] = [result]
         for item in request["documents"]:
             if str(item["document_id"]) == identifier:
                 item["path"] = str(target)
@@ -150,3 +151,39 @@ def retain_inputs(store, run, rows, results):
             report=str(directory / "ocr-report.json"),
         )
     store.save()
+
+
+def ocr_request_input(row, run):
+    """Relocate catalog-declared absolute targets in a tool-facing copy only."""
+    source = Path(row["raw_path"])
+    local = {
+        resource["resource_id"]: resource["path"]
+        for resource in row.get("resources") or []
+        if isinstance(resource.get("resource_id"), str)
+        and resource.get("path")
+        and Path(resource["path"]).is_file()
+    }
+    if not any(
+        Path(target).is_absolute() and target != retained
+        for target, retained in local.items()
+    ):
+        return str(source), row["ocr_resources"], {}
+    # A tool-facing copy has a different parent: relocate known relative uses too.
+    replacements = {before: after for before, after in local.items() if before != after}
+    text = source.read_text(encoding="utf-8")
+    for before, after in replacements.items():
+        for spelling in {before, quote(before, safe="/:")}:
+            for ending in (")", " ", "\t", "\n"):
+                text = text.replace(
+                    "](" + spelling + ending, "](" + quote(after, safe="/:") + ending
+                )
+            text = text.replace(
+                "](<" + spelling + ">)", "](<" + quote(after, safe="/:") + ">)"
+            )
+    copy = run.directory / "ocr-inputs" / f"{row['slot']}.md"
+    copy.parent.mkdir(parents=True, exist_ok=True)
+    copy.write_text(text, encoding="utf-8")
+    selected = row["ocr_resources"]
+    if selected is not None:
+        selected = [replacements.get(target, target) for target in selected]
+    return str(copy), selected, {value: key for key, value in replacements.items()}

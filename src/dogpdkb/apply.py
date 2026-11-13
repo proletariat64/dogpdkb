@@ -257,7 +257,14 @@ def compare_inputs(settings, book, store, run, rows):
                     evidence=old,
                 )
             )
-        incoming.append(descriptor(book, row, row["raw_path"]))
+        incoming.append(
+            descriptor(
+                book,
+                row,
+                row["raw_path"],
+                evidence=store.document(row["document_id"]).get("raw"),
+            )
+        )
     manifests, valid = [], True
     for name, documents in (("baseline", baseline), ("incoming", incoming)):
         source, target = (
@@ -410,6 +417,9 @@ def ocr_inputs(settings, book, store, run, rows):
                 run, row, "ocr", stop or "BATCH_DEADLINE_EXCEEDED", status="unattempted"
             )
             continue
+        from dogpdkb.inputs import ocr_request_input
+
+        tool_input, selected_resources, identities = ocr_request_input(row, run)
         request = run.directory / f"ocr-{index}-request.json"
         report = run.directory / f"ocr-{index}-report.json"
         atomic_json(
@@ -419,8 +429,8 @@ def ocr_inputs(settings, book, store, run, rows):
                 "documents": [
                     {
                         "document_id": identifier,
-                        "path": row["raw_path"],
-                        "resources": row["ocr_resources"],
+                        "path": tool_input,
+                        "resources": selected_resources,
                     }
                 ],
             },
@@ -471,6 +481,13 @@ def ocr_inputs(settings, book, store, run, rows):
             if len(records) != 1 or str(records[0]["document_id"]) != identifier:
                 raise ValueError("OCR source mismatch")
             result = records[0]
+            for resource in [
+                *result.get("resources", []),
+                *result.get("ocr", {}).get("images", []),
+            ]:
+                key = resource.get("resource_id")
+                if key in identities:
+                    resource["resource_id"] = identities[key]
             if payload.get("causes"):
                 stop = payload["causes"][0]
         except (ValueError, KeyError, TypeError):

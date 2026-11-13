@@ -162,3 +162,51 @@ option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','do
     assert (
         Path(document["input_copy"]).read_bytes() == Path(document["path"]).read_bytes()
     )
+
+
+def test_unattempted_ocr_reads_retained_absolute_image_after_old_wash_deleted(tmp_path):
+    from tests.test_orchestrator_apply_cli import two_sources
+
+    config, differences = enriched_instance(tmp_path)
+    two_sources(tmp_path, differences)
+    remote = json.loads((tmp_path / "remote.json").read_text())
+    remote["43"]["body"] += "\n![diagram](ABSOLUTE_IMAGE)\n"
+    (tmp_path / "remote.json").write_text(json.dumps(remote))
+    tool = tmp_path / "skylark.py"
+    tool.write_text(
+        tool.read_text().replace(
+            "path.write_text(doc['body'])",
+            "image=path.parent.parent/'images'/('diagram-'+item['document_id']+'.png'); image.parent.mkdir(parents=True,exist_ok=True); __import__('PIL.Image',fromlist=['Image']).new('RGB',(2,2),'red').save(image); path.write_text(doc['body'].replace('ABSOLUTE_IMAGE',str(image)))",
+        )
+    )
+    ocr = tmp_path / "enrich.py"
+    ocr.write_text("""import json,sys
+from pathlib import Path
+args=sys.argv[1:]
+def option(name):return Path(args[args.index(name)+1])
+doc=json.loads(option('--manifest').read_text())['documents'][0]
+body=Path(doc['path']).read_text()
+if not Path(__file__).with_name('allow').exists():
+ option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','causes':['OCR_AUTH_UNAVAILABLE'],'documents':[{'document_id':doc['document_id'],'status':'partial','output':None,'resources':[]}]}));raise SystemExit(2)
+if doc['document_id']=='43':
+ target=body.split('](')[1].split(')')[0]
+ assert Path(target).is_file(),target
+ with Path(__file__).with_name('valid-images').open('a') as log:log.write('43\\n')
+output=option('--output-dir')/'enriched.md';output.parent.mkdir(parents=True,exist_ok=True);output.write_text(body)
+option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[]}]}))
+""")
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 2, first.stderr
+    run = Path(json.loads(first.stdout)["run"]).parent
+    original_catalog = json.loads((run / "incoming.json").read_text())
+    identifier = original_catalog["documents"][1]["resources"][0]["resource_id"]
+    shutil.rmtree(run)
+    (tmp_path / "allow").touch()
+    second = cli("apply", "--config", config, "--input", differences)
+    assert second.returncode == 2, second.stderr
+    assert (tmp_path / "valid-images").read_text().splitlines() == ["43"]
+    next_run = Path(json.loads(second.stdout)["run"]).parent
+    comparison = json.loads((next_run / "compare-report.json").read_text())
+    item = next(row for row in comparison["results"] if row["document_id"] == "43")
+    assert item["resources"]["status"] == "UNCHANGED"
+    assert item["resources"]["items"][0]["resource_id"] == identifier
