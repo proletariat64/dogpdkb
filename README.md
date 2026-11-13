@@ -4,6 +4,27 @@ dogpdkb 是供 crontab 调用的知识库 CLI 编排器：选择增量、生成�
 Skylark、mdcompare、mdocr 和 Graphify，保存真实结果，并提供只读状态观察。
 Web 发布与软件生命周期独立。
 
+## Local help
+
+All installed CLI help is in English and works offline without configuration or
+authentication. Use root help to choose a command, command help for a first
+invocation, and `--help --full` for the complete local contract:
+
+```bash
+dogpdkb --help
+dogpdkb sync --help
+dogpdkb sync --help --full
+mdcompare knowledge -h --full
+mdocr batch -h --full
+skylark export -h --full
+```
+
+`-h` and `--help` are equivalent at each scope; `--full` requires a help flag.
+Each tool supports root `--version`. Help describes its actual input schemas,
+path rules, output files, side effects, exit meanings and recovery steps. Skylark
+remains a separate installation; its source delivery is recorded in the CLI-help
+acceptance notes, not bundled into the Python distribution.
+
 ## 日常使用
 
 ```bash
@@ -37,6 +58,20 @@ Markdown 语料；`update-graph --input MANIFEST` 编译。`sync` 共用这套�
 同版本同一步骤的失败或不明结果不会在日常运行自动重试，由定时清理 agent 排查。
 新版本仍正常处理；OCR 失败不阻断可用正文编译。缺席只记录，不自动删除既有语料
 或图谱。失败图谱不回滚已更新语料；Graphify 编译按目录整批成功后发布；失败保留旧图。
+
+成功或 partial 的 sync 自动清理本次 wash 的成功临时副本，保留失败文档 Markdown、
+相关图片、报告和简要运行记录。计划暂停、整批失败和中断不自动清理；清理错误
+进入 stderr，不改变同步退出码。partial 后续由 agent 创建新 run 处理，不恢复旧批次。
+
+```bash
+dogpdkb purge --config ./instance/dogpdkb.toml --book funds --run RUN
+dogpdkb purge --config ./instance/dogpdkb.toml --book funds --all
+# 丢弃暂停、失败或中断 run；仍遵守写锁
+dogpdkb purge --config ./instance/dogpdkb.toml --book funds --run RUN --force
+```
+
+purge 只删除所选 book 的 wash，包括失败材料和运行记录；正式语料、图谱、持久
+版本事实、必要比较输入和工具缓存保留。它不解除失败抑制、不触发重试或历史回填。
 
 ## 小订阅
 

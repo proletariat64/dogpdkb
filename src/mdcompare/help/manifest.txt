@@ -1,0 +1,64 @@
+# Manifest schema 1.0
+
+
+
+Each manifest has this shape. Make a separate incoming manifest with its captured
+new path and metadata; filenames and directories are never document identity.
+
+```json
+{
+  "schema_version": "1.0",
+  "documents": [
+    {
+      "knowledge_base": "example-book",
+      "document_id": "42",
+      "content_kind": "raw",
+      "path": "old/document.md",
+      "metadata": {
+        "name": "Transfer limits",
+        "logical_path": "Payments/Limits",
+        "source_ref": "example-book:42",
+        "sync_timestamp": "2026-11-07T00:00:00Z"
+      },
+      "resources": []
+    }
+  ]
+}
+```
+
+Paths are absolute or relative to the containing manifest. ID, knowledge base and
+path must be nonempty strings. Metadata name, logical_path and source_ref are
+required strings; sync_timestamp is optional. Duplicate scoped IDs and JSON keys
+are rejected. The same numeric document ID in another knowledge base is distinct.
+An empty incoming list is valid. Baseline-only documents are reported as absent
+from this incoming set, never inferred remote deletions. Pure sync timestamp
+changes are visible independently and do not trigger content updates.
+
+`resources: []` means no evidence was supplied; it is not proof that a document
+contains no images or embedded/downloaded dependencies. Declaration IDs pair
+resources independently of URLs. Use local captured byte paths or the narrow
+explicit immutable-version contract; a URL alone cannot prove unchanged bytes.
+Resource order, count, titles, alt text and link meaning remain visible. See
+resource schema and limits.
+
+Optional `ocr` supplies captured successful baseline artifacts and desired incoming
+prepared JPEG/configuration evidence. Original resource equality cannot establish
+OCR reuse: source correspondence, usable artifacts, JPEG bytes, preprocessing and
+OCR configuration must independently agree. Missing success/usable output and
+unverifiable provenance have different outcomes. See OCR schema and action
+priority.
+
+Declare old OCR-enriched files as `historical_enriched`, never raw. Without retained
+raw and complete verifiable provenance, historical comparisons remain UNKNOWN,
+including equal or contained text. Observed differences are still explained as
+asymmetric input-stage differences. Historical input schema
+describes the narrowly supported exact reconstruction proof; it does not recover
+missing original text or certify publication.
+
+
+Catalog accepts resources omitted; compare requires an array. Knowledge ignores
+resource/OCR/provenance declarations for decisions, while still protecting
+declared input paths from report replacement. For all commands, CLI paths use
+cwd; manifest fields use the containing manifest directory. Empty documents
+arrays are valid. Unknown fields do not replace required fields. Null is not a
+substitute for required strings, metadata objects or resources arrays.

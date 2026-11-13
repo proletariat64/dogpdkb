@@ -108,7 +108,9 @@ def locked_main(function):
     @wraps(function)
     def invoke(*args, **kwargs):
         arguments = list(args[0] if args and args[0] is not None else sys.argv[1:])
-        if "--help" in arguments or "-h" in arguments or arguments == ["--version"]:
+        if any(
+            flag in arguments for flag in ("--help", "-h", "--full")
+        ) or arguments == ["--version"]:
             return function(*args, **kwargs)
         with ExitStack() as stack:
             try:

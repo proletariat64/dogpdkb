@@ -1,0 +1,16 @@
+# Offline preflight
+
+--package skips instance loading and checks only the installed distribution.
+Otherwise config/book resolution is required and configured public tool --help
+entry points are probed. No business request, token validation, SSO login, source
+download, OCR, extraction or corpus publication is performed. A passing probe
+proves entry-point availability only, not complete tool compatibility or remote
+service availability. Tool help itself must obey its own read-only contract.
+
+--json returns a JSON array of checks. Each row has name and status (ok/fail); configuration checks add book on success or
+reason on failure; tool probes add exit_code. The package-only result is
+[{"name":"package","status":"ok"}].
+Human output prints checks instead. Exit 1 means at least one failure; inspect
+the named check and fix configuration/installation before sync. Interrupted
+tool probes propagate 130/143. Repeating rechecks and may launch the same tool
+help subprocesses; unlike reading dogpdkb help, doctor is an explicit probe.

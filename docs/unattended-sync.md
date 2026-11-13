@@ -32,9 +32,27 @@ dogpdkb sync --config /srv/kb/dogpdkb.toml --book funds --resume /path/run-direc
 15 2 * * * /home/kb/.local/bin/dogpdkb sync --config /srv/kb/dogpdkb.toml --book funds >>/var/log/dogpdkb/result.log 2>>/var/log/dogpdkb/diagnostic.log
 ```
 
-采用系统 logrotate 管理日志。程序没有调度服务、内置轮转、自动 wash、历史引用
-搬迁或失败处置平台。run 和证据由定时清理 agent 决定处理；持久 state 独立保留，
-删除 run 不重置同版本失败抑制。OCR 成功缓存由 mdocr 管理。
+采用系统 logrotate 管理日志。程序没有调度服务、内置轮转、历史引用搬迁或失败
+处置平台。成功或 partial 的 sync 持锁清理本次成功临时副本与重复编译工作区，
+保留失败文档 Markdown、相关图片、报告和简要运行记录。暂停、整批失败和中断不
+自动清理。清理错误写 stderr，保持原同步退出码。OCR 成功缓存由 mdocr 管理。
+
+## 清理与手动 purge
+
+自动清理只处理本次 run，不扫描历史。partial 的失败交给后续 agent 判断，
+通过新 run 处理，不要求恢复原批次；同版本失败抑制仍有效。
+
+```bash
+dogpdkb purge --config /srv/kb/dogpdkb.toml --book funds --run RUN
+dogpdkb purge --config /srv/kb/dogpdkb.toml --book funds --all
+dogpdkb purge --config /srv/kb/dogpdkb.toml --book funds --run RUN --force
+```
+
+run/all 必须二选一。purge 删除目标 wash 的全部内容，包含失败材料与运行记录；
+暂停、失败或中断 run 需要 force。批量选择含这些 run 而未给 force 时整次拒绝，
+不悄悄跳过。force 不终止进程或绕过同目标写锁，不允许越出所选 book 的 wash。
+正式语料、图谱、持久 state、必要比较输入和工具缓存均不删除。
+手动 purge 的删除错误返回非零；删除 run 不重置失败抑制，也不执行任何工具或回填。
 
 ## 观察与退出码
 
@@ -56,7 +74,7 @@ watch 是前台只读查询，JSON 模式每行一个快照。展示阶段、公
 | 130 / 143 | SIGINT / SIGTERM |
 
 mdcompare 的不确定报告会让有效完整来源自动编译，不机械造成整体 partial。
-OCR partial 会保留交接并继续可用正文；单来源图编译失败保旧，成功来源继续。
+OCR partial 会保留交接并继续可用正文；Graphify 目录级整批失败保留旧图。
 语料和图谱成功版本独立，后续成功不会掩盖前面失败。
 
 [配置与使用](../README.md)、[持久状态](sync-state-design.md)、

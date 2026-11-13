@@ -9,16 +9,8 @@ import uuid
 from pathlib import Path
 from typing import NoReturn
 
-import requests
-
 from . import __version__
-from .ocr import ocr_document
-from .paddle import PaddleClient
-from .prepare import (
-    DEFAULT_ENABLED_EXTENSIONS,
-    prepare_document,
-    readable_extensions,
-)
+from . import help as contracts
 
 
 class CliError(Exception):
@@ -29,9 +21,16 @@ class _HelpfulParser(argparse.ArgumentParser):
     """Print the full help of the failing command on argument errors, so a
     misuse teaches the user how to use mdocr instead of a bare usage line."""
 
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
     def error(self, message: str) -> NoReturn:
         self.print_help(sys.stderr)
-        self.exit(2, f"\n{self.prog}: error: {message}\n")
+        self.exit(
+            2,
+            f"\n{self.prog}: error: {message}\nTry '{self.prog} --help' for usage.\n",
+        )
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -47,26 +46,48 @@ def atomic_write(path: Path, text: str) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(*, full: bool = False) -> argparse.ArgumentParser:
     parser = _HelpfulParser(
         prog="mdocr",
         description="Prepare images referenced by Markdown and optionally OCR them.",
+        epilog=contracts.ROOT + ("\n" + contracts.ROOT_FULL if full else ""),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"mdocr {__version__}")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="with -h/--help, show the full local contract",
+    )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=False)
 
     for name, help_text in (
-        ("prepare", "copy Markdown with images normalized to local JPEG assets"),
+        ("prepare", "copy Markdown with local Prepared image JPEGs; no model calls"),
         ("ocr", "replace eligible image embeds with marked PaddleOCR results"),
     ):
-        command = sub.add_parser(name, help=help_text, description=help_text)
+        contract = contracts.PREPARE if name == "prepare" else contracts.OCR
+        full_contract = (
+            contracts.PREPARE_FULL if name == "prepare" else contracts.OCR_FULL
+        )
+        command = sub.add_parser(
+            name,
+            help=help_text,
+            description=help_text,
+            epilog=contract + ("\n" + full_contract if full else ""),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        command.add_argument(
+            "--full",
+            action="store_true",
+            help="with -h/--help, show the full local contract",
+        )
         command.add_argument(
             "-f",
             "--file",
             required=True,
             nargs="+",
             metavar="FILE",
-            help="Markdown file(s) to process",
+            help="required Markdown file(s); paths relative to cwd; basenames must be unique",
         )
         command.add_argument(
             "-o",
@@ -74,35 +95,79 @@ def build_parser() -> argparse.ArgumentParser:
             required=True,
             type=Path,
             metavar="DIR",
-            help="directory for outputs and prepared assets",
+            help="required directory for output Markdown and Prepared image JPEGs; relative to cwd",
         )
         command.add_argument(
             "--download",
             action="store_true",
-            help="download remote images instead of skipping them",
+            help="download eligible HTTP(S) images; default: retain remote links with warnings",
         )
         command.add_argument(
             "--format",
             action="append",
             default=[],
             metavar="EXT[,EXT...]",
-            help="add Pillow-readable image extension(s)",
+            help="add Pillow-readable extensions to PNG/WebP/GIF/JPEG/TIFF defaults; repeatable",
         )
         command.add_argument(
             "--force",
             action="store_true",
-            help="overwrite existing outputs and re-OCR existing mdocr blocks",
+            help=(
+                "overwrite existing output Markdown; never submits OCR jobs"
+                if name == "prepare"
+                else "overwrite output Markdown and re-OCR existing blocks from their local JPEGs"
+            ),
         )
     batch = sub.add_parser(
-        "batch", help="Process a generic OCR manifest and publish structured outcomes"
+        "batch",
+        help="process a JSON OCR manifest with cached successes and structured outcomes",
+        description="Process a JSON OCR manifest and report per-resource outcomes.",
+        epilog=contracts.BATCH + ("\n" + contracts.BATCH_FULL if full else ""),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    batch.add_argument("--manifest", type=Path, required=True)
-    batch.add_argument("--output-dir", type=Path, required=True)
-    batch.add_argument("--report", type=Path, required=True)
-    batch.add_argument("--cache-dir", type=Path)
-    batch.add_argument("--download", action="store_true")
-    batch.add_argument("--endpoint")
-    batch.add_argument("--max-seconds", type=float, default=900)
+    batch.add_argument(
+        "--full",
+        action="store_true",
+        help="with -h/--help, show the full local contract",
+    )
+    batch.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        help="required mdocr-batch-input-1.0 JSON manifest; path relative to cwd",
+    )
+    batch.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="required directory for enriched Markdown and Prepared image JPEGs; outputs replaced",
+    )
+    batch.add_argument(
+        "--report",
+        type=Path,
+        required=True,
+        help="required mdocr-batch-1.0 JSON report path; atomically replaced",
+    )
+    batch.add_argument(
+        "--cache-dir",
+        type=Path,
+        help="persistent successful OCR cache; default: OUTPUT_DIR/.cache; paths relative to cwd",
+    )
+    batch.add_argument(
+        "--download",
+        action="store_true",
+        help="download eligible HTTP(S) images, including cache checks; default: disabled",
+    )
+    batch.add_argument(
+        "--endpoint",
+        help="compatible PaddleOCR jobs URL; default: official PaddleOCR endpoint",
+    )
+    batch.add_argument(
+        "--max-seconds",
+        type=float,
+        default=900,
+        help="finite nonnegative batch wall-time budget in seconds; default: 900; 0 stops selected work",
+    )
     return parser
 
 
@@ -124,6 +189,8 @@ def _validate(args: argparse.Namespace) -> list[Path]:
 
 def _enabled_extensions(values: list[str]) -> frozenset[str]:
     """Normalize and validate user-requested Pillow image extensions."""
+    from .prepare import DEFAULT_ENABLED_EXTENSIONS, readable_extensions
+
     requested: set[str] = set()
     for value in values:
         for item in value.split(","):
@@ -168,6 +235,12 @@ def _check_output_collisions(files: list[Path], args: argparse.Namespace) -> Non
 
 
 def run_command(args: argparse.Namespace) -> int:
+    import requests
+
+    from .ocr import ocr_document
+    from .paddle import PaddleClient
+    from .prepare import prepare_document
+
     files = _validate(args)
     enabled_extensions = _enabled_extensions(args.format)
     _check_output_collisions(files, args)
@@ -235,8 +308,16 @@ def run_command(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    option_end = arguments.index("--") if "--" in arguments else len(arguments)
+    options = arguments[:option_end]
+    full = "--full" in options
+    parser = build_parser(full=full)
+    if full and not any(flag in options for flag in ("-h", "--help")):
+        parser.error("--full requires -h or --help")
+    args = parser.parse_args(
+        [arg for arg in options if arg != "--full"] + arguments[option_end:]
+    )
     if args.command is None:
         parser.print_help()
         return 0

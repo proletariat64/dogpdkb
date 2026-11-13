@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
+from dogpdkb.help import HelpParser
 from dogpdkb.planning import (
     descriptor,
     load_plan,
@@ -41,6 +42,10 @@ def call_tool(settings, run, name, arguments, *, timeout=None):
 
 
 def failure(run, row, step, reason, **details):
+    tool = run.data.get("tool", {})
+    expected = {"export": "skylark", "ocr": "mdocr", "compare": "mdcompare"}
+    if "exit_code" in details and tool.get("name") == expected.get(step):
+        details.setdefault("argv", tool.get("argv"))
     run.failure(
         document_id=row["document_id"],
         version=row.get("version"),
@@ -229,8 +234,61 @@ def prepare_inputs(settings, book, store, run, differences):
                 )
             if code not in {0, 2}:
                 raise ValueError(f"Skylark export unavailable ({code}); see {report}")
+        catalog_failed_exports(settings, book, run, by_id)
         rows = [row for row in rows if row["document_id"] in kept]
     return rows
+
+
+def catalog_failed_exports(settings, book, run, rows):
+    failures = [
+        item
+        for item in run.data["failures"]
+        if item["step"] == "export" and Path(item.get("input") or "").is_file()
+    ]
+    if not failures:
+        return
+    source = run.directory / "failed-export-descriptors.json"
+    report = run.directory / "failed-export-resources.json"
+    try:
+        atomic_json(
+            source,
+            {
+                "schema_version": "1.0",
+                "documents": [
+                    descriptor(book, rows[item["document_id"]], item["input"])
+                    for item in failures
+                ],
+            },
+        )
+        code = call_tool(
+            settings,
+            run,
+            "mdcompare",
+            ["catalog", "--input", source, "--output", report],
+        )
+        if code:
+            raise ValueError("failed export resource catalog unavailable")
+        payload = read_json(report)
+        if not isinstance(payload, dict) or payload.get("schema_version") != "1.0":
+            raise ValueError("invalid failed export resource catalog")
+        documents = {item["document_id"]: item for item in payload["documents"]}
+        for item in failures:
+            document = documents[item["document_id"]]
+            if document.get("resource_warnings"):
+                raise ValueError("failed export resource catalog is uncertain")
+            resources = document.get("resources", [])
+            if not isinstance(resources, list) or not all(
+                isinstance(resource, dict) for resource in resources
+            ):
+                raise ValueError("invalid failed export resource entries")
+            item["resources"] = resources
+            item.setdefault("reports", []).append(str(report))
+    except InterruptedError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        for item in failures:
+            item["resource_catalog_error"] = str(error)
+    run.save()
 
 
 def compare_inputs(settings, book, store, run, rows):
@@ -257,7 +315,14 @@ def compare_inputs(settings, book, store, run, rows):
                     evidence=old,
                 )
             )
-        incoming.append(descriptor(book, row, row["raw_path"]))
+        incoming.append(
+            descriptor(
+                book,
+                row,
+                row["raw_path"],
+                evidence=store.document(row["document_id"]).get("raw"),
+            )
+        )
     manifests, valid = [], True
     for name, documents in (("baseline", baseline), ("incoming", incoming)):
         source, target = (
@@ -410,6 +475,9 @@ def ocr_inputs(settings, book, store, run, rows):
                 run, row, "ocr", stop or "BATCH_DEADLINE_EXCEEDED", status="unattempted"
             )
             continue
+        from dogpdkb.inputs import ocr_request_input
+
+        tool_input, selected_resources, identities = ocr_request_input(row, run)
         request = run.directory / f"ocr-{index}-request.json"
         report = run.directory / f"ocr-{index}-report.json"
         atomic_json(
@@ -419,8 +487,8 @@ def ocr_inputs(settings, book, store, run, rows):
                 "documents": [
                     {
                         "document_id": identifier,
-                        "path": row["raw_path"],
-                        "resources": row["ocr_resources"],
+                        "path": tool_input,
+                        "resources": selected_resources,
                     }
                 ],
             },
@@ -471,6 +539,13 @@ def ocr_inputs(settings, book, store, run, rows):
             if len(records) != 1 or str(records[0]["document_id"]) != identifier:
                 raise ValueError("OCR source mismatch")
             result = records[0]
+            for resource in [
+                *result.get("resources", []),
+                *result.get("ocr", {}).get("images", []),
+            ]:
+                key = resource.get("resource_id")
+                if key in identities:
+                    resource["resource_id"] = identities[key]
             if payload.get("causes"):
                 stop = payload["causes"][0]
         except (ValueError, KeyError, TypeError):
@@ -533,8 +608,9 @@ def publish_corpus(book, store, run, rows, results):
             temporary.replace(output)
         finally:
             temporary.unlink(missing_ok=True)
-        witness = run.directory / "published" / f"{index}.md"
-        witness.parent.mkdir(parents=True, exist_ok=True)
+        inputs = store.input_directory(identifier)
+        inputs.mkdir(parents=True, exist_ok=True)
+        witness = Path(tempfile.mkdtemp(prefix="corpus-", dir=inputs)) / "corpus.md"
         shutil.copyfile(output, witness)
         resources = [dict(resource) for resource in (row.get("resources") or [])]
         evidence = result.get("ocr")
@@ -650,6 +726,9 @@ def apply_run(
         store,
         check_baseline=not run.data.get("artifacts", {}).get("manifest"),
     )
+    from dogpdkb.inputs import retain_inputs
+
+    retain_inputs(store, run, plan["documents"], results)
     manifest = publish_corpus(book, store, run, plan["documents"], results)
     partial = bool(run.data["failures"])
     if run.data["command"] != "sync":
@@ -685,7 +764,7 @@ def record_interruption(store, run, code):
 
 
 def parser_for(command="apply"):
-    parser = argparse.ArgumentParser(prog=f"dogpdkb {command}")
+    parser = HelpParser(prog=f"dogpdkb {command}")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--book")
     selection = parser.add_mutually_exclusive_group(required=command == "apply")

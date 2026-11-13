@@ -1,0 +1,71 @@
+# Apply manifest and recovery contract
+
+Choose exactly one of --input DIFFERENCES and --resume RUN. Input is the frozen
+dogpdkb-differences-1 JSON emitted by discover, not Markdown. Use discover's saved
+artifact rather than assembling production selections manually. Its fields are
+schema, book, run_id, captured_at, listing, documents, absent, ignored and cutoff;
+selected document fields include document_id, observed version, title, remote
+path, source_url, format, metadata, reasons and prior local facts. Run/book and
+frozen targets must agree. Read discover --help --full for the complete listing
+and difference field contract.
+
+apply exports, catalogs, compares, freezes a plan, performs best-effort OCR and
+publishes complete usable corpus Markdown. It does not compile the graph.
+--stop-after plan saves all raw/comparison inputs and exits 0 before OCR or
+corpus publication. Resume checks saved inputs/witnesses and cannot repair
+deleted/changed plan inputs by downloading them again. A source change or
+intervening incompatible publication requires a fresh discovery and plan.
+
+The dogpdkb-compile-1 JSON contains schema, book (key), run_id, documents and
+failures. Minimal shape (paths and witnesses must actually be produced by apply):
+
+```json
+{"schema":"dogpdkb-compile-1","book":"funds","run_id":"run-example","documents":[{"document_id":"42","version":{"value":"2026-11-13T00:00:00Z","precision":"instant","utc":"2026-11-13T00:00:00+00:00"},"path":"/absolute/corpus/source.md","input_copy":"/absolute/state/funds/inputs/42/source.md","metadata":{"name":"Example","logical_path":"folder","source_ref":"https://example.invalid/source"},"action":"compile","reason_codes":["BODY_CHANGED"]}],"failures":[]}
+```
+
+Document actions: compile (complete current source), metadata (source metadata
+maintenance only), reuse (no graph content work). Paths identify full published
+Markdown; input_copy is its exact durable witness. Version is observed, never
+synthesized. The emitted document object contains:
+
+- document_id: nonempty source ID string; version: the observed normalized
+  version object; path and input_copy: absolute published-source/witness strings.
+- metadata: object with name, logical_path and source_ref for the published
+  source; action: compile, metadata or reuse; reason_codes: string array.
+- resources: always an array of resource objects, empty when no cataloged
+  resources exist. Objects retain mdcompare catalog evidence: resource_id (target
+  string), url (target string), kind (image, attachment or media), optional
+  absolute path when local bytes exist, and any declared evidence fields. For matching OCR
+  evidence, path points to retained original bytes rather than disposable wash.
+- ocr: optional prepared-jpeg-ocr-v1 evidence object from mdocr batch, omitted
+  when no evidence object is available. Its contract is prepared-jpeg-ocr-v1;
+  preprocessing contains name/version, configuration contains engine/model/
+  jpeg_quality, and images is an array of successful records with resource_id,
+  status success, and absolute source_path/prepared_image/artifact strings.
+  An empty images array does not itself mean all OCR was attempted or completed.
+- baseline_version: normalized version object or null when the comparison
+  baseline has no known version. previous_graph: prior graph-facts object, empty
+  when no graph facts exist. Both fields are emitted even without prior success.
+- pending_metadata: source metadata object retained for acknowledging the pending
+  observation, defaulting to {} when the selected row has no metadata. This is
+  separate from normalized published metadata. The graph stage falls back to
+  metadata if pending_metadata is absent in an input manifest.
+- pending_steps: always an array, currently ["ocr"] when that document's entire
+  OCR invocation was unattempted because of a shared stop or exhausted budget;
+  otherwise []. This is not a list of individual failed images or a retry queue.
+  An absent field is treated as no pending steps by the graph stage.
+
+After graph success, pending observation facts are cleared only when no pending
+steps remain and observed version/metadata match the manifest's acknowledgement.
+Thus successful graph publication can retain pending never-started OCR work;
+[] alone does not erase recorded OCR failures or same-version suppression.
+Keep these fields and the original evidence when diagnosing recovery. Do not
+edit a manifest to fabricate completion, remove suppression, or enable resume.
+Failures carry step/document/version/reason and evidence when available; they
+remain separate from usable documents and can cause exit 2.
+
+stdout fields are exit_code, paused, manifest (path or null), run (run.json
+path). stderr carries live diagnostics. OCR partial can still publish usable
+bodies; source/graph facts advance only after their actual success. Same-version
+failed/unknown steps stay suppressed. A repeated invocation may perform downloads
+or model calls only for eligible work; do not blindly repeat to fix a failed step.

@@ -41,7 +41,7 @@ internal formats. New/uncertain body knowledge compiles automatically. Image/OCR
 changes can require compile even when body knowledge is reusable.
 
 Each manifest document and corpus record also contains `input_copy`, an exact
-published Markdown witness under `run/published/`. Graph submission can compare
+published Markdown witness under `state/<book>/inputs/<document-id>/`. Graph submission can compare
 its bytes directly with the corpus file to reject changed/missing frozen input;
 no additional hash/fingerprint mechanism is introduced. `baseline_version` states
 the version used for body comparison. A reusable body does not certify a missing
@@ -62,6 +62,12 @@ The orchestrator passes `resources: null`: mdocr owns image selection and checks
 its successful cache. An absent/unusable cache makes necessary OCR work eligible;
 an unchanged comparison report is not permission to discard old OCR silently.
 The orchestrator does not normalize a foreign tool's URL selector format.
+Latest raw baselines, catalogued local resources and usable OCR outputs are kept
+outside wash. A tool-facing Markdown copy may relocate catalog-declared local
+destinations; canonical raw bytes and original resource identities are preserved.
+Published Markdown must not depend on a disposable success copy. Completed/partial
+sync cleans its own wash and no longer promises resume of that run; failed
+Markdown, local images and reports remain available until explicit purge.
 
 A plan freezes `previous_corpus` and `previous_graph`; a difference freezes its
 `local` facts. The compile manifest carries `previous_graph` through to graph

@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import argparse
 import os
 import shutil
 import sys
 from pathlib import Path
 
+from dogpdkb.help import HelpParser
 from dogpdkb.planning import reject_rollback
-from dogpdkb.processes import run_command
+from dogpdkb.processes import diagnostic_argv, run_command
 from dogpdkb.records import Run, Store, atomic_json, read_json, version_key
 from dogpdkb.settings import load_config, select_book
 
@@ -151,15 +151,16 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
             report=str(report),
         )
     run.stage("graphify", total=len(pending), completed=0, failed=0)
+    argv = [
+        *settings.command("graphify"),
+        "extract",
+        str(book.corpus),
+        "--out",
+        str(workspace),
+        "--no-cluster",
+    ]
     code = run_command(
-        [
-            *settings.command("graphify"),
-            "extract",
-            str(book.corpus),
-            "--out",
-            str(workspace),
-            "--no-cluster",
-        ],
+        argv,
         log=run.directory / "graphify.log",
         env={"GRAPHIFY_OUT": "graphify-out", "GRAPHIFY_FORCE": "0"},
     )
@@ -199,6 +200,7 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
             "schema": "dogpdkb-graph-result-1",
             "status": status,
             "exit_code": code,
+            "argv": diagnostic_argv(argv),
             "graph": str(graph_path),
             "candidate": str(candidate),
             "reason": reason,
@@ -208,7 +210,9 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
         doc_id = row["document_id"]
         acknowledgement = {}
         if status == "completed":
-            witness = run.directory / "graph-success" / f"{doc_id}.md"
+            retained_report = store.input_directory(doc_id) / "graph-report.json"
+            atomic_json(retained_report, {**read_json(report), "candidate": None})
+            witness = store.input_directory(doc_id) / "graph.md"
             witness.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(row["input_copy"], witness)
             acknowledgement = {
@@ -222,7 +226,7 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
                 "version": row["version"],
                 "source_file": str(Path(row["path"]).relative_to(book.corpus)),
                 "run_id": run.id,
-                "report": str(report),
+                "report": str(retained_report),
             }
             observed = document.get("pending")
             if (
@@ -240,7 +244,7 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
             row["version"],
             status,
             run.id,
-            report=str(report),
+            report=str(retained_report if status == "completed" else report),
             reason=reason,
             **acknowledgement,
         )
@@ -255,6 +259,7 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
                 message=reason,
                 report=str(report),
                 exit_code=code,
+                argv=diagnostic_argv(argv),
             )
     complete = len(pending) if status == "completed" else 0
     run.stage(
@@ -275,7 +280,7 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="dogpdkb update-graph", description=__doc__)
+    parser = HelpParser(prog="dogpdkb update-graph", description=__doc__)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--book")
     parser.add_argument(

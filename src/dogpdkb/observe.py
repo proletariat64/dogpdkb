@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import time
 from datetime import datetime
 from pathlib import Path
 
+from dogpdkb.help import HelpParser
 from dogpdkb.records import (
     RUN_SCHEMA,
     Store,
@@ -89,7 +89,7 @@ def report(data: dict) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="dogpdkb status")
+    parser = HelpParser(prog="dogpdkb status")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--book")
     parser.add_argument("--run")

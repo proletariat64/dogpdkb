@@ -72,8 +72,8 @@ Input is the existing mdcompare manifest schema (`schema_version: "1.0"`,
 `documents` with `knowledge_base`, `document_id`, `path`, `content_kind`, and
 `metadata`); `resources` may be omitted. Output is a full mdcompare manifest with
 absolute document/resource paths and a `resources` list populated from Markdown
-uses. Entries contain `resource_id` (target), `url`, `kind` (`image` or
-`attachment`), and `path` when a local resource exists. Existing declared resource
+uses. Entries contain `resource_id` (target), `url`, `kind` (`image`, `attachment`
+or `media`), and `path` when a local resource exists. Existing declared resource
 evidence is preserved by target. Remote resources are never fetched. A document's
 `resource_warnings` records parser uncertainty; unresolved syntax is not silently
 claimed complete. Output must not replace an input document or the input manifest.

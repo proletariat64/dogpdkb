@@ -1,6 +1,5 @@
 """Regenerate the knowledge-base catalog and layered map from local artifacts."""
 
-import argparse
 import collections
 import json
 import os
@@ -12,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from dogpdkb.help import HelpParser
 from dogpdkb.instance_lock import locked_main
 from dogpdkb.records import UTC8
 from dogpdkb.settings import Settings, load_config, select_book
@@ -317,7 +317,7 @@ def publish_snapshots(output: Path, catalog: dict, layered: dict) -> None:
 
 @locked_main
 def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = HelpParser(prog="dogpdkb publish-web", description=__doc__)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--book")
     parser.add_argument(

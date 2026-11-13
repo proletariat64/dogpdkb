@@ -1,0 +1,21 @@
+# Read-only observation contract
+
+--run accepts an ID, a run directory, or run.json; the run's book key must match.
+Without it, choose the newest active run, otherwise the newest recorded run by
+start time and record mtime. --watch polls every 1 second; --json alone outputs
+one JSON object, --watch --json outputs one independent object per line (JSONL).
+Stop a watch with Ctrl-C (exit 130). No configuration/corpus/graph/state is written,
+no write lock is acquired, and no tool or remote authentication is needed.
+
+No recorded runs yields {"schema":"dogpdkb-status-1","status":"no-runs","runs":0}.
+Otherwise output contains the run fields documented in the common contract,
+schema dogpdkb-status-1, recorded_status (saved status), status (observed status),
+alive (boolean), elapsed_seconds (nonnegative number or null if dates are
+unparseable), and run_directory (absolute path). A recorded running run becomes
+observationally interrupted when its owner is not live and holding its lock.
+Counts and artifacts are only recorded facts; missing totals are not estimated.
+Human output lists stage, counts, elapsed time and artifact pointers.
+
+Repeated calls only observe; they do not resume/retry. Inspect run failures and
+the pointed reports to choose recovery. A cleaned completed/partial sync run
+cannot resume; deleting wash cannot clear its durable failures.
