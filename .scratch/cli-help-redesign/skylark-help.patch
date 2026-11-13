@@ -2,10 +2,7 @@ diff --git a/CLI.md b/CLI.md
 index 83084ab..c313b3c 100644
 --- a/CLI.md
 +++ b/CLI.md
-@@ -40,3 +40,39 @@ and diagnostics go to stderr. Reports contain paths and metadata, not bodies.
- 
- `npm test` runs the existing gateway transport tests and public CLI subprocess
- tests using a local fake proxy; no live gateway, OCR or extraction is called.
+@@ -42,0 +43,36 @@ tests using a local fake proxy; no live gateway, OCR or extraction is called.
 +
 +## Local help and invocation errors
 +
@@ -46,23 +43,14 @@ diff --git a/cli.ts b/cli.ts
 index 52c22ef..bd5f623 100644
 --- a/cli.ts
 +++ b/cli.ts
-@@ -3,6 +3,8 @@
- import { readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
- import { dirname, resolve } from 'node:path';
- import { parseArgs } from 'node:util';
+@@ -5,0 +6,2 @@ import { parseArgs } from 'node:util';
 +import { helpText } from './help.js';
 +import packageInfo from './package.json';
- import { callReadWithRetry, unwrapEnvelope, docBody, docHeader, rewriteImageURL } from './index.js';
- 
- type Json = Record<string, any>;
-@@ -128,13 +130,30 @@ async function exportDocs(requestPath:string,output:string):Promise<number> {
-  save(output,JSON.stringify({schema:'skylark-export-result-1',status:failed?'partial':'completed',documents,counts:{total:documents.length,completed:documents.length-failed,failed}},null,2)+'\n');
-  return failed?2:0;
- }
+@@ -130,0 +133,3 @@ async function exportDocs(requestPath:string,output:string):Promise<number> {
 +class UsageError extends Error {}
 +const command = process.argv[2] && !process.argv[2].startsWith('-') ? process.argv[2] : undefined;
 +const helpHint = `skylark${command === 'listing' || command === 'export' ? ` ${command}` : ''} --help`;
- try {
+@@ -132,6 +137,16 @@ try {
 - const {values,positionals}=parseArgs({options:{url:{type:'string'},output:{type:'string'},request:{type:'string'},help:{type:'boolean'}},allowPositionals:true});
 - if(values.help){console.log('skylark listing --url BOOK_URL --output JSON\nskylark export --request JSON --output JSON');}
 - else if(!values.output||positionals.length!==1||(positionals[0]==='listing'?!values.url:positionals[0]==='export'?!values.request:true)){
@@ -85,405 +73,13 @@ index 52c22ef..bd5f623 100644
 + else if(scope==='export'&&!values.request)throw new UsageError('export requires --request INPUT');
 + else {
 +  process.exitCode=scope==='listing'?await listing(values.url!,values.output):await exportDocs(values.request!,values.output);
-   console.log(JSON.stringify({output:resolve(values.output),exit_code:process.exitCode}));
-  }
+@@ -140 +155,5 @@ try {
 -}catch(error){process.stderr.write(`${error instanceof Error?error.message:String(error)}\n`);process.exitCode=1;}
 +}catch(error){
 + const usage=error instanceof UsageError||(error instanceof Error&&'code' in error&&String(error.code).startsWith('ERR_PARSE_ARGS_'));
 + process.stderr.write(`skylark${command==='listing'||command==='export'?` ${command}`:''}: ${error instanceof Error?error.message:String(error)}${usage?`\nTry '${helpHint}'.`:''}\n`);
 + process.exitCode=usage?64:1;
 +}
-diff --git a/dist/cli.mjs b/dist/cli.mjs
-index f0e5850..e8e5945 100755
---- a/dist/cli.mjs
-+++ b/dist/cli.mjs
-@@ -5,6 +5,342 @@ import { readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from "node
- import { dirname, resolve } from "node:path";
- import { parseArgs } from "node:util";
- 
-+// help.ts
-+var environment = `Environment and authentication:
-+  Gateway commands need company-network access, an installed utoo-proxy and its
-+  existing corporate SSO login. A first real call may request browser login;
-+  establish it through the normal utoo-proxy flow. Help/version never authenticate.
-+  UTOO_PROXY_BIN: executable path; default $HOME/.utoo-proxy/utoo-proxy.
-+  SKYLARK_MCP_URL: gateway URL; default the corporate production Skylark gateway.
-+  SKYLARK_TIMEOUT_MS: per gateway call, default 45000 milliseconds.
-+  SKYLARK_MAX_RETRIES: retryable read failures, default 5 retries (up to 6 calls).
-+  SKYLARK_RETRY_BASE_MS: backoff base, default 1000 milliseconds.
-+  SKYLARK_DEBUG=1: protocol diagnostics on stderr; off by default.
-+  No CLI config file or separate token flag is used; inherited environment and
-+  existing proxy SSO state configure gateway access.`;
-+var navigation = `Local documentation:
-+  Use -h or --help at this scope. Add --full for the complete offline contract:
-+  skylark listing --help --full
-+  skylark export --help --full
-+  --full without a help flag is invalid. No browser or source checkout is needed.`;
-+var ordinary = {
-+  root: `usage: skylark COMMAND [OPTIONS]
-+
-+Read Yuque/Skylark metadata and export complete Markdown through the gateway.
-+Remote operations are read-only; requested reports and Markdown are local writes.
-+
-+Commands:
-+  listing   Validate a complete book listing and TOC without fetching bodies.
-+  export    Export requested documents/tables and report individual failures.
-+
-+First use:
-+  Establish the existing utoo-proxy SSO login, then read a book's metadata:
-+  skylark listing --url https://yuque.antfin.com/group/book --output listing.json
-+  To export bodies, use skylark export --help for the minimal request JSON.
-+
-+Options:
-+  -h, --help   Show help and exit 0 without accessing gateway or writing files.
-+  --full       Include the complete local contract; requires -h or --help.
-+  --version    Show the installed Skylark package version and exit 0.
-+
-+Output and repeat behavior:
-+  Commands write JSON reports at --output. Stdout is a JSON output pointer;
-+  stderr carries progress/diagnostics. Repeating a business command reads remote
-+  data again and atomically replaces successful requested local outputs. It has
-+  no CLI resume or reusable result cache; inspect reports before repeating.
-+
-+Exit codes:
-+  0 complete (or successful help/version); 2 isolated document export failures;
-+  1 gateway/listing/request/storage failure; 64 invalid CLI usage.
-+
-+${environment}
-+
-+${navigation}`,
-+  listing: `usage: skylark listing --url BOOK_URL --output JSON
-+
-+Validate all metadata pages and the TOC for one book; do not fetch document bodies.
-+
-+Options:
-+  --url BOOK_URL   Required Yuque book URL; it must resolve to a book, not a doc.
-+  --output JSON    Required listing report file; relative to the current directory.
-+                  Parent directories are created. Existing files are replaced
-+                  atomically only after the complete listing succeeds.
-+  -h, --help       Show this help and exit 0, without SSO/gateway or local writes.
-+  --full           Add the complete local schema; requires -h or --help.
-+
-+Minimal invocation:
-+  skylark listing --url https://yuque.antfin.com/group/book --output listing.json
-+
-+Output and writes:
-+  --output receives skylark-listing-1 JSON: schema, complete=true, book,
-+  documents, toc, captured_at. Documents include document_id and actual version.
-+  Stdout: {"output":"/absolute/listing.json","exit_code":0}
-+  Stderr: listing progress and errors. No body/image download, OCR, or corpus writes.
-+
-+Completeness and next steps:
-+  All pages and TOC must succeed, document IDs must be unique, and the observed
-+  count must match the book count checked again after paging. There is no remote
-+  snapshot token: concurrent same-count edits cannot be ruled out. Null document
-+  version means unknown. Use export --help to build a separate body request.
-+  On failure no new report is published; an older output file may still exist.
-+  Inspect stderr, correct auth/input or unstable source, then deliberately repeat.
-+  Repeat reads every page again and can replace --output; there is no resume/cache.
-+
-+Exit codes:
-+  0 complete listing; 1 gateway, completeness, or local storage failure;
-+  64 invalid CLI usage (missing/unknown arguments). Help exits 0.
-+
-+${environment}
-+
-+Local full contract: skylark listing --help --full`,
-+  export: `usage: skylark export --request INPUT --output JSON
-+
-+Export complete regular documents or native tables to requested Markdown files.
-+Remote gateway operations are read-only; this command writes local files.
-+
-+Options:
-+  --request INPUT  Required JSON request file; relative to the current directory.
-+                   Each documents[].path is also relative to the current directory,
-+                   NOT the request file. Prefer absolute paths to avoid ambiguity.
-+  --output JSON    Required result report; relative to the current directory.
-+  -h, --help       Show help and exit 0 without reading the request or contacting SSO.
-+  --full           Add complete schemas and boundary behavior; requires help.
-+
-+Minimal request.json (use your actual document ID):
-+  {"schema":"skylark-export-request-1","documents":[
-+    {"document_id":"123","path":"123.md","format":"md"}
-+  ]}
-+Minimal invocation:
-+  skylark export --request request.json --output report.json
-+
-+Inputs and outputs:
-+  document_id is a nonempty string or number. path is a nonempty local output path.
-+  format is optional: md/omitted exports regular Markdown; table or laketable
-+  traverses native table columns/records. Source is a complete document, not a delta.
-+  Successful files contain a metadata header and full body. Image URLs may be
-+  rewritten; images and attachments are not downloaded, and no OCR is performed.
-+  --output receives skylark-export-result-1 JSON with status, documents, counts.
-+  Stdout: {"output":"/absolute/report.json","exit_code":0} (or exit_code 2).
-+  Stderr: per-document progress and diagnostics. File parents are created;
-+  successful Markdown and the final report atomically replace existing files.
-+  Use distinct paths for request, report, and every document to avoid overwrites.
-+
-+Partial results and next steps:
-+  A failed source is recorded and other sources continue; failed exports publish
-+  no new Markdown, but an older file may remain. Read documents[].error and retain
-+  completed files. A shared storage failure can leave earlier successful files
-+  without a new report. Do not treat a leftover report as proof this run completed.
-+  Repeating rereads/reexports every requested document, may trigger SSO and remote
-+  read retries, and overwrites each success. No result cache/resume exists. Choose
-+  a new request of sources to retry after inspecting errors; no model call occurs.
-+  Compare reported actual versions with your selected versions; null is unknown.
-+
-+Exit codes:
-+  0 all requested documents completed (including empty documents list);
-+  2 per-document failures with a structured partial report;
-+  1 invalid/unreadable request, gateway/shared command or local storage failure;
-+  64 invalid CLI usage. Help exits 0.
-+
-+${environment}
-+
-+Local full contract: skylark export --help --full`
-+};
-+var fullEnvironment = `Full environment contract:
-+  Default SKYLARK_MCP_URL:
-+  https://mcpgwoffice-prod.alipay.com/mcpgw/v1/shttpproxy/message/MAIN_CHAIR_mcp.ant.faas.skylarkmcpserver.skylarkmcpserver
-+  Environment values are inherited at invocation. There are no CLI overrides.
-+  Numeric timeout/backoff values must be finite and positive; retry count must be
-+  finite and nonnegative. Accepted numbers are rounded down; invalid values fall
-+  back to the documented defaults. Retryable read errors use exponential backoff
-+  with its exponential component capped at 30000 ms plus 0-499 ms jitter; server
-+  retry-after guidance takes precedence.
-+  Timeout is per proxy round trip, not an overall CLI budget. Each gateway call
-+  uses a fresh proxy subprocess and existing disk SSO state. The CLI does not
-+  provide a login command. Set up SSO using your existing proxy workflow before
-+  business calls. Help and version do not validate or expose current env values.`;
-+var fullContracts = {
-+  root: `Full contract: Skylark local CLI
-+
-+Public command grammar:
-+  skylark listing --url BOOK_URL --output JSON
-+  skylark export --request INPUT --output JSON
-+  skylark [listing|export] (-h|--help) [--full]
-+  skylark --version
-+  Exactly one business command is required. No arguments is usage exit 64.
-+  Unknown commands/options, wrong-command options, missing values, missing
-+  required options, standalone --full, and command-level --version are usage
-+  errors (64), with a concrete stderr diagnostic and scoped help hint.
-+  Root --version identifies the installed pi-skylark package. --help takes
-+  precedence over --version at root. Help accepts missing business arguments.
-+  CLI filesystem arguments are relative to cwd; no config file changes that.
-+
-+Result channels and publication:
-+  On a completed command (including export partial), stdout is one JSON object
-+  with output (absolute report path) and exit_code (0 or 2). It is a pointer, not
-+  a report body. Progress and diagnostics use stderr. A shared error exits 1
-+  without a new stdout pointer. Reports end in a newline.
-+  Local save creates parent directories, writes PATH.PID.tmp, then renames it
-+  onto PATH and removes temporary files. Each successful file is atomic;
-+  the whole command is not transactional. Existing unrelated files are untouched
-+  unless you explicitly select their paths. Choose distinct paths for all
-+  inputs/outputs; the CLI does not reject path collisions or duplicate targets.
-+  Neither command mutates remote content, initializes corpus state, publishes a
-+  site, extracts a graph, downloads images, or calls an OCR/model service.
-+
-+Tool-specific schemas and boundary behavior:
-+  skylark listing --help --full   skylark-listing-1 and completeness boundaries
-+  skylark export --help --full    request/result schemas and partial handling
-+
-+${fullEnvironment}`,
-+  listing: `Full contract: listing
-+
-+Input contract:
-+  --url must resolve through skylark_resolve_url to a book. --output is an
-+  arbitrary writable JSON file path, relative to cwd. Both options are required
-+  and have no defaults. --request and command-level --version are invalid here.
-+
-+Output schema skylark-listing-1:
-+  schema: literal "skylark-listing-1".
-+  complete: literal true; incomplete listings never produce a new report.
-+  book: gateway metadata object plus book_id (number or nonempty string), url
-+    (requested URL), and items_count (required nonnegative integer). Other fields,
-+    including name when present, pass through as returned by the gateway.
-+  documents: array of gateway document objects in listing order. Each preserves
-+    gateway fields and adds document_id (string form of id), version (first
-+    non-null value of content_updated_at, updated_at, version; otherwise null).
-+    Version values are gateway evidence, not normalized or fabricated by the CLI.
-+  toc: the complete gateway TOC array; entries pass through without reinterpretation.
-+  captured_at: local completion timestamp as an ISO-8601 UTC string.
-+
-+Example report shape (gateway metadata can contain additional fields):
-+  {"schema":"skylark-listing-1","complete":true,
-+   "book":{"book_id":9,"url":"https://yuque.antfin.com/group/book","items_count":1},
-+   "documents":[{"id":123,"document_id":"123","version":null}],
-+   "toc":[],"captured_at":"2026-11-13T00:00:00.000Z"}
-+
-+Completeness and failure boundaries:
-+  Fetch book detail, pages of up to 50 documents, TOC, then detail again. Reject
-+  missing/invalid counts, empty or oversized expected pages, duplicate document
-+  IDs, malformed TOC, count mismatches, or a count changed at the final recheck.
-+  An empty book (items_count 0) is valid and has no document-list calls; TOC and
-+  final detail are still required. A page failure prevents any new --output.
-+  There is no snapshot token: equal before/after counts do not prove unchanged
-+  document versions during traversal. Captured time is not a remote snapshot.
-+  No document body is fetched. Null version remains unknown. Caller policy owns
-+  selection, version comparison, deltas, and whether another listing is needed.
-+
-+Recovery and repeated invocation:
-+  Exit 1 leaves an earlier report untouched; consult this run's stderr/exit,
-+  not the mere presence of --output. Fix the reported cause before rerunning.
-+  Repeating starts from the first page and reuses no listing checkpoint/cache;
-+  success atomically replaces the report. There is no --resume or retry command.
-+
-+${fullEnvironment}`,
-+  export: `Full contract: export
-+
-+Input JSON schema skylark-export-request-1:
-+  Root object: schema must be "skylark-export-request-1" and documents an array.
-+  documents[] objects:
-+    document_id: number or nonempty string; digit-only strings are sent as numbers.
-+    path: nonempty string naming the local complete-Markdown output file.
-+    format: optional; case-insensitive table or laketable selects native tables.
-+      Omitted, md, and other non-table values use regular document Markdown.
-+  Additional root and document fields are ignored. No uniqueness check is imposed
-+  on IDs or paths: duplicate entries are processed in order, can reread the same
-+  source, and later successes overwrite the same target. Use unique targets.
-+  Empty documents [] is valid and yields completed counts of zero.
-+  Null/malformed request roots or non-array documents fail the command (exit 1).
-+  Invalid per-document IDs/paths are isolated when an entry is an object; null
-+  entries can fail the command before an isolated result is formed.
-+  --request, --output, and every documents[].path are relative to cwd, not the
-+  request file's directory. Neither flag has a default. Prefer absolute paths.
-+  The CLI does not prevent a document/report path from overwriting a request or
-+  another document; choose distinct paths for all inputs and outputs.
-+
-+Output JSON schema skylark-export-result-1:
-+  schema: literal "skylark-export-result-1".
-+  status: "completed" when failed count is zero; otherwise "partial".
-+  counts: {total: number of request entries, completed: successful entries,
-+    failed: failed entries}; all counts are nonnegative integers.
-+  documents[]: one result per request entry, in the same order:
-+    document_id: String(input.document_id).
-+    path: original requested path, not converted to absolute. It can be omitted
-+      from an invalid entry's failed result if the input omitted it.
-+    status: "completed" or "failed".
-+    Completed adds version (first non-null content_updated_at/updated_at/version
-+      from gateway detail, otherwise null); metadata containing id, title,
-+      content_updated_at, updated_at when returned; bytes (UTF-8 byte length of
-+      the written Markdown). Undefined metadata fields are omitted by JSON.
-+    Failed adds error (diagnostic string), without publishing new Markdown.
-+  Extra gateway fields outside this selected metadata are not copied to results.
-+
-+Example partial report:
-+  {"schema":"skylark-export-result-1","status":"partial",
-+   "documents":[{"document_id":"123","path":"123.md","status":"completed",
-+     "version":null,"metadata":{"id":123,"title":"Example"},"bytes":92},
-+     {"document_id":"456","path":"456.md","status":"failed","error":"invalid document detail"}],
-+   "counts":{"total":2,"completed":1,"failed":1}}
-+  Stdout is only {"output":"/absolute/report.json","exit_code":2}; read the
-+  report for per-document status. A report is published only after all entries.
-+
-+Markdown and native-table boundaries:
-+  Each success has the shared title/document/book metadata header followed by
-+  the complete body and a newline. Empty string body is represented by an explicit
-+  empty marker; missing/non-string bodies fail. Numeric document IDs are coerced
-+  for the gateway. No diff fragment is emitted.
-+  Native tables list sheets, retrieve columns, and page records in groups of 200.
-+  Each sheet becomes a Markdown table. Cells escape pipes, preserve newlines as
-+  line breaks, render lists, and map option IDs where metadata allows. Missing
-+  sheets/columns, duplicate record IDs, invalid record data, and non-advancing
-+  pagination fail that document. Detail version is compared before and after
-+  table traversal. Same-version concurrent edits remain a remote limitation.
-+  Image URL rewriting does not acquire image bytes. No image/attachment download,
-+  resource preparation, OCR, model call, graph extraction, or corpus policy runs.
-+
-+Failure, publication, and recovery:
-+  Source/gateway failures inside one document become failed records (exit 2 if
-+  the final report can be written). Later sources still run. Reported actual
-+  version can be null or another gateway value; caller must compare it to the
-+  selected source version and keep unknown evidence unknown.
-+  Each successful Markdown is atomically replaced immediately. Report publication
-+  is atomic at the end. A local write failure is a shared error (exit 1), can
-+  stop remaining work, and can leave earlier successes with an old/missing report.
-+  A failed source leaves any previous target file unchanged; existence does not
-+  prove this attempt succeeded. There is no rollback of earlier successes.
-+  Inspect errors and versions, retain usable outputs, then deliberately request
-+  only sources you intend to reexport. Repeat fetches every requested body/table
-+  again, can authenticate/retry reads, and overwrites each success and the final
-+  report. There is no result cache, incremental mode, resume, or model charge.
-+
-+${fullEnvironment}`
-+};
-+function helpText(scope, full) {
-+  const key = scope ?? "root";
-+  return ordinary[key] + (full ? `
-+
-+${fullContracts[key]}` : "");
-+}
-+
-+// package.json
-+var package_default = {
-+  name: "pi-skylark",
-+  version: "0.1.0",
-+  private: true,
-+  description: "Skylark (Yuque) bridge \u2014 pi project extension",
-+  type: "module",
-+  files: ["dist/cli.mjs", "index.ts", "cli.ts", "help.ts", "CLI.md", "README.md"],
-+  bin: { skylark: "dist/cli.mjs" },
-+  scripts: {
-+    build: "esbuild cli.ts --bundle --platform=node --format=esm --outfile=dist/cli.mjs",
-+    test: "node test/run.mjs && node test/cli.mjs && node test/help.mjs"
-+  },
-+  devDependencies: {
-+    "@earendil-works/pi-coding-agent": "^0.84.1",
-+    esbuild: "^0.28.1",
-+    typebox: "^1.3.7"
-+  }
-+};
-+
- // ../../home/ubuntu/dev/pi_skylark/node_modules/typebox/build/system/hashing/hash.mjs
- var ByteMarker;
- (function(ByteMarker2) {
-@@ -434,19 +770,33 @@ async function exportDocs(requestPath, output) {
-   save(output, JSON.stringify({ schema: "skylark-export-result-1", status: failed ? "partial" : "completed", documents, counts: { total: documents.length, completed: documents.length - failed, failed } }, null, 2) + "\n");
-   return failed ? 2 : 0;
- }
-+var UsageError = class extends Error {
-+};
-+var command = process.argv[2] && !process.argv[2].startsWith("-") ? process.argv[2] : void 0;
-+var helpHint = `skylark${command === "listing" || command === "export" ? ` ${command}` : ""} --help`;
- try {
--  const { values, positionals } = parseArgs({ options: { url: { type: "string" }, output: { type: "string" }, request: { type: "string" }, help: { type: "boolean" } }, allowPositionals: true });
--  if (values.help) {
--    console.log("skylark listing --url BOOK_URL --output JSON\nskylark export --request JSON --output JSON");
--  } else if (!values.output || positionals.length !== 1 || (positionals[0] === "listing" ? !values.url : positionals[0] === "export" ? !values.request : true)) {
--    process.stderr.write("usage: skylark listing --url URL --output JSON | export --request JSON --output JSON\n");
--    process.exitCode = 64;
--  } else {
--    process.exitCode = positionals[0] === "listing" ? await listing(values.url, values.output) : await exportDocs(values.request, values.output);
-+  const { values, positionals } = parseArgs({ options: { url: { type: "string" }, output: { type: "string" }, request: { type: "string" }, help: { type: "boolean", short: "h" }, full: { type: "boolean" }, version: { type: "boolean" } }, allowPositionals: true });
-+  const scope = positionals[0];
-+  if (positionals.length > 1) throw new UsageError("expected one command; unexpected argument " + positionals[1]);
-+  if (scope !== void 0 && scope !== "listing" && scope !== "export") throw new UsageError(`unknown command '${scope}'; choose listing or export`);
-+  if (values.full && !values.help) throw new UsageError("--full requires -h or --help");
-+  if (values.version && scope) throw new UsageError("--version is a root option; use skylark --version");
-+  if (scope === "listing" && values.request !== void 0) throw new UsageError("--request belongs to export; listing requires --url");
-+  if (scope === "export" && values.url !== void 0) throw new UsageError("--url belongs to listing; export requires --request");
-+  if (values.help) console.log(helpText(scope, Boolean(values.full)));
-+  else if (values.version) console.log(`skylark ${package_default.version}`);
-+  else if (!scope) throw new UsageError("a command is required; choose listing or export");
-+  else if (!values.output) throw new UsageError("missing required option --output JSON");
-+  else if (scope === "listing" && !values.url) throw new UsageError("listing requires --url BOOK_URL");
-+  else if (scope === "export" && !values.request) throw new UsageError("export requires --request INPUT");
-+  else {
-+    process.exitCode = scope === "listing" ? await listing(values.url, values.output) : await exportDocs(values.request, values.output);
-     console.log(JSON.stringify({ output: resolve(values.output), exit_code: process.exitCode }));
-   }
- } catch (error) {
--  process.stderr.write(`${error instanceof Error ? error.message : String(error)}
-+  const usage = error instanceof UsageError || error instanceof Error && "code" in error && String(error.code).startsWith("ERR_PARSE_ARGS_");
-+  process.stderr.write(`skylark${command === "listing" || command === "export" ? ` ${command}` : ""}: ${error instanceof Error ? error.message : String(error)}${usage ? `
-+Try '${helpHint}'.` : ""}
- `);
--  process.exitCode = 1;
-+  process.exitCode = usage ? 64 : 1;
- }
 diff --git a/help.ts b/help.ts
 new file mode 100644
 index 0000000..8a649c0
@@ -812,48 +408,26 @@ diff --git a/package.json b/package.json
 index 75dcc1e..5bcc797 100644
 --- a/package.json
 +++ b/package.json
-@@ -4,10 +4,11 @@
- 	"private": true,
- 	"description": "Skylark (Yuque) bridge — pi project extension",
- 	"type": "module",
+@@ -6,0 +7 @@
 +	"files": ["dist/cli.mjs", "index.ts", "cli.ts", "help.ts", "CLI.md", "README.md"],
- 	"bin": { "skylark": "dist/cli.mjs" },
- 	"scripts": {
- 		"build": "esbuild cli.ts --bundle --platform=node --format=esm --outfile=dist/cli.mjs",
+@@ -10 +11 @@
 -		"test": "node test/run.mjs && node test/cli.mjs"
 +		"test": "node test/run.mjs && node test/cli.mjs && node test/help.mjs"
- 	},
- 	"devDependencies": {
- 		"@earendil-works/pi-coding-agent": "^0.84.1",
 diff --git a/test/cli.mjs b/test/cli.mjs
 index ac5d895..c8e3497 100644
 --- a/test/cli.mjs
 +++ b/test/cli.mjs
-@@ -1,8 +1,8 @@
- import { build } from 'esbuild';
- import { spawnSync } from 'node:child_process';
+@@ -3 +3 @@ import { spawnSync } from 'node:child_process';
 -import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 +import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync } from 'node:fs';
- import { tmpdir } from 'node:os';
+@@ -5 +5 @@ import { tmpdir } from 'node:os';
 -import { join } from 'node:path';
 +import { join, resolve } from 'node:path';
- import assert from 'node:assert/strict';
- 
- await build({entryPoints:['cli.ts'], bundle:true, platform:'node', format:'esm', outfile:'test/.build/cli.mjs', logLevel:'silent'});
-@@ -26,7 +26,8 @@ const data=(name,args)=>{
- createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;const result=m.method==='tools/call'?{content:[{type:'text',text:JSON.stringify({ok:true,data:data(m.params.name,m.params.arguments)})}]}:{};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');});
- `,{mode:0o755});
- const env={...process.env,UTOO_PROXY_BIN:proxy,CALLS:join(dir,'calls'),SKYLARK_MAX_RETRIES:'0'};
+@@ -29 +29,2 @@ const env={...process.env,UTOO_PROXY_BIN:proxy,CALLS:join(dir,'calls'),SKYLARK_M
 -const run=(args,extra={})=>spawnSync(process.execPath,['test/.build/cli.mjs',...args],{env:{...env,...extra},encoding:'utf8'});
 +const cli=resolve('test/.build/cli.mjs');
 +const run=(args,extra={},cwd=process.cwd())=>spawnSync(process.execPath,[cli,...args],{env:{...env,...extra},cwd,encoding:'utf8'});
- try {
-  const listing=join(dir,'listing.json');
-  let r=run(['listing','--url','https://example/book','--output',listing]);
-@@ -52,5 +53,29 @@ try {
-  assert.match(readFileSync(join(dir,'one.md'),'utf8'),/Actual body/);
-  assert.match(readFileSync(join(dir,'table.md'),'utf8'),/A\\\|B/);
-  assert.equal(existsSync(join(dir,'bad.md')),false);
+@@ -55 +56,25 @@ try {
 - console.log('Skylark CLI: complete listing, rejection, Markdown/table export and isolated failure passed');
 + // The public help example is executable, and document paths use cwd rather
 + // than the request file directory. This is an independent real-files seam.
@@ -880,7 +454,6 @@ index ac5d895..c8e3497 100644
 + assert.equal(r.status,0,r.stderr);
 + assert.deepEqual(JSON.parse(readFileSync(report,'utf8')).counts,{total:0,completed:0,failed:0});
 + console.log('Skylark CLI: listing, rejection, Markdown/table export, isolated failure, help JSON/cwd, retained failed target, and empty request passed');
- } finally {rmSync(dir,{recursive:true,force:true});}
 diff --git a/test/help.mjs b/test/help.mjs
 new file mode 100644
 index 0000000..f8f5043

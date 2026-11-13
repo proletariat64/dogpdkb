@@ -34,8 +34,8 @@ synthesized. The emitted document object contains:
   source; action: compile, metadata or reuse; reason_codes: string array.
 - resources: always an array of resource objects, empty when no cataloged
   resources exist. Objects retain mdcompare catalog evidence: resource_id (target
-  string), url (target string), kind (image or attachment), optional absolute path
-  when local bytes exist, and any declared evidence fields. For matching OCR
+  string), url (target string), kind (image, attachment or media), optional
+  absolute path when local bytes exist, and any declared evidence fields. For matching OCR
   evidence, path points to retained original bytes rather than disposable wash.
 - ocr: optional prepared-jpeg-ocr-v1 evidence object from mdocr batch, omitted
   when no evidence object is available. Its contract is prepared-jpeg-ocr-v1;

@@ -1,10 +1,20 @@
 # Skylark listing/export CLI contract
 
-Use the restored independent Skylark CLI, commit
-`0e7c21883481d04a42a771c6fad1ddd5e6e0aa91`, branch
-`feat/orchestrator-export-cli`. The restored build is currently
-`/tmp/pi-skylark-restored-cli-0e7c218/dist/cli.mjs`; the original checkout's
-uncommitted edits remain separate. No Graphify or Yuque source changes are needed.
+Use the independent Skylark CLI from `feat/cli-local-help`, implementation commit
+`0dbb2cc904ce257596252b377769d94ec6811cc1`, built on the restored CLI contract
+at `0e7c21883481d04a42a771c6fad1ddd5e6e0aa91`. Run `npm run build` in that
+source checkout or install its built local npm package. The help implementation
+is a separate source delivery; do not assume the default branch or an older
+user installation already contains it. See the
+[delivery and acceptance record](../.scratch/cli-help-redesign/skylark-acceptance.md).
+The original checkout's uncommitted edits remain separate. No Graphify or Yuque
+source changes are needed.
+
+Root and command `-h`/`--help` provide English first-invocation guidance;
+`skylark listing --help --full` and `skylark export -h --full` expose the complete
+bundled local schemas, environment, write scope, exits and repeat-call semantics.
+Root `skylark --version` identifies the package. These requests need no gateway,
+SSO or writable runtime; `--full` is a help modifier, not an execution mode.
 
 Configure `[tools]` with `skylark = ["node", "/path/to/pi_skylark/dist/cli.mjs"]`,
 or use the installed `skylark` bin. Tool environment retains `UTOO_PROXY_BIN`,

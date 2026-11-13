@@ -2,7 +2,7 @@
 
 Type: task
 Status: claimed
-Blocked by: 01, 02, 03, 04
+Blocked by: 01, 02, 03, 04, 07
 
 ## Scope
 

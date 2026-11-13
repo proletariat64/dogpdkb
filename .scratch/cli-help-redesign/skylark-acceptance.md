@@ -20,9 +20,13 @@ A separate linked worktree now holds the durable source commit described below.
 
 ## Delivered changes
 
-- [Binary-safe patch](skylark-help.patch): CLI routing, bundled English ordinary
-  and full local contracts, packaging file selection, documentation, tests, and
-  rebuilt executable. Apply against the restored commit, not the dirty main tree.
+- [Binary-safe source patch](skylark-help.patch): CLI routing, bundled English
+  ordinary/full contracts, packaging selection, documentation, and tests. Apply
+  against the restored commit using `git apply --unidiff-zero`, then run
+  `npm run build`. The patch deliberately excludes generated dist/cli.mjs so it
+  applies both to the exact Git source and the restored snapshot that already
+  contains that executable. The durable commit and npm package include the
+  rebuilt executable. Do not apply the patch to the dirty main tree.
 - Durable source worktree: `/tmp/skylark-help-delivery`.
 - Durable Git branch: `feat/cli-local-help` in the original Skylark repository.
 - Implementation commit: `0dbb2cc904ce257596252b377769d94ec6811cc1`.
@@ -63,10 +67,12 @@ Final commands passed:
   fake MCP proxy with real Markdown outputs. Relative document paths resolved
   from cwd rather than the request directory. Partial export retained an old
   failed target unchanged; empty requests completed with zero counts.
-- `git diff --check` and `git apply --check` against the unchanged restored
-  source passed. In the durable Git worktree the original commit has no tracked
-  dist executable; the six source/doc/test changes were applied excluding that
-  generated hunk, then `npm run build` regenerated and committed the executable.
+- `git diff --check` and `git apply --unidiff-zero --check` against the unchanged
+  restored snapshot passed for the final six-file source patch. Reverse-checking
+  the patch against the durable implementation also passed. In the durable Git
+  worktree the original commit has no tracked dist executable; `npm run build`
+  regenerated the separately committed executable. Omitting that generated file
+  prevents an already-existing-dist error when applying to the restored snapshot.
 - The durable source worktree independently reran `npm run build` and `make test`
   successfully before committing its exact seven implementation files. Its graph
   was refreshed and changes analyzed against the actual default `origin/main`.
