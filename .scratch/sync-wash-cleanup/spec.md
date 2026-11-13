@@ -1,6 +1,6 @@
 # Sync wash 清理规格
 
-Status: ready-for-agent
+Status: implementing
 
 ## 目标
 
