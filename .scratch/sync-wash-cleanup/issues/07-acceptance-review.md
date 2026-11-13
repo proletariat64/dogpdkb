@@ -1,8 +1,8 @@
 # 完成集成验收、文档与评审
 
 Type: implementation
-Status: open
-Assignee: unassigned
+Status: claimed
+Assignee: codex
 Parent: ../spec.md
 Blocked by: 04, 05, 06
 

@@ -74,7 +74,7 @@ watch 是前台只读查询，JSON 模式每行一个快照。展示阶段、公
 | 130 / 143 | SIGINT / SIGTERM |
 
 mdcompare 的不确定报告会让有效完整来源自动编译，不机械造成整体 partial。
-OCR partial 会保留交接并继续可用正文；单来源图编译失败保旧，成功来源继续。
+OCR partial 会保留交接并继续可用正文；Graphify 目录级整批失败保留旧图。
 语料和图谱成功版本独立，后续成功不会掩盖前面失败。
 
 [配置与使用](../README.md)、[持久状态](sync-state-design.md)、
