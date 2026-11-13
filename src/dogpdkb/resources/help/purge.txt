@@ -5,6 +5,9 @@ directory inside this selected book's wash; directory and run.json references
 must resolve to the same permitted scope. Parent traversal, symlink wash/run
 paths, symlink run metadata, and overlap with protected state/corpus/graph/cache
 are rejected. All candidates are checked before deletion starts.
+Saved schema, book key/source URL and run ID must match the selected wash.
+Changed corpus/graph execution targets do not prevent deleting an owned run;
+resuming execution still requires its frozen targets to match configuration.
 
 Default permits completed/partial runs only. --force also permits discarding
 paused, failed or interrupted work, permanently losing that run's saved plan,

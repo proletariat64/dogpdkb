@@ -11,6 +11,12 @@ from urllib.parse import quote
 from dogpdkb.records import atomic_json, read_json
 
 
+def _local_destination(path, original=""):
+    """Encode a filesystem path while retaining the original URL fragment."""
+    _, separator, fragment = original.partition("#")
+    return quote(path, safe="/:") + separator + fragment
+
+
 def retain_raw(directory, source, resources):
     """Copy catalogued files with their raw-relative filesystem layout intact."""
     root = directory / "raw"
@@ -84,7 +90,7 @@ def retain_ocr_files(directory, run, result, output, resources, original_paths):
             text,
             original_paths
             | {
-                r["resource_id"]: r["path"]
+                r["resource_id"]: _local_destination(r["path"], r["resource_id"])
                 for r in resources
                 if r.get("path") and Path(r["path"]).is_file()
             },
@@ -121,7 +127,7 @@ def retain_inputs(store, run, rows, results):
             [dict(r) for r in original_resources],
         )
         original_paths = {
-            before["path"]: after["path"]
+            before["path"]: _local_destination(after["path"])
             for before, after in zip(original_resources, resources)
             if before.get("path") and after.get("path")
         }
@@ -131,7 +137,7 @@ def retain_inputs(store, run, rows, results):
         if not Path(result.get("output") or "").is_file():
             fallback = directory / "corpus-input.md"
             targets = {
-                r["resource_id"]: r["path"]
+                r["resource_id"]: _local_destination(r["path"], r["resource_id"])
                 for r in resources
                 if r.get("path") and Path(r["path"]).is_file()
             }
@@ -150,6 +156,15 @@ def retain_inputs(store, run, rows, results):
         request_path, report_path = Path(previous["input"]), Path(previous["report"])
         try:
             request, report = read_json(request_path), read_json(report_path)
+            request_document = next(
+                (
+                    r
+                    for r in request["documents"]
+                    if str(r["document_id"]) == identifier
+                ),
+                {},
+            )
+            ocr_source = Path(request_document["path"])
             result = results.get(identifier) or next(
                 (
                     r
@@ -163,13 +178,23 @@ def retain_inputs(store, run, rows, results):
         output = Path(result.get("output") or "")
         if not output.is_file():
             continue
+        # Absolute targets become relative in the tool-facing OCR copy. The
+        # returned Markdown can retain those spellings, including fragments.
+        original_paths.update(
+            {
+                _local_destination(
+                    os.path.relpath(before["path"], ocr_source.parent),
+                    before["resource_id"],
+                ): _local_destination(after["path"], before["resource_id"])
+                for before, after in zip(original_resources, resources)
+                if before.get("path") and after.get("path")
+            }
+        )
         retained = retain_ocr_files(
             directory, run, result, output, resources, original_paths
         )
         report["documents"] = [result]
-        for item in request["documents"]:
-            if str(item["document_id"]) == identifier:
-                item["path"] = str(target)
+        request_document["path"] = str(target)
         result["output"] = str(retained)
         result["path"] = str(target)
         results[identifier] = result
@@ -183,9 +208,9 @@ def retain_inputs(store, run, rows, results):
 
 
 def relocate_targets(text, replacements):
-    """Relocate destinations without changing explicit literal examples."""
+    """Replace declared targets with URL destinations, preserving literals."""
     targets = {
-        spelling: quote(after, safe="/:")
+        spelling: after
         for before, after in replacements.items()
         for spelling in {before, quote(before, safe="/:")}
     }
@@ -358,7 +383,13 @@ def ocr_request_input(row, run):
         before: os.path.relpath(after, copy.parent) for before, after in local.items()
     }
     text = source.read_text(encoding="utf-8")
-    text = relocate_targets(text, replacements)
+    text = relocate_targets(
+        text,
+        {
+            before: _local_destination(after, before)
+            for before, after in replacements.items()
+        },
+    )
     copy.parent.mkdir(parents=True, exist_ok=True)
     copy.write_text(text, encoding="utf-8")
     selected = row["ocr_resources"]

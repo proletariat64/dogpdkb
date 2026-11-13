@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import pytest
 
@@ -12,6 +13,83 @@ from tests.test_orchestrator_apply_cli import cli
 from tests.test_wash_durable_inputs import enriched_instance
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+@pytest.mark.parametrize("has_ocr_output", [False, True])
+def test_local_fragments_survive_ocr_input_publication_and_purge(
+    tmp_path, absolute, has_ocr_output
+):
+    import re
+
+    config, differences = enriched_instance(tmp_path)
+    remote_path = tmp_path / "remote.json"
+    remote = json.loads(remote_path.read_text())
+    remote["42"]["body"] += (
+        '\n<svg><use href="RESOURCE#check"></use>'
+        '<use xlink:href="RESOURCE#cross%20mark"></use></svg>\n'
+    )
+    remote_path.write_text(json.dumps(remote))
+    exporter = tmp_path / "skylark.py"
+    exporter.write_text(
+        exporter.read_text().replace(
+            "path.write_text(doc['body'])",
+            "image=path.parent.parent/'images'/'icons #.svg'; "
+            "image.parent.mkdir(parents=True,exist_ok=True); "
+            'image.write_text(\'<svg><symbol id="check"/><symbol id="cross mark"/></svg>\'); '
+            "target=__import__('urllib.parse',fromlist=['quote']).quote("
+            + ("str(image)" if absolute else "'../images/'+image.name")
+            + ",safe='/'); path.write_text(doc['body'].replace('RESOURCE',target))",
+        )
+    )
+    ocr = tmp_path / "enrich.py"
+    script = ocr.read_text().replace(
+        "output.write_text(",
+        "Path(__file__).with_name('observed-ocr.md').write_text(Path(doc['path']).read_text()); output.write_text(",
+    )
+    if not has_ocr_output:
+        script = (
+            script.replace("'output':str(output)", "'output':None").replace(
+                "'status':'completed'", "'status':'partial'"
+            )
+            + "\nraise SystemExit(2)\n"
+        )
+    ocr.write_text(script)
+
+    result = cli("apply", "--config", config, "--input", differences)
+    assert result.returncode == (0 if has_ocr_output else 2), result.stderr
+    output = json.loads(result.stdout)
+    run = Path(output["run"]).parent
+    request = json.loads((run / "ocr-0-request.json").read_text())["documents"][0]
+    observed = (tmp_path / "observed-ocr.md").read_text()
+    targets = re.findall(r'(?:xlink:)?href="([^"]+)"', observed)
+    assert [urlsplit(target).fragment for target in targets] == [
+        "check",
+        "cross%20mark",
+    ]
+    for target in targets:
+        path = (Path(request["path"]).parent / unquote(urlsplit(target).path)).resolve()
+        assert path.is_file(), target
+    document = json.loads(Path(output["manifest"]).read_text())["documents"][0]
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    raw = Path(state["documents"]["42"]["raw"]["path"])
+    assert raw.read_bytes() == (run / "raw/0.md").read_bytes()
+    published = Path(document["path"])
+    targets = re.findall(r'(?:xlink:)?href="([^"]+)"', published.read_text())
+    assert [urlsplit(target).fragment for target in targets] == [
+        "check",
+        "cross%20mark",
+    ]
+    removed = cli("purge", "--config", config, "--run", output["run"])
+    assert removed.returncode == 0, removed.stderr
+    assert not run.exists()
+    for target in targets:
+        assert "%20%23.svg#" in target
+        path = (published.parent / unquote(urlsplit(target).path)).resolve()
+        assert (
+            path.read_text()
+            == '<svg><symbol id="check"/><symbol id="cross mark"/></svg>'
+        )
 
 
 def image_instance(tmp_path):

@@ -137,6 +137,83 @@ def test_purge_all_validates_every_run_before_deleting(tmp_path):
     assert other.exists()
 
 
+@pytest.mark.parametrize("changed", ["corpus", "graph"])
+@pytest.mark.parametrize(
+    "selection,status",
+    [("single", "completed"), ("single", "paused"), ("all", "completed")],
+)
+def test_purge_owned_wash_after_execution_target_changes(
+    tmp_path, changed, selection, status
+):
+    config = instance(tmp_path)
+    selected = run_directory(tmp_path, status=status)
+    if changed == "corpus":
+        books = tmp_path / "books.json"
+        rows = json.loads(books.read_text())
+        rows[0]["corpus"] = "new-corpus"
+        books.write_text(json.dumps(rows))
+    else:
+        config.write_text(
+            config.read_text().replace("[paths]\n", '[paths]\ngraph_dir="new-graph"\n')
+        )
+    preserved = []
+    for name in (
+        "corpus/funds/source.md",
+        "corpus/funds/graphify-out/graph.json",
+        "new-corpus/source.md",
+        "new-graph/graph.json",
+        "state/funds/inputs/raw.md",
+        "cache/image.json",
+    ):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(name)
+        preserved.append(path)
+    args = ["--all"] if selection == "all" else ["--run", selected.name]
+    runs = [selected]
+    if selection == "all":
+        current = run_directory(tmp_path, "run-current")
+        data = json.loads((current / "run.json").read_text())
+        data["targets"][changed] = str(
+            tmp_path / ("new-corpus" if changed == "corpus" else "new-graph")
+        )
+        (current / "run.json").write_text(json.dumps(data))
+        runs.append(current)
+    if status == "paused":
+        denied = cli(config, "--book", "funds", *args)
+        assert denied.returncode == 1 and "--force" in denied.stderr
+        assert selected.exists()
+        args.append("--force")
+    result = cli(config, "--book", "funds", *args)
+    assert result.returncode == 0, result.stderr
+    assert set(json.loads(result.stdout)["purged"]) == {str(run) for run in runs}
+    assert all(not run.exists() for run in runs)
+    assert all(
+        path.read_text() == str(path.relative_to(tmp_path)) for path in preserved
+    )
+
+
+@pytest.mark.parametrize("invalid", ["schema", "book", "source", "run-id"])
+def test_purge_all_rejects_invalid_saved_ownership_before_deleting(tmp_path, invalid):
+    config = instance(tmp_path)
+    valid = run_directory(tmp_path, "run-a")
+    invalid_run = run_directory(tmp_path, "run-z")
+    metadata = invalid_run / "run.json"
+    data = json.loads(metadata.read_text())
+    if invalid == "schema":
+        data["schema"] = "unknown"
+    elif invalid == "book":
+        data["book"]["key"] = "other"
+    elif invalid == "source":
+        data["targets"]["book_url"] = "https://example.invalid/other"
+    else:
+        data["run_id"] = "run-elsewhere"
+    metadata.write_text(json.dumps(data))
+    result = cli(config, "--book", "funds", "--all", "--force")
+    assert result.returncode == 1, result.stdout
+    assert valid.exists() and invalid_run.exists()
+
+
 @pytest.mark.parametrize("args", [[], ["--run", "run-x", "--all"]])
 def test_purge_requires_exactly_one_target(tmp_path, args):
     result = cli(instance(tmp_path), "--book", "funds", *args)

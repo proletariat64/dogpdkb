@@ -89,6 +89,9 @@ use a newly generated plan for a different source or target.
 Cleaned completed/partial runs are not resumable. Manual `purge` deletes only
 selected wash; force permits discarding unfinished runs but never bypasses locks
 or clears durable facts, corpus, graphs, persistent inputs or tool caches.
+Purge validates saved schema, book key/source URL and run ID against the selected
+wash; it does not require the saved corpus/graph execution targets to match the
+current configuration. Protected-path and live-owner checks still apply.
 
 ## Processes and observation
 

@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from dogpdkb.help import HelpParser
-from dogpdkb.records import Run, Store, process_alive
+from dogpdkb.records import RUN_SCHEMA, Store, process_alive, read_json
 from dogpdkb.settings import load_config, select_book
 
 
@@ -49,12 +49,23 @@ def purge_runs(store, reference=None, *, all_runs=False, force=False):
             raise ValueError(f"wash overlaps protected data: {target}")
         if (path / "run.json").is_symlink():
             raise ValueError("refusing symlink run metadata")
-        run = Run.load(store, path)
-        status = run.data.get("status")
-        if status == "running" and process_alive(run.data.get("pid")):
-            raise ValueError(f"run is still running: {run.id}")
+        # Deletion needs ownership, not the frozen execution targets for resume.
+        data = read_json(path / "run.json")
+        if (
+            not isinstance(data, dict)
+            or data.get("schema") != RUN_SCHEMA
+            or data.get("run_id") != path.name
+            or not isinstance(data.get("book"), dict)
+            or data["book"].get("key") != store.book.key
+            or not isinstance(data.get("targets"), dict)
+            or data["targets"].get("book_url") != store.book.url
+        ):
+            raise ValueError("run does not belong to the selected book wash or schema")
+        status = data.get("status")
+        if status == "running" and process_alive(data.get("pid")):
+            raise ValueError(f"run is still running: {path.name}")
         if status not in {"completed", "partial"} and not force:
-            raise ValueError(f"discarding {status} run requires --force: {run.id}")
+            raise ValueError(f"discarding {status} run requires --force: {path.name}")
         checked.append(target)
     for path in checked:
         shutil.rmtree(path)
