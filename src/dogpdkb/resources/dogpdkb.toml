@@ -8,7 +8,7 @@ corpus = "corpus"
 staging = "staging"
 state = "state"
 web = "web"
-# Runs and evidence are retained for the scheduled cleanup agent.
+# Completed sync cleans successful copies; failed Markdown/images/reports remain.
 results = "sync-results"
 # Tool-owned successful OCR cache; never inspect its layout from dogpdkb.
 ocr_cache = "ocr-cache"

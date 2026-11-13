@@ -191,6 +191,7 @@ def smoke(dist: Path) -> None:
             "sync",
             "update-graph",
             "status",
+            "purge",
             "publish-web",
         ):
             run([command, name, "--help"])
@@ -247,8 +248,37 @@ def smoke(dist: Path) -> None:
         assert phases.index("mdocr") < next(
             i for i, row in enumerate(calls) if row[:2] == ["graphify", "extract"]
         )
+        assert records[0].is_file()
+        assert not list(records[0].parent.glob("graphify-*"))
+        assert not (records[0].parent / "raw").exists()
+        assert list((work / "state/funds/inputs").rglob("*.md"))
+        run([command, "sync", "--config", config])
+        later_calls = [
+            json.loads(line)
+            for line in (work / "commands.jsonl").read_text().splitlines()
+        ]
+        for operation in (("skylark", "export"), ("graphify", "extract")):
+            assert sum(row[:2] == list(operation) for row in later_calls) == sum(
+                row[:2] == list(operation) for row in calls
+            )
+        protected = {
+            path: path.read_bytes()
+            for directory in (work / "state", work / "corpus", work / "ocr-cache")
+            for path in directory.rglob("*")
+            if path.is_file() and path.name != ".dogpdkb.lock"
+        }
+        run([command, "purge", "--config", config, "--all"])
+        assert not list((work / "runs/funds").glob("run-*"))
+        assert all(path.read_bytes() == value for path, value in protected.items())
+        status = json.loads(run([command, "status", "--config", config, "--json"]))
+        assert status["status"] == "no-runs", status
+        paused = json.loads(
+            run([command, "sync", "--config", config, "--stop-after", "plan"])
+        )
+        run([command, "purge", "--config", config, "--run", paused["run"]], expected=1)
+        run([command, "purge", "--config", config, "--run", paused["run"], "--force"])
         print(
-            "Installed CLI smoke passed: isolated wheel, plan/resume, real mdcompare/mdocr, external Skylark/Graphify fixtures."
+            "Installed CLI smoke passed: isolated wheel, plan/resume, cleanup/no-op/purge, real mdcompare/mdocr, external Skylark/Graphify fixtures."
         )
 
 

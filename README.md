@@ -38,6 +38,20 @@ Markdown 语料；`update-graph --input MANIFEST` 编译。`sync` 共用这套�
 新版本仍正常处理；OCR 失败不阻断可用正文编译。缺席只记录，不自动删除既有语料
 或图谱。失败图谱不回滚已更新语料；Graphify 编译按目录整批成功后发布；失败保留旧图。
 
+成功或 partial 的 sync 自动清理本次 wash 的成功临时副本，保留失败文档 Markdown、
+相关图片、报告和简要运行记录。计划暂停、整批失败和中断不自动清理；清理错误
+进入 stderr，不改变同步退出码。partial 后续由 agent 创建新 run 处理，不恢复旧批次。
+
+```bash
+dogpdkb purge --config ./instance/dogpdkb.toml --book funds --run RUN
+dogpdkb purge --config ./instance/dogpdkb.toml --book funds --all
+# 丢弃暂停、失败或中断 run；仍遵守写锁
+dogpdkb purge --config ./instance/dogpdkb.toml --book funds --run RUN --force
+```
+
+purge 只删除所选 book 的 wash，包括失败材料和运行记录；正式语料、图谱、持久
+版本事实、必要比较输入和工具缓存保留。它不解除失败抑制、不触发重试或历史回填。
+
 ## 小订阅
 
 在独立 `books.json` 来源中设置 `document_ids`，并使用独立 key 和目标目录：

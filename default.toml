@@ -8,8 +8,8 @@ corpus = "graphify_flatten_ready"
 staging = "wash"
 state = "skylark_books/state"
 web = "web-output"
-# Runs/evidence are retained for the scheduled cleanup agent. Durable document
-# versions and failed-step facts live under state, outside run directories.
+# Completed sync cleans successful temporary copies; failed inputs/reports remain.
+# Durable versions and necessary latest inputs live under state, outside wash.
 results = "sync-results"
 # Tool-owned successful OCR cache; dogpdkb does not inspect its layout.
 ocr_cache = "ocr-cache"
