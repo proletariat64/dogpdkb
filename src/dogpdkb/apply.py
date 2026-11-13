@@ -41,12 +41,13 @@ def call_tool(settings, run, name, arguments, *, timeout=None):
     return code
 
 
-def failure(run, row, step, reason, **details):
+def failure(run, row, step, reason, *, persist=True, **details):
     tool = run.data.get("tool", {})
     expected = {"export": "skylark", "ocr": "mdocr", "compare": "mdcompare"}
     if "exit_code" in details and tool.get("name") == expected.get(step):
         details.setdefault("argv", tool.get("argv"))
     run.failure(
+        persist=persist,
         document_id=row["document_id"],
         version=row.get("version"),
         step=step,
@@ -204,6 +205,12 @@ def prepare_inputs(settings, book, store, run, differences):
             except ValueError:
                 valid = False
             status = "completed" if valid else "failed" if result else "unknown"
+            if valid:
+                store.document(row["document_id"])["raw"] = {
+                    "version": row["version"],
+                    "path": row["raw_path"],
+                    "metadata": descriptor(book, row, row["raw_path"])["metadata"],
+                }
             store.complete(
                 row["document_id"],
                 "export",
@@ -215,12 +222,6 @@ def prepare_inputs(settings, book, store, run, differences):
                 path=row["raw_path"],
             )
             if valid:
-                store.document(row["document_id"])["raw"] = {
-                    "version": row["version"],
-                    "path": row["raw_path"],
-                    "metadata": descriptor(book, row, row["raw_path"])["metadata"],
-                }
-                store.save()
                 freeze_input(row)
                 kept.add(row["document_id"])
             else:
@@ -292,14 +293,13 @@ def catalog_failed_exports(settings, book, run, rows):
 
 
 def compare_inputs(settings, book, store, run, rows):
-    run.stage("compare", total=len(rows))
+    run.stage("compare", total=len(rows), phase="prepare")
     active = []
     for row in rows:
         previous = store.document(row["document_id"]).get("raw", {})
         row["resources"] = previous.get("resources")
         if not store.suppressed(row["document_id"], "compare", row["version"]):
             active.append(row)
-            store.attempt(row["document_id"], "compare", row["version"], run.id)
     if not active:
         return {}, {}
     baseline, incoming = [], []
@@ -323,13 +323,28 @@ def compare_inputs(settings, book, store, run, rows):
                 evidence=store.document(row["document_id"]).get("raw"),
             )
         )
-    manifests, valid = [], True
+    manifests, sources = [], []
     for name, documents in (("baseline", baseline), ("incoming", incoming)):
         source, target = (
             run.directory / f"{name}-descriptors.json",
             run.directory / f"{name}.json",
         )
         atomic_json(source, {"schema_version": "1.0", "documents": documents})
+        sources.append(source)
+        manifests.append(target)
+    store.complete_batch(
+        {
+            "doc_id": row["document_id"],
+            "name": "compare",
+            "version": row["version"],
+            "status": "running",
+            "run_id": run.id,
+        }
+        for row in active
+    )
+    run.stage("compare", total=len(active), phase="tools")
+    valid = True
+    for source, target in zip(sources, manifests):
         code = call_tool(
             settings,
             run,
@@ -337,7 +352,6 @@ def compare_inputs(settings, book, store, run, rows):
             ["catalog", "--input", source, "--output", target],
         )
         valid = valid and code == 0 and target.is_file()
-        manifests.append(target)
     if valid:
         try:
             catalog = read_json(manifests[1])
@@ -387,6 +401,8 @@ def compare_inputs(settings, book, store, run, rows):
             report = {}
         reports.append(report)
         run.data["artifacts"][mode] = str(output)
+    run.stage("compare", total=len(active), phase="record-results")
+    outcomes = []
     for row in active:
         status = (
             "completed"
@@ -399,6 +415,7 @@ def compare_inputs(settings, book, store, run, rows):
                 row,
                 "compare",
                 "COMPARISON_REPORT_UNAVAILABLE",
+                persist=False,
                 exit_code=code,
                 argv=run.data.get("tool", {}).get("argv"),
                 reports=[
@@ -407,15 +424,19 @@ def compare_inputs(settings, book, store, run, rows):
                 ],
                 inputs=[str(path) for path in manifests],
             )
-        store.complete(
-            row["document_id"],
-            "compare",
-            row["version"],
-            status,
-            run.id,
-            knowledge=run.data["artifacts"]["knowledge"],
-            comparison=run.data["artifacts"]["compare"],
+        outcomes.append(
+            {
+                "doc_id": row["document_id"],
+                "name": "compare",
+                "version": row["version"],
+                "status": status,
+                "run_id": run.id,
+                "knowledge": run.data["artifacts"]["knowledge"],
+                "comparison": run.data["artifacts"]["compare"],
+            }
         )
+    store.complete_batch(outcomes)
+    run.save()
     return reports
 
 
@@ -741,6 +762,7 @@ def apply_run(
 
 
 def record_interruption(store, run, code):
+    outcomes = []
     for identifier, document in store.data["documents"].items():
         for step, record in list(document.get("steps", {}).items()):
             if record.get("run_id") == run.id and record.get("status") == "running":
@@ -749,17 +771,27 @@ def record_interruption(store, run, code):
                     for key, value in record.items()
                     if key not in {"version", "status", "run_id", "updated_at"}
                 }
-                store.complete(
-                    identifier, step, record["version"], "unknown", run.id, **details
+                outcomes.append(
+                    {
+                        "doc_id": identifier,
+                        "name": step,
+                        "version": record["version"],
+                        "status": "unknown",
+                        "run_id": run.id,
+                        **details,
+                    }
                 )
-                run.failure(
-                    document_id=identifier,
-                    version=record["version"],
-                    step=step,
-                    reason="CALL_INTERRUPTED",
-                    exit_code=code,
-                    **details,
+                run.data["failures"].append(
+                    {
+                        "document_id": identifier,
+                        "version": record["version"],
+                        "step": step,
+                        "reason": "CALL_INTERRUPTED",
+                        "exit_code": code,
+                        **details,
+                    }
                 )
+    store.complete_batch(outcomes)
     run.finish("interrupted", code)
 
 

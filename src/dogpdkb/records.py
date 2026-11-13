@@ -158,8 +158,28 @@ class Store:
         return self.complete(doc_id, name, version, "running", run_id, **details)
 
     def complete(self, doc_id, name, version, status, run_id, **details) -> dict:
+        record = self._record(doc_id, name, version, status, run_id, **details)
+        self.save()
+        return record
+
+    def complete_batch(self, records) -> None:
+        """Persist one external batch at its call/result boundary."""
+        records = list(records)
+        for item in records:
+            self._validate_step(item["version"], item["status"])
+        for item in records:
+            self._record(**item)
+        if records:
+            self.save()
+
+    @staticmethod
+    def _validate_step(version, status):
         if status not in {"running", "completed", "failed", "unknown", "skipped"}:
             raise ValueError(f"unsupported step result: {status}")
+        version_key(version)
+
+    def _record(self, doc_id, name, version, status, run_id, **details) -> dict:
+        self._validate_step(version, status)
         key = version_key(version)
         record = {
             **details,
@@ -175,7 +195,6 @@ class Store:
             blocked[key] = {"status": status, "run_id": run_id}
         elif status == "completed":
             blocked.pop(key, None)
-        self.save()
         return record
 
     @contextmanager
@@ -337,13 +356,17 @@ class Run:
         self.data["updated_at"] = now_iso()
         atomic_json(self.path, self.data)
 
-    def stage(self, name: str, **counts) -> None:
+    def stage(self, name: str, *, phase: str | None = None, **counts) -> None:
         self.data.update(stage=name, counts=counts)
+        self.data.pop("phase", None)
+        if phase is not None:
+            self.data["phase"] = phase
         self.save()
 
-    def failure(self, **details) -> None:
+    def failure(self, *, persist=True, **details) -> None:
         self.data["failures"].append(details)
-        self.save()
+        if persist:
+            self.save()
 
     def finish(self, status: str, exit_code=0, reason=None) -> None:
         if status not in {"paused", "completed", "partial", "failed", "interrupted"}:

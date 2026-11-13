@@ -37,6 +37,15 @@ Reusing the same key for a different source book URL is rejected.
   an external call; `store.complete(id, name, version, status, run_id, **details)`
   persists the actual result. Statuses are `completed`, `failed`, `unknown`,
   `skipped`; step details may hold artifact/reason/exit_code/input references.
+- `store.complete_batch(records)` uses the same step fields and version-block
+  rules as `complete`, but persists all records with one atomic state write.
+  Each record supplies `doc_id`, `name`, `version`, `status`, `run_id` and any
+  step details. Comparison and Graphify mark their complete external batch
+  `running` before the first subprocess and commit outcomes once afterward.
+  Comparison resource updates use one additional write. Local descriptor
+  preparation does not mark an external attempt. Empty batches do not write.
+  Individual export/OCR calls retain their own before/after checkpoints;
+  successful export results and raw facts share one post-call write.
 - `store.suppressed(id, name, version)` is true for this version's
   failed/unknown/in-flight attempt, so a later daily batch does not retry it.
   Unstarted work has no record and is not suppressed. A new version is not
@@ -71,6 +80,14 @@ Duplicate IDs fail before any durable registration.
 
 - `run.directory`, `run.path`, `run.id`, `run.data`; `run.save()`.
 - `run.stage(name, **counts)` records current stage and publicly known counters.
+  Optional `phase` is a separate status field: comparison and Graphify expose
+  `prepare`, `tools`, and `record-results`. These describe wrapper activity,
+  not per-document comparison or extraction completion. Entering a new stage
+  clears the previous phase unless the caller supplies one.
+- `run.failure(..., persist=False)` accumulates a known batch's failures for
+  the owner's following save/stage/finish. Normal individual failures persist
+  immediately. Interrupted running steps are marked unknown in one state write,
+  then the complete failure list and interrupted run result are saved together.
 - `run.failure(**details)` appends a failure/evidence row.
 - `run.finish(status, exit_code=0, reason=None)` records paused/completed/partial/
   failed/interrupted; it does not itself clean up or retry. The sync owner cleans

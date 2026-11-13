@@ -82,7 +82,9 @@ def report(data: dict) -> str:
         return "no sync runs recorded"
     counts = " ".join(f"{key}={value}" for key, value in data.get("counts", {}).items())
     return (
-        f"run {data['run_id']} status={data['status']} stage={data.get('stage') or 'none'}\n"
+        f"run {data['run_id']} status={data['status']} stage={data.get('stage') or 'none'}"
+        + (f" phase={data['phase']}" if data.get("phase") else "")
+        + "\n"
         f"{counts}\nelapsed={data['elapsed_seconds']}s updated={data.get('updated_at')}\n"
         f"artifacts: {data.get('artifacts', {})}"
     )
