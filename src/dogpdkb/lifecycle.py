@@ -187,7 +187,7 @@ def uninstall(yes: bool = False) -> int:
                 raise ValueError("Noninteractive uninstall requires --yes.")
             if input("Uninstall dogpdkb? [y/N] ").strip().lower() != "y":
                 return 1
-        for name in ("dogpdkb", "mdocr"):
+        for name in ("dogpdkb", "mdocr", "mdcompare"):
             link = installation.binary / name
             if (
                 link.is_symlink()

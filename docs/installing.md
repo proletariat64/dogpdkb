@@ -34,7 +34,9 @@ Only the published version-bound script has a package URL and checksum.
 Defaults:
 
 - Programs and versioned virtual environments: `~/.local/share/dogpdkb/`.
-- Command links: `~/.local/bin/dogpdkb` and `~/.local/bin/mdocr`.
+- Command links: `~/.local/bin/dogpdkb`, `~/.local/bin/mdocr` and
+  `~/.local/bin/mdcompare` (or the selected `DOGPDKB_BIN_DIR`). Installing or
+  upgrading with this installer adds the previously missing `mdcompare` link.
 - Example configuration: `~/.config/dogpdkb/dogpdkb.toml` and `books.json`.
 
 The installer prints a PATH command if `~/.local/bin` is not already on PATH;
