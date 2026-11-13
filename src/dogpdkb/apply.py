@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -607,8 +608,9 @@ def publish_corpus(book, store, run, rows, results):
             temporary.replace(output)
         finally:
             temporary.unlink(missing_ok=True)
-        witness = store.input_directory(identifier) / "corpus.md"
-        witness.parent.mkdir(parents=True, exist_ok=True)
+        inputs = store.input_directory(identifier)
+        inputs.mkdir(parents=True, exist_ok=True)
+        witness = Path(tempfile.mkdtemp(prefix="corpus-", dir=inputs)) / "corpus.md"
         shutil.copyfile(output, witness)
         resources = [dict(resource) for resource in (row.get("resources") or [])]
         evidence = result.get("ocr")

@@ -1,0 +1,314 @@
+"""Publication retention through public CLIs and real filesystem faults."""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from tests.test_orchestrator_apply_cli import cli
+from tests.test_wash_durable_inputs import enriched_instance
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def image_instance(tmp_path):
+    config, differences = enriched_instance(tmp_path)
+    (tmp_path / "enrich.py").write_text(
+        """import json,sys
+from pathlib import Path
+from urllib.parse import quote
+args=sys.argv[1:]
+def option(name): return Path(args[args.index(name)+1])
+doc=json.loads(option('--manifest').read_text())['documents'][0]
+output=option('--output-dir')/'enriched.md';output.parent.mkdir(parents=True,exist_ok=True)
+body=Path(doc['path']).read_text()
+image=output.parent/'prepared image.png';image.write_bytes(body.encode())
+output.write_text(body+'\\n![prepared]('+quote(str(image),safe='/')+')\\n')
+resource={'resource_id':'image','status':'success','source_path':str(image),'prepared_image':str(image)}
+option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[resource],'ocr':{'images':[resource]}}]}))
+"""
+    )
+    return config, differences
+
+
+def next_version(tmp_path, differences):
+    version = "2026-11-13T10:00:00Z"
+    remote_path = tmp_path / "remote.json"
+    remote = json.loads(remote_path.read_text())
+    remote["42"].update(version=version, body="# Title\n\nReplacement knowledge.\n")
+    remote_path.write_text(json.dumps(remote))
+    selected = json.loads(differences.read_text())
+    selected["documents"][0]["version"] = {
+        "value": version,
+        "utc": "2026-11-13T10:00:00+00:00",
+        "precision": "instant",
+    }
+    differences.write_text(json.dumps(selected))
+
+
+def fault_cli(arguments, fault):
+    """Deny an external filesystem operation, without replacing product calls."""
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys,runpy\nfrom pathlib import Path\n"
+            + fault
+            + "\nsys.argv=['dogpdkb',*sys.argv[1:]]\n"
+            "runpy.run_module('dogpdkb',run_name='__main__')\n",
+            *map(str, arguments),
+        ],
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=20,
+    )
+
+
+def test_failed_asset_retention_keeps_previous_published_image(tmp_path):
+    config, differences = image_instance(tmp_path)
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 0, first.stderr
+    manifest = json.loads(Path(json.loads(first.stdout)["manifest"]).read_text())
+    document = manifest["documents"][0]
+    corpus = Path(document["path"])
+    before = corpus.read_bytes()
+    image = Path(document["ocr"]["images"][0]["prepared_image"])
+    old_image = image.read_bytes()
+    next_version(tmp_path, differences)
+    failed = fault_cli(
+        ["apply", "--config", config, "--input", differences],
+        """def deny_retention(event,args):
+ if event=='shutil.copyfile' and '/ocr-files/' in str(args[1]):
+  raise OSError('INJECTED_ASSET_COPY_FAILURE')
+sys.addaudithook(deny_retention)
+""",
+    )
+    assert failed.returncode == 1, failed.stderr
+    assert "INJECTED_ASSET_COPY_FAILURE" in failed.stderr
+    assert corpus.read_bytes() == before
+    assert image.is_file(), "last published corpus lost its prepared image"
+    assert image.read_bytes() == old_image
+
+
+@pytest.mark.parametrize("interrupt_state_save", [False, True])
+def test_old_corpus_witness_remains_immutable_across_publication(
+    tmp_path, interrupt_state_save
+):
+    config, differences = image_instance(tmp_path)
+    graphify = tmp_path / "graphify.py"
+    graphify.write_text(
+        """import json,sys
+from pathlib import Path
+Path(__file__).with_name('graph-called').touch()
+args=sys.argv[1:]; output=Path(args[args.index('--out')+1])/'graphify-out'
+output.mkdir(parents=True,exist_ok=True)
+(output/'graph.json').write_text(json.dumps({'nodes':[],'links':[]}))
+(output/'manifest.json').write_text('{}')
+"""
+    )
+    config.write_text(
+        config.read_text()
+        + "graphify="
+        + json.dumps([sys.executable, str(graphify)])
+        + "\n"
+    )
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 0, first.stderr
+    manifest_path = Path(json.loads(first.stdout)["manifest"])
+    document = json.loads(manifest_path.read_text())["documents"][0]
+    corpus, witness = Path(document["path"]), Path(document["input_copy"])
+    old_bytes = witness.read_bytes()
+    image = Path(document["ocr"]["images"][0]["prepared_image"])
+    old_image = image.read_bytes()
+    next_version(tmp_path, differences)
+    arguments = ["apply", "--config", config, "--input", differences]
+    if interrupt_state_save:
+        state = tmp_path / "state/funds/state.json"
+        second = fault_cli(
+            arguments,
+            f"""def deny_state_commit(event,args):
+ if event=='os.rename' and Path(args[1])==Path({str(state)!r}):
+  if 'Replacement knowledge.' in Path({str(corpus)!r}).read_text():
+   raise OSError('INJECTED_CORPUS_STATE_FAILURE')
+sys.addaudithook(deny_state_commit)
+""",
+        )
+        assert second.returncode == 1, second.stderr
+        assert "INJECTED_CORPUS_STATE_FAILURE" in second.stderr
+    else:
+        second = cli(*arguments)
+        assert second.returncode == 0, second.stderr
+        latest = json.loads(Path(json.loads(second.stdout)["manifest"]).read_text())[
+            "documents"
+        ][0]
+        assert latest["input_copy"] != str(witness)
+        assert Path(latest["input_copy"]).read_bytes() == corpus.read_bytes()
+    assert corpus.read_bytes() != old_bytes
+    assert witness.read_bytes() == old_bytes
+    assert image.read_bytes() == old_image
+    rejected = cli("update-graph", "--config", config, "--input", manifest_path)
+    assert rejected.returncode == 1, rejected.stderr
+    assert not (tmp_path / "graph-called").exists()
+
+
+def test_ocr_request_survives_cleanup_after_earlier_export_failure(tmp_path):
+    from tests.test_wash_cleanup_cli import instance
+
+    config, tool = instance(tmp_path)
+    script = tool.read_text().replace(
+        "    write(flag('--output'), {'schema':'skylark-export-result-1'",
+        "    if rows[0]['document_id']=='1': rows[0]['status']='failed'\n"
+        "    write(flag('--output'), {'schema':'skylark-export-result-1'",
+    )
+    script = script.replace(
+        "if tool in ('mdcompare', 'mdocr'):",
+        "if tool == 'mdocr':\n"
+        "    pathlib.Path(args[args.index('--report')+1]).write_text('invalid')\n"
+        "    raise SystemExit(2)\n"
+        "if tool in ('mdcompare', 'mdocr'):",
+    )
+    tool.write_text(script)
+    result = cli("sync", "--config", config)
+    assert result.returncode == 2, result.stderr
+    run_path = Path(json.loads(result.stdout)["run"])
+    record = json.loads(run_path.read_text())
+    assert record["cleanup"]["status"] == "completed"
+    assert {failure["step"] for failure in record["failures"]} >= {"export", "ocr"}
+    request = run_path.parent / "ocr-0-request.json"
+    assert request.is_file(), "cleanup lost the actual failed OCR invocation"
+    assert json.loads(request.read_text())["documents"][0]["document_id"] == "2"
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    assert state["documents"]["2"]["steps"]["ocr"]["input"] == str(request)
+
+
+def test_resumed_run_uses_new_publication_generation(tmp_path):
+    from tests.test_orchestrator_apply_cli import two_sources
+
+    config, differences = image_instance(tmp_path)
+    two_sources(tmp_path, differences)
+    tool = tmp_path / "enrich.py"
+    script = tool.read_text().replace(
+        "'schema_version':'mdocr-batch-1.0','documents'",
+        "'schema_version':'mdocr-batch-1.0','causes':"
+        "(['OCR_AUTH_UNAVAILABLE'] if not Path(__file__).with_name('allow').exists() else []),"
+        "'documents'",
+    )
+    script = script.replace(
+        "'status':'completed'",
+        "'status':('completed' if Path(__file__).with_name('allow').exists() else 'partial')",
+    )
+    tool.write_text(
+        script
+        + "\nraise SystemExit(0 if Path(__file__).with_name('allow').exists() else 2)\n"
+    )
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 2, first.stderr
+    first_result = json.loads(first.stdout)
+    before = json.loads(Path(first_result["manifest"]).read_text())
+    old_document = next(
+        row for row in before["documents"] if row["document_id"] == "43"
+    )
+    assert old_document["pending_steps"] == ["ocr"]
+    old_witness = Path(old_document["input_copy"])
+    old_bytes = old_witness.read_bytes()
+    (tmp_path / "allow").touch()
+    resumed = cli("apply", "--config", config, "--resume", first_result["run"])
+    assert resumed.returncode == 2, resumed.stderr
+    resumed_result = json.loads(resumed.stdout)
+    assert resumed_result["run"] == first_result["run"]
+    after = json.loads(Path(resumed_result["manifest"]).read_text())
+    new_document = next(row for row in after["documents"] if row["document_id"] == "43")
+    assert new_document["pending_steps"] == []
+    assert new_document["input_copy"] != str(old_witness)
+    assert old_witness.read_bytes() == old_bytes
+    assert Path(new_document["input_copy"]).read_bytes() != old_bytes
+
+
+@pytest.mark.parametrize(
+    "markup",
+    [
+        '<img src="ABSOLUTE_IMAGE" alt="Diagram">',
+        "<img src='ABSOLUTE_IMAGE' alt='Diagram'>",
+        "<img src=ABSOLUTE_IMAGE>",
+        '![diagram][image]\n[image]: ../images/diagram.png "Original"',
+        '![diagram][image]\n[image]: <../images/diagram.png> "Original"',
+        '<img srcset="ABSOLUTE_IMAGE 1x, ../images/diagram.png 2x">',
+    ],
+)
+def test_catalogued_noninline_resource_survives_wash_purge(tmp_path, markup):
+    config, differences = enriched_instance(tmp_path)
+    remote_path = tmp_path / "remote.json"
+    remote = json.loads(remote_path.read_text())
+    remote["42"]["body"] += "\n" + markup + "\n\nliteral target: ABSOLUTE_IMAGE\n"
+    remote_path.write_text(json.dumps(remote))
+    exporter = tmp_path / "skylark.py"
+    exporter.write_text(
+        exporter.read_text().replace(
+            "path.write_text(doc['body'])",
+            "image=path.parent.parent/'images'/'diagram.png'; "
+            "image.parent.mkdir(parents=True,exist_ok=True); "
+            "__import__('PIL.Image',fromlist=['Image']).new('RGB',(2,2),'red').save(image); "
+            "path.write_text(doc['body'].replace('ABSOLUTE_IMAGE',str(image)))",
+        )
+    )
+    result = cli("apply", "--config", config, "--input", differences)
+    assert result.returncode == 0, result.stderr
+    run = Path(json.loads(result.stdout)["run"])
+    document = json.loads(Path(json.loads(result.stdout)["manifest"]).read_text())[
+        "documents"
+    ][0]
+    raw_source = next((run.parent / "raw").glob("*.md")).read_bytes()
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    assert Path(state["documents"]["42"]["raw"]["path"]).read_bytes() == raw_source
+    original_image = run.parent / "images/diagram.png"
+    assert f"literal target: {original_image}" in Path(document["path"]).read_text()
+    removed = cli("purge", "--config", config, "--run", run)
+    assert removed.returncode == 0, removed.stderr
+    assert not run.parent.exists()
+    descriptors = tmp_path / "published.json"
+    descriptors.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "documents": [
+                    {
+                        "knowledge_base": "funds",
+                        "document_id": "42",
+                        "content_kind": "raw",
+                        "path": document["path"],
+                        "metadata": document["metadata"],
+                    }
+                ],
+            }
+        )
+    )
+    catalog = tmp_path / "catalog.json"
+    checked = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mdcompare",
+            "catalog",
+            "--input",
+            str(descriptors),
+            "--output",
+            str(catalog),
+        ],
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    assert checked.returncode == 0, checked.stderr
+    resources = json.loads(catalog.read_text())["documents"][0]["resources"]
+    assert resources
+    assert all(
+        resource.get("path") and Path(resource["path"]).is_file()
+        for resource in resources
+    )
