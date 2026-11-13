@@ -1,16 +1,19 @@
 # dogpdkb — 全球资金平台产品 knowledge corpus
 
-This repo is **not a normal code project.** It holds a graphify-built knowledge
-graph over a Yuque product-knowledge base, plus the planning artifacts for serving
-that graph through an interactive dashboard. Almost everything heavy is gitignored
-and lives only on this machine.
+This repo contains the installable `dogpdkb` CLI orchestrator, independent
+`mdcompare` and `mdocr` CLIs, and a Graphify-built Yuque knowledge corpus with
+an independent Web dashboard. Large corpus/graph artifacts are machine-local
+and intentionally gitignored. Current CLI contracts and development gates are
+in `README.md`; implementation acceptance is under `.scratch/`.
 
 ## What lives here
 
 | Path | Tracked? | What it is |
 | --- | --- | --- |
-| `graphify_flatten_ready/*.md` | **no** (gitignored `graphify*/`) | 4,584 raw corpus docs, ~106 MB, exported from Yuque book "全球资金平台产品" (`roots.json`) |
-| `graphify_flatten_ready/graphify-out/graph.json` | **no** | The compiled graph: **34,661 nodes / 47,509 edges**, networkx node-link format, ~36 MB. Built once via `graphify`. Machine-local — do NOT commit, do NOT rebuild casually. |
+| `src/dogpdkb/` | **yes** | Serial CLI orchestration, durable facts, read-only status, independent Web/lifecycle |
+| `src/mdcompare/`, `src/mdocr/` | **yes** | Independent tools; orchestrator consumes their public CLIs/artifacts |
+| `graphify_flatten_ready/*.md` | **no** (gitignored `graphify*/`) | Historical baseline: 4,584 raw docs, ~106 MB, exported from Yuque book "全球资金平台产品" (`roots.json`); measure current counts when needed |
+| `graphify_flatten_ready/graphify-out/graph.json` | **no** | Historical baseline: **34,661 nodes / 47,509 edges**, ~36 MB, built via Graphify. Machine-local — do NOT commit or rebuild casually. |
 | `graphify_flatten_ready/graphify-out/` (rest) | **no** | `GRAPH_REPORT.md`, `manifest.json`, `cache/`, `memory/`, `reflections/`, `.graphify_analysis.json`, `.graphify_labels.json` |
 | `scripts/graphify-watchdog-uat.py` | **yes** | Monitor that watches a graphify extraction run (snapshot/hourly checks) |
 | `snapshot/` | **no** | Watchdog runtime output (`snapshot.md`, `hourly-checks.log`) |
@@ -18,9 +21,31 @@ and lives only on this machine.
 | `roots.json`, `roots.md` | **yes** | Origin: `https://yuque.antfin.com/global-fund-platform/gom7xx` |
 | `wash/`, `inbox/` | **yes** | Empty staging dirs |
 
-**Git root exists only so pi-lens treats this as a project** (`scripts/` is the
-only real "code"). The corpus and the graph are intentionally not version
-controlled — `git status` should stay clean.
+Code, tests and engineering scripts are version controlled. Corpus, graph,
+cache, credentials and run artifacts remain outside commits.
+
+## Hard boundary: orchestrate public CLIs
+
+`discover`, `apply`, `update-graph` and `sync` form one serial implementation.
+The orchestrator owns selection, plans, actual version/step results and policy;
+Skylark, mdcompare, mdocr and Graphify own their tool algorithms and runtime.
+
+- In `src/dogpdkb/`, call tools only through subprocess argv and documented
+  JSON/Markdown artifacts. Importing tool packages, private symbols or invoking
+  those imports through a helper script is forbidden, including `mdocr.config`.
+- Graphify and Yuque are external tools: never change their source or require a fork.
+  Only user-owned tools may receive authorized CLI extensions. Keep
+  comparison/OCR/cache/graph extraction and merging inside their tools.
+- Run `init-state` before using an existing corpus. It registers facts without
+  rewriting Markdown/graph or importing old runs/state. Preserve separate
+  observed/raw/corpus/graph truth and same-version failure/unknown suppression.
+- Keep Web publication separate from sync. Old evidence/run cleanup is an
+  external agent responsibility; do not add migration or automatic retry layers.
+
+When changing an integration, read `docs/orchestrator-tool-contracts.md`,
+`docs/orchestrator-skylark-contract.md` or `docs/orchestrator-graphify-contract.md`
+for that tool. Shared state/discover interfaces are in
+`docs/orchestrator-core-contracts.md` and `docs/orchestrator-discover-contract.md`.
 
 ## The graph artifact
 
@@ -79,6 +104,7 @@ in a layer. A direct graphify→U-A transform must synthesize all of those.
 
 ## Conventions for agents working here
 
+- The `yuque` CLI supports listing and downloading Yuque resources. Sync uses the restored Skylark CLI.
 - Sync recent deltas only; historical missing docs were intentionally filtered—do not backfill.
 
 1. **Fast path for corpus questions:** if `graphify_flatten_ready/graphify-out/graph.json`
@@ -91,8 +117,11 @@ in a layer. A direct graphify→U-A transform must synthesize all of those.
    scrub, do not flag, do not paste contents into logs/docs.
 4. **`graphify*/`, `snapshot/`, `.pi/` are gitignored on purpose.** If `git status`
    shows them, the `.gitignore` is broken — fix the ignore, don't `git add`.
-5. **No `.code-review-graph/`** here, so the global "use crg before Grep/Read"
-   rule does NOT apply. Use `rg`/`fd`/`read` directly.
+5. **Code relationships:** use code-review-graph first for symbols, dependencies,
+   tests and impact, with the current worktree as `repo_root`. Refresh incomplete
+   or stale coverage; analyze impact before substantial edits and actual default
+   branch changes before commits/review. Keep `.code-review-graph/` uncommitted.
+   Use `rg` for literals/non-code or graph gaps.
 6. **Never run `pkill -f <pattern>` from a `bash -c` containing that pattern** —
    it matches and kills the invoking shell. Kill by numeric PID via `pgrep -f`
    first. (Bitten 3× during the extraction run.)
@@ -101,7 +130,7 @@ in a layer. A direct graphify→U-A transform must synthesize all of those.
 
 Global pi rules in `~/.pi/agent/AGENTS.md` and `~/AGENTS.md` (caveman chat style,
 conventional commit prefixes, pi-lens as primary linter). Those still apply except
-where this file narrows them (point 5 above).
+where this file narrows them.
 
 ## Agent skills
 

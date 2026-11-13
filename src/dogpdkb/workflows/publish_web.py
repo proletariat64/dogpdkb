@@ -13,22 +13,14 @@ from pathlib import Path
 from typing import Any
 
 from dogpdkb.instance_lock import locked_main
-from dogpdkb.sync_progress import progress_for_config
-from dogpdkb.sync_time import UTC8
+from dogpdkb.records import UTC8
+from dogpdkb.settings import Settings, load_config, select_book
 
 NAME_RE = re.compile(r"-(\d{4}-\d{2}-\d{2})-\[(\d+)\]\.md$")
-from mdocr.config import (
-    SyncConfig,
-    cli_path,
-    config_arguments,
-    configure,
-    configured_book,
-    current_config,
-)
 
 
-def group_for(category: str, config: SyncConfig | None = None) -> str:
-    config = config or current_config()
+def group_for(category: str, config: Settings | None = None) -> str:
+    config = config or load_config()
     if category in config.groups:
         return config.groups[category]
     for prefix, group in config.group_prefixes.items():
@@ -41,9 +33,9 @@ def build_catalog(
     corpus: Path,
     graph: dict[str, Any],
     book: dict[str, str],
-    config: SyncConfig | None = None,
+    config: Settings | None = None,
 ) -> dict[str, Any]:
-    config = config or current_config()
+    config = config or load_config()
     concepts = collections.defaultdict(list)
     community_nodes = collections.defaultdict(list)
     for node in graph["nodes"]:
@@ -324,17 +316,31 @@ def publish_snapshots(output: Path, catalog: dict, layered: dict) -> None:
 
 
 @locked_main
-def main() -> None:
+def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    config_arguments(parser, book=True)
-    parser.add_argument("-i", "--input", type=cli_path)
-    parser.add_argument("--graph", type=cli_path)
-    parser.add_argument("-o", "--output", type=cli_path)
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--book")
+    parser.add_argument(
+        "-i", "--input", type=lambda value: Path(value).expanduser().resolve()
+    )
+    parser.add_argument(
+        "--graph", type=lambda value: Path(value).expanduser().resolve()
+    )
+    parser.add_argument(
+        "-o", "--output", type=lambda value: Path(value).expanduser().resolve()
+    )
     parser.add_argument("--book-name")
     parser.add_argument("--book-url")
-    args = parser.parse_args()
-    config = configure(parser, args.config)
-    source = configured_book(parser, config, args, args.book_url)
+    args = parser.parse_args(argv)
+    try:
+        config = load_config(args.config)
+        source = (
+            None
+            if args.input and args.output and args.book_url
+            else select_book(config, args.book)
+        )
+    except ValueError as error:
+        parser.error(str(error))
     args.input = args.input or source.corpus
     if not args.input.is_dir():
         parser.error(f"input dir not found: {args.input}")
@@ -349,26 +355,14 @@ def main() -> None:
     catalog = build_catalog(
         args.input,
         graph,
-        {"name": args.book_name or source.name or source.url, "url": source.url},
+        {
+            "name": args.book_name or (source.name if source else args.book_url),
+            "url": args.book_url or source.url,
+        },
         config,
     )
     layered = build_map(graph, catalog, community_limit=config.community_limit)
-    tracker = progress_for_config(config, source, args.input)
-    if tracker:
-        tracker.claim(args.output, phase="web")
-        tracker.phase("web", "running")
-    try:
-        publish_snapshots(args.output, catalog, layered)
-    except BaseException as error:
-        if tracker:
-            tracker.phase("web", "failed", reason=type(error).__name__)
-        raise
-    if tracker:
-        tracker.phase(
-            "web", "completed", output=str(args.output), graph=str(graph_path)
-        )
-        if not os.environ.get("DOGPDKB_RUN_STAGING"):
-            tracker.finish()
+    publish_snapshots(args.output, catalog, layered)
     result = {
         "status": "completed",
         "documents": catalog["stats"]["documents"],

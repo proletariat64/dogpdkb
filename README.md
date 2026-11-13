@@ -1,312 +1,105 @@
 # dogpdkb
 
-The deliverable is the complete **dogpdkb knowledge synchronization platform**:
-Yuque discovery/export, image preparation/OCR, incremental graph updates, and Web
-data publication. The `mdocr` command is an included component, not a separate
-release unit. See [platform installation and preflight](docs/platform.md).
+dogpdkb 是供 crontab 调用的知识库 CLI 编排器：选择增量、生成计划、串行调用
+Skylark、mdcompare、mdocr 和 Graphify，保存真实结果，并提供只读状态观察。
+Web 发布与软件生命周期独立。
 
-## Server installation
-
-The [product homepage](http://poolab-iys595a7znqgza1e.inc.alipay.net/kb/#install)
-shows a copyable Linux installation command and links to AntCode Releases. It
-explicitly distinguishes preview packages from stable versions.
-
-Published Releases include a version-bound installer. On Linux, replace `v0.1.1`
-with an existing Release tag:
+## 日常使用
 
 ```bash
-curl -fsSL https://code.alipay.com/pd.pt/dogpdkb/releases/download/v0.1.1/install.sh | bash
+# 为可安装 CLI 创建禁用的示例，编辑 books.json 后再启用来源
+dogpdkb init-config -o ./instance
+# 编辑 ./instance/dogpdkb.toml，选择公开工具入口
+# 登记现有语料，不改正文或图谱、不重新提取
+dogpdkb init-state --config ./instance/dogpdkb.toml --book funds
+
+dogpdkb sync --config ./instance/dogpdkb.toml --book funds
+# 全批下载、比较和计划；不会 OCR、写本批语料或编译
+dogpdkb sync --config ./instance/dogpdkb.toml --book funds --stop-after plan
+# RUN 为输出中的 run ID 或目录；只推进未完成步骤
+dogpdkb sync --config ./instance/dogpdkb.toml --book funds --resume RUN
+
+dogpdkb status --config ./instance/dogpdkb.toml --book funds --json
+dogpdkb status --config ./instance/dogpdkb.toml --book funds --run RUN --watch
+# 机器观察：每行一个只读 JSON 快照
+dogpdkb status --config ./instance/dogpdkb.toml --book funds --watch --json
 ```
 
-No AntCode CLI or login is required on the server. Installer-managed deployments
-from v0.1.1 provide explicit lifecycle commands:
+`discover` 只扫描；`apply --input DIFFERENCES` 下载、比较、计划、OCR 并更新正式
+Markdown 语料；`update-graph --input MANIFEST` 编译。`sync` 共用这套实现，顺序为
+全批扫描 → 全批下载 → 全批比较 → 计划 → 全批 OCR → 语料落盘 → 图谱更新。
+详见[操作合同](docs/unattended-sync.md)与[状态说明](docs/sync-state-design.md)。
 
-```bash
-dogpdkb update --version 0.1.2  # choose an existing published version
-dogpdkb uninstall              # confirm interactively; --yes for automation
-```
+返回码：0 完成、无工作或停在计划；2 可用集合完成但有部分失败；1 整批失败；
+64 参数错误；130/143 中断。stdout 是结果，stderr 实时输出进度与工具诊断，
+可直接由 shell 重定向和系统 logrotate 管理。没有工具公开计数时不推算百分比。
 
-An upgrade builds and checks a fresh environment, switches to it, then removes the
-previous managed environment. Uninstall removes managed program files and command
-links, not configuration or user data. A v0.1.0 installation must first run the
-new version's curl installer to gain these commands. See
-[installation, paths and prerequisites](docs/installing.md).
+同版本同一步骤的失败或不明结果不会在日常运行自动重试，由定时清理 agent 排查。
+新版本仍正常处理；OCR 失败不阻断可用正文编译。缺席只记录，不自动删除既有语料
+或图谱。失败图谱不回滚已更新语料；Graphify 编译按目录整批成功后发布；失败保留旧图。
 
-## Repository layout
+## 小订阅
 
-- `src/dogpdkb/`: installed platform CLI, doctor, configuration templates and workflows.
-- `src/mdocr/`: included Markdown image preparation and OCR component.
-- `src/mdcompare/`: standalone offline content comparison and OCR reuse advice.
-- `scripts/`: development helpers and backwards-compatible workflow entry points.
-- `tests/`: offline automated tests.
-- `web/kb/`: product homepage and independent installation/release panel.
-- `docs/`: engineering documentation.
-- `skylark_books/`: source registry and legacy source reference.
-- `inbox/`: incoming knowledge materials.
-- `graphify_flatten_ready/`: local corpus and graph artifacts, ignored by Git.
-
-## mdcompare — offline content comparison CLI
-
-`mdcompare compare` independently compares captured raw Markdown, resources and
-OCR reuse evidence before processing. It emits versioned JSON, bounded optional
-differences and conservative UNKNOWN decisions; it does not run a sync or OCR.
-See the [mdcompare guide](docs/mdcompare.md), [evidence contracts](docs/mdcompare-contract.md)
-and [real-file UAT record](docs/mdcompare-uat.md). It is included in the wheel.
-For the opt-in daily raw snapshot, review and approved whole-document workflow, see
-[daily knowledge sync](docs/daily-knowledge-sync.md) and its
-[isolated UAT](docs/daily-knowledge-sync-uat.md). Existing commands remain unchanged
-unless `--snapshot` or `sync --knowledge` is explicitly selected. Existing cleaned
-corpora can be registered with `dogpdkb init-state --config dogpdkb.toml --book <key>`;
-knowledge capture and planning then save each completed step in the corpus
-`.sync-state.json`. See [state, UTC+8 and single-updater behavior](docs/sync-state-design.md).
-
-The unattended batch runner `dogpdkb sync --config <file> --book <key>` executes
-capture, mdcompare, plan, ocr and compile in one run, records durable results and
-anomalies outside the cleanable wash workspace, and cleans earlier finished work
-directories after each completed or partial batch. `dogpdkb status` and
-`dogpdkb anomalies` query that history read-only; `dogpdkb wash` inventories and
-migrates historical work directories without deleting them. See
-[unattended deployment](docs/unattended-sync.md) for copyable crontab and
-logrotate examples, durable locations and cleanup guarantees. The
-[bounded offline UAT record](docs/unattended-sync-uat.md) exercises the unified
-entry on retained real Markdown with external-interface shims.
-
-## mdocr — Markdown image prepare/OCR CLI
-
-`mdocr` prepares images referenced by Markdown and can replace them with OCR
-markdown from the PaddleOCR API. Bootstrap once with Python 3.12 and `uv`, then
-activate the worktree-local environment:
-
-```bash
-make bootstrap
-source .venv/bin/activate  # exposes `dogpdkb`, `mdocr` and `mdcompare`
-```
-
-Run `make check` before pushing: it runs `make doc-guard`, `make lint`, and
-`make test`. Each command can also be run independently. See
-[the document and CI rules](docs/doc-guard.md) for scope and conventions.
-
-Use `make build` for the platform wheel/source distribution, `make smoke` for
-an isolated installation test, and `make doctor` for offline operational preflight
-(or `make doctor DOCTOR_ARGS=--package` for package-only checks).
-
-GitHub is the source repository: development and version changes go through a PR
-and merge into `master`. From the clean, synchronized `master` checkout, run
-`make release` to publish the already-reviewed package version. It pushes only the
-source tag to GitHub; AntCode hosts installation attachments, not a copy of the
-source branch. Preview with `make release DRY_RUN=1`. See
-[local release and retry](docs/releasing.md). Publication uses the local AntCode
-login and finishes by updating the homepage through `poolab`; see
-[homepage delivery](docs/homepage.md).
-
-GitHub Actions runs `make check` and `make smoke` on every push and pull request,
-after bootstrapping Python 3.12 with the committed `uv.lock`. The checks do not
-require Yuque/PaddleOCR credentials or local corpus/graph artifacts. To block
-merges, configure the repository's branch rules to require the `check` status;
-adding a workflow alone does not enforce branch protection.
-
-### Yuque Knowledge Base Sync
-
-```bash
-source ~/.bashrc
-
-# Discover a plan only: does not publish corpus/graph/Web, but writes staging files
-dogpdkb sync --dry-run
-
-# Sync the corpus, Graphify graph, and Web data
-dogpdkb sync
-
-# Resume after a failure
-dogpdkb sync --resume --staging <previous-run-directory>
-```
-
-Supports Doc, Sheet, Table, and image OCR. Incremental updates only; no full graph rebuild.
-
-Usage:
-
-```bash
-mdocr -h                    # top-level help
-mdocr ocr -h                # per-command help
-
-mdocr prepare -f doc.md -o out/          # normalize local images to JPEG assets
-mdocr ocr -f doc.md -o out/              # replace images with OCR markdown
-mdocr ocr -f a.md b.md -o out/ --download  # multiple files + fetch remote images
-mdocr prepare -f doc.md -o out/ --force  # overwrite existing outputs
-```
-
-Notes:
-
-- Input files are never modified; outputs go to `-o DIR` (`<name>.md` plus
-  `assets/<name>/` JPEG copies, links rewritten).
-- Remote images are skipped with a warning unless `--download` is given.
-- `ocr` reads the `PADDLEOCR_TOKEN` environment variable for the PaddleOCR API.
-
-### PaddleOCR result download — bcebos CDN workaround
-
-`mdocr ocr` downloads each OCR result JSONL from PaddleOCR's BOS bucket
-(`paddleocr-store-N.bj.bcebos.com`). The job's result URL randomly picks a
-`store-N` name, and the public DNS round-robin routes most of them
-(`store-2..8`) to a dead CDN edge (`103.235.47.176`) that accepts TCP but
-stalls reads, producing `Read timed out. (read timeout=60)` after the job
-already reached `done`.
-
-This box pins all eight `store-N` names to a healthy edge in `/etc/hosts`:
-
-```text
-182.61.129.11 paddleocr-store-1.bj.bcebos.com
-182.61.129.11 paddleocr-store-2.bj.bcebos.com
-... (through paddleocr-store-8.bj.bcebos.com)
-```
-
-`182.61.129.11` serves every `store-N` name (same bucket/region, verified
-0.1 s responses). hosts outranks DNS, so result downloads bypass the dead edge.
-
-Additionally, run OCR with the BOS domain **excluded from the proxy**, because
-the local sing-box proxy re-resolves and can still land on the dead edge:
-
-```bash
-export NO_PROXY="$NO_PROXY,bj.bcebos.com"
-mdocr ocr -f doc.md -o out/
-```
-
-Notes:
-
-- `requests` matches `NO_PROXY` by bare domain — `*.bj.bcebos.com` does **not**
-  match, use `bj.bcebos.com`.
-- Verify health: `curl -sS -o /dev/null -w '%{http_code}\n' --noproxy '*' \
-  --resolve 'paddleocr-store-2.bj.bcebos.com:443:182.61.129.11' \
-  https://paddleocr-store-2.bj.bcebos.com/` (expect `403`, bucket root).
-- To revert: delete the `paddleocr-store-*` lines from `/etc/hosts`.
-- If Baidu rotates edges, re-verify the pinned IP before mass OCR runs.
-
-### Configuration and book registry
-
-All knowledge-sync entry points accept `--config <file>`. In a source checkout,
-with no input they read the repository's `default.toml` (independent of the current
-directory). A wheel installation instead reads `./dogpdkb.toml` from the caller's
-working directory; `dogpdkb init-config` creates portable, disabled examples.
-`DOGPDKB_CONFIG` can select another file; an explicit `--config` wins. A selected
-file replaces `default.toml`, rather than merging with it.
-
-Operational precedence is CLI arguments, then environment overrides, then TOML,
-then portable program defaults. Relative paths in TOML are based on that file's
-directory; CLI and environment paths are based on the working directory. `~` is
-expanded. Credentials such as `PADDLEOCR_TOKEN` stay in the environment.
-
-```bash
-# Uses default.toml and its single enabled book
-.venv/bin/python scripts/sync_knowledge_base.py --dry-run
-
-# Local deployment overrides: copy default.toml, edit paths/gateway, then run
-cp default.toml config.local.toml
-.venv/bin/python scripts/sync_knowledge_base.py --config config.local.toml \
-  --book fund-platform --dry-run
-
-# Existing explicit parameters still override config
-.venv/bin/python scripts/sync_knowledge_base.py --config config.local.toml \
-  --input ./corpus --skylark-url https://example.invalid/team/book \
-  --web-dir ./site --dry-run
-```
-
-`default.toml` currently contains this project's existing gateway, image URL
-mapping and Web classification rules. It is configuration, not a sanitized public
-template. Set `[paths].web` explicitly for a deployed Web server; the portable
-default writes to local `web-output/<book-key>/`. Set `graphify_python` when
-Graphify lives in another environment; otherwise the current interpreter is used.
-
-The unattended `dogpdkb sync` OCR stage is best-effort. `[paths].ocr_cache`
-(default `ocr-cache`) holds long-term OCR success evidence — the original image,
-its prepared JPEG and the recognized artifact — outside the cleanable wash run
-directory, so repeated syncs reuse verified results instead of re-OCR.
-`[ocr].budget_seconds` (default `1800`) bounds the whole stage; on exhaustion the
-stage keeps completed results, archives unfinished images and proceeds to
-compile. Both keys are read through the shared configuration system and appear
-in the non-secret resume snapshot; no new environment variables are introduced
-(`PADDLEOCR_TOKEN` remains environment-only).
-
-Web publication writes both JSON files into a generation under `.snapshots/`,
-then atomically switches a shared `current` symlink. The public `catalog.json`
-and `map/map-data.json` paths remain unchanged and become relative symlinks;
-the static server must follow symlinks. Existing ordinary files are preserved
-in an initial generation, and older generations are retained for recovery.
-
-The source list is `skylark_books/roots.json`, referenced by
-`[source].books_file`. It is an input registry, not an automatically discovered
-list of all accessible Yuque books. Example entry:
+在独立 `books.json` 来源中设置 `document_ids`，并使用独立 key 和目标目录：
 
 ```json
-[
-  {
-    "key": "fund-platform",
-    "name": "Example knowledge base",
-    "url": "https://example.invalid/team/book",
-    "enabled": true,
-    "corpus": "../graphify_flatten_ready"
-  }
-]
+[{"key":"small","url":"https://yuque.antfin.com/group/book","document_ids":["123","456"]}]
 ```
 
-Each key must be unique and safe as a directory name. With multiple enabled
-books, `--book <key>` is required; `--book` and `--skylark-url` are mutually
-exclusive. A book's optional `corpus` is relative to the registry file. Without
-it, the corpus is `<paths.corpus>/<key>`; the existing book keeps its current
-corpus through an explicit entry. `--input` or `DOGPDKB_CORPUS` overrides the
-selected corpus. `roots.md` is a legacy reference, not a second configuration.
+省略该字段订阅整本；显式列表必须非空且 ID 唯一。仍完整读取列表以验证来源，
+随后仅选择指定文档。已建立状态后变更 ID 范围需要新的 key/state，避免旧计划
+跨订阅恢复。小订阅同样使用普通 `sync`、`--stop-after plan` 和 `--resume`。
 
-Captured book ID, name, source URL, document totals and listing completeness are
-written in each `sync-updates-*.json` (`get_sync_updates.py --json`, always on in
-the pipeline). Standalone discovery defaults to `<paths.state>/<key>/`;
-standalone apply reads that location. Pipeline plans/checkpoints stay together
-under `<paths.staging>/<key>/sync-<timestamp>/`. Both locations are ignored by Git;
-`.sync-state.json` stays inside each corpus to retain incremental timestamps.
-An ad-hoc `--skylark-url` uses the `adhoc` key: provide separate `--input`,
-`--staging` and `--web-dir` when operating multiple ad-hoc sources.
+## 配置与工具边界
 
-The pipeline forwards `--config` to every child entry point and records effective
-non-secret settings in its checkpoint. Resume rejects changed configuration;
-older checkpoints without configuration metadata require a new staging run.
-Read-only MCP requests retry recognized temporary timeouts, rate limits, and
-service/network failures with bounded exponential backoff and jitter.
-`skylark.max_retries` counts retries after the initial attempt. Authentication,
-permission, parameter, and unknown failures stop without that retry loop. Logs
-distinguish the local wait deadline from a timeout returned by the remote call;
-a returned `Request timeout for 15000 ms` does not describe the local timeout
-setting.
+显式 `--config` 优先于 `DOGPDKB_CONFIG`；源码 checkout 默认读取 `default.toml`，
+安装包默认读取当前目录 `dogpdkb.toml`。TOML 路径相对配置文件，来源 `corpus`
+相对 books.json。多个 enabled 来源必须指定 `--book`。凭证只放工具既有环境。
 
-On failure or cancellation, keep the staging directory and use the printed
-`Retry:` command with the same configuration and environment. An incomplete
-listing is fetched in full on resume: saved offset pages are diagnostic files,
-not a consistent remote snapshot. A completed plan is reused. For that fixed
-plan, valid export and OCR checkpoints are reused; missing artifacts are redone.
-Resume does not request every completed document's latest remote version.
+```toml
+[tools]
+mdcompare = "mdcompare"
+mdocr = "mdocr"
+graphify = "/opt/graphify/bin/graphify"
+skylark = ["node", "/opt/pi-skylark/dist/cli.mjs"]
+```
 
-Required export or OCR failures leave a failed diagnostic manifest and prevent
-corpus publication, planned deletion, sync-state updates, and graph/Web stages.
-This also applies to direct `apply` and `apply --no-merge`; an empty new document
-may be explicitly skipped, while an existing document becoming empty is updated.
-After successful recovery, publication uses the whole fixed batch. Once
-publication begins, disk errors or cancellation may leave some files published;
-there is no transaction across the entire corpus and no automatic rollback of
-partial batches published by older versions.
+编排器对工具只调用公开 CLI、读取公开产物，不导入工具包或复刻其内部算法。
+本轮新增能力必须先提供给所选工具入口：
 
-Graph updates also pin the original graph artifacts before extraction, build
-from that backup, and compare bytes before publication. A staging directory from
-before this baseline checkpoint was introduced must be replaced by a new run.
-If publication fails because another publisher changed the graph baseline, keep
-the staging directory and retry with `--resume --rebase-graph --staging <run>`.
-This reuses the completed corpus manifest and rebuilds only its graph delta
-against the current graph, then republishes the Web snapshot. Starting fresh
-discovery instead can miss changes whose corpus timestamps already advanced.
+- [mdcompare catalog、mdocr batch](docs/orchestrator-tool-contracts.md)，随本仓库 wheel 提供。
+- [Graphify 原版 CLI](docs/orchestrator-graphify-contract.md)：目录级增量、原生 manifest/cache 和整批发布。
+- [Skylark listing/export](docs/orchestrator-skylark-contract.md)：已恢复的独立 CLI 与构建方法。
 
-| Environment override | TOML key |
-| --- | --- |
-| `DOGPDKB_BOOKS_FILE` | `source.books_file` |
-| `DOGPDKB_CORPUS`, `DOGPDKB_STAGING`, `DOGPDKB_STATE`, `DOGPDKB_WEB` | corresponding `paths` key |
-| `DOGPDKB_GRAPH_DIR`, `GRAPHIFY_PYTHON` | `paths.graph_dir`, `paths.graphify_python` |
-| `SKYLARK_MCP_URL`, `UTOO_PROXY_BIN` | `skylark.mcp_url`, `skylark.proxy_bin` |
-| `SKYLARK_TIMEOUT_MS` | `skylark.timeout_seconds` (environment value is milliseconds) |
-| `SKYLARK_MAX_RETRIES`, `SKYLARK_CONCURRENCY` | corresponding `skylark` key |
+Graphify 直接使用未修改的已发布 CLI；已有图缺少其原生 manifest 时停止，
+不自动回填历史。Skylark 使用已恢复的独立 CLI，配置它的真实可执行路径。
 
-Unknown keys, malformed URLs and invalid numeric settings fail before sync work.
-The MCP protocol version, API page sizes and graph safety checks remain program
-rules. PaddleOCR provider defaults remain owned by the existing `mdocr` CLI.
+## 安装与独立功能
+
+见[安装](docs/installing.md)、[交付边界](docs/platform.md)。现有 managed 安装的
+`dogpdkb update --version VERSION`、`dogpdkb uninstall` 保留，配置和用户数据保留。
+`dogpdkb publish-web` 是独立操作，sync 不调用它。Web 产物和生命周期行为不纳入
+同步重写；发布软件、部署站点或真实付费处理需另外授权。
+
+仓库包含 `src/dogpdkb/` 编排器、独立 `src/mdocr/` 和 `src/mdcompare/` 工具、
+`web/kb/`、工程脚本与测试。机器上的语料、图谱、缓存和运行产物不提交 Git。
+旧参数、旧状态、旧 run 不迁移；旧流水线和内置 wash/anomalies 平台已移除。
+
+## 开发验证
+
+优先复用已可用的 Python 3.12 环境。新环境使用 `make bootstrap`；不要在已有
+共享环境执行会删除其他包的精确同步。
+
+```bash
+make check   # 文档、Ruff、测试
+make build   # wheel + sdist
+make smoke   # 隔离安装后通过公开 CLI 验证
+```
+
+CLI 合同测试使用真实本地 Markdown 与外部工具替身；独立 mdcompare/mdocr 与
+上游 Graphify/Skylark CLI 测试另列。替身测试、隔离安装、付费 OCR/提取和生产 UAT
+是不同证据，本次不自动执行付费或生产任务。
+
+[mdcompare](docs/mdcompare.md)、[OCR 合同](docs/spec/mdocr.md)、
+[文档规则](docs/doc-guard.md)、[发行流程](docs/releasing.md)。旧 UAT 和评审文档
+保留为历史证据；当前重写合同见 `.scratch/cli-orchestrator-rewrite/spec.md`。

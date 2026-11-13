@@ -1,22 +1,14 @@
-"""Installed entry points for the complete knowledge synchronization platform."""
+"""Public commands for serial knowledge synchronization and independent Web publication."""
 
 from __future__ import annotations
 
 import argparse
 import importlib.metadata
-import subprocess
 import sys
 from pathlib import Path
 
-from dogpdkb.instance_lock import locked_main, subprocess_lock_options
+from dogpdkb.instance_lock import locked_main
 
-WORKFLOWS = {
-    "sync": "sync_knowledge_base.py",
-    "discover": "get_sync_updates.py",
-    "apply": "apply_sync_updates.py",
-    "update-graph": "update_graph.py",
-    "publish-web": "publish_web.py",
-}
 RESOURCES = Path(__file__).resolve().parent / "resources"
 
 
@@ -43,23 +35,31 @@ def init_config(directory: Path) -> None:
 
 def _main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] in WORKFLOWS:
-        script = Path(__file__).resolve().parent / "workflows" / WORKFLOWS[arguments[0]]
-        return subprocess.call(
-            [sys.executable, str(script), *arguments[1:]], **subprocess_lock_options()
-        )
+    if arguments and arguments[0] == "discover":
+        from dogpdkb.discover import main as discover_main
+
+        return discover_main(arguments[1:])
+    if arguments and arguments[0] == "sync":
+        from dogpdkb.sync import main as sync_main
+
+        return sync_main(arguments[1:])
+    if arguments and arguments[0] == "update-graph":
+        from dogpdkb.graph import main as graph_main
+
+        return graph_main(arguments[1:])
+    if arguments and arguments[0] == "apply":
+        from dogpdkb.apply import main as apply_main
+
+        return apply_main(arguments[1:])
+    if arguments and arguments[0] == "publish-web":
+        from dogpdkb.workflows.publish_web import main as web_main
+
+        web_main(arguments[1:])
+        return 0
     if arguments and arguments[0] == "status":
-        from dogpdkb.sync_status import main as status_main
+        from dogpdkb.observe import main as status_main
 
         return status_main(arguments[1:])
-    if arguments and arguments[0] == "anomalies":
-        from dogpdkb.sync_anomalies import main as anomalies_main
-
-        return anomalies_main(arguments[1:])
-    if arguments and arguments[0] == "wash":
-        from dogpdkb.sync_wash import main as wash_main
-
-        return wash_main(arguments[1:])
     parser = argparse.ArgumentParser(description=__doc__, prog="dogpdkb")
     try:
         version = importlib.metadata.version("dogpdkb")
@@ -67,27 +67,16 @@ def _main(argv: list[str] | None = None) -> int:
         version = "uninstalled"
     parser.add_argument("--version", action="version", version=f"dogpdkb {version}")
     commands = parser.add_subparsers(dest="command")
-    for name in WORKFLOWS:
+    for name in ("discover", "apply", "update-graph", "sync", "publish-web"):
         commands.add_parser(name, help=f"run {name}; use {name} --help for options")
     commands.add_parser(
         "status", help="read-only sync batch status; use status --help for options"
-    )
-    commands.add_parser(
-        "anomalies",
-        help="scan durable results/anomalies and record dispositions; use anomalies --help",
-    )
-    commands.add_parser(
-        "wash",
-        help="inventory historical wash workspaces and migrate necessary artifacts; use wash --help",
     )
     doctor = commands.add_parser("doctor", help="read-only, offline preflight checks")
     doctor.add_argument("--config", type=Path)
     doctor.add_argument("--book")
     doctor.add_argument(
         "--package", action="store_true", help="check installed package only"
-    )
-    doctor.add_argument(
-        "--require-ocr", action="store_true", help="require an OCR token"
     )
     doctor.add_argument("--json", action="store_true", help="machine-readable report")
     initialize = commands.add_parser(
@@ -99,8 +88,6 @@ def _main(argv: list[str] | None = None) -> int:
     )
     initialize_state.add_argument("--config", type=Path)
     initialize_state.add_argument("--book")
-    initialize_state.add_argument("-i", "--input", type=Path)
-    initialize_state.add_argument("--graph-dir", type=Path)
     upgrade = commands.add_parser(
         "update", help="install a specified Release; retain configuration and data"
     )
@@ -111,25 +98,20 @@ def _main(argv: list[str] | None = None) -> int:
     remove.add_argument(
         "--yes", action="store_true", help="confirm noninteractive removal"
     )
-    args = parser.parse_args(arguments)
+    try:
+        args = parser.parse_args(arguments)
+    except SystemExit as error:
+        return 64 if error.code == 2 else error.code
     if args.command == "init-state":
         import json
 
-        from dogpdkb.sync_state import initialize_state
-        from mdocr.config import load_config, select_book
+        from dogpdkb.records import initialize
+        from dogpdkb.settings import load_config, select_book
 
         try:
             config = load_config(args.config)
             book = select_book(config, args.book)
-            corpus = (args.input or book.corpus).expanduser().resolve()
-            graph = (
-                (args.graph_dir or config.graph_dir or corpus / "graphify-out")
-                .expanduser()
-                .resolve()
-            )
-            result = initialize_state(
-                corpus, graph, book.key, url=book.url, name=book.name
-            )
+            result = initialize(config, book)
         except (OSError, ValueError) as error:
             parser.exit(1, f"dogpdkb init-state: {error}\n")
         print(json.dumps(result, ensure_ascii=False))
@@ -146,10 +128,13 @@ def _main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError) as error:
             parser.exit(1, f"dogpdkb {args.command}: {error}\n")
     if args.command == "doctor":
-        from dogpdkb.doctor import diagnose, print_report
+        from dogpdkb.preflight import diagnose, print_report
 
-        report = diagnose(args.config, args.book, args.package, args.require_ocr)
+        report = diagnose(args.config, args.book, args.package)
         print_report(report, json_output=args.json)
+        for row in report:
+            if row.get("exit_code") in {130, 143}:
+                return row["exit_code"]
         return 1 if any(row["status"] == "fail" for row in report) else 0
     if args.command == "init-config":
         try:
@@ -166,6 +151,13 @@ def _main(argv: list[str] | None = None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] in {*WORKFLOWS, "init-state", "update", "uninstall"}:
+    if arguments and arguments[0] in {"update", "uninstall"}:
         return locked_main(_main)(arguments)
-    return _main(arguments)
+    from dogpdkb.lifecycle import runtime_lock
+
+    try:
+        with runtime_lock():
+            return _main(arguments)
+    except ValueError as error:
+        print(f"dogpdkb: {error}", file=sys.stderr)
+        return 1

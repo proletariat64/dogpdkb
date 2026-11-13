@@ -1,1 +1,1 @@
-"""dogpdkb knowledge synchronization platform; mdocr is its image component."""
+"""Serial knowledge synchronization through independent public tool CLIs."""

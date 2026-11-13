@@ -93,6 +93,16 @@ def build_parser() -> argparse.ArgumentParser:
             action="store_true",
             help="overwrite existing outputs and re-OCR existing mdocr blocks",
         )
+    batch = sub.add_parser(
+        "batch", help="Process a generic OCR manifest and publish structured outcomes"
+    )
+    batch.add_argument("--manifest", type=Path, required=True)
+    batch.add_argument("--output-dir", type=Path, required=True)
+    batch.add_argument("--report", type=Path, required=True)
+    batch.add_argument("--cache-dir", type=Path)
+    batch.add_argument("--download", action="store_true")
+    batch.add_argument("--endpoint")
+    batch.add_argument("--max-seconds", type=float, default=900)
     return parser
 
 
@@ -230,6 +240,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 0
+    if args.command == "batch":
+        from .batch import run_batch
+
+        try:
+            return run_batch(args)
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"mdocr: batch: {exc}", file=sys.stderr)
+            return 1
     try:
         return run_command(args)
     except CliError as exc:

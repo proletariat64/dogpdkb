@@ -1,5 +1,7 @@
 # 统一无人值守同步最终双轴审查记录
 
+> 历史证据：本文记录重写前的实现，不代表当前 CLI。操作以 [日常同步](unattended-sync.md) 为准。
+
 日期：2026-11-12。审查对象是集成分支 `unified-unattended-sync`（票 01–08 全部合入后），基线 `f09f45d`（origin/master merge-base），91 提交、60 文件、+11712/-450。按 `code-review` skill 双轴并行审查：**Standards**（是否遵循仓库编码标准 + Fowler 代码异味基线）与 **Spec**（是否忠于规格与各票公开合同）。本记录由票 09 关闭，逐项给出处置（修复 / 验证为非问题 / 延后并说明理由）与回归证据。
 
 审查报告原文：`/tmp/uus09-review/standards.md`（20 项）、`/tmp/uus09-review/spec.md`（2 项）；orchestrator 证据裁决：`/tmp/uus09-review/adjudication.md`。`/tmp` 易失，长期证据以本记录与票 09 Answer 为准。

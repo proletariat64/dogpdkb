@@ -21,6 +21,7 @@ from pathlib import Path
 MARKER = ".dogpdkb-managed"
 BASE = "https://code.alipay.com/pd.pt/dogpdkb/releases/download"
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+_runtime_descriptor = None
 
 
 @dataclass(frozen=True)
@@ -86,13 +87,15 @@ def locate() -> Installation:
 
 
 @contextlib.contextmanager
-def locked(installation: Installation):
+def locked(installation: Installation, *, shared=False):
     """Keep lock inode even after uninstall; all activation/removal shares it."""
     path = installation.prefix / ".lifecycle.lock"
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(
+                descriptor, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB
+            )
         except BlockingIOError as error:
             raise ValueError("Another installation operation is running.") from error
         if locate() != installation:
@@ -100,6 +103,27 @@ def locked(installation: Installation):
         yield descriptor
     finally:
         os.close(descriptor)
+
+
+@contextlib.contextmanager
+def runtime_lock():
+    """Keep a managed interpreter available while commands and tools use it."""
+    global _runtime_descriptor
+    try:
+        installation = locate()
+    except ValueError:
+        yield
+        return
+    with locked(installation, shared=True) as descriptor:
+        _runtime_descriptor = descriptor
+        try:
+            yield
+        finally:
+            _runtime_descriptor = None
+
+
+def runtime_lock_fds():
+    return (_runtime_descriptor,) if _runtime_descriptor is not None else ()
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):

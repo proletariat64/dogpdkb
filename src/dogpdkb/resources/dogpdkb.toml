@@ -8,17 +8,21 @@ corpus = "corpus"
 staging = "staging"
 state = "state"
 web = "web"
-# Durable batch results, anomaly handoff and persisted inputs; survives wash cleanup.
+# Runs and evidence are retained for the scheduled cleanup agent.
 results = "sync-results"
-# Long-term OCR success evidence (original + prepared JPEG + artifact); survives
-# wash cleanup so repeated syncs reuse verified results without re-OCR.
+# Tool-owned successful OCR cache; never inspect its layout from dogpdkb.
 ocr_cache = "ocr-cache"
 
 [ocr]
-# Best-effort OCR stage total time budget (seconds). On exhaustion the stage
-# keeps completed results, archives unfinished images and proceeds to compile.
+# Passed to mdocr's best-effort batch CLI; in-flight calls retain tool timeouts.
 budget_seconds = 1800
 
 [skylark]
 mcp_url = "https://example.invalid/mcp"
 proxy_bin = "utoo-proxy"
+
+[tools]
+mdcompare = "mdcompare"
+mdocr = "mdocr"
+graphify = "graphify"
+skylark = "skylark"

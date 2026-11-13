@@ -8,29 +8,30 @@ corpus = "graphify_flatten_ready"
 staging = "wash"
 state = "skylark_books/state"
 web = "web-output"
-# results holds durable batch results/anomalies; ocr_cache holds long-term OCR
-# success evidence. Both live outside the cleanable wash run directory.
+# Runs/evidence are retained for the scheduled cleanup agent. Durable document
+# versions and failed-step facts live under state, outside run directories.
 results = "sync-results"
+# Tool-owned successful OCR cache; dogpdkb does not inspect its layout.
 ocr_cache = "ocr-cache"
 # graph_dir defaults to <selected corpus>/graphify-out
-# graphify_python defaults to the current interpreter
+
+[tools]
+mdcompare = "mdcompare"
+mdocr = "mdocr"
+# Use the original Graphify extract CLI and its native manifest/cache.
+graphify = "graphify"
+# Require the standalone listing/export CLI; may be an argv array, for example
+# ["node", "/opt/pi-skylark/dist/cli.mjs"].
+skylark = "skylark"
 
 [ocr]
-# Best-effort OCR stage total time budget (seconds). On exhaustion the stage
-# keeps completed results, archives unfinished images and proceeds to compile.
+# Passed to mdocr's best-effort batch CLI. In-flight calls retain tool timeouts.
 budget_seconds = 1800
 
 [skylark]
 mcp_url = "https://mcpgwoffice-prod.alipay.com/mcpgw/v1/shttpproxy/message/MAIN_CHAIR_mcp.ant.faas.skylarkmcpserver.skylarkmcpserver"
 proxy_bin = "~/.utoo-proxy/utoo-proxy"
 timeout_seconds = 60
-max_retries = 5
-concurrency = 2
-
-[images]
-url_rewrites = [
-  { from = "https://intranetproxy.alipay.com/skylark/lark/", to = "https://yuque.antfin.com/images/lark/" },
-]
 
 [web]
 community_limit = 120

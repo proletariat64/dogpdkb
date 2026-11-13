@@ -1,9 +1,53 @@
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from scripts import publish_web
+
+
+def test_explicit_web_sources_do_not_require_enabled_sync_book(tmp_path):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "Title-2026-11-12-[42].md").write_text("Current body")
+    graph = tmp_path / "graph.json"
+    graph.write_text('{"nodes":[],"links":[]}')
+    (tmp_path / "books.json").write_text(
+        '[{"key":"disabled","enabled":false,"url":"https://example.invalid/disabled","corpus":"missing"}]'
+    )
+    settings = tmp_path / "instance.toml"
+    settings.write_text('[source]\nbooks_file="books.json"\n')
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "dogpdkb",
+            "publish-web",
+            "--config",
+            str(settings),
+            "--input",
+            str(corpus),
+            "--graph",
+            str(graph),
+            "--output",
+            str(tmp_path / "web"),
+            "--book-url",
+            "https://example.invalid/explicit",
+        ],
+        env={
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "web/catalog.json").is_file()
 
 
 def test_web_snapshots_follow_current_corpus_and_graph(tmp_path: Path):
