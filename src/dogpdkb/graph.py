@@ -133,6 +133,7 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
             return 1
     import tempfile
 
+    run.stage("graphify", total=len(pending), completed=0, failed=0, phase="prepare")
     workspace = Path(tempfile.mkdtemp(prefix="graphify-", dir=run.directory))
     candidate = workspace / "graphify-out"
     if graph_dir.exists():
@@ -141,16 +142,19 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
     run.data["artifacts"].update(
         graph_report=str(report), graph_candidate=str(candidate)
     )
-    for row in pending:
-        store.attempt(
-            row["document_id"],
-            "graph",
-            row["version"],
-            run.id,
-            input=row["path"],
-            report=str(report),
-        )
-    run.stage("graphify", total=len(pending), completed=0, failed=0)
+    store.complete_batch(
+        {
+            "doc_id": row["document_id"],
+            "name": "graph",
+            "version": row["version"],
+            "status": "running",
+            "run_id": run.id,
+            "input": row["path"],
+            "report": str(report),
+        }
+        for row in pending
+    )
+    run.stage("graphify", total=len(pending), completed=0, failed=0, phase="tools")
     argv = [
         *settings.command("graphify"),
         "extract",
@@ -206,6 +210,10 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
             "reason": reason,
         },
     )
+    run.stage(
+        "graphify", total=len(pending), completed=0, failed=0, phase="record-results"
+    )
+    outcomes = []
     for row in pending:
         doc_id = row["document_id"]
         acknowledgement = {}
@@ -238,18 +246,21 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
                 == row.get("pending_metadata", row.get("metadata", {}))
             ):
                 document.pop("pending", None)
-        store.complete(
-            doc_id,
-            "graph",
-            row["version"],
-            status,
-            run.id,
-            report=str(retained_report if status == "completed" else report),
-            reason=reason,
-            **acknowledgement,
+        outcomes.append(
+            {
+                "doc_id": doc_id,
+                "name": "graph",
+                "version": row["version"],
+                "status": status,
+                "run_id": run.id,
+                "report": str(retained_report if status == "completed" else report),
+                "reason": reason,
+                **acknowledgement,
+            }
         )
         if status != "completed":
             run.failure(
+                persist=False,
                 document_id=doc_id,
                 version=row["version"],
                 step="graph",
@@ -261,6 +272,7 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
                 exit_code=code,
                 argv=diagnostic_argv(argv),
             )
+    store.complete_batch(outcomes)
     complete = len(pending) if status == "completed" else 0
     run.stage(
         "graphify",
