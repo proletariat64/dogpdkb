@@ -8,6 +8,7 @@ from pathlib import Path
 from . import __version__
 from .catalog import catalog_manifest
 from .comparison import compare_documents
+from .help import NORMAL, full_contract
 from .io import (
     InputError,
     InputReader,
@@ -21,8 +22,35 @@ from .model import CompareOptions
 
 
 class ArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("formatter_class", argparse.RawDescriptionHelpFormatter)
+        super().__init__(*args, **kwargs)
+        self.full_help = False
+        self.add_argument(
+            "--full",
+            action="store_true",
+            help="show the complete local contract with -h/--help",
+        )
+
+    def parse_known_args(self, args=None, namespace=None):
+        arguments = list(sys.argv[1:] if args is None else args)
+        self.full_help = "--full" in arguments
+        if self.full_help and not any(flag in arguments for flag in ("-h", "--help")):
+            self.error("--full requires -h or --help")
+        return super().parse_known_args(arguments, namespace)
+
+    def format_help(self):
+        text = super().format_help()
+        if self.full_help:
+            text += full_contract(self.prog.split()[-1])
+        return text
+
     def error(self, message):
-        self.exit(1, "mdcompare: INVALID_ARGUMENTS\n")
+        self.exit(
+            1,
+            f"{self.prog}: INVALID_ARGUMENTS: {message}\n"
+            f"See {self.prog} --help for usage.\n",
+        )
 
 
 def nonnegative_int(value: str) -> int:
@@ -43,15 +71,37 @@ def _positive_file_limit(value: str) -> int:
 
 
 def main(argv=None) -> int:
-    parser = ArgumentParser(prog="mdcompare")
+    parser = ArgumentParser(
+        prog="mdcompare",
+        description="Compare captured Markdown offline or catalog its resource evidence.",
+        epilog=NORMAL["mdcompare"],
+    )
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
     compare = sub.add_parser(
-        "compare", help="Strict file and processing-evidence comparison"
+        "compare",
+        help="Strict file and processing-evidence comparison",
+        description="Compare text, resources, metadata and captured OCR evidence without processing them.",
+        epilog=NORMAL["compare"],
     )
-    compare.add_argument("--baseline", type=Path, required=True)
-    compare.add_argument("--incoming", type=Path, required=True)
-    compare.add_argument("--output", type=Path, required=True)
+    compare.add_argument(
+        "--baseline",
+        type=Path,
+        required=True,
+        help="baseline JSON manifest of immutable local snapshots",
+    )
+    compare.add_argument(
+        "--incoming",
+        type=Path,
+        required=True,
+        help="incoming JSON manifest using the same scoped document identities",
+    )
+    compare.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="authoritative JSON report path; parent must exist",
+    )
     compare.add_argument(
         "--report", type=Path, help="Optional private human-readable report"
     )
@@ -64,12 +114,12 @@ def main(argv=None) -> int:
         "--max-file-bytes",
         type=_positive_file_limit,
         default=16 * 1024 * 1024,
-        help="Maximum bytes per document or evidence file; oversized inputs stay UNKNOWN",
+        help="Maximum bytes per document/evidence file (default: 16777216); oversized inputs stay UNKNOWN",
     )
     compare.add_argument(
         "--normalize-line-endings",
         action="store_true",
-        help="Explicitly normalize CRLF and lone CR to LF (rule version 1)",
+        help="Opt into CRLF/lone CR to LF (rule version 1); default: preserve bytes",
     )
     compare.add_argument(
         "--max-diff-work",
@@ -96,10 +146,26 @@ def main(argv=None) -> int:
             "Report reusable, added, revised and unresolved body knowledge. "
             "Images and marked OCR blocks are ignored; no image/OCR tasks are created."
         ),
+        epilog=NORMAL["knowledge"],
     )
-    knowledge.add_argument("--baseline", type=Path, required=True)
-    knowledge.add_argument("--incoming", type=Path, required=True)
-    knowledge.add_argument("--output", type=Path, required=True)
+    knowledge.add_argument(
+        "--baseline",
+        type=Path,
+        required=True,
+        help="baseline JSON manifest of captured Markdown bodies",
+    )
+    knowledge.add_argument(
+        "--incoming",
+        type=Path,
+        required=True,
+        help="incoming JSON manifest; image/OCR evidence is ignored",
+    )
+    knowledge.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="authoritative knowledge-1.0 JSON report path; parent must exist",
+    )
     knowledge.add_argument(
         "--report", type=Path, help="Optional private human-readable knowledge report"
     )
@@ -110,13 +176,13 @@ def main(argv=None) -> int:
         "--max-file-bytes",
         type=_positive_file_limit,
         default=CompareOptions.max_file_bytes,
-        help="Maximum bytes per Markdown file; oversized inputs stay UNKNOWN",
+        help="Maximum bytes per Markdown file (default: 16777216); oversized inputs stay UNKNOWN",
     )
     knowledge.add_argument(
         "--max-diff-work",
         type=nonnegative_int,
         default=CompareOptions.max_diff_work,
-        help="Maximum fuzzy knowledge-alignment work; exact reuse is still evaluated",
+        help="Maximum fuzzy alignment work (default: 2000000); exact reuse is still evaluated",
     )
     knowledge.add_argument(
         "--max-evidence-chars",
@@ -125,10 +191,23 @@ def main(argv=None) -> int:
         help="Maximum body evidence characters per document (default: 8000)",
     )
     catalog = sub.add_parser(
-        "catalog", help="Build an offline resource manifest from Markdown"
+        "catalog",
+        help="Build an offline resource manifest from Markdown",
+        description="Read a JSON descriptor manifest and inventory local Markdown dependencies without downloading.",
+        epilog=NORMAL["catalog"],
     )
-    catalog.add_argument("--input", type=Path, required=True)
-    catalog.add_argument("--output", type=Path, required=True)
+    catalog.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="schema_version 1.0 JSON descriptor manifest; resources optional",
+    )
+    catalog.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="catalog JSON manifest path; missing parents are created",
+    )
     args = parser.parse_args(argv)
     if args.command == "catalog":
         try:

@@ -1,0 +1,41 @@
+# Catalog input and result contract
+
+Input uses manifest schema_version "1.0" and documents. Every document requires
+knowledge_base, document_id, content_kind, path and metadata as described in
+the manifest schema. resources is optional and defaults to []. If present it
+must be an array. ocr may be absent or null; a non-null value must be an object.
+Declared resources use the resource schema below.
+
+The output is {"schema_version":"1.0","documents":[...]}. Entries retain
+input document fields and add resource_warnings, an array of machine-readable
+resource parser warning codes. Documents are sorted by scoped identity.
+Document path and resource path fields are made absolute. Existing declared
+evidence is retained by matching target. Discovered resource_id defaults to
+the target string, kind is image or attachment, and url retains that target.
+A path is supplied for a local file when found; absence of path does not mean
+remote content was downloaded or inspected. Resources keep stable IDs where
+matching declared evidence exists. A colliding declared ID for a different URL
+fails with RESOURCE_ID_COLLISION.
+
+OCR source_path, prepared_image and artifact fields, and supported provenance
+raw_path, prepared_image and artifact_path fields are resolved against the
+manifest directory. Local Markdown targets resolve against the Markdown parent.
+No URLs are fetched. Original Markdown, resources and all declared evidence
+remain read-only. Output parents are created. The output cannot alias any of
+these inputs; it is staged privately and atomically replaced on success.
+
+A historical_enriched document with mdocr-raw-snapshot-v1 provenance is inventoried
+from its verified raw source view. Other historical declarations are preserved
+as evidence, not treated as a reconstructed raw source. Unsupported resource
+syntax is retained in resource_warnings and cannot establish completeness.
+
+Limits: 16 MiB per manifest/document/evidence file; at most 10,000 resource
+declarations or occurrences and cumulative resource syntax work estimate
+20,000,000 per document. Exceeded discovery budgets are reported as uncertainty.
+
+Exit codes: 0 catalog written; 1 invalid invocation, unreadable/invalid input,
+input instability, output/input collision or publication failure. Typical
+diagnostics include MANIFEST_SCHEMA_INVALID, DUPLICATE_DOCUMENT_ID,
+RESOURCE_SCHEMA_INVALID, RESOURCE_ID_COLLISION and REPORT_INPUT_COLLISION.
+Inspect stderr and resource_warnings. A repeated call re-reads local inputs
+and replaces the requested catalog, without downloading or comparison.

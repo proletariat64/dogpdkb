@@ -1,0 +1,172 @@
+"""Installed, offline help for the independent mdcompare CLI."""
+
+from importlib.resources import files
+
+MANIFEST_EXAMPLE = """{
+  "schema_version": "1.0",
+  "documents": [{
+    "knowledge_base": "example-book", "document_id": "42",
+    "content_kind": "raw", "path": "document.md",
+    "metadata": {"name": "Limits", "logical_path": "Payments/Limits",
+                 "source_ref": "example-book:42"},
+    "resources": []
+  }]
+}"""
+
+ROOT = """Start here:
+  1. Capture immutable local Markdown snapshots.
+  2. Describe them in JSON manifests (not Markdown command arguments).
+  3. Use catalog to discover resources; knowledge for body-only reuse;
+     compare for strict text, resource, metadata and OCR-evidence decisions.
+
+Example:
+  mdcompare catalog --input descriptors.json --output manifest.json
+  mdcompare knowledge --baseline old.json --incoming new.json --output report.json
+
+Prerequisites and effects:
+  No configuration, login, token, network or model is required. Inputs are
+  read-only; only explicitly requested manifests/reports are published.
+  Command-line paths are relative to cwd. Manifest paths are relative to
+  their containing JSON manifest. Reports may replace existing output files.
+
+Output and next steps:
+  Successful commands are silent on stdout; diagnostics go to stderr.
+  Consume the JSON output file, not stdout or the exit number alone.
+
+Exit codes:
+  0  Completed: inspect the report; differences or additions are allowed.
+  2  Comparison report has unresolved/review results or item errors; inspect
+     reason_codes and source locations before deciding on further work.
+  1  Invalid arguments/input or global publication failure; fix the diagnostic.
+
+More help:
+  mdcompare COMMAND --help        First-invocation contract and JSON example.
+  mdcompare COMMAND --help --full Complete installed schema and edge cases.
+  mdcompare --help --full         Tool-wide input and publication contract.
+  -h is equivalent to --help. --full requires one of these help flags.
+"""
+
+COMPARE = f"""Inputs:
+  --baseline and --incoming are JSON manifest files, not Markdown files.
+  Pair documents by (knowledge_base, document_id), never by filenames.
+  A minimal manifest (create document.md beside each manifest) is:
+{MANIFEST_EXAMPLE}
+
+Example:
+  mdcompare compare --baseline old.json --incoming new.json --output report.json
+
+Prerequisites and paths:
+  Offline; no authentication or model. Supply immutable local snapshots.
+  CLI paths resolve from cwd; document/resource/OCR paths from each manifest.
+  Create report parent directories first. --report is optional (no Markdown
+  report by default); --include-evidence is opt-in (no body snippets by default).
+
+Outputs and write scope:
+  --output is the authoritative schema_version 1.0 JSON report. --report adds
+  a human Markdown report. Inputs are never changed; existing output reports
+  are privately staged and atomically replaced (mode 0600). Output paths must
+  not alias one another or any declared input. Stdout is silent; stderr has
+  concise diagnostics. No downloading, OCR, graph extraction or baseline update.
+
+Exit codes and next steps:
+  0  Resolved report; differences are valid. Inspect action and reason_codes.
+  2  Report contains UNKNOWN or item errors; retain known changes, inspect
+     text/resources/metadata/ocr dimensions and repair the stated evidence gap.
+  1  Invalid arguments/manifest or global read/publication failure; fix stderr
+     diagnostics. Do not mistake an old output file for a newly complete report.
+  Rerunning reads snapshots again and replaces requested reports; it does not
+  fetch missing evidence, run models, process resources or authorize publication.
+
+Full schema: mdcompare compare --help --full
+"""
+
+KNOWLEDGE = f"""Inputs:
+  --baseline and --incoming are JSON manifest files, not Markdown files.
+  Documents are paired by (knowledge_base, document_id). Minimal manifest:
+{MANIFEST_EXAMPLE}
+
+Example:
+  mdcompare knowledge --baseline old.json --incoming new.json --output body.json
+
+Scope and prerequisites:
+  Offline, read-only body knowledge comparison; no login, token or model.
+  Images, alt text/image URLs and explicit marked OCR blocks are excluded.
+  Resource/OCR declarations are ignored for decisions; ordinary body links
+  remain meaningful. No image/OCR work is generated. --report is optional;
+  --include-evidence explicitly permits bounded body snippets in reports.
+
+Paths, outputs and effects:
+  CLI paths resolve from cwd; input paths from their JSON manifest directory.
+  Create report parent directories first. --output writes knowledge-1.0 JSON;
+  optional --report writes Markdown. Inputs never change; existing reports are
+  atomically replaced, mode 0600. Outputs cannot alias declared inputs.
+  Stdout is silent; diagnostics go to stderr. No extraction or baseline advance.
+
+Exit codes and next steps:
+  0  Determinate body results; additions are allowed. Inspect status and units.
+  2  Complete report with REVIEW, UNKNOWN or item errors. Inspect reason_codes,
+     units, old/new source locations and graphify_plan before deciding on work.
+  1  Invalid arguments/manifests or global read/publication failure; fix stderr
+     diagnostics and do not consume a stale report as a new complete result.
+  REVIEW is not an extraction queue. graphify_plan is advice only; preserve
+  uncertainty and existing knowledge. Repeating the command re-reads inputs
+  and replaces reports; it does not resolve semantic uncertainty or run a model.
+
+Full schema: mdcompare knowledge --help --full
+"""
+
+CATALOG = f"""Input:
+  --input is a JSON descriptor manifest, not a Markdown document. Each path
+  identifies local Markdown. Minimal input (resources may be omitted):
+{MANIFEST_EXAMPLE}
+
+Example:
+  mdcompare catalog --input descriptors.json --output manifest.json
+
+Prerequisites and paths:
+  Offline; no token, login or model. CLI paths resolve from cwd. Document and
+  declared evidence paths resolve from the input manifest directory; Markdown
+  local image/link targets resolve from the Markdown file's parent.
+
+Output and write scope:
+  --output writes schema_version 1.0 JSON with absolute document/evidence paths,
+  resources and resource_warnings. Each discovered resource has resource_id,
+  url, kind and path when local bytes exist. Remote resources are never fetched.
+  Missing/unsupported syntax stays visible in resource_warnings, not a claim
+  of completeness. Stdout is silent; diagnostics go to stderr.
+  Input Markdown/manifests/evidence are read-only. Output parents are created;
+  existing output is atomically replaced (mode 0600). Output must not alias an
+  input manifest, document or declared/discovered local resource/evidence file.
+
+Exit codes and next steps:
+  0  Catalog written; inspect resource_warnings before comparing dependencies.
+  1  Invalid arguments/manifest, unreadable input or publication failure; fix
+     stderr diagnostics. An old output file is not a newly successful catalog.
+  Repeating catalog refreshes this inventory and replaces the selected output.
+  It does not download resources, OCR, compare knowledge or advance a baseline.
+
+Full schema: mdcompare catalog --help --full
+"""
+
+
+NORMAL = {
+    "mdcompare": ROOT,
+    "compare": COMPARE,
+    "knowledge": KNOWLEDGE,
+    "catalog": CATALOG,
+}
+
+
+def full_contract(command: str) -> str:
+    """Read only bundled documentation, never a checkout or remote resource."""
+    names = ["manifest.txt", "input-safety.txt"]
+    if command == "compare":
+        names += ["compare.txt", "resources.txt", "ocr.txt", "history.txt"]
+    elif command == "knowledge":
+        names += ["knowledge.txt"]
+    elif command == "catalog":
+        names += ["catalog.txt", "resources.txt"]
+    return "\nComplete local contract\n=======================\n\n" + "\n\n".join(
+        files("mdcompare").joinpath("help", name).read_text(encoding="utf-8")
+        for name in names
+    )
