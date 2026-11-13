@@ -6,9 +6,10 @@ environment with verified ownership; arbitrary pip/uv environments and source
 checkouts are refused. No network, remote authentication or model calls occur.
 
 After acquiring the exclusive lifecycle lock, removes matching owned dogpdkb,
-mdocr and mdcompare command symlinks, the current environment pointer and the active
-environment directory. Configuration and all external data remain. The shared
-lifecycle lock inode remains. Unrelated links and environments are untouched.
+mdocr, mdcompare and skylark command symlinks, the current environment pointer and the active
+environment directory, including its npm-installed Skylark. Configuration and all
+external data remain. Node.js, npm and unrelated global npm installations remain.
+The shared lifecycle lock inode remains. Unrelated links and environments are untouched.
 Cancellation returns 1, successful removal 0, refusal or I/O failure 1, invalid
 CLI usage 64. A deletion error may leave partial program files: inspect the
 printed paths and use the original installation method for recovery.

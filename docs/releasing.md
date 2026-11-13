@@ -112,6 +112,13 @@ The Release contains a wheel, source archive, version-bound `install.sh`,
 `SHA256SUMS` and `RELEASE_NOTES.md`. Notes include source provenance and up
 to eight visible commit subjects.
 
+The generated installer also installs `pi-skylark@latest` with npm into its
+managed environment and exposes `skylark` alongside the Python commands. Node.js
+and npm must already be installed on the destination. Skylark is fetched at
+installation time, including on same-version reinstalls; it is not pinned or
+added as a Release attachment. npm/startup failure leaves the old environment
+active. No separate Skylark source build or publication is needed.
+
 Publication starts as a draft and finalizes after the expected files are present.
 AntCode Releases are deliberately anonymous: metadata and installation attachments can be
 downloaded without an AntCode account. This does not change repository visibility;

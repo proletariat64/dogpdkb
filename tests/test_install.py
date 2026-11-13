@@ -107,6 +107,23 @@ else:
 """,
         )
         (self.tools / "uv").symlink_to(root / "uv-source")
+        self.python_script(self.tools / "node", "print('v22.0.0')\n")
+        self.python_script(
+            self.tools / "npm",
+            """
+import json, os, pathlib, sys
+args = sys.argv[1:]
+assert args[0] == 'install' and args[-1] == 'pi-skylark@latest'
+with open(os.environ['FAKE_LOG'], 'a') as stream:
+    stream.write(json.dumps(['npm', *args]) + '\\n')
+if os.environ.get('FAIL_NPM'): sys.exit(1)
+prefix = pathlib.Path(args[args.index('--prefix') + 1])
+binary = prefix / 'node_modules/.bin/skylark'
+binary.parent.mkdir(parents=True)
+binary.write_text(pathlib.Path(os.environ['FAKE_CLI_SOURCE']).read_text().replace('@TEST_VERSION@', os.environ.get('SKYLARK_LATEST', '1.0.0')))
+binary.chmod(0o755)
+""",
+        )
 
     @staticmethod
     def python_script(path, body):
@@ -198,7 +215,7 @@ def test_install_and_upgrade_preserve_config_and_data(installer):
 
 
 @pytest.mark.parametrize(
-    "failure", ["DOWNLOAD", "CHECKSUM", "INSTALL", "DOCTOR", "MDCOMPARE"]
+    "failure", ["DOWNLOAD", "CHECKSUM", "INSTALL", "DOCTOR", "MDCOMPARE", "NPM"]
 )
 def test_failed_upgrade_keeps_working_install(installer, failure):
     assert installer.run().returncode == 0
@@ -221,7 +238,7 @@ def test_bootstrap_uv_without_antcode_or_existing_uv(installer):
 
 
 @pytest.mark.parametrize("kind", ["file", "symlink"])
-@pytest.mark.parametrize("command", ["dogpdkb", "mdocr", "mdcompare"])
+@pytest.mark.parametrize("command", ["dogpdkb", "mdocr", "mdcompare", "skylark"])
 def test_refuse_to_overwrite_unmanaged_binary(installer, kind, command):
     installer.binary.parent.mkdir(parents=True)
     binary = installer.binary.parent / command
@@ -254,6 +271,36 @@ def test_upgrade_adds_missing_mdcompare_link(installer):
         subprocess.check_output(["mdcompare", "--version"], env=env, text=True).strip()
         == "mdcompare 0.1.1"
     )
+
+
+def test_reinstall_refreshes_skylark_latest(installer):
+    assert installer.run().returncode == 0
+    command = installer.binary.parent / "skylark"
+    assert command.readlink() == installer.prefix / "current/bin/skylark"
+    assert (
+        subprocess.check_output(
+            [str(command), "--version"], env=installer.env, text=True
+        ).strip()
+        == "skylark 1.0.0"
+    )
+    previous = (installer.prefix / "current").resolve()
+    installer.env["SKYLARK_LATEST"] = "1.1.0"
+    assert installer.run().returncode == 0
+    assert (
+        subprocess.check_output(
+            [str(command), "--version"], env=installer.env, text=True
+        ).strip()
+        == "skylark 1.1.0"
+    )
+    assert not previous.exists()
+
+
+@pytest.mark.parametrize("tool", ["node", "npm"])
+def test_missing_node_or_npm_fails_before_installation(installer, tool):
+    (installer.tools / tool).unlink()
+    result = installer.run()
+    assert result.returncode == 1 and f"Missing prerequisite: {tool}" in result.stderr
+    assert not installer.prefix.exists()
 
 
 def test_partial_config_is_not_overwritten_or_completed(installer):

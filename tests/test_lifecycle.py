@@ -27,7 +27,7 @@ def managed(tmp_path, monkeypatch):
     return installer
 
 
-@pytest.mark.parametrize("foreign_command", ["mdocr", "mdcompare"])
+@pytest.mark.parametrize("foreign_command", ["mdocr", "mdcompare", "skylark"])
 def test_uninstall_keeps_config_data_and_unrelated_paths(managed, foreign_command):
     active = (managed.prefix / "current").resolve()
     unrelated = managed.prefix / "versions/unrelated"
@@ -44,7 +44,7 @@ def test_uninstall_keeps_config_data_and_unrelated_paths(managed, foreign_comman
     assert not (managed.prefix / "current").is_symlink()
     assert not managed.binary.is_symlink()
     assert foreign.readlink() == Path("/other/tool")
-    for name in {"mdocr", "mdcompare"} - {foreign_command}:
+    for name in {"mdocr", "mdcompare", "skylark"} - {foreign_command}:
         assert not (managed.binary.parent / name).is_symlink()
     assert (managed.config / "books.json").is_file()
     assert (data / "user.md").read_text() == "keep"
