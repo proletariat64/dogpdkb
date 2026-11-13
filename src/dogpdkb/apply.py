@@ -533,7 +533,7 @@ def publish_corpus(book, store, run, rows, results):
             temporary.replace(output)
         finally:
             temporary.unlink(missing_ok=True)
-        witness = run.directory / "published" / f"{index}.md"
+        witness = store.input_directory(identifier) / "corpus.md"
         witness.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(output, witness)
         resources = [dict(resource) for resource in (row.get("resources") or [])]
@@ -650,6 +650,9 @@ def apply_run(
         store,
         check_baseline=not run.data.get("artifacts", {}).get("manifest"),
     )
+    from dogpdkb.inputs import retain_inputs
+
+    retain_inputs(store, run, plan["documents"], results)
     manifest = publish_corpus(book, store, run, plan["documents"], results)
     partial = bool(run.data["failures"])
     if run.data["command"] != "sync":

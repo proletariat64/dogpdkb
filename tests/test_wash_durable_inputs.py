@@ -1,0 +1,164 @@
+"""Durable input guarantees through public CLI and real Markdown artifacts."""
+
+import json
+import shutil
+import sys
+from pathlib import Path
+
+from tests.test_orchestrator_apply_cli import cli, instance
+
+
+def enriched_instance(tmp_path):
+    config, differences = instance(tmp_path)
+    tool = tmp_path / "enrich.py"
+    tool.write_text("""import json,sys
+from pathlib import Path
+args=sys.argv[1:]
+def option(name):return Path(args[args.index(name)+1])
+doc=json.loads(option('--manifest').read_text())['documents'][0]
+output=option('--output-dir')/'enriched.md';output.parent.mkdir(parents=True,exist_ok=True)
+output.write_text(Path(doc['path']).read_text()+'\\nTool-added evidence.\\n')
+option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','status':'completed','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[]}]}))
+with Path(__file__).with_name('ocr-calls').open('a') as log: log.write('call\\n')
+""")
+    config.write_text(
+        config.read_text().replace(
+            "mdocr=" + json.dumps([sys.executable, "-m", "mdocr.cli"]),
+            "mdocr=" + json.dumps([sys.executable, str(tool)]),
+        )
+    )
+    return config, differences
+
+
+def test_new_version_compares_raw_baseline_after_old_wash_is_deleted(tmp_path):
+    config, differences = enriched_instance(tmp_path)
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 0, first.stderr
+    shutil.rmtree(Path(json.loads(first.stdout)["run"]).parent)
+    remote = json.loads((tmp_path / "remote.json").read_text())
+    remote["42"]["version"] = "2026-11-13T10:00:00Z"
+    (tmp_path / "remote.json").write_text(json.dumps(remote))
+    selected = json.loads(differences.read_text())
+    selected["documents"][0]["version"] = {
+        "value": "2026-11-13T10:00:00Z",
+        "utc": "2026-11-13T10:00:00+00:00",
+        "precision": "second",
+    }
+    differences.write_text(json.dumps(selected))
+    second = cli("apply", "--config", config, "--input", differences)
+    assert second.returncode == 0, second.stderr
+    manifest = json.loads(Path(json.loads(second.stdout)["manifest"]).read_text())
+    assert manifest["documents"][0]["action"] == "reuse"
+
+
+def test_same_version_ocr_reuse_and_corpus_witness_survive_old_wash_deletion(tmp_path):
+    config, differences = enriched_instance(tmp_path)
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 0, first.stderr
+    first_result = json.loads(first.stdout)
+    manifest = json.loads(Path(first_result["manifest"]).read_text())
+    shutil.rmtree(Path(first_result["run"]).parent)
+    witness = Path(manifest["documents"][0]["input_copy"])
+    assert witness.is_file()
+    assert witness.read_bytes() == Path(manifest["documents"][0]["path"]).read_bytes()
+    second = cli("apply", "--config", config, "--input", differences)
+    assert second.returncode == 0, second.stderr
+    assert (tmp_path / "ocr-calls").read_text().splitlines() == ["call"]
+    assert (tmp_path / "events").read_text().splitlines() == ["export"]
+
+
+def test_raw_relative_images_remain_readable_after_wash_deletion(tmp_path):
+    config, differences = enriched_instance(tmp_path)
+    remote = json.loads((tmp_path / "remote.json").read_text())
+    remote["42"]["body"] += "\n![diagram](../images/diagram.png)\n"
+    (tmp_path / "remote.json").write_text(json.dumps(remote))
+    tool = tmp_path / "skylark.py"
+    tool.write_text(
+        tool.read_text().replace(
+            "path.write_text(doc['body'])",
+            "path.write_text(doc['body']); image=path.parent.parent/'images'/'diagram.png'; image.parent.mkdir(parents=True,exist_ok=True); __import__('PIL.Image',fromlist=['Image']).new('RGB',(2,2),'red').save(image)",
+        )
+    )
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 0, first.stderr
+    shutil.rmtree(Path(json.loads(first.stdout)["run"]).parent)
+    state = json.loads((tmp_path / "state" / "funds" / "state.json").read_text())
+    raw = state["documents"]["42"]["raw"]
+    assert (Path(raw["path"]).parent / "../images/diagram.png").is_file()
+    assert Path(raw["resources"][0]["path"]).is_file()
+    remote["42"]["version"] = "2026-11-13T10:00:00Z"
+    (tmp_path / "remote.json").write_text(json.dumps(remote))
+    selected = json.loads(differences.read_text())
+    selected["documents"][0]["version"] = {
+        "value": "2026-11-13T10:00:00Z",
+        "utc": "2026-11-13T10:00:00+00:00",
+        "precision": "second",
+    }
+    differences.write_text(json.dumps(selected))
+    second = cli("apply", "--config", config, "--input", differences)
+    assert second.returncode == 0, second.stderr
+    run = Path(json.loads(second.stdout)["run"]).parent
+    comparison = json.loads((run / "compare-report.json").read_text())
+    assert comparison["results"][0]["resources"]["status"] == "UNCHANGED"
+    knowledge = json.loads((run / "knowledge-report.json").read_text())
+    assert knowledge["results"][0]["status"] == "REUSE"
+
+
+def test_unknown_ocr_report_remains_partial_and_retains_raw_baseline(tmp_path):
+    config, differences = enriched_instance(tmp_path)
+    tool = tmp_path / "enrich.py"
+    tool.write_text(
+        "import sys\nfrom pathlib import Path\na=sys.argv[1:]\nPath(a[a.index('--report')+1]).write_text('invalid')\nraise SystemExit(2)\n"
+    )
+    result = cli("apply", "--config", config, "--input", differences)
+    assert result.returncode == 2, result.stderr
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    assert state["documents"]["42"]["steps"]["ocr"]["status"] == "unknown"
+    shutil.rmtree(Path(json.loads(result.stdout)["run"]).parent)
+    assert Path(state["documents"]["42"]["raw"]["path"]).is_file()
+
+
+def test_successful_graph_witness_and_report_survive_wash_deletion(tmp_path):
+    from tests.test_orchestrator_graph_cli import cli as graph_cli
+    from tests.test_orchestrator_graph_cli import fixture
+
+    config, manifest, source = fixture(tmp_path)
+    result = graph_cli(config, manifest)
+    assert result.returncode == 0, result.stderr
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    step = state["documents"]["42"]["steps"]["graph"]
+    shutil.rmtree(manifest.parent)
+    assert Path(step["input_copy"]).read_bytes() == source.read_bytes()
+    report = json.loads(Path(step["report"]).read_text())
+    assert report["status"] == "completed"
+    assert report["candidate"] is None
+
+
+def test_declared_ocr_images_are_relocated_before_corpus_publication(tmp_path):
+    config, differences = enriched_instance(tmp_path)
+    tool = tmp_path / "enrich.py"
+    tool.write_text("""import json,sys
+from pathlib import Path
+from urllib.parse import quote
+args=sys.argv[1:]
+def option(name):return Path(args[args.index(name)+1])
+doc=json.loads(option('--manifest').read_text())['documents'][0]
+output=option('--output-dir')/'enriched.md';output.parent.mkdir(parents=True,exist_ok=True)
+image=output.parent/'prepared image.png';image.write_bytes(b'original image bytes')
+output.write_text(Path(doc['path']).read_text()+'\\n![prepared]('+quote(str(image),safe='/')+')\\n')
+resource={'resource_id':'image','status':'success','source_path':str(image),'prepared_image':str(image)}
+option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[resource],'ocr':{'images':[resource]}}]}))
+""")
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 0, first.stderr
+    manifest = json.loads(Path(json.loads(first.stdout)["manifest"]).read_text())
+    document = manifest["documents"][0]
+    shutil.rmtree(Path(json.loads(first.stdout)["run"]).parent)
+    image = Path(document["ocr"]["images"][0]["prepared_image"])
+    assert image.read_bytes() == b"original image bytes"
+    from urllib.parse import quote
+
+    assert quote(str(image), safe="/") in Path(document["path"]).read_text()
+    assert (
+        Path(document["input_copy"]).read_bytes() == Path(document["path"]).read_bytes()
+    )

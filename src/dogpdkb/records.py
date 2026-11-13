@@ -127,6 +127,11 @@ class Store:
         if book.document_ids is not None:
             self.data["book"]["document_ids"] = list(book.document_ids)
 
+    def input_directory(self, doc_id: str) -> Path:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", doc_id):
+            raise ValueError("source ID cannot be represented as a local filename")
+        return self.path.parent / "inputs" / doc_id
+
     def save(self) -> None:
         atomic_json(self.path, self.data)
 

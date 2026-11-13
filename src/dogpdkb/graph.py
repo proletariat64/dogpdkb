@@ -208,7 +208,9 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
         doc_id = row["document_id"]
         acknowledgement = {}
         if status == "completed":
-            witness = run.directory / "graph-success" / f"{doc_id}.md"
+            retained_report = store.input_directory(doc_id) / "graph-report.json"
+            atomic_json(retained_report, {**read_json(report), "candidate": None})
+            witness = store.input_directory(doc_id) / "graph.md"
             witness.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(row["input_copy"], witness)
             acknowledgement = {
@@ -222,7 +224,7 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
                 "version": row["version"],
                 "source_file": str(Path(row["path"]).relative_to(book.corpus)),
                 "run_id": run.id,
-                "report": str(report),
+                "report": str(retained_report),
             }
             observed = document.get("pending")
             if (
@@ -240,7 +242,7 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
             row["version"],
             status,
             run.id,
-            report=str(report),
+            report=str(retained_report if status == "completed" else report),
             reason=reason,
             **acknowledgement,
         )
