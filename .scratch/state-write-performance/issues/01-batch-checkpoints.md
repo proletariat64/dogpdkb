@@ -1,6 +1,6 @@
 # Batch durable checkpoints at public tool boundaries
 
-Status: in progress
+Status: resolved
 Type: task
 
 ## Problem
@@ -30,3 +30,11 @@ migration, retry policy and model/tool algorithms are outside this patch.
 - Interruption persists all unknown results in one write. Later individually
   unstarted export/OCR work remains eligible, covered by existing CLI tests.
 - Focused tests, lint, local OCR review and PR CI; no local full make check/smoke.
+
+## Result
+
+Implemented in PR #22. The final targeted suite passed 79 tests. Local OCR
+review reported zero findings across four runtime files; Greptile scored the
+implementation commit 5/5 with no actionable issues. PR CI passed full check
+and installed smoke. Release preparation subsequently adds version 0.2.2;
+formal make release runs its built-in gates under the user's release request.

@@ -29,9 +29,11 @@ before they execute. It also covers a failed state save, preparation failure,
 old-version blocks, actual termination during comparison, interruption cleanup,
 public status phases, and Graphify success/failure/interruption batches.
 
-Existing apply/core/graph CLI suites initially passed: 71 tests, plus one live
-termination regression passed separately. The final combined targeted run and
-review are recorded in the PR. Full make check/make smoke run only in CI.
+The final combined apply/core/graph/operations/boundary suite passed 79 tests.
+Ruff and document guard passed. Local OCR reported zero findings across four
+runtime files, and Greptile scored the implementation commit 5/5 with no
+actionable issues. PR CI passed full make check and make smoke. Formal release
+performs its built-in local gates under the subsequent user release request.
 
 Production UAT, installed CLIs and state files are outside this worktree and
 were not changed.
