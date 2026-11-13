@@ -99,3 +99,13 @@ this help commit. A PR to the existing restored feature branch would include
 only the help commit; the parent integration task owns that remote decision.
 Do not claim the dogpdkb PR alone updates Skylark's upstream main or its installed
 user command. The original dirty user checkout was intentionally left untouched.
+
+## Publication authorization
+
+An attempted push of feat/cli-local-help to
+https://github.com/proletariat64/pi_skylark was rejected before execution by
+automatic approval review: trusted instructions did not explicitly authorize
+that separate repository destination. The local branch, commit, package and
+source patch remain available. Destination-specific authorization has been
+requested; no workaround or alternate export was attempted for that push.
+The dogpdkb branch/PR remains the explicitly requested primary delivery.

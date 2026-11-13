@@ -47,3 +47,6 @@ failed before correction. The nearest 99 CLI regressions pass; canonical raw
 bytes and published literal examples remain unchanged. Retained publication
 generations are immutable; no migration, fingerprint or automatic retry added.
 Final full-gate and artifact proof are owned by tickets 05/06.
+
+Final bounded lexer corrections: 3774f54; nearest 102 CLI regressions and 7
+independent peer cases pass. All reported findings closed by targeted evidence.

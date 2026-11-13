@@ -238,8 +238,9 @@ partial result as a reason to rerun.
     mismatch, incomplete dogpdkb configuration/resume guidance, incorrect
     publication usage prefix, and prepare help claiming re-OCR behavior.
     Include commands added since the audit, notably purge.
-13. Run the affected repositories' focused CLI checks and required document,
-    lint, test, build, and isolated-install gates. Record actual versions,
+13. After OCR remediation, run focused CLI regressions locally only. Per the
+    user's explicit delivery instruction, full make check and make smoke gates
+    run in PR CI, without equivalent local script workarounds. Record actual versions,
     command counts, pass/fail results, and evidence limitations. Keep source
     tests, fresh-install acceptance, CI, host deployment, and production/model
     acceptance separate. Do not broaden into live services after these gates

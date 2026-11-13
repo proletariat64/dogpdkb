@@ -1,7 +1,7 @@
 # feat: Review and new PR after completion delivery
 
 Type: task
-Status: ready-for-agent
+Status: claimed
 Blocked by: 05
 
 ## Scope
@@ -15,3 +15,7 @@ Spec: [CLI help redesign](../spec.md).
 Meet the relevant spec decisions through the agreed public CLI seam. Record red/green evidence, focused checks, delivered commit or patch, and limitations before resolving.
 
 ## Comments
+
+All known review findings are fixed and targeted regressions pass. User clarified
+that no PR existed; publish a new PR from the existing integration branch.
+Full post-fix check/smoke belongs to PR CI, not another local run.

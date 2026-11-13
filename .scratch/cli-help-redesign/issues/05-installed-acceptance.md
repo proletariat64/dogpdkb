@@ -15,3 +15,7 @@ Spec: [CLI help redesign](../spec.md).
 Meet the relevant spec decisions through the agreed public CLI seam. Record red/green evidence, focused checks, delivered commit or patch, and limitations before resolving.
 
 ## Comments
+
+User verification boundary: after OCR fixes, full make check/make smoke run
+only in PR CI. Prior local installed proof remains scoped to its recorded
+source; final-source full acceptance is pending CI.

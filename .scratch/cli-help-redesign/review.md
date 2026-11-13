@@ -66,3 +66,32 @@ A full clean-checkout gate at 1a738af passed 952 tests, doc guard 131 documents,
 and Ruff/formatting. Final source adds the seven literal/attribute cases; final
 count will be recorded from execution. The complete resource-kind enum has been
 corrected to image/attachment/media in local full help and the tool contract.
+
+## Final literal-boundary review
+
+The next exact-range OCR reviewed one source file and found three bounded lexer
+issues: rejected fenced openers hiding same-line triple-backtick code spans,
+backticks inside reference labels splitting definition context, and code-span
+pairing crossing blank paragraph boundaries. These are recorded in
+/tmp/dogpdkb-help-ocr-relocation-final.txt and assigned to the same preservation
+implementer for public CLI regressions and focused correction. Earlier final
+959-test and 100-call artifact results apply to source 3c37b04 and are not
+substituted for acceptance of the corrected source.
+
+## Final known-finding closure and verification boundary
+
+Commit 3774f54 fixes the final three lexer findings. The nearest 102 public CLI
+regressions pass, including all 21 publication-preservation cases. Independent
+peer inspection and seven focused public cases close the exact three findings.
+The last provider report still contains three findings; their closure is test
+and peer evidence, not a claim of a final provider-zero report. Runtime source
+is integrated at 0cddefd.
+
+The user explicitly directed that, after OCR remediation, local full
+`make check` and `make smoke` must not be repeated; PR CI owns those gates.
+The already-running full check was interrupted with exit 130. The latest direct
+smoke launch was rejected by automatic approval review before starting because
+it was equivalent to the newly prohibited local full smoke gate. No workaround
+or retry was attempted. Earlier 959-test/full-smoke/100-call results remain
+identified with their earlier source snapshots; full final-source acceptance
+will be recorded from PR CI. All known implementation findings are fixed.
