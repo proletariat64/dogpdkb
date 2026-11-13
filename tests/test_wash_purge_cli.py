@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -74,6 +75,204 @@ def run_directory(tmp_path, name="run-example", status="completed", book="funds"
     (directory / "failed.md").write_text("# Failed source\n![image](failed.png)\n")
     (directory / "failed.png").write_bytes(b"failure evidence")
     return directory
+
+
+@contextmanager
+def external_writer(lock_path):
+    """A real external process owns the existing kernel lock, not its PID text."""
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import fcntl, sys; "
+                "lock = open(sys.argv[1], 'r'); "
+                "fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB); "
+                "print('locked', flush=True); sys.stdin.read()"
+            ),
+            str(lock_path),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout.readline().strip() == "locked"
+        yield
+    finally:
+        process.stdin.close()
+        process.wait(timeout=5)
+        process.stdout.close()
+
+
+def change_execution_targets(tmp_path, config):
+    books = tmp_path / "books.json"
+    rows = json.loads(books.read_text())
+    rows[0]["corpus"] = "new-corpus"
+    books.write_text(json.dumps(rows))
+    config.write_text(
+        config.read_text().replace("[paths]\n", '[paths]\ngraph_dir="new-graph"\n')
+    )
+
+
+@pytest.mark.parametrize("target", ["corpus", "graph"])
+@pytest.mark.parametrize("selection", ["single", "all"])
+def test_purge_obeys_saved_target_lock_after_parent_exits(tmp_path, target, selection):
+    config = instance(tmp_path)
+    selected = run_directory(tmp_path, "run-z", status="running")
+    metadata = selected / "run.json"
+    data = json.loads(metadata.read_text())
+    dead_parent = subprocess.run(
+        [sys.executable, "-c", "import os; print(os.getpid())"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    data["pid"] = int(dead_parent.stdout)
+    metadata.write_text(json.dumps(data))
+    lock_path = Path(data["targets"][target]) / ".dogpdkb.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(str(data["pid"]))
+    change_execution_targets(tmp_path, config)
+    candidates = [selected]
+    if selection == "all":
+        earlier = run_directory(tmp_path, "run-a")
+        earlier_data = json.loads((earlier / "run.json").read_text())
+        earlier_data["targets"].update(
+            corpus=str(tmp_path / "new-corpus"), graph=str(tmp_path / "new-graph")
+        )
+        (earlier / "run.json").write_text(json.dumps(earlier_data))
+        candidates.append(earlier)
+    args = ["--all"] if selection == "all" else ["--run", selected.name]
+    with external_writer(lock_path):
+        denied = cli(config, "--book", "funds", *args, "--force")
+        assert denied.returncode == 1, denied.stdout
+        assert "another writer" in denied.stderr
+        assert all((path / "failed.png").is_file() for path in candidates)
+        assert lock_path.read_text() == str(data["pid"])
+    result = cli(config, "--book", "funds", *args, "--force")
+    assert result.returncode == 0, result.stderr
+    assert all(not path.exists() for path in candidates)
+    assert lock_path.read_text() == str(data["pid"])
+
+
+@pytest.mark.parametrize("existing_lock", [False, True])
+def test_purge_holds_all_saved_target_locks_through_deletion(tmp_path, existing_lock):
+    config = instance(tmp_path)
+    selected = run_directory(tmp_path, "run-z")
+    earlier = run_directory(tmp_path, "run-a")
+    targets = json.loads((selected / "run.json").read_text())["targets"]
+    lock_paths = [Path(targets[key]) / ".dogpdkb.lock" for key in ("corpus", "graph")]
+    for path in lock_paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if existing_lock:
+            path.write_text("old owner")
+    change_execution_targets(tmp_path, config)
+    evidence = tmp_path / "deletion-locks.jsonl"
+    contender = """
+import fcntl, json, sys
+results = []
+for path in sys.argv[1:]:
+    with open(path, 'r') as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            results.append('held')
+        else:
+            results.append('free')
+print(json.dumps(results))
+"""
+    # Observe the real deletion boundary; no product function is replaced.
+    wrapper = """
+import json, runpy, subprocess, sys
+evidence, contender, lock_paths = sys.argv[1:4]
+sys.argv = ['dogpdkb', *sys.argv[4:]]
+def audit(event, args):
+    if event == 'shutil.rmtree':
+        result = subprocess.run(
+            [sys.executable, '-c', contender, *json.loads(lock_paths)],
+            capture_output=True, text=True, check=True,
+        )
+        with open(evidence, 'a') as stream:
+            stream.write(result.stdout)
+sys.addaudithook(audit)
+runpy.run_module('dogpdkb', run_name='__main__')
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            wrapper,
+            str(evidence),
+            contender,
+            json.dumps([str(path) for path in lock_paths]),
+            "purge",
+            "--config",
+            str(config),
+            "--book",
+            "funds",
+            "--all",
+        ],
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not selected.exists() and not earlier.exists()
+    assert [json.loads(line) for line in evidence.read_text().splitlines()] == [
+        ["held", "held"],
+        ["held", "held"],
+    ]
+    assert all(
+        path.read_text() == ("old owner" if existing_lock else "")
+        for path in lock_paths
+    )
+
+
+@pytest.mark.parametrize("target", ["corpus", "graph"])
+@pytest.mark.parametrize("invalid", [None, "", "relative/path", 5, "overlap"])
+def test_purge_rejects_unsafe_saved_targets_before_any_deletion(
+    tmp_path, target, invalid
+):
+    config = instance(tmp_path)
+    earlier = run_directory(tmp_path, "run-a")
+    selected = run_directory(tmp_path, "run-z")
+    metadata = selected / "run.json"
+    data = json.loads(metadata.read_text())
+    data["targets"][target] = (
+        str(earlier / "saved-data") if invalid == "overlap" else invalid
+    )
+    metadata.write_text(json.dumps(data))
+    result = cli(config, "--book", "funds", "--all", "--force")
+    assert result.returncode == 1, result.stdout
+    assert "saved" in result.stderr
+    assert earlier.exists() and selected.exists()
+
+
+def test_purge_does_not_follow_saved_lock_symlink(tmp_path):
+    config = instance(tmp_path)
+    selected = run_directory(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("untouched")
+    corpus = tmp_path / "corpus" / "funds"
+    corpus.mkdir(parents=True)
+    (corpus / ".dogpdkb.lock").symlink_to(outside)
+    change_execution_targets(tmp_path, config)
+    result = cli(config, "--book", "funds", "--run", selected.name, "--force")
+    assert result.returncode == 1, result.stdout
+    assert selected.exists() and outside.read_text() == "untouched"
+
+
+def test_purge_does_not_recreate_missing_saved_target_directories(tmp_path):
+    config = instance(tmp_path)
+    selected = run_directory(tmp_path)
+    change_execution_targets(tmp_path, config)
+    result = cli(config, "--book", "funds", "--run", selected.name)
+    assert result.returncode == 0, result.stderr
+    assert not selected.exists()
+    assert not (tmp_path / "corpus").exists()
 
 
 def test_purge_removes_selected_wash_and_preserves_other_data(tmp_path):

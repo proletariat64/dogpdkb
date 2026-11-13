@@ -8,6 +8,11 @@ are rejected. All candidates are checked before deletion starts.
 Saved schema, book key/source URL and run ID must match the selected wash.
 Changed corpus/graph execution targets do not prevent deleting an owned run;
 resuming execution still requires its frozen targets to match configuration.
+Saved corpus/graph targets must be absolute paths and must not overlap any
+selected run. Purge holds both current and saved target locks through all
+deletions, even when the saved parent PID has exited. Missing historical target
+directories stay absent; existing ones may receive a missing .dogpdkb.lock file.
+Existing saved lock contents are preserved.
 
 Default permits completed/partial runs only. --force also permits discarding
 paused, failed or interrupted work, permanently losing that run's saved plan,

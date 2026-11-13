@@ -92,6 +92,12 @@ or clears durable facts, corpus, graphs, persistent inputs or tool caches.
 Purge validates saved schema, book key/source URL and run ID against the selected
 wash; it does not require the saved corpus/graph execution targets to match the
 current configuration. Protected-path and live-owner checks still apply.
+Saved corpus/graph targets must be absolute and cannot overlap selected wash.
+Purge acquires their locks in addition to current target locks before deleting
+any candidate, retaining every acquired lock until all deletions finish. This
+protects external children that retain a lock after the recorded parent exits.
+Missing historical target directories are not recreated; existing directories
+may receive a missing lock file without rewriting existing lock contents.
 
 ## Processes and observation
 

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import shutil
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 
 from dogpdkb.help import HelpParser
@@ -33,6 +36,7 @@ def purge_runs(store, reference=None, *, all_runs=False, force=False):
         store.settings.ocr_cache,
     ]
     checked = []
+    saved_targets = set()
     for path in candidates:
         if (
             path.is_symlink()
@@ -61,14 +65,46 @@ def purge_runs(store, reference=None, *, all_runs=False, force=False):
             or data["targets"].get("book_url") != store.book.url
         ):
             raise ValueError("run does not belong to the selected book wash or schema")
+        for key in ("corpus", "graph"):
+            value = data["targets"].get(key)
+            if not isinstance(value, str) or not value or not Path(value).is_absolute():
+                raise ValueError(f"saved {key} target must be an absolute path")
+            saved_targets.add(Path(value).resolve())
         status = data.get("status")
         if status == "running" and process_alive(data.get("pid")):
             raise ValueError(f"run is still running: {path.name}")
         if status not in {"completed", "partial"} and not force:
             raise ValueError(f"discarding {status} run requires --force: {path.name}")
         checked.append(target)
-    for path in checked:
-        shutil.rmtree(path)
+    if any(
+        target.is_relative_to(saved) or saved.is_relative_to(target)
+        for target in checked
+        for saved in saved_targets
+    ):
+        raise ValueError("wash overlaps saved corpus/graph target")
+    current_locks = {
+        store.book.corpus.resolve() / ".dogpdkb.lock",
+        store.settings.graph_for(store.book).resolve() / ".dogpdkb.lock",
+    }
+    saved_locks = {target / ".dogpdkb.lock" for target in saved_targets}
+    with ExitStack() as locks:
+        for path in sorted(saved_locks - current_locks):
+            try:
+                descriptor = os.open(
+                    path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
+                )
+            except FileNotFoundError:
+                # Do not recreate historical target trees just for deletion.
+                continue
+            locks.callback(os.close, descriptor)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise ValueError(
+                    f"another writer is running for saved target {path.parent}"
+                ) from error
+        for path in checked:
+            shutil.rmtree(path)
     return {"book": store.book.key, "purged": [str(path) for path in checked]}
 
 
