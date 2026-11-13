@@ -27,7 +27,8 @@ A separate linked worktree now holds the durable source commit described below.
   applies both to the exact Git source and the restored snapshot that already
   contains that executable. The durable commit and npm package include the
   rebuilt executable. Do not apply the patch to the dirty main tree.
-- Durable source worktree: `/tmp/skylark-help-delivery`.
+- Implementation worktree: `/tmp/skylark-help-delivery` (removed after validation;
+  the durable local branch and commit remain).
 - Durable Git branch: `feat/cli-local-help` in the original Skylark repository.
 - Implementation commit: `0dbb2cc904ce257596252b377769d94ec6811cc1`.
 - Exact parent: `0e7c21883481d04a42a771c6fad1ddd5e6e0aa91` on the restored
@@ -109,3 +110,6 @@ that separate repository destination. The local branch, commit, package and
 source patch remain available. Destination-specific authorization has been
 requested; no workaround or alternate export was attempted for that push.
 The dogpdkb branch/PR remains the explicitly requested primary delivery.
+
+The linked implementation worktree has been cleaned. The durable feature branch,
+source commit, package, source patch and original dirty main checkout remain.

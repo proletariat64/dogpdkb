@@ -1,6 +1,6 @@
 # Fresh-install help and side-effect acceptance
 
-Status: passed after observed mdocr import-side-effect correction
+Status: final artifact passed; original import-side-effect defect corrected and reverified
 Date: 2026-11-13
 
 ## Artifacts and environment
@@ -17,14 +17,19 @@ Date: 2026-11-13
 - Independent Skylark entry point:
   `/tmp/skylark-help-install/node_modules/.bin/skylark`, installed from
   `/tmp/skylark-help-redesign/artifacts/pi-skylark-0.1.0.tgz`.
-- Passing fixed-wheel trace evidence and JSON results:
-  `/tmp/dogpdkb-help-proof-evidence-fixed`.
-- Fixed-wheel harness: `/tmp/dogpdkb-help-proof-run-fixed.py`.
+- Final passing trace evidence and JSON results:
+  `/tmp/dogpdkb-help-proof-evidence-final`.
+- Final reproduction harness: `/tmp/dogpdkb-help-proof-run-final.py`.
+- Earlier passing import-fix proof and harness remain preserved:
+  `/tmp/dogpdkb-help-proof-evidence-fixed` and
+  `/tmp/dogpdkb-help-proof-run-fixed.py`.
 - Preserved pre-fix evidence and harness:
   `/tmp/dogpdkb-help-proof-evidence` and `/tmp/dogpdkb-help-proof-run.py`.
-- Passing Python artifact was rebuilt after integration commit `64cf261` and
-  reinstalled explicitly into the same task-owned environment; all 73 installed
-  runtime/help files again directly matched the replacement wheel.
+- Final Python artifact source commit:
+  `3c37b047d822fa74074882c3f1058c126b7d8341`. The rebuilt final wheel was
+  explicitly reinstalled into the same task-owned environment; all 73 installed
+  runtime/help files directly matched that exact final wheel after the trace run.
+  Final artifact summary is retained with the traces as final-artifact-summary.json.
 
 ## Coverage
 
@@ -62,13 +67,14 @@ All 100 requests produced nonempty stdout, empty stderr, and exit 0. All tested
 filesystem metadata, HOME/cwd/cache trees, ownership marker, and lock contents
 remained unchanged. No request attempted flock or launched a business tool.
 
-The fixed-wheel matrix passed strict side-effect acceptance for all 100 calls:
+The final-artifact matrix passed strict side-effect acceptance for all 100 calls:
 zero network syscalls, zero operational write syscalls, zero flock syscalls, and
 zero unexpected business subprocesses. Expected interpreter exec chains and
 Node runtime threads/IPC were observed separately; they were not counted as
-business activity. The exclusive lifecycle lock remained held and all recorded
-filesystem snapshots remained unchanged. The complete passing rerun took 30.36
-seconds under tracing.
+business activity. Across 230 trace files, the only 113 exec calls were the
+expected executable/interpreter chains. The exclusive lifecycle lock remained
+held and all recorded filesystem snapshots remained unchanged. The complete final
+passing rerun took 52.12 seconds under tracing; no runtime timeout occurred.
 
 Before the correction, all 100 calls also exited 0, but all 17 mdocr help/version
 requests opened an IPv6 socket and bound ::1 on an ephemeral port. The original
@@ -84,8 +90,9 @@ imports and the complete fresh-installed matrix now records zero such syscalls.
 The mdocr correction was made by the implementation task, not this acceptance
 task. This acceptance explicitly reinstalled the rebuilt fixed wheel and reran
 all 100 calls in the isolated managed-shaped environment, preserving other user
-installs. The disposable environment and harness remain available for a final
-artifact rerun after any later rebuild. No source or Git/PR change was made by
+installs. The final artifact was reinstalled and reverified after all implementation fixes.
+The disposable environment and harness remain available if another artifact is
+built, but this proof describes the completed final artifact above. No source or Git/PR change was made by
 this acceptance task.
 
 This proof covers help/version and observed side effects for these exact local
@@ -94,3 +101,22 @@ export completeness, paid model behavior, production synchronization, release
 publication, or deployed-host acceptance. No such operation was run. Interpreter
 cache creation is excluded by the explicit Python environment setting, not by
 an assertion that Python never writes bytecode in an arbitrary environment.
+
+## Final runtime CI handoff
+
+The strict 100-call trace above is scoped to its recorded source 3c37b04.
+Subsequent runtime corrections are in the destination-relocation helper and
+were verified by 102 focused CLI cases and seven independent peer cases.
+Final runtime payload: 0cddefd44f070f686d5ef4f4ce5ba814faa94858.
+
+Per the user's explicit instruction, post-OCR full check/smoke runs only in PR CI.
+Both final-source runs at code-equivalent head 07d44bf passed:
+
+- https://github.com/proletariat64/dogpdkb/actions/runs/43368250538
+- https://github.com/proletariat64/dogpdkb/actions/runs/43368302338
+
+The latter job records successful quality-gate and isolated platform installation
+steps. The latest local full check was interrupted (130); the latest direct
+smoke launch was rejected before starting. Earlier local installed proofs are
+not relabeled as final-source reruns. No production source or paid model tool
+operation was performed.

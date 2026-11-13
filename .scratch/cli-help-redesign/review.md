@@ -1,6 +1,6 @@
 # CLI help implementation review
 
-Status: final artifact acceptance and review in progress
+Status: resolved
 
 ## Standards
 
@@ -95,3 +95,22 @@ it was equivalent to the newly prohibited local full smoke gate. No workaround
 or retry was attempted. Earlier 959-test/full-smoke/100-call results remain
 identified with their earlier source snapshots; full final-source acceptance
 will be recorded from PR CI. All known implementation findings are fixed.
+
+## Delivery result
+
+All known findings are closed by focused regression and independent peer
+verification. Final runtime payload: 0cddefd. The last three provider findings
+were fixed in 3774f54 and verified by 102 nearest CLI cases plus seven peer
+cases; no final provider-zero result is claimed.
+
+PR #20 is open from the existing feat/sync-wash-cleanup branch. At code-equivalent
+head 07d44bf both CI runs passed: push 43368250538 and PR 43368302338. The PR job
+explicitly reports successful Run quality gate and Build and verify isolated
+platform installation steps. This is final-source CI proof, distinct from the
+prior locally recorded 959-test/full-smoke/100-call snapshots. No local full
+gate was rerun after the user's instruction.
+
+All task-owned linked implementation/verification worktrees are cleaned; original
+checkouts, dirty user files, source snapshot and useful package/proof artifacts
+are preserved. The independent Skylark push remains rejected pending explicit
+repository-destination authorization; primary PR delivery is complete.

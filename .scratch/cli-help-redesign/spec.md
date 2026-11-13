@@ -1,6 +1,6 @@
 # feat: Redesign local help and invocation guidance for all four CLIs
 
-Status: ready-for-agent
+Status: resolved
 Type: feature
 Created: 2026-11-13
 
@@ -291,6 +291,11 @@ partial result as a reason to rerun.
   [mdocr contract](../../docs/spec/mdocr.md). Use the current domain glossary and
   command behavior to resolve stale descriptions; do not silently change the
   business contract to match an old document.
-- Publication is this local tracker specification with `Status: ready-for-agent`.
+- Publication is this local tracker specification with `Status: resolved`.
   Implementation tickets, commits, reviews, CI, release, and deployment are
   separate actions and are not claimed by publishing the spec.
+
+- Implementation delivery: [dogpdkb PR #20](https://github.com/proletariat64/dogpdkb/pull/20).
+  All seven local implementation tickets are resolved. Independent Skylark
+  source/build/patch are complete; its separate remote push was not authorized
+  by automatic review and remains pending explicit destination authorization.
