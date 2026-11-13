@@ -41,6 +41,10 @@ def call_tool(settings, run, name, arguments, *, timeout=None):
 
 
 def failure(run, row, step, reason, **details):
+    tool = run.data.get("tool", {})
+    expected = {"export": "skylark", "ocr": "mdocr", "compare": "mdcompare"}
+    if "exit_code" in details and tool.get("name") == expected.get(step):
+        details.setdefault("argv", tool.get("argv"))
     run.failure(
         document_id=row["document_id"],
         version=row.get("version"),
