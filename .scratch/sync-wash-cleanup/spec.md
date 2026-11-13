@@ -1,6 +1,6 @@
 # Sync wash 清理规格
 
-Status: implementing
+Status: implemented
 
 ## 目标
 

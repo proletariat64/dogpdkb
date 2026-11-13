@@ -1,0 +1,54 @@
+Review complete: 4 finding(s) across 11 selected item(s).
+
+─── src/dogpdkb/cleanup.py:59-60 ───
+[bug · medium] A failed incoming catalog leaves `row["resources"]` as `None`: `compare_inputs()`
+initializes it from a newly exported raw record, and only replaces it after successful catalog
+validation. That value is persisted in plan.json. The sync can still finish partial, but this loop
+then raises TypeError, so cleanup aborts before pruning anything. Treat a null resource list as
+empty so comparison failures do not prevent cleanup of the successful parts of the run.
+
+-             for resource in row.get("resources", []):
++             for resource in row.get("resources") or []:
+                  retain(resource.get("path"))
+
+
+─── src/dogpdkb/purge.py:28-28 ───
+[bug · medium] This rebases every relative run path under the wash root, including paths already
+relative to the working directory. For example, with the default staging layout, `--run
+runs/funds/run-123/run.json` becomes `<root>/runs/funds/run-123` and is rejected even though it
+names a valid selected-book run. `Run.load()` already accepts such working-directory-relative paths.
+Resolve path references from the working directory (while still checking their parent against the
+selected wash root), and use root-relative lookup for bare run IDs.
+
+
+
+─── src/dogpdkb/inputs.py:91-93 ───
+[bug · high] Relocate the original resolved raw-resource paths as well as their resource IDs. With
+the real mdocr batch implementation, a failed relative image such as `../images/diagram.png` is
+emitted in the output as an absolute wash path, and its failed resource record has no `source_path`,
+`prepared_image`, or `artifact`. Consequently, neither this resource-ID mapping nor `mappings`
+matches that output link. The retained `ocr.md` and published corpus still reference the wash image
+and break when the partial run is purged. Capture the old catalogued paths before `retain_raw()`
+replaces them and map those paths to the durable copies too; cover this with a real-mdocr
+partial-image test followed by wash deletion.
+
+
+
+─── src/dogpdkb/inputs.py:207-207 ───
+[bug · medium] These replacement values are absolute catalog paths, but mdocr's
+`parse_image_match()` marks targets beginning with `/` as unsupported, and `prepare_one()` rejects
+them. When this branch handles a retained absolute reference, it also rewrites otherwise supported
+relative references to absolute paths, so those images now fail OCR too. Build destinations relative
+to the tool-facing copy's parent (and adjust selections/identity mappings accordingly) rather than
+inserting absolute paths. The existing fake-tool test only checks that the target exists and does
+not exercise this restriction of the real mdocr CLI.
+
+
+
+LLM retry report summary: 2 of 32 requests affected -- 2 requests failed
+
+Core review (2 requests):
+- scripts/smoke_install.py,src/dogpdkb/cleanup.py,src/dogpdkb/cli.py,src/dogpdkb/purge.py: timed out (HTTP 200) -> failed
+- src/dogpdkb/apply.py,src/dogpdkb/graph.py,src/dogpdkb/inputs.py,src/dogpdkb/records.py,src/dogpdkb/sync.py: timed out (HTTP 200) -> failed
+
+Per-attempt detail: --format json (retry_report).

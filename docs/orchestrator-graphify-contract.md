@@ -48,6 +48,10 @@ Only the complete successful batch advances selected documents' graph facts.
 A nonzero extraction fails the entire batch; there is no per-source success
 claim. `dogpdkb-graph-result-1` is the orchestrator's own execution evidence, not a
 schema required from Graphify. Directory scans are not remote atomic snapshots.
+Execution evidence includes the actual sanitized argv and exit code. Successful
+graph witnesses and latest reports live outside wash; completed/partial sync
+reclaims the duplicate candidate workspace while retaining necessary failure
+reports and source inputs. Manual purge never removes the published graph/cache.
 
 ## Verification
 
