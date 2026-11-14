@@ -94,25 +94,53 @@ def descriptor(book, row, path, *, historical=False, evidence=None):
     return result
 
 
-def make_plan(book, run, documents, knowledge, comparison):
+def make_plan(book, run, documents, knowledge, comparison, *, workspace=None):
     bodies = {str(r["document_id"]): r for r in knowledge.get("results", [])}
     full = {str(r["document_id"]): r for r in comparison.get("results", [])}
     rows = []
     for row in documents:
         identifier = row["document_id"]
         body, detail = bodies.get(identifier, {}), full.get(identifier, {})
-        reuse = body.get("status") == "REUSE" and body.get("comparison_complete", False)
-        action = "compile"
-        reasons = ["BODY_REUSABLE" if reuse else "FULL_SOURCE_REQUIRED"]
-        if reuse:
+        advice = body.get("graphify_plan", {})
+        hold_reasons = advice.get("hold_reason_codes", [])
+        unavailable = (
+            body.get("status") == "UNKNOWN"
+            or not body.get("comparison_complete", False)
+            or "BASELINE_BODY_INCOMPLETE" in hold_reasons
+            or "BASELINE_BODY_INCOMPLETE" in body.get("reason_codes", [])
+            or advice.get("action")
+            not in {"KEEP_EXISTING", "HOLD_EXISTING", "BODY_DELTA_CANDIDATE"}
+        )
+        if unavailable:
+            action, reasons = "defer", ["BODY_COMPARISON_DEFERRED"]
+            run.failure(
+                persist=False,
+                document_id=identifier,
+                version=row.get("version"),
+                step="compare",
+                reason="BODY_COMPARISON_DEFERRED",
+                input=row.get("raw_path"),
+                reason_codes=body.get("reason_codes", []),
+                reports=[
+                    value
+                    for key, value in run.data["artifacts"].items()
+                    if key in {"knowledge", "compare"}
+                ],
+            )
+        elif advice["action"] == "HOLD_EXISTING":
+            action, reasons = "retain", ["BODY_RETAINED", *hold_reasons]
+        elif advice["action"] == "KEEP_EXISTING":
             action = (
                 "metadata"
                 if detail.get("metadata", {}).get("status") == "CHANGED"
                 else "reuse"
             )
+            reasons = ["BODY_REUSABLE"]
+        else:
+            action, reasons = "compile", ["FULL_SOURCE_REQUIRED"]
         resources = detail.get("resources", {}).get("status")
         ocr = detail.get("ocr", {}).get("status")
-        if (
+        if action not in {"defer", "retain"} and (
             resources in {"CHANGED", "NEW"}
             or detail.get("resources", {}).get("references_changed")
             or ocr in {"CHANGED", "NEW", "REMOVED"}
@@ -134,7 +162,7 @@ def make_plan(book, run, documents, knowledge, comparison):
         "run_id": run.id,
         "documents": rows,
     }
-    path = run.directory / "plan.json"
+    path = (workspace or run.directory) / "plan.json"
     atomic_json(path, plan)
     run.data["artifacts"]["plan"] = str(path)
     run.save()

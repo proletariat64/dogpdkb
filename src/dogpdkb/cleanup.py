@@ -136,7 +136,9 @@ def clean_run(store, run, *, preserve=()):
                 report = read_json(path)
                 report["candidate"] = None
                 atomic_json(path, report)
-        manifest_path = run.directory / "manifest.json"
+        manifest_path = Path(
+            run.data["artifacts"].get("manifest", run.directory / "manifest.json")
+        )
         if manifest_path.is_file():
             manifest = read_json(manifest_path)
             manifest["failures"] = run.data["failures"]

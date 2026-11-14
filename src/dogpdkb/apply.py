@@ -121,11 +121,23 @@ def prepare_inputs(settings, book, store, run, differences):
         reject_rollback(store, [row])
         document = store.document(identifier)
         previous = document.get("raw", {})
-        baseline = (
-            previous
-            if Path(previous.get("path", "")).is_file()
-            else document.get("corpus", {})
-        )
+        graph_step = store.step(identifier, "graph") or {}
+        graph_witness = graph_step.get("input_copy")
+        if graph_step.get("status") == "completed" and graph_witness:
+            baseline = {
+                **document.get("graph_baseline", {}),
+                "path": graph_witness,
+                "version": graph_step["version"],
+                "metadata": graph_step.get("metadata", {}),
+            }
+        elif document.get("graph_baseline"):
+            baseline = document["graph_baseline"]
+        else:
+            baseline = (
+                previous
+                if Path(previous.get("path", "")).is_file()
+                else document.get("corpus", {})
+            )
         row["baseline"] = dict(baseline)
         row["previous_corpus"] = dict(document.get("corpus", {}))
         row["previous_graph"] = dict(document.get("graph", {}))
@@ -292,13 +304,16 @@ def catalog_failed_exports(settings, book, run, rows):
     run.save()
 
 
-def compare_inputs(settings, book, store, run, rows):
+def compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=False):
+    workspace = workspace or run.directory
     run.stage("compare", total=len(rows), phase="prepare")
     active = []
     for row in rows:
         previous = store.document(row["document_id"]).get("raw", {})
         row["resources"] = previous.get("resources")
-        if not store.suppressed(row["document_id"], "compare", row["version"]):
+        if replan or not store.suppressed(
+            row["document_id"], "compare", row["version"]
+        ):
             active.append(row)
     if not active:
         return {}, {}
@@ -326,8 +341,8 @@ def compare_inputs(settings, book, store, run, rows):
     manifests, sources = [], []
     for name, documents in (("baseline", baseline), ("incoming", incoming)):
         source, target = (
-            run.directory / f"{name}-descriptors.json",
-            run.directory / f"{name}.json",
+            workspace / f"{name}-descriptors.json",
+            workspace / f"{name}.json",
         )
         atomic_json(source, {"schema_version": "1.0", "documents": documents})
         sources.append(source)
@@ -361,15 +376,16 @@ def compare_inputs(settings, book, store, run, rows):
             }
             for row in active:
                 row["resources"] = resources.get(row["document_id"], [])
-                store.document(row["document_id"])["raw"]["resources"] = row[
-                    "resources"
-                ]
+                if not replan:
+                    store.document(row["document_id"])["raw"]["resources"] = row[
+                        "resources"
+                    ]
             store.save()
         except (ValueError, KeyError, TypeError):
             valid = False
     reports = []
     for mode in ("knowledge", "compare"):
-        output = run.directory / f"{mode}-report.json"
+        output = workspace / f"{mode}-report.json"
         code = (
             call_tool(
                 settings,
@@ -403,12 +419,24 @@ def compare_inputs(settings, book, store, run, rows):
         run.data["artifacts"][mode] = str(output)
     run.stage("compare", total=len(active), phase="record-results")
     outcomes = []
+    indexed = [
+        {str(item.get("document_id")): item for item in report.get("results", [])}
+        for report in reports
+    ]
     for row in active:
+        identifier = row["document_id"]
+        body = indexed[0].get(identifier, {})
+        advice = body.get("graphify_plan", {})
         status = (
-            "completed"
-            if all(report.get("results") for report in reports)
-            else "failed"
+            "completed" if all(identifier in items for items in indexed) else "failed"
         )
+        if status == "completed" and (
+            body.get("status") == "UNKNOWN"
+            or not body.get("comparison_complete", False)
+            or "BASELINE_BODY_INCOMPLETE" in advice.get("hold_reason_codes", [])
+            or "BASELINE_BODY_INCOMPLETE" in body.get("reason_codes", [])
+        ):
+            status = "unknown"
         if status == "failed":
             failure(
                 run,
@@ -419,7 +447,7 @@ def compare_inputs(settings, book, store, run, rows):
                 exit_code=code,
                 argv=run.data.get("tool", {}).get("argv"),
                 reports=[
-                    str(run.directory / f"{name}-report.json")
+                    str(workspace / f"{name}-report.json")
                     for name in ("knowledge", "compare")
                 ],
                 inputs=[str(path) for path in manifests],
@@ -447,6 +475,8 @@ def ocr_inputs(settings, book, store, run, rows):
     for index, row in enumerate(rows):
         validate_inputs([row])
         identifier, version = row["document_id"], row["version"]
+        if row["action"] in {"retain", "defer"}:
+            continue
         previous = store.step(identifier, "ocr")
         if (
             previous
@@ -604,6 +634,7 @@ def ocr_inputs(settings, book, store, run, rows):
 def prepare_publication(book, store, run, rows, results):
     """Freeze the complete publication handoff before replacing any corpus file."""
     published = []
+    baseline_saved = False
     for index, row in enumerate(rows):
         identifier = row["document_id"]
         if not re.fullmatch(r"[A-Za-z0-9_-]+", identifier):
@@ -624,6 +655,21 @@ def prepare_publication(book, store, run, rows, results):
             raise ValueError("refusing corpus symlink replacement")
         inputs = store.input_directory(identifier)
         inputs.mkdir(parents=True, exist_ok=True)
+        document = store.document(identifier)
+        old_basis = row.get("baseline_input_copy")
+        if old_basis and not document.get("graph_baseline"):
+            basis = inputs / "graph-baseline.md"
+            shutil.copyfile(old_basis, basis)
+            source = row["previous_graph"].get("source_file")
+            old_source = Path(row["previous_corpus"].get("path", ""))
+            if source is None and old_source.is_relative_to(book.corpus):
+                source = str(old_source.relative_to(book.corpus))
+            document["graph_baseline"] = {
+                **row["baseline"],
+                "path": str(basis),
+                "source_file": source,
+            }
+            baseline_saved = True
         witness = Path(tempfile.mkdtemp(prefix="corpus-", dir=inputs)) / "corpus.md"
         shutil.copyfile(candidate, witness)
         before_copy = None
@@ -644,7 +690,7 @@ def prepare_publication(book, store, run, rows, results):
             r["resource_id"]: r.get("artifact")
             for r in previous.get("ocr", {}).get("images", [])
         }
-        if any(
+        if action not in {"retain", "defer"} and any(
             r.get("status") == "success"
             or r.get("status") == "reused"
             and before.get(r["resource_id"]) != r.get("artifact")
@@ -676,6 +722,8 @@ def prepare_publication(book, store, run, rows, results):
                 "reason_codes": row["reason_codes"],
             }
         )
+    if baseline_saved:
+        store.save()
     publication = {
         "schema": "dogpdkb-publication-1",
         "book": book.key,
@@ -703,6 +751,20 @@ def validate_publication_target(document):
     elif not output.exists() and not document.get("before_copy"):
         return
     raise ValueError("publication target changed; generate a new plan")
+
+
+def acknowledge_comparison(record, document):
+    """A handled body version does not need daily rediscovery or fake graph success."""
+    pending = record.get("pending")
+    if (
+        document["action"] in {"retain", "reuse", "metadata"}
+        and not document.get("pending_steps")
+        and pending
+        and same_version(pending["version"], document["version"])
+        and pending.get("metadata")
+        == document.get("pending_metadata", document["metadata"])
+    ):
+        record.pop("pending", None)
 
 
 def publish_corpus(book, store, run, plan, publication):
@@ -766,6 +828,7 @@ def publish_corpus(book, store, run, plan, publication):
                 )
                 if key in document
             }
+            acknowledge_comparison(store.document(document["document_id"]), document)
             dirty = True
     finally:
         if dirty:
@@ -846,6 +909,109 @@ def apply_run(
     }
 
 
+def replan_published(settings, book, store, run):
+    """Explicitly reselect a published batch using its original frozen bodies."""
+    from copy import deepcopy
+
+    from dogpdkb.graph import _manifest
+
+    original = _manifest(settings, book, store, run, run.data["artifacts"]["manifest"])
+    plan = load_plan(run, book, store)
+    if plan.get("run_id") != run.id or not Path(
+        run.data["artifacts"]["plan"]
+    ).resolve().is_relative_to(run.directory.resolve()):
+        raise ValueError("original comparison plan ownership mismatch")
+    if [(r["document_id"], r["version"]) for r in plan["documents"]] != [
+        (r["document_id"], r["version"]) for r in original["documents"]
+    ]:
+        raise ValueError("saved comparison scope differs from published batch")
+    rows = deepcopy(plan["documents"])
+    for row in rows:
+        # Never compare the current corpus against itself after publication.
+        witness = Path(row["input_copy"])
+        if not witness.is_file() or not witness.resolve().is_relative_to(
+            run.directory.resolve()
+        ):
+            raise ValueError(
+                "original comparison input unavailable; generate a new plan"
+            )
+        row["raw_path"] = str(witness)
+        baseline = row.get("baseline", {})
+        if baseline.get("path"):
+            old = row.get("baseline_input_copy")
+            if (
+                not old
+                or not Path(old).is_file()
+                or not Path(old).resolve().is_relative_to(run.directory.resolve())
+            ):
+                raise ValueError(
+                    "original baseline snapshot unavailable; generate a new plan"
+                )
+            row["baseline"] = {**baseline, "path": old}
+    workspace = Path(tempfile.mkdtemp(prefix="replan-", dir=run.directory))
+    previous_artifacts = dict(run.data["artifacts"])
+    frozen_inputs = []
+    for index, row in enumerate(rows):
+        source = Path(row["input_copy"])
+        target = workspace / f"incoming-{index}.md"
+        shutil.copyfile(source, target)
+        frozen_inputs.append((source, target))
+        row.update(raw_path=str(target), input_copy=str(target))
+        if row.get("baseline_input_copy"):
+            source = Path(row["baseline_input_copy"])
+            target = workspace / f"baseline-{index}.md"
+            shutil.copyfile(source, target)
+            frozen_inputs.append((source, target))
+            row["baseline_input_copy"] = str(target)
+            row["baseline"] = {**row["baseline"], "path": str(target)}
+    knowledge, comparison = compare_inputs(
+        settings, book, store, run, rows, workspace=workspace, replan=True
+    )
+    if any(
+        source.read_bytes() != target.read_bytes() for source, target in frozen_inputs
+    ):
+        raise ValueError("original comparison snapshots changed during replan")
+    _manifest(settings, book, store, run, original)
+    refreshed = make_plan(book, run, rows, knowledge, comparison, workspace=workspace)
+    # A body comparison changes selection, not the published corpus/OCR payload.
+    decisions = {r["document_id"]: r for r in refreshed["documents"]}
+    manifest = deepcopy(original)
+    for row in manifest["documents"]:
+        decision = decisions[row["document_id"]]
+        row.update(action=decision["action"], reason_codes=decision["reason_codes"])
+        acknowledge_comparison(store.document(row["document_id"]), row)
+        old = decision.get("baseline_input_copy")
+        document = store.document(row["document_id"])
+        if old and not document.get("graph_baseline"):
+            target = store.input_directory(row["document_id"]) / "graph-baseline.md"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(old, target)
+            source = decision["previous_graph"].get("source_file")
+            original_path = Path(decision["previous_corpus"].get("path", ""))
+            if source is None and original_path.is_relative_to(book.corpus):
+                source = str(original_path.relative_to(book.corpus))
+            document["graph_baseline"] = {
+                **decision["baseline"],
+                "path": str(target),
+                "source_file": source,
+            }
+    # Retain historical failures as evidence; recovery does not clear a graph block.
+    manifest["failures"] = list(run.data["failures"])
+    target = workspace / "manifest.json"
+    atomic_json(target, manifest)
+    run.data.setdefault("replans", []).append(
+        {
+            "workspace": str(workspace),
+            "previous_artifacts": previous_artifacts,
+            "manifest": str(target),
+        }
+    )
+    run.data["artifacts"]["manifest"] = str(target)
+    store.save()
+    run.save()
+    return target
+
+
 def record_interruption(store, run, code):
     outcomes = []
     for identifier, document in store.data["documents"].items():
@@ -891,6 +1057,7 @@ def parser_for(command="apply"):
     parser.add_argument("--stop-after", choices=["plan"])
     if command == "sync":
         parser.add_argument("--retry-graph", action="store_true")
+        parser.add_argument("--replan", action="store_true")
     return parser
 
 

@@ -24,14 +24,17 @@ failures. Minimal shape (paths and witnesses must actually be produced by apply)
 ```
 
 Document actions: compile (complete current source), metadata (source metadata
-maintenance only), reuse (no graph content work). Paths identify full published
+maintenance only), reuse (no graph content work), retain (complete no-candidate
+body comparison; keep previous graph knowledge without certifying equality),
+and defer (comparison unavailable/incomplete; retain graph and record an
+exception). Paths identify full published
 Markdown; input_copy is its exact durable witness. Version is observed, never
 synthesized. The emitted document object contains:
 
 - document_id: nonempty source ID string; version: the observed normalized
   version object; path and input_copy: absolute published-source/witness strings.
 - metadata: object with name, logical_path and source_ref for the published
-  source; action: compile, metadata or reuse; reason_codes: string array.
+  source; action: compile, metadata, reuse, retain or defer; reason_codes: string array.
 - resources: always an array of resource objects, empty when no cataloged
   resources exist. Objects retain mdcompare catalog evidence: resource_id (target
   string), url (target string), kind (image, attachment or media), optional
