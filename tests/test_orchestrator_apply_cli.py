@@ -710,7 +710,7 @@ def test_resume_before_plan_refuses_changed_prepared_input(tmp_path, mutation):
     assert not list((tmp_path / "corpus").glob("*.md"))
 
 
-def test_compare_contract_failure_is_partial_but_valid_unknown_can_compile(tmp_path):
+def test_compare_contract_failure_and_valid_unknown_defer_without_compile(tmp_path):
     config, differences = instance(tmp_path)
     original = config.read_text()
     broken = tmp_path / "compare_broken.py"
@@ -724,7 +724,7 @@ def test_compare_contract_failure_is_partial_but_valid_unknown_can_compile(tmp_p
     failed = cli("apply", "--config", config, "--input", differences)
     assert failed.returncode == 2, failed.stderr
     manifest = json.loads(Path(json.loads(failed.stdout)["manifest"]).read_text())
-    assert manifest["documents"][0]["action"] == "compile"
+    assert manifest["documents"][0]["action"] == "defer"
     assert any(
         row["reason"] == "COMPARISON_REPORT_UNAVAILABLE" for row in manifest["failures"]
     )
@@ -753,10 +753,12 @@ def test_compare_contract_failure_is_partial_but_valid_unknown_can_compile(tmp_p
         )
     )
     unknown = cli("apply", "--config", config, "--input", differences)
-    assert unknown.returncode == 0, unknown.stderr
+    assert unknown.returncode == 2, unknown.stderr
     manifest = json.loads(Path(json.loads(unknown.stdout)["manifest"]).read_text())
-    assert manifest["documents"][0]["action"] == "compile"
-    assert manifest["failures"] == []
+    assert manifest["documents"][0]["action"] == "defer"
+    assert any(
+        row["reason"] == "BODY_COMPARISON_DEFERRED" for row in manifest["failures"]
+    )
 
 
 @pytest.mark.parametrize("change", ["corpus", "graph", "source"])
@@ -921,3 +923,140 @@ def test_apply_rejects_unsubscribed_difference_before_export_or_saved_inputs(
     assert not list((tmp_path / "runs").rglob("differences.json"))
     assert not list((tmp_path / "runs").rglob("prepared-inputs.json"))
     assert not list((tmp_path / "runs").rglob("export-*-request.json"))
+
+
+def seed_body_baseline(tmp_path, config, text):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "Title-2026-11-11-[42].md").write_text(text)
+    result = cli("init-state", "--config", config)
+    assert result.returncode == 0, result.stderr
+
+
+def test_complete_hold_retains_graph_without_manual_gate(tmp_path):
+    config, differences = instance(tmp_path)
+    seed_body_baseline(
+        tmp_path,
+        config,
+        "# Title\n\nFull current knowledge.\n\nHistorical old-only paragraph.\n",
+    )
+    result = cli("apply", "--config", config, "--input", differences)
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(Path(json.loads(result.stdout)["manifest"]).read_text())
+    row = manifest["documents"][0]
+    assert row["action"] == "retain"
+    assert "BODY_RETAINED" in row["reason_codes"]
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    assert "version" not in state["documents"]["42"]["graph"]
+    assert "ocr" not in state["documents"]["42"]["steps"]
+
+
+def test_unavailable_body_defers_without_ocr_and_keeps_old_comparison_basis(tmp_path):
+    config, differences = instance(tmp_path)
+    seed_body_baseline(
+        tmp_path,
+        config,
+        "# Title\n\nOld knowledge.\n\n<!-- mdocr:ocr-begin -->\nunknown tail\n",
+    )
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 2, first.stderr
+    manifest = json.loads(Path(json.loads(first.stdout)["manifest"]).read_text())
+    assert manifest["documents"][0]["action"] == "defer"
+    state_path = tmp_path / "state/funds/state.json"
+    state = json.loads(state_path.read_text())
+    doc = state["documents"]["42"]
+    assert doc["steps"]["compare"]["status"] == "unknown"
+    assert "ocr" not in doc["steps"]
+    assert "unknown tail" in Path(doc["graph_baseline"]["path"]).read_text()
+    # A newer raw version must not become its own successful graph baseline.
+    remote = json.loads((tmp_path / "remote.json").read_text())
+    remote["42"]["version"] = "2026-11-13T10:00:00Z"
+    (tmp_path / "remote.json").write_text(json.dumps(remote))
+    changed = json.loads(differences.read_text())
+    changed["documents"][0]["version"] = {"value": "2026-11-13T10:00:00Z"}
+    differences.write_text(json.dumps(changed))
+    second = cli("apply", "--config", config, "--input", differences)
+    assert second.returncode == 2, second.stderr
+    result = json.loads(Path(json.loads(second.stdout)["manifest"]).read_text())
+    assert result["documents"][0]["action"] == "defer"
+    state = json.loads(state_path.read_text())
+    assert "version" not in state["documents"]["42"]["graph"]
+
+
+def test_explicit_graph_replan_preserves_original_reports_and_published_bytes(tmp_path):
+    config, differences = instance(tmp_path)
+    seed_body_baseline(tmp_path, config, "# Title\n\nPrevious different knowledge.\n")
+    graph = tmp_path / "graphify.py"
+    graph.write_text(
+        "from pathlib import Path\nPath(__file__).with_suffix('.called').touch()\nraise SystemExit(2)\n"
+    )
+    config.write_text(
+        config.read_text()
+        + "graphify="
+        + json.dumps([sys.executable, str(graph)])
+        + "\n"
+    )
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 0, first.stderr
+    output = json.loads(first.stdout)
+    run = json.loads(Path(output["run"]).read_text())
+    original_manifest = Path(output["manifest"])
+    original_plan = Path(run["artifacts"]["plan"])
+    original_report = Path(run["artifacts"]["knowledge"])
+    frozen = {
+        p: p.read_bytes() for p in [original_manifest, original_plan, original_report]
+    }
+    document = json.loads(original_manifest.read_text())["documents"][0]
+    published = Path(document["path"])
+    before = published.read_bytes()
+    recovered = cli(
+        "sync",
+        "--config",
+        config,
+        "--resume",
+        output["run"],
+        "--retry-graph",
+        "--replan",
+    )
+    assert recovered.returncode == 2, recovered.stderr
+    assert graph.with_suffix(".called").exists()
+    assert published.read_bytes() == before
+    assert all(p.read_bytes() == content for p, content in frozen.items())
+    latest = json.loads(Path(output["run"]).read_text())
+    assert latest["replans"][0]["previous_artifacts"]["manifest"] == str(
+        original_manifest
+    )
+    refreshed = json.loads(Path(latest["artifacts"]["manifest"]).read_text())
+    assert refreshed["documents"][0]["action"] == "compile"
+    assert refreshed["documents"][0]["input_copy"] == document["input_copy"]
+    assert (tmp_path / "events").read_text().splitlines() == ["export"]
+
+
+def test_graph_replan_rejects_missing_original_baseline_before_tools(tmp_path):
+    config, differences = instance(tmp_path)
+    seed_body_baseline(tmp_path, config, "# Title\n\nPrevious different knowledge.\n")
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 0, first.stderr
+    output = json.loads(first.stdout)
+    run = json.loads(Path(output["run"]).read_text())
+    plan = json.loads(Path(run["artifacts"]["plan"]).read_text())
+    Path(plan["documents"][0]["baseline_input_copy"]).unlink()
+    recovered = cli(
+        "sync",
+        "--config",
+        config,
+        "--resume",
+        output["run"],
+        "--retry-graph",
+        "--replan",
+    )
+    assert recovered.returncode == 1
+    assert "original baseline snapshot unavailable" in recovered.stderr
+    assert not list(Path(output["run"]).parent.glob("replan-*"))
+
+
+@pytest.mark.parametrize("args", [["--replan"], ["--resume", "missing", "--replan"]])
+def test_graph_replan_requires_explicit_owned_recovery_flags(args):
+    result = cli("sync", *args)
+    assert result.returncode == 64
+    assert "--replan requires" in result.stderr
