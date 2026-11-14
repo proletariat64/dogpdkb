@@ -14,15 +14,28 @@ from dogpdkb.settings import load_config, select_book
 
 
 def sync_run(
-    settings, book, store, run, *, stop_after=None, resume=False, retry_graph=False
+    settings,
+    book,
+    store,
+    run,
+    *,
+    stop_after=None,
+    resume=False,
+    retry_graph=False,
+    replan=False,
 ):
     from dogpdkb.discover import discover
 
     retained = (
         {path for path in run.directory.rglob("*") if path.is_file()}
-        if retry_graph and run.data.get("cleanup")
+        if retry_graph and (run.data.get("cleanup") or replan)
         else set()
     )
+    if replan:
+        from dogpdkb.apply import replan_published
+
+        replan_published(settings, book, store, run)
+        retained.update(path for path in run.directory.rglob("*") if path.is_file())
     if retry_graph:
         manifest = run.data["artifacts"].get("manifest")
         if not manifest:
@@ -68,6 +81,10 @@ def main(argv=None):
     parser = parser_for("sync")
     try:
         args = parser.parse_args(argv)
+        if args.replan and (not args.resume or not args.retry_graph or args.stop_after):
+            parser.error(
+                "--replan requires --resume and --retry-graph without --stop-after"
+            )
         if args.retry_graph and (not args.resume or args.stop_after):
             parser.error("--retry-graph requires --resume and cannot use --stop-after")
     except SystemExit as error:
@@ -102,6 +119,7 @@ def main(argv=None):
                     stop_after=args.stop_after,
                     resume=bool(args.resume),
                     retry_graph=args.retry_graph,
+                    replan=args.replan,
                 )
             except InterruptedError as error:
                 record_interruption(store, run, error.args[0])

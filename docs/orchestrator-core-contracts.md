@@ -159,3 +159,36 @@ supplies configured gateway/proxy/timeout variables for listing and export.
 `dogpdkb.observe.main(argv=None)` implements `dogpdkb status`: config/book/run,
 json/watch. `view_run(path)` returns a read-only snapshot, with process/lock
 liveness and elapsed seconds. Watch emits JSONL when combined with JSON.
+
+## Automatic body routing and explicit reselection
+
+Complete `HOLD_EXISTING` body advice produces `retain`; unavailable/incomplete
+body comparison (including incomplete baseline evidence) produces `defer` and a
+durable unknown comparison result. Neither invokes new OCR or promotes resource
+uncertainty into full-source extraction. Strict KEEP remains reuse/metadata,
+while concrete body candidates compile. Retained/deferred documents can publish
+a usable corpus version without advancing graph extraction facts. A durable
+`graph_baseline` descriptor preserves the previous full body outside wash, with
+`path` to its witness and `source_file` relative to corpus; future comparisons
+prefer the latest actual successful graph witness, then that preserved basis.
+This prevents a newer raw export from silently becoming its own graph baseline.
+
+`sync --resume RUN --retry-graph --replan` explicitly recomputes a saved published
+batch's selection using its original plan and retained input/baseline snapshots.
+It validates the published manifest before/after public comparison, preserves
+original artifacts in a separate replan workspace and changes only manifest
+actions/reasons. No export/OCR/publication repeats, elapsed OCR budget resets,
+or automatic historical retry occurs. Missing original snapshots or mismatched
+identities, versions, targets or published bytes stop before graph execution.
+
+After successful corpus publication, a complete retain/reuse/metadata decision
+acknowledges only a matching pending version and metadata with no pending steps.
+Explicit reselection of an already published batch uses the same rule. This
+prevents unchanged daily listings from repeatedly comparing handled documents;
+it neither advances graph extraction facts nor discards the previous graph
+baseline. Deferred comparison failures remain unknown and suppressed.
+
+Cleanup retains the active compile manifest and its run-owned replan comparison
+workspace independently of any earlier cleanup marker. An interrupted explicit
+replan followed by an ordinary graph-only retry therefore keeps the revised
+selection, reports and original body/baseline copies available for recovery.

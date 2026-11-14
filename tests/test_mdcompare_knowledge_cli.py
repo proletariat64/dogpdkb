@@ -164,7 +164,7 @@ def test_verified_generated_region_inside_code_fence_is_outside_body(tmp_path):
         [document(new, body_scope=scope)],
     )
     assert result.returncode == 0, result.stderr
-    assert report["rules"]["version"] == "body-units-v4"
+    assert report["rules"]["version"] == "body-units-v5"
     assert report["rules"]["generated_regions"] == (
         "outside_code_or_verified_generated_regions_v1"
     )
@@ -621,9 +621,7 @@ def test_graphify_plan_counts_only_new_body_units_not_reused_or_headings(tmp_pat
     )
 
 
-@pytest.mark.parametrize(
-    "scenario", ["old_only", "title_uncertain", "budget", "read_failure"]
-)
+@pytest.mark.parametrize("scenario", ["old_only", "budget", "read_failure"])
 def test_graphify_plan_uncertainty_never_schedules_whole_document(tmp_path, scenario):
     old = tmp_path / "old.md"
     new = tmp_path / "new.md"
@@ -634,12 +632,6 @@ def test_graphify_plan_uncertainty_never_schedules_whole_document(tmp_path, scen
     extra = []
     if scenario == "old_only":
         new.write_text("付款必须审批。\n")
-    elif scenario == "title_uncertain":
-        incoming["metadata"] = {
-            "name": "Another subject",
-            "logical_path": "Funds",
-            "source_ref": "book:1",
-        }
     elif scenario == "budget":
         new.write_text("付款无需审批。\n\n退款必须复核。\n")
         extra = ["--max-diff-work", "0"]
@@ -681,3 +673,139 @@ def test_human_report_keeps_old_only_review_separate_from_extraction_work(tmp_pa
         report["rules"]["graphify_execution"] == "plan_only_no_full_document_fallback"
     )
     assert human.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    "old_header,new_header", [(False, True), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("ending", ["\n", "\r\n", "\r"])
+def test_verified_exporter_metadata_is_not_body_knowledge(
+    tmp_path, old_header, new_header, ending
+):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+
+    def exported(header, count):
+        metadata = (
+            f"doc_id: 1 · book: Example book (book_id 42) · word_count: {count}\n"
+            if header
+            else "\n"
+        )
+        return "# Limits\n" + metadata + "Refunds need approval.\n"
+
+    old.write_text(exported(old_header, 20).replace("\n", ending))
+    new.write_text(exported(new_header, 21).replace("\n", ending))
+    original = old.read_bytes(), new.read_bytes()
+    result, report = invoke(tmp_path, [document(old)], [document(new)])
+    assert result.returncode == 0, result.stderr
+    row = report["results"][0]
+    assert row["status"] == "REUSE"
+    assert row["graphify_plan"]["action"] == "KEEP_EXISTING"
+    assert row["units"][-1]["new"]["start_line"] == 3
+    assert original == (old.read_bytes(), new.read_bytes())
+
+
+@pytest.mark.parametrize(
+    "prefix,line",
+    [
+        ("# Limits\n", "doc_id: 2 · book: Example book (book_id 42) · word_count: 20"),
+        (
+            "# Other subject\n",
+            "doc_id: 1 · book: Example book (book_id 42) · word_count: 20",
+        ),
+        (
+            "# Limits\n",
+            "doc_id: 1 · book: Example book (book_id 42) · word_count: 20 extra rule",
+        ),
+        (
+            "# Limits\n",
+            "    doc_id: 1 · book: Example book (book_id 42) · word_count: 20",
+        ),
+        (
+            "# Limits\n\nBusiness rule.\n\n",
+            "doc_id: 1 · book: Example book (book_id 42) · word_count: 20",
+        ),
+        ("```text\n", "doc_id: 1 · book: Example book (book_id 42) · word_count: 20"),
+    ],
+)
+def test_exporter_header_lookalikes_remain_observable_body(tmp_path, prefix, line):
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    old.write_text("# Limits\n\nRefunds need approval.\n")
+    new.write_text(prefix + line + "\n\nRefunds need approval.\n")
+    _, report = invoke(tmp_path, [document(old)], [document(new)])
+    row = report["results"][0]
+    assert row["graphify_plan"]["action"] == "BODY_DELTA_CANDIDATE"
+
+
+def test_unrelated_bad_baseline_does_not_hide_local_body_candidate(tmp_path):
+    old, bad, new = (tmp_path / name for name in ("old.md", "bad.md", "new.md"))
+    old.write_text("# Limits\n\nRefunds need approval.\n")
+    bad.write_text("# Limits\n<!-- mdocr:ocr-begin -->\nunclosed derived region\n")
+    new.write_text(
+        "# Limits\n\nRefunds need approval.\n\nDaily settlement requires reconciliation.\n"
+    )
+    _, report = invoke(tmp_path, [document(old), document(bad, "2")], [document(new)])
+    row = report["results"][0]
+    assert report["errors"][0]["document_id"] == "2"
+    assert row["comparison_complete"]
+    assert row["status"] == "DELTA"
+    assert row["graphify_plan"]["action"] == "BODY_DELTA_CANDIDATE"
+    assert "BASELINE_BODY_INCOMPLETE" not in row["reason_codes"]
+
+
+@pytest.mark.parametrize("subject_kind", ["document", "section"])
+def test_meaningful_subject_change_remains_extraction_candidate(tmp_path, subject_kind):
+    old, new = tmp_path / "old.md", tmp_path / "new.md"
+    old.write_text("# USD\n\n- Transfer limit is 100.\n")
+    new.write_text("# EUR\n\n- Transfer limit is 100.\n")
+    incoming = document(new)
+    if subject_kind == "document":
+        incoming["metadata"]["name"] = "EUR accounts"
+    _, report = invoke(tmp_path, [document(old)], [incoming])
+    assert report["results"][0]["graphify_plan"]["action"] == "BODY_DELTA_CANDIDATE"
+
+
+def test_added_verified_exporter_title_does_not_reextract_existing_body(tmp_path):
+    old, new = tmp_path / "old.md", tmp_path / "new.md"
+    old.write_text("# USD\n\n- Transfer limit is 100.\n")
+    new.write_text(
+        "# Limits\ndoc_id: 1 · book: Example (book_id 99) · word_count: 20\n# USD\n\n- Transfer limit is 100.\n"
+    )
+    _, report = invoke(tmp_path, [document(old)], [document(new)])
+    assert report["results"][0]["graphify_plan"]["action"] != "BODY_DELTA_CANDIDATE"
+
+
+@pytest.mark.parametrize(
+    "case,expected",
+    [
+        ("old_only", "OLD_BODY_ONLY"),
+        ("unclosed", "COMPARISON_UNAVAILABLE"),
+        ("budget", "COMPARISON_INCOMPLETE"),
+    ],
+)
+def test_hold_reason_codes_distinguish_retention_from_unavailable_body(
+    tmp_path, case, expected
+):
+    old, new = tmp_path / "old.md", tmp_path / "new.md"
+    old.write_text("Approve refunds.\n\nReconcile payments.\n")
+    new.write_text("Approve refunds.\n")
+    extra = []
+    if case == "unclosed":
+        old.write_text("Approve refunds.\n<!-- mdocr:ocr-begin -->\nunknown tail")
+    elif case == "budget":
+        new.write_text("Automatically approve refunds.\n\nReconcile payments.\n")
+        extra = ["--max-diff-work", "0"]
+    _, report = invoke(tmp_path, [document(old)], [document(new)], *extra)
+    plan = report["results"][0]["graphify_plan"]
+    assert plan["action"] == "HOLD_EXISTING"
+    assert expected in plan["hold_reason_codes"]
+
+
+def test_repeated_identical_body_in_unchanged_sections_stays_reusable(tmp_path):
+    old, new = tmp_path / "old.md", tmp_path / "new.md"
+    text = "# USD\n\n- Transfer limit is 100.\n\n# EUR\n\n- Transfer limit is 100.\n"
+    old.write_text(text)
+    new.write_text(text)
+    _, report = invoke(tmp_path, [document(old)], [document(new)])
+    assert report["results"][0]["graphify_plan"]["action"] == "KEEP_EXISTING"

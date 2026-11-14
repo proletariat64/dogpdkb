@@ -48,3 +48,21 @@ checks and byte witnesses remain mandatory. No block is cleared before a real
 successful result. Each attempt keeps a separate report; earlier failures stay
 recorded and can keep the run partial. This is explicit operator recovery,
 not an automatic daily retry or a way to recover missing/changed inputs.
+
+After a comparison/routing fix, recompute the saved published batch explicitly:
+
+```text
+dogpdkb sync --config instance/dogpdkb.toml --book funds --resume RUN --retry-graph --replan
+```
+
+--replan requires both --resume and --retry-graph and rejects --stop-after. It
+requires the saved original plan plus its complete raw/baseline snapshots, even
+if a final published manifest survived cleanup. It validates identities, current
+published versions/targets and byte witnesses before comparison and again before
+using the revised selection. Comparisons use run-owned copies of the original
+snapshots, never the already replaced corpus as its own baseline. Each replan
+keeps a separate directory and preserves previous reports/manifests. Only actions
+and reason codes change in the compile manifest; published corpus, OCR output and
+its elapsed budget remain unchanged. Missing/changed originals require a new
+plan. This opt-in recovery does not reset graph failure suppression or enable an
+automatic same-version retry.
