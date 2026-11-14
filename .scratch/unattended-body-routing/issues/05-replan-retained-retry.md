@@ -17,3 +17,10 @@ Preserve same-version suppression, immutable full-source witnesses and truthful 
 - Keep the fix in the responsible graph integration layer, without a new retry engine or native artifact fabrication.
 - Focused checks locally; ordinary full PR CI; Greptile latest-head 5/5; isolated co.bot selective acceptance before merge/release.
 - Publish the patch, update both hosts and resume the original production task using official dogpdkb in tmux. No local OCR review or OCR CI.
+
+## Implementation evidence
+
+- The current production blocker is a deferred new source without a prior graph witness. A separate retained-source suppression record was historical; the existing day-versus-instant version distinction remains unchanged.
+- Read-only metadata confirms 35 deferred sources lack old-body witnesses, with zero ownership in either public native manifest or graph source records. Other unselected rows have witness metadata.
+- The fix prepares omissions only after native ownership absence proof, preserves the original files and graph facts, and restricts same-version recovery to the owning run's explicit authorization. Ordinary and foreign-run suppression remain.
+- 66 nearby graph CLI/state tests pass, including 11 new public CLI scenarios. Ruff and diff checks pass. Latest-head Greptile and isolated installed-wheel upgrade acceptance remain pending.
