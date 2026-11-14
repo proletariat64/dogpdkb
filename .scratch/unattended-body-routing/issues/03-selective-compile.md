@@ -1,6 +1,6 @@
 # 03: Actual selective native extraction
 
-Status: ready-for-agent
+Status: claimed
 Type: task
 Blocked by: 02
 

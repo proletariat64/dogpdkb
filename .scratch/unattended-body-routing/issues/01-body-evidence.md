@@ -1,6 +1,6 @@
 # 01: Verified body evidence and isolated comparison failures
 
-Status: ready-for-agent
+Status: claimed
 Type: task
 Blocked by: None
 

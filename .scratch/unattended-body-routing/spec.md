@@ -36,7 +36,8 @@ Recognize verified exporter metadata as non-body, isolate source-scope failures,
 - Corpus and graph facts remain separate. New raw/corpus publication does not itself certify graph extraction. Metadata/resource/OCR behavior remains explicit and must not silently override body failures into expensive work.
 - Native Graphify extraction and merge stay inside the unmodified external CLI. Do not edit native cache identities, fabricate successful manifests, rewrite graph records, or introduce a fork. Verify how selection affects native scanning and preservation before implementation.
 - Existing pending/failure/suppression mechanisms carry deferred outcomes; no new retry engine, migration layer, SQLite, semantic model stage or fingerprint mechanism.
-- Saved obsolete plans are not silently rewritten or trusted. Production recovery must use official commands and validate identity, version, targets and witnesses.
+- Saved obsolete plans are not silently rewritten or trusted. An explicit resume/replan CLI path may recompute selection from retained immutable old/new bodies while preserving the published corpus, existing OCR output/budget and original reports. It validates identity, version, targets and witnesses and never silently imports historical state. Explicit graph retry authorization still applies to the owning saved run.
+- Native Graphify has no safe include-list flag: exclusions prune graph records. When retained/deferred current corpus bytes differ from last graph inputs, prepare a complete run-owned corpus mirror using selected current bodies and unselected proven graph witnesses, retaining relative paths and native artifacts verbatim. Native cache decisions, zero-node healing and image processing remain external-tool behavior; document them rather than claiming candidate counts guarantee exact call counts.
 - Documentation and code remain English. No local OCR review or OCR CI. Greptile is the AI reviewer.
 
 ## Testing Decisions

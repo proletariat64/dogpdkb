@@ -1,6 +1,6 @@
 # 02: Automatic retained and deferred sync outcomes
 
-Status: ready-for-agent
+Status: claimed
 Type: task
 Blocked by: 01
 
