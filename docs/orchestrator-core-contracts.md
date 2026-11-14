@@ -103,6 +103,24 @@ failures. Status is observationally interrupted when `running` has no live owner
 `targets` freezes the source book URL and absolute corpus/graph targets. Loading
 a run for execution rejects changed targets before any tool call or publication;
 use a newly generated plan for a different source or target.
+Corpus publication saves `publication.json` (`dogpdkb-publication-1`) before
+replacing any corpus file. It freezes the complete compile rows, retained output
+witnesses and optional `before_copy` snapshots; book/run identity and plan
+IDs/versions/targets must match. Resume accepts only the frozen previous or
+intended output bytes, preserving raw-input checks, target locks, symlink guards
+and newer-version rejection. It resumes publication directly without re-entering
+listing, download, comparison or OCR. Short same-directory temporary names avoid
+lengthening valid final filenames; corpus facts are saved once per batch (also
+on a caught partial publication error). A replacement that precedes the state
+save is reconciled from the handoff. The final `dogpdkb-compile-1` manifest is
+written only after complete publication and excludes `before_copy`.
+
+A saved final compile manifest is reused even with pending optional OCR work;
+resuming a run does not renew its bounded OCR budget. Existing failures/pending
+reasons remain observable and usable bodies can proceed to incremental Graphify.
+Explicit recovery of older failed runs belongs to the external agent; there is
+no automatic historical migration or retry layer.
+
 Cleaned completed/partial runs are not resumable. Manual `purge` deletes only
 selected wash; force permits discarding unfinished runs but never bypasses locks
 or clears durable facts, corpus, graphs, persistent inputs or tool caches.
