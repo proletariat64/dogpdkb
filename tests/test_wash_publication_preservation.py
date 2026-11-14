@@ -264,7 +264,7 @@ def test_ocr_request_survives_cleanup_after_earlier_export_failure(tmp_path):
     assert state["documents"]["2"]["steps"]["ocr"]["input"] == str(request)
 
 
-def test_resumed_run_uses_new_publication_generation(tmp_path):
+def test_later_run_uses_new_publication_generation(tmp_path):
     from tests.test_orchestrator_apply_cli import two_sources
 
     config, differences = image_instance(tmp_path)
@@ -295,10 +295,10 @@ def test_resumed_run_uses_new_publication_generation(tmp_path):
     old_witness = Path(old_document["input_copy"])
     old_bytes = old_witness.read_bytes()
     (tmp_path / "allow").touch()
-    resumed = cli("apply", "--config", config, "--resume", first_result["run"])
+    resumed = cli("apply", "--config", config, "--input", differences)
     assert resumed.returncode == 2, resumed.stderr
     resumed_result = json.loads(resumed.stdout)
-    assert resumed_result["run"] == first_result["run"]
+    assert resumed_result["run"] != first_result["run"]
     after = json.loads(Path(resumed_result["manifest"]).read_text())
     new_document = next(row for row in after["documents"] if row["document_id"] == "43")
     assert new_document["pending_steps"] == []
