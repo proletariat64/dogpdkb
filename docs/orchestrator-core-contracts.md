@@ -127,6 +127,9 @@ including after cleanup, and revalidates it through the graph stage. It never
 re-enters discovery, download, comparison, OCR or corpus publication. Missing or
 changed witnesses still require a new plan. Historical failures stay recorded;
 the final result can remain partial even after successful graph recovery.
+Recovery snapshots the already-cleaned run's retained file paths before the new
+attempt, so cleanup preserves its failure bundles even when the old plan was
+pruned. Newly created disposable graph workspace files can still be reclaimed.
 Manual `purge` deletes only
 selected wash; force permits discarding unfinished runs but never bypasses locks
 or clears durable facts, corpus, graphs, persistent inputs or tool caches.

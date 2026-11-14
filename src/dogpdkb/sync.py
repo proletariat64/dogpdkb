@@ -18,6 +18,11 @@ def sync_run(
 ):
     from dogpdkb.discover import discover
 
+    retained = (
+        {path for path in run.directory.rglob("*") if path.is_file()}
+        if retry_graph and run.data.get("cleanup")
+        else set()
+    )
     if retry_graph:
         manifest = run.data["artifacts"].get("manifest")
         if not manifest:
@@ -55,7 +60,7 @@ def sync_run(
     run.finish("failed" if code == 1 else "partial" if code == 2 else "completed", code)
     from dogpdkb.cleanup import clean_run
 
-    clean_run(store, run)
+    clean_run(store, run, preserve=retained)
     return {**result, "exit_code": code}
 
 

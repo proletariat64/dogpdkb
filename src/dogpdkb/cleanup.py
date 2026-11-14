@@ -89,7 +89,7 @@ def failure_files(store, run):
     return keep
 
 
-def clean_run(store, run):
+def clean_run(store, run, *, preserve=()):
     if run.data["command"] != "sync" or run.data["status"] not in {
         "completed",
         "partial",
@@ -116,7 +116,9 @@ def clean_run(store, run):
             for path in protected
         ):
             raise ValueError("wash overlaps protected data")
-        keep = {run.path, run.directory / "manifest.json"} | failure_files(store, run)
+        keep = {run.path, run.directory / "manifest.json", *preserve} | failure_files(
+            store, run
+        )
         run.save()
 
         def prune(directory):

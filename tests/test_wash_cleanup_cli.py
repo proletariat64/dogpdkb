@@ -204,6 +204,49 @@ def test_sync_graph_retry_requires_explicit_saved_run(tmp_path):
     assert not (tmp_path / "commands.jsonl").exists()
 
 
+def test_graph_recovery_preserves_cleaned_unknown_ocr_failure_bundle(tmp_path):
+    from PIL import Image
+
+    config, tool = instance(tmp_path)
+    Image.new("RGB", (8, 8), "red").save(tmp_path / "fixture.png")
+    original = tool.read_text()
+    script = (
+        original.replace(
+            "        rows.append({**doc,",
+            "        if doc['document_id']=='2':\n            image=path.parent/'2.png';image.write_bytes((root/'fixture.png').read_bytes());path.write_text(path.read_text()+'\\n![failed](2.png)\\n')\n        rows.append({**doc,",
+        )
+        .replace(
+            "if tool in ('mdcompare', 'mdocr'):",
+            "if tool == 'mdocr': raise SystemExit(1)\nif tool in ('mdcompare', 'mdocr'):",
+        )
+        .replace(
+            "    graph=flag('--out')",
+            "    raise SystemExit(1)\n    graph=flag('--out')",
+        )
+    )
+    tool.write_text(script)
+    first = cli("sync", "--config", config)
+    assert first.returncode == 2, first.stderr
+    run = Path(json.loads(first.stdout)["run"])
+    assert json.loads(run.read_text())["cleanup"]["status"] == "completed"
+    retained = {
+        path: path.read_bytes()
+        for path in run.parent.rglob("*")
+        if path.is_file() and path.name not in {"run.json", "manifest.json"}
+    }
+    assert (run.parent / "raw/2.png") in retained
+    assert any(path.name.endswith("-request.json") for path in retained)
+    tool.write_text(original)
+
+    result = cli("sync", "--config", config, "--resume", run, "--retry-graph")
+
+    assert result.returncode in {0, 2}, result.stderr
+    for path, content in retained.items():
+        assert path.is_file(), f"recovery discarded failure evidence: {path}"
+        assert path.read_bytes() == content
+    assert not list(run.parent.glob("graphify-*/graphify-out"))
+
+
 @pytest.mark.parametrize("fault", ["blocked-directory", "malformed-plan"])
 def test_cleanup_failure_reports_stderr_without_changing_sync_result(tmp_path, fault):
     config, tool = instance(tmp_path)
