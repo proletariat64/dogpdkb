@@ -155,6 +155,106 @@ def test_newer_held_failure_does_not_block_compiling_other_graph_inputs(tmp_path
     assert after["42"]["steps"]["graph"]["status"] == "completed"
 
 
+@pytest.mark.parametrize("action", ["retain", "defer"])
+@pytest.mark.parametrize("owner", ["same", "foreign"])
+def test_explicit_own_run_retry_allows_a_validated_retained_same_version(
+    tmp_path, action, owner
+):
+    config, manifest, _ = fixture(tmp_path)
+    held_source(tmp_path, manifest, action)
+    state_path = tmp_path / "state/funds/state.json"
+    state = json.loads(state_path.read_text())
+    step = {
+        "status": "unknown",
+        "version": {"value": "old"},
+        "run_id": manifest.parent.name if owner == "same" else "foreign-run",
+    }
+    state["documents"]["held"]["steps"]["graph"] = step
+    write(state_path, state)
+
+    result = cli(config, manifest, retry_graph=True)
+
+    assert result.returncode == (2 if action == "defer" or owner == "foreign" else 0), (
+        result.stdout + result.stderr
+    )
+    assert (tmp_path / "calls.jsonl").is_file() == (owner == "same")
+    after = json.loads(state_path.read_text())["documents"]
+    assert after["held"]["steps"]["graph"] == step
+    assert after["held"]["graph"] == state["documents"]["held"]["graph"]
+
+
+@pytest.mark.parametrize(
+    "retry,owner,owned_by",
+    [
+        (True, "same", None),
+        (False, "same", None),
+        (True, "foreign", None),
+        (True, "same", "graph"),
+        (True, "same", "manifest"),
+        (True, "same", "edge"),
+        (True, "same", "hyperedge"),
+    ],
+)
+def test_new_deferred_source_requires_native_absence_and_retry_ownership(
+    tmp_path, retry, owner, owned_by
+):
+    config, manifest, selected = fixture(tmp_path)
+    held_source(tmp_path, manifest, "defer")
+    state_path = tmp_path / "state/funds/state.json"
+    state = json.loads(state_path.read_text())
+    held = state["documents"]["held"]
+    held.pop("graph_baseline")
+    held.pop("graph")
+    step = {
+        "status": "unknown",
+        "version": VERSION,
+        "run_id": manifest.parent.name if owner == "same" else "foreign-run",
+    }
+    held["steps"]["graph"] = step
+    write(state_path, state)
+    native = selected.parent / "graphify-out"
+    write(
+        native / "graph.json",
+        {"nodes": [{"id": "selected-old", "source_file": selected.name}], "links": []},
+    )
+    write(native / "manifest.json", {selected.name: {"native": "old"}})
+    if owned_by == "graph":
+        write(
+            native / "graph.json",
+            {"nodes": [{"id": "held-old", "source_file": "Held.md"}], "links": []},
+        )
+    elif owned_by == "manifest":
+        write(native / "manifest.json", {"Held.md": {"native": "old"}})
+    elif owned_by in {"edge", "hyperedge"}:
+        graph = json.loads((native / "graph.json").read_text())
+        graph["links" if owned_by == "edge" else "hyperedges"] = [
+            {"source_file": "Held.md"}
+        ]
+        write(native / "graph.json", graph)
+    tool = tmp_path / "graphify.py"
+    tool.write_text(
+        "import json,sys\nfrom pathlib import Path\n"
+        "base=Path(sys.argv[1]); args=sys.argv[3:]; root=Path(args[0])\n"
+        "assert not (root/'Held.md').exists(), 'unverified deferred body submitted'\n"
+        f"assert (root/{selected.name!r}).is_file()\n"
+        "output=Path(args[args.index('--out')+1])/'graphify-out'\n"
+        "(output/'graph.json').write_text(json.dumps({'nodes':[{'id':'healthy'}], 'links':[]}))\n"
+        "(base/'scope-checked').touch()\n"
+    )
+
+    result = cli(config, manifest, retry_graph=retry)
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    allowed = retry and owner == "same" and owned_by is None
+    assert (tmp_path / "scope-checked").exists() == allowed
+    after = json.loads(state_path.read_text())["documents"]
+    assert after["held"]["steps"]["graph"] == step
+    assert "graph" not in after["held"]
+    assert (selected.parent / "Held.md").is_file()
+    if allowed:
+        assert after["42"]["steps"]["graph"]["status"] == "completed"
+
+
 @pytest.mark.parametrize("action,code", [("retain", 0), ("defer", 2)])
 def test_only_retained_sources_do_not_call_graphify(tmp_path, action, code):
     config, manifest, _ = fixture(tmp_path)

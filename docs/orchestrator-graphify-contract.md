@@ -27,6 +27,12 @@ Missing required retained evidence stops the batch with
 `GRAPHIFY_RETAINED_INPUT_REQUIRED` before any external call. Selected and
 substituted source bytes are rechecked after extraction, before publication.
 The public corpus is never rewritten to construct this view.
+One narrow exception is a new deferred source with no registered baseline,
+graph baseline or graph fact: it may be omitted from the mirror only when both
+the native manifest and all public graph source ownership records show no
+contribution for that path. This cannot delete existing native ownership or
+submit its uncertain body. The execution report lists such
+`omitted_deferred_sources`; their graph facts and failed attempts remain intact.
 The orchestrator's execution report records its actual `corpus` input root.
 Failed mirrors remain run-owned evidence; successful mirrors are disposable.
 
@@ -67,7 +73,13 @@ operator must diagnose it or a new version must arrive. After fixing the cause,
 may retry only failed/unknown/in-flight graph versions belonging to that saved
 run and present in its validated final compile manifest. Target locks, source
 identity, input witnesses, metadata and newer-version checks still apply. A
-blocked source outside that batch or belonging to another run still stops the
+replanned same-run source now marked retain/defer is also eligible for explicit
+recovery when its prior input witness is validated or the new deferred source
+has proven absence from native ownership as described above. This authorizes
+the batch to proceed without clearing its blocked record or marking that
+unselected source successfully extracted. Ordinary execution and failures owned
+by another run remain suppressed.
+A blocked source outside that batch or belonging to another run still stops the
 directory scan. No suppression is cleared before execution; only actual success
 clears the matching graph block. Each attempt uses a new workspace/report and
 retains earlier failure evidence. Ordinary sync never opts into this recovery.

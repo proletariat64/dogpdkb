@@ -1,6 +1,6 @@
 # 03: Actual selective native extraction
 
-Status: claimed
+Status: resolved
 Type: task
 Blocked by: 02
 
@@ -18,4 +18,5 @@ Native Graphify honors selection without graph loss; focused checks and isolated
 
 - Integrated complete corpus mirror with retained graph witnesses, unchanged native artifacts and source identities, truthful per-document graph results, and missing-witness failure before external dispatch.
 - Graphify 0.9.96 output anchoring requires a sibling mirror; focused regression asserts this shape.
-- Actual local Graphify 0.9.45 with a localhost mock provider selected only the changed source and preserved the held graph. Actual co.bot 0.9.96 validation remains pending the Greptile gate; local proof is not installed-host acceptance.
+- Actual local Graphify 0.9.45 with a localhost mock provider selected only the changed source and preserved the held graph.
+- After latest-head Greptile 5/5 on PR #25, actual co.bot 0.9.96 passed selected-only mock-provider dispatch, retained-node survival, selected-node replacement and stable relative manifest keys. Separate six-document real-file CLI acceptance passed with compile, retain, reuse and defer routes, preserving the corpus during explicit published-run replan.

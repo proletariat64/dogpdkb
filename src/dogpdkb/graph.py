@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import unicodedata
 from pathlib import Path
 
 from dogpdkb.help import HelpParser
@@ -85,8 +86,8 @@ def _graph(path):
 
 
 def _previous_graph_input(store, doc_id, document):
-    descriptor = dict(document.get("graph_baseline", {}))
-    graph = document.get("graph", {})
+    descriptor = dict(document.get("graph_baseline") or {})
+    graph = document.get("graph") or {}
     step = store.step(doc_id, "graph") or {}
     if (
         graph.get("status") == "completed"
@@ -101,11 +102,60 @@ def _previous_graph_input(store, doc_id, document):
     return descriptor
 
 
-def _retained_corpus(settings, book, store, run, data, pending, workspace):
+def _unowned_deferred_sources(settings, book, store, data):
+    """Omit only new deferred sources absent from both native ownership artifacts."""
+    candidates = {}
+    for row in data["documents"]:
+        document = store.data["documents"].get(row["document_id"], {})
+        if row["action"] == "defer" and not any(
+            document.get(key) for key in ("baseline", "graph_baseline", "graph")
+        ):
+            candidates[row["document_id"]] = Path(row["path"]).resolve()
+    if not candidates:
+        return set()
+    native = settings.graph_for(book)
+    if (
+        not (native / "graph.json").is_file()
+        or not (native / "manifest.json").is_file()
+    ):
+        return set()
+    manifest = read_json(native / "manifest.json")
+    if not isinstance(manifest, dict):
+        raise TypeError("Graphify baseline manifest must be an object")
+    graph = _graph(native / "graph.json")
+    sources = list(manifest)
+    for kind in ("nodes", "links", "edges", "hyperedges"):
+        records = graph.get(kind, [])
+        if not isinstance(records, list):
+            raise TypeError("Graphify ownership records must be arrays")
+        for record in records:
+            if not isinstance(record, dict):
+                raise TypeError("Graphify ownership record must be an object")
+            if record.get("source_file"):
+                sources.append(record["source_file"])
+
+    def identity(value):
+        if not isinstance(value, str):
+            raise TypeError("Graphify source_file must be a string")
+        path = Path(value.replace("\\", "/"))
+        if not path.is_absolute():
+            path = book.corpus / path
+        return unicodedata.normalize("NFC", str(path.resolve()))
+
+    owned = {identity(source) for source in sources}
+    return {
+        doc_id
+        for doc_id, path in candidates.items()
+        if identity(str(path)) not in owned
+    }
+
+
+def _retained_corpus(settings, book, store, run, data, pending, workspace, omitted):
     """Freeze previous full graph bodies without excluding their native sources."""
     selected = {row["document_id"] for row in pending}
     rows = {row["document_id"]: row for row in data["documents"]}
     retained = []
+    omitted_paths = []
     for doc_id, document in store.data["documents"].items():
         if doc_id in selected:
             continue
@@ -116,6 +166,9 @@ def _retained_corpus(settings, book, store, run, data, pending, workspace):
         if not current.is_absolute() or not current.resolve().is_relative_to(
             book.corpus
         ):
+            continue
+        if doc_id in omitted:
+            omitted_paths.append(current.relative_to(book.corpus))
             continue
         descriptor = _previous_graph_input(store, doc_id, document)
         witness, source_file = descriptor.get("path"), descriptor.get("source_file")
@@ -138,7 +191,7 @@ def _retained_corpus(settings, book, store, run, data, pending, workspace):
         if relative.is_absolute() or ".." in relative.parts or relative == Path("."):
             raise ValueError("retained graph source must have a relative corpus path")
         retained.append((current.relative_to(book.corpus), relative, Path(witness)))
-    if not retained:
+    if not retained and not omitted_paths:
         return book.corpus, []
 
     native_manifest = read_json(settings.graph_for(book) / "manifest.json")
@@ -167,6 +220,8 @@ def _retained_corpus(settings, book, store, run, data, pending, workspace):
         ]
 
     shutil.copytree(book.corpus, mirror, ignore=ignore, symlinks=True)
+    for relative in omitted_paths:
+        (mirror / relative).unlink()
     selected_paths = {
         Path(row["path"]).resolve().relative_to(book.corpus) for row in pending
     }
@@ -222,10 +277,13 @@ def run_graph(settings, book, store, run, manifest=None, *, retry_graph=False) -
     if not pending:
         return 2 if partial else 0
     selected = {row["document_id"] for row in pending}
+    manifest_ids = {row["document_id"] for row in data["documents"]}
+    omitted = _unowned_deferred_sources(settings, book, store, data)
     # A directory scan could otherwise silently retry a blocked source from an
     # earlier batch, even when the new plan selected different documents.
     for doc_id, document in store.data["documents"].items():
         version = document.get("corpus", {}).get("version")
+        retained_input = False
         if doc_id not in selected:
             previous_input = _previous_graph_input(store, doc_id, document)
             witness = previous_input.get("path")
@@ -235,13 +293,20 @@ def run_graph(settings, book, store, run, manifest=None, *, retry_graph=False) -
                 and Path(witness).is_file()
             ):
                 version = previous_input.get("version")
+                retained_input = True
         if version and store.suppressed(doc_id, "graph", version):
             previous = store.step(doc_id, "graph") or {}
-            # Explicit recovery authorizes only this run's frozen batch. Keep
-            # the block until a real successful result replaces the attempt.
+            # Replanning can retain or omit an own-run source that used to be
+            # selected. Authorize only its validated mirror representation;
+            # leave its failed record intact because it is not acknowledged.
             if (
                 retry_graph
-                and doc_id in selected
+                and (
+                    doc_id in selected
+                    or (
+                        doc_id in manifest_ids and (retained_input or doc_id in omitted)
+                    )
+                )
                 and previous.get("run_id") == run.id
                 and previous.get("status") in {"running", "failed", "unknown"}
                 and version_key(previous["version"]) == version_key(version)
@@ -276,7 +341,7 @@ def run_graph(settings, book, store, run, manifest=None, *, retry_graph=False) -
     if graph_dir.exists():
         shutil.copytree(graph_dir, candidate)
     corpus, witnesses = _retained_corpus(
-        settings, book, store, run, data, pending, workspace
+        settings, book, store, run, data, pending, workspace, omitted
     )
     if corpus is None:
         return 2
@@ -355,6 +420,7 @@ def run_graph(settings, book, store, run, manifest=None, *, retry_graph=False) -
             "graph": str(graph_path),
             "candidate": str(candidate),
             "corpus": str(corpus),
+            "omitted_deferred_sources": sorted(omitted),
             "reason": reason,
         },
     )
