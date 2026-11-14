@@ -753,6 +753,20 @@ def validate_publication_target(document):
     raise ValueError("publication target changed; generate a new plan")
 
 
+def acknowledge_comparison(record, document):
+    """A handled body version does not need daily rediscovery or fake graph success."""
+    pending = record.get("pending")
+    if (
+        document["action"] in {"retain", "reuse", "metadata"}
+        and not document.get("pending_steps")
+        and pending
+        and same_version(pending["version"], document["version"])
+        and pending.get("metadata")
+        == document.get("pending_metadata", document["metadata"])
+    ):
+        record.pop("pending", None)
+
+
 def publish_corpus(book, store, run, plan, publication):
     """Resume only frozen local publication work, including unrecorded replacements."""
     rows, documents = plan["documents"], publication["documents"]
@@ -814,6 +828,7 @@ def publish_corpus(book, store, run, plan, publication):
                 )
                 if key in document
             }
+            acknowledge_comparison(store.document(document["document_id"]), document)
             dirty = True
     finally:
         if dirty:
@@ -964,6 +979,7 @@ def replan_published(settings, book, store, run):
     for row in manifest["documents"]:
         decision = decisions[row["document_id"]]
         row.update(action=decision["action"], reason_codes=decision["reason_codes"])
+        acknowledge_comparison(store.document(row["document_id"]), row)
         old = decision.get("baseline_input_copy")
         document = store.document(row["document_id"])
         if old and not document.get("graph_baseline"):

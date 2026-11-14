@@ -1060,3 +1060,62 @@ def test_graph_replan_requires_explicit_owned_recovery_flags(args):
     result = cli("sync", *args)
     assert result.returncode == 64
     assert "--replan requires" in result.stderr
+
+
+def test_retained_body_is_not_selected_again_by_next_daily_discovery(tmp_path):
+    config, _ = instance(tmp_path)
+    seed_body_baseline(
+        tmp_path,
+        config,
+        "# Title\n\nFull current knowledge.\n\nHistorical old-only paragraph.\n",
+    )
+    listing = tmp_path / "listing.json"
+    listing.write_text(
+        json.dumps(
+            {
+                "schema": "skylark-listing-1",
+                "complete": True,
+                "book": {
+                    "url": "https://example.invalid/team/book",
+                    "book_id": 8,
+                    "items_count": 1,
+                },
+                "documents": [
+                    {
+                        "document_id": "42",
+                        "title": "Title",
+                        "path": "folder",
+                        "source_url": "https://example.invalid/doc/42",
+                        "format": "md",
+                        "version": "2026-11-12T10:00:00Z",
+                    }
+                ],
+                "toc": [],
+                "captured_at": "2026-11-12T12:00:00Z",
+            }
+        )
+    )
+    first = cli("discover", "--config", config, "--listing", listing)
+    assert first.returncode == 0, first.stderr
+    selection = Path(json.loads(first.stdout)["differences"])
+    assert len(json.loads(selection.read_text())["documents"]) == 1
+    applied = cli("apply", "--config", config, "--input", selection)
+    assert applied.returncode == 0, applied.stderr
+    manifest = json.loads(Path(json.loads(applied.stdout)["manifest"]).read_text())
+    assert manifest["documents"][0]["action"] == "retain"
+    next_day = cli("discover", "--config", config, "--listing", listing)
+    assert next_day.returncode == 0, next_day.stderr
+    assert (
+        json.loads(Path(json.loads(next_day.stdout)["differences"]).read_text())[
+            "documents"
+        ]
+        == []
+    )
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    document = state["documents"]["42"]
+    assert "pending" not in document
+    assert "version" not in document["graph"]
+    assert (
+        "Historical old-only paragraph."
+        in Path(document["graph_baseline"]["path"]).read_text()
+    )

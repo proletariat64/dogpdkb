@@ -180,3 +180,10 @@ original artifacts in a separate replan workspace and changes only manifest
 actions/reasons. No export/OCR/publication repeats, elapsed OCR budget resets,
 or automatic historical retry occurs. Missing original snapshots or mismatched
 identities, versions, targets or published bytes stop before graph execution.
+
+After successful corpus publication, a complete retain/reuse/metadata decision
+acknowledges only a matching pending version and metadata with no pending steps.
+Explicit reselection of an already published batch uses the same rule. This
+prevents unchanged daily listings from repeatedly comparing handled documents;
+it neither advances graph extraction facts nor discards the previous graph
+baseline. Deferred comparison failures remain unknown and suppressed.
