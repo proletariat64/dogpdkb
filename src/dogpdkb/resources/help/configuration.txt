@@ -113,7 +113,8 @@ output is streamed as diagnostics, never parsed into invented business counts.
 Inspect status and the referenced reports before choosing a next action. A plan
 pause has exit 0 and is eligible for explicit resume with intact frozen inputs.
 Completed/partial sync cleans successful wash copies, retaining failure evidence
-and compact records; cleaned runs cannot resume. An external agent diagnoses
+and compact records; cleaned runs support only explicit --retry-graph recovery
+through their retained final compile manifest. An external agent diagnoses
 failed/unknown work and creates new work subject to durable suppression. An
 ordinary repeat is not an automatic retry mechanism. A failed graph does not
 roll back already published corpus; absent remote IDs do not delete local data.

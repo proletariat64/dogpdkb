@@ -144,7 +144,7 @@ if mode=='mutate': next(Path(args[0]).glob('*.md')).write_text('changed during e
     return config, manifest, source
 
 
-def cli(config, manifest, environment=None):
+def cli(config, manifest, environment=None, *, retry_graph=False):
     return subprocess.run(
         [
             sys.executable,
@@ -155,6 +155,7 @@ def cli(config, manifest, environment=None):
             str(config),
             "--input",
             str(manifest),
+            *(["--retry-graph"] if retry_graph else []),
         ],
         env=environment or {**os.environ, "PYTHONPATH": str(ROOT / "src")},
         check=False,
@@ -203,6 +204,112 @@ def test_source_failure_keeps_graph_version_and_is_not_retried(tmp_path):
     before = (tmp_path / "calls.jsonl").read_bytes()
     assert cli(config, manifest).returncode == 2
     assert (tmp_path / "calls.jsonl").read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "mode,code", [("failed", 2), ("invalid", 1), ("interrupt", 130)]
+)
+def test_explicit_graph_retry_recovers_same_run_and_keeps_failure_evidence(
+    tmp_path, mode, code
+):
+    config, manifest, source = fixture(tmp_path)
+    (tmp_path / "mode").write_text(mode)
+    assert cli(config, manifest).returncode == code
+    run_path = manifest.parent / "run.json"
+    before = json.loads(run_path.read_text())
+    report = Path(before["artifacts"]["graph_report"])
+    evidence = report.read_bytes()
+    (tmp_path / "mode").write_text("success")
+
+    result = cli(config, manifest, retry_graph=True)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len((tmp_path / "calls.jsonl").read_text().splitlines()) == 2
+    assert report.read_bytes() == evidence
+    after = json.loads(run_path.read_text())
+    assert after["failures"] == before["failures"]
+    assert after["artifacts"]["graph_report"] != str(report)
+    document = json.loads((tmp_path / "state/funds/state.json").read_text())[
+        "documents"
+    ]["42"]
+    assert document["graph"]["status"] == "completed"
+    assert document["steps"]["graph"]["status"] == "completed"
+    assert not document["blocked_versions"]["graph"]
+    assert (source.parent / "graphify-out/graph.json").is_file()
+
+
+def test_graph_retry_refuses_another_runs_failure(tmp_path):
+    config, manifest, _source = fixture(tmp_path)
+    (tmp_path / "mode").write_text("failed")
+    assert cli(config, manifest).returncode == 2
+    state_path = tmp_path / "state/funds/state.json"
+    state = json.loads(state_path.read_text())
+    state["documents"]["42"]["steps"]["graph"]["run_id"] = "another-run"
+    write(state_path, state)
+    before = (tmp_path / "calls.jsonl").read_bytes()
+    assert cli(config, manifest, retry_graph=True).returncode == 2
+    assert (tmp_path / "calls.jsonl").read_bytes() == before
+
+
+def test_graph_retry_refuses_changed_source_before_tool_call(tmp_path):
+    config, manifest, source = fixture(tmp_path)
+    (tmp_path / "mode").write_text("failed")
+    assert cli(config, manifest).returncode == 2
+    source.write_text("Changed after failure")
+    before = (tmp_path / "calls.jsonl").read_bytes()
+    assert cli(config, manifest, retry_graph=True).returncode == 1
+    assert (tmp_path / "calls.jsonl").read_bytes() == before
+
+
+def test_graph_retry_does_not_authorize_unselected_blocked_sources(tmp_path):
+    config, manifest, _source = fixture(tmp_path)
+    (tmp_path / "mode").write_text("failed")
+    assert cli(config, manifest).returncode == 2
+    state_path = tmp_path / "state/funds/state.json"
+    state = json.loads(state_path.read_text())
+    state["documents"]["43"] = {
+        "corpus": {"version": VERSION},
+        "steps": {
+            "graph": {
+                "status": "failed",
+                "version": VERSION,
+                "run_id": manifest.parent.name,
+            }
+        },
+    }
+    write(state_path, state)
+    before = (tmp_path / "calls.jsonl").read_bytes()
+    assert cli(config, manifest, retry_graph=True).returncode == 2
+    assert (tmp_path / "calls.jsonl").read_bytes() == before
+
+
+def test_graph_retry_cannot_bypass_target_lock(tmp_path):
+    import fcntl
+
+    config, manifest, source = fixture(tmp_path)
+    (tmp_path / "mode").write_text("failed")
+    assert cli(config, manifest).returncode == 2
+    before = (tmp_path / "calls.jsonl").read_bytes()
+    with (source.parent / ".dogpdkb.lock").open("r") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = cli(config, manifest, retry_graph=True)
+    assert result.returncode == 1
+    assert "another writer" in result.stderr
+    assert (tmp_path / "calls.jsonl").read_bytes() == before
+
+
+def test_graph_retry_recovers_running_attempt_after_owner_exits(tmp_path):
+    config, manifest, _source = fixture(tmp_path)
+    state_path = tmp_path / "state/funds/state.json"
+    state = json.loads(state_path.read_text())
+    state["documents"]["42"]["steps"]["graph"] = {
+        "status": "running",
+        "version": VERSION,
+        "run_id": manifest.parent.name,
+    }
+    write(state_path, state)
+    result = cli(config, manifest, retry_graph=True)
+    assert result.returncode == 0, result.stderr
 
 
 def test_invalid_report_is_unknown_and_does_not_advance_graph_truth(tmp_path):

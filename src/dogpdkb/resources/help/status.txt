@@ -18,4 +18,5 @@ Human output lists stage, counts, elapsed time and artifact pointers.
 
 Repeated calls only observe; they do not resume/retry. Inspect run failures and
 the pointed reports to choose recovery. A cleaned completed/partial sync run
-cannot resume; deleting wash cannot clear its durable failures.
+supports only explicit --retry-graph recovery from its retained final compile
+manifest; deleting wash cannot clear its durable failures.

@@ -29,6 +29,22 @@ failures and per-document reports; numeric exits alone do not grant retry.
 Stopped plans and interrupted/failed runs retain evidence. Saved input copies
 are checked before and after OCR and again before publication. Missing/changed
 inputs require a fresh plan, not automatic redownload. Completed/partial sync
-cleans successful wash copies; it cannot be resumed after cleanup. Durable
+cleans successful wash copies; ordinary resume is unavailable after cleanup. Durable
 failure/unknown suppression remains after purge. An agent must diagnose failures
 before arranging new work; ordinary repeated sync does not repair them.
+
+After diagnosing and fixing a graph failure, explicitly retry only that stage:
+
+```text
+dogpdkb sync --config instance/dogpdkb.toml --book funds --resume RUN --retry-graph
+```
+
+--retry-graph requires --resume and cannot use --stop-after. It uses the saved
+final compile manifest, even after cleanup, without repeating discovery,
+downloads, comparison, OCR or corpus writes. Only this run's failed/unknown or
+abandoned in-flight graph versions in that manifest are authorized. Other
+blocked sources still stop compilation. Original target locks, version/metadata
+checks and byte witnesses remain mandatory. No block is cleared before a real
+successful result. Each attempt keeps a separate report; earlier failures stay
+recorded and can keep the run partial. This is explicit operator recovery,
+not an automatic daily retry or a way to recover missing/changed inputs.
