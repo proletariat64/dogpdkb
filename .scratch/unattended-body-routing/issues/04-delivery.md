@@ -1,6 +1,6 @@
 # 04: Review, release and installed production acceptance
 
-Status: ready-for-agent
+Status: claimed
 Type: task
 Blocked by: 01, 02, 03
 
