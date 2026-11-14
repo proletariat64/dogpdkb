@@ -121,7 +121,16 @@ reasons remain observable and usable bodies can proceed to incremental Graphify.
 Explicit recovery of older failed runs belongs to the external agent; there is
 no automatic historical migration or retry layer.
 
-Cleaned completed/partial runs are not resumable. Manual `purge` deletes only
+Cleaned completed/partial runs are not ordinarily resumable. Explicit
+`sync --resume RUN --retry-graph` uses only a retained final compile manifest,
+including after cleanup, and revalidates it through the graph stage. It never
+re-enters discovery, download, comparison, OCR or corpus publication. Missing or
+changed witnesses still require a new plan. Historical failures stay recorded;
+the final result can remain partial even after successful graph recovery.
+Recovery snapshots the already-cleaned run's retained file paths before the new
+attempt, so cleanup preserves its failure bundles even when the old plan was
+pruned. Newly created disposable graph workspace files can still be reclaimed.
+Manual `purge` deletes only
 selected wash; force permits discarding unfinished runs but never bypasses locks
 or clears durable facts, corpus, graphs, persistent inputs or tool caches.
 Purge validates saved schema, book key/source URL and run ID against the selected

@@ -158,6 +158,95 @@ def test_failed_graph_keeps_input_and_report_without_candidate_graph(tmp_path):
     assert not list(run.parent.glob("graphify-*/graphify-out"))
 
 
+@pytest.mark.parametrize("tool_exit,expected", [(1, 2), (130, 130)])
+def test_sync_graph_retry_uses_retained_manifest_without_repeating_other_tools(
+    tmp_path, tool_exit, expected
+):
+    config, tool = instance(tmp_path)
+    original = tool.read_text()
+    tool.write_text(
+        original.replace(
+            "    graph=flag('--out')",
+            f"    raise SystemExit({tool_exit})\n    graph=flag('--out')",
+        )
+    )
+    first = cli("sync", "--config", config)
+    assert first.returncode == expected, first.stderr
+    run = Path(json.loads(first.stdout)["run"])
+    before = json.loads(run.read_text())
+    calls_before = (tmp_path / "commands.jsonl").read_text().splitlines()
+    tool.write_text(original)
+
+    result = cli("sync", "--config", config, "--resume", run, "--retry-graph")
+
+    assert result.returncode in {0, 2}, result.stderr
+    calls_after = (tmp_path / "commands.jsonl").read_text().splitlines()
+    assert [json.loads(line)[:2] for line in calls_after[len(calls_before) :]] == [
+        ["graphify", "extract"]
+    ]
+    after = json.loads(run.read_text())
+    assert [row["reason"] for row in after["failures"]] == [
+        row["reason"] for row in before["failures"]
+    ]
+    assert all(Path(row["report"]).is_file() for row in after["failures"])
+    assert after["counts"] == {"total": 2, "completed": 2, "failed": 0}
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    assert all(
+        doc["graph"]["status"] == "completed" for doc in state["documents"].values()
+    )
+
+
+def test_sync_graph_retry_requires_explicit_saved_run(tmp_path):
+    config, _ = instance(tmp_path)
+    result = cli("sync", "--config", config, "--retry-graph")
+    assert result.returncode == 64
+    assert "requires --resume" in result.stderr
+    assert not (tmp_path / "commands.jsonl").exists()
+
+
+def test_graph_recovery_preserves_cleaned_unknown_ocr_failure_bundle(tmp_path):
+    from PIL import Image
+
+    config, tool = instance(tmp_path)
+    Image.new("RGB", (8, 8), "red").save(tmp_path / "fixture.png")
+    original = tool.read_text()
+    script = (
+        original.replace(
+            "        rows.append({**doc,",
+            "        if doc['document_id']=='2':\n            image=path.parent/'2.png';image.write_bytes((root/'fixture.png').read_bytes());path.write_text(path.read_text()+'\\n![failed](2.png)\\n')\n        rows.append({**doc,",
+        )
+        .replace(
+            "if tool in ('mdcompare', 'mdocr'):",
+            "if tool == 'mdocr': raise SystemExit(1)\nif tool in ('mdcompare', 'mdocr'):",
+        )
+        .replace(
+            "    graph=flag('--out')",
+            "    raise SystemExit(1)\n    graph=flag('--out')",
+        )
+    )
+    tool.write_text(script)
+    first = cli("sync", "--config", config)
+    assert first.returncode == 2, first.stderr
+    run = Path(json.loads(first.stdout)["run"])
+    assert json.loads(run.read_text())["cleanup"]["status"] == "completed"
+    retained = {
+        path: path.read_bytes()
+        for path in run.parent.rglob("*")
+        if path.is_file() and path.name not in {"run.json", "manifest.json"}
+    }
+    assert (run.parent / "raw/2.png") in retained
+    assert any(path.name.endswith("-request.json") for path in retained)
+    tool.write_text(original)
+
+    result = cli("sync", "--config", config, "--resume", run, "--retry-graph")
+
+    assert result.returncode in {0, 2}, result.stderr
+    for path, content in retained.items():
+        assert path.is_file(), f"recovery discarded failure evidence: {path}"
+        assert path.read_bytes() == content
+    assert not list(run.parent.glob("graphify-*/graphify-out"))
+
+
 @pytest.mark.parametrize("fault", ["blocked-directory", "malformed-plan"])
 def test_cleanup_failure_reports_stderr_without_changing_sync_result(tmp_path, fault):
     config, tool = instance(tmp_path)

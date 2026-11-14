@@ -61,7 +61,15 @@ Markdown 语料；`update-graph --input MANIFEST` 编译。`sync` 共用这套�
 
 成功或 partial 的 sync 自动清理本次 wash 的成功临时副本，保留失败文档 Markdown、
 相关图片、报告和简要运行记录。计划暂停、整批失败和中断不自动清理；清理错误
-进入 stderr，不改变同步退出码。partial 后续由 agent 创建新 run 处理，不恢复旧批次。
+进入 stderr，不改变同步退出码。普通 resume 不恢复已清理批次。
+
+For a diagnosed graph failure, fix the provider/environment first, then run
+`dogpdkb sync --config ./instance/dogpdkb.toml --book funds --resume RUN --retry-graph`.
+This explicit recovery revalidates the retained final compile manifest, including
+after cleanup, and repeats only Graphify. It preserves earlier failure reports;
+target locks, source/version checks and frozen byte witnesses still apply.
+Unrelated failed batches remain blocked. Historical failures may keep exit 2
+even after graph recovery; inspect the current graph stage and its report.
 
 ```bash
 dogpdkb purge --config ./instance/dogpdkb.toml --book funds --run RUN

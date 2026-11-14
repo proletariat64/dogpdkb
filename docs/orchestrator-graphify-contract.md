@@ -24,7 +24,16 @@ For a new graph, unselected historical Markdown also stops the run. Establish a
 baseline separately using the original CLI; init-state does not invent one.
 A failed/unknown graph attempt at the current corpus version blocks subsequent
 directory compilation, including batches selecting other sources. An external
-cleanup agent must resolve it or a new version must arrive. Separate capture/OCR failures do not block compilation of usable, published
+operator must diagnose it or a new version must arrive. After fixing the cause,
+`sync --resume RUN --retry-graph` (or `update-graph --input MANIFEST --retry-graph`)
+may retry only failed/unknown/in-flight graph versions belonging to that saved
+run and present in its validated final compile manifest. Target locks, source
+identity, input witnesses, metadata and newer-version checks still apply. A
+blocked source outside that batch or belonging to another run still stops the
+directory scan. No suppression is cleared before execution; only actual success
+clears the matching graph block. Each attempt uses a new workspace/report and
+retains earlier failure evidence. Ordinary sync never opts into this recovery.
+Separate capture/OCR failures do not block compilation of usable, published
 corpus sources; they keep the overall run partial. Failed raw inputs are not
 added to the compile manifest.
 

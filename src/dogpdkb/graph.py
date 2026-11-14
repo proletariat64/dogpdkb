@@ -83,7 +83,7 @@ def _graph(path):
     return data
 
 
-def run_graph(settings, book, store, run, manifest=None) -> int:
+def run_graph(settings, book, store, run, manifest=None, *, retry_graph=False) -> int:
     """Run native directory extraction; publish only a complete batch."""
     manifest = manifest or run.data["artifacts"].get("manifest")
     if not manifest:
@@ -105,11 +105,23 @@ def run_graph(settings, book, store, run, manifest=None) -> int:
         pending.append(row)
     if not pending:
         return 2 if data.get("failures") else 0
+    selected = {row["document_id"] for row in pending}
     # A directory scan could otherwise silently retry a blocked source from an
     # earlier batch, even when the new plan selected different documents.
     for doc_id, document in store.data["documents"].items():
         version = document.get("corpus", {}).get("version")
         if version and store.suppressed(doc_id, "graph", version):
+            previous = store.step(doc_id, "graph") or {}
+            # Explicit recovery authorizes only this run's frozen batch. Keep
+            # the block until a real successful result replaces the attempt.
+            if (
+                retry_graph
+                and doc_id in selected
+                and previous.get("run_id") == run.id
+                and previous.get("status") in {"running", "failed", "unknown"}
+                and version_key(previous["version"]) == version_key(version)
+            ):
+                continue
             run.failure(
                 document_id=doc_id,
                 version=version,
@@ -295,6 +307,7 @@ def main(argv=None) -> int:
     parser = HelpParser(prog="dogpdkb update-graph", description=__doc__)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--book")
+    parser.add_argument("--retry-graph", action="store_true")
     parser.add_argument(
         "-i",
         "--input",
@@ -320,7 +333,9 @@ def main(argv=None) -> int:
             run = Run.load(store, manifest.get("run_id", ""))
             run.data.update(status="running", pid=os.getpid(), ended_at=None)
             run.save()
-            code = run_graph(settings, book, store, run, manifest)
+            code = run_graph(
+                settings, book, store, run, manifest, retry_graph=args.retry_graph
+            )
             run.finish(
                 "interrupted"
                 if code in {130, 143}

@@ -13,13 +13,32 @@ from dogpdkb.records import Run, Store
 from dogpdkb.settings import load_config, select_book
 
 
-def sync_run(settings, book, store, run, *, stop_after=None, resume=False):
+def sync_run(
+    settings, book, store, run, *, stop_after=None, resume=False, retry_graph=False
+):
     from dogpdkb.discover import discover
 
-    differences = None if resume else discover(settings, book, store, run)
-    result = apply_run(
-        settings, book, store, run, differences, stop_after=stop_after, resume=resume
+    retained = (
+        {path for path in run.directory.rglob("*") if path.is_file()}
+        if retry_graph and run.data.get("cleanup")
+        else set()
     )
+    if retry_graph:
+        manifest = run.data["artifacts"].get("manifest")
+        if not manifest:
+            raise ValueError("graph recovery requires a saved final compile manifest")
+        result = {"exit_code": 0, "paused": False, "manifest": manifest}
+    else:
+        differences = None if resume else discover(settings, book, store, run)
+        result = apply_run(
+            settings,
+            book,
+            store,
+            run,
+            differences,
+            stop_after=stop_after,
+            resume=resume,
+        )
     if result["paused"]:
         return result
     from dogpdkb.graph import run_graph
@@ -27,7 +46,12 @@ def sync_run(settings, book, store, run, *, stop_after=None, resume=False):
     run.data.update(status="running", ended_at=None, exit_code=None, reason=None)
     run.save()
     graph_code = run_graph(
-        settings, book, store, run, manifest=Path(result["manifest"])
+        settings,
+        book,
+        store,
+        run,
+        manifest=Path(result["manifest"]),
+        retry_graph=retry_graph,
     )
     if graph_code in {130, 143}:
         record_interruption(store, run, graph_code)
@@ -36,7 +60,7 @@ def sync_run(settings, book, store, run, *, stop_after=None, resume=False):
     run.finish("failed" if code == 1 else "partial" if code == 2 else "completed", code)
     from dogpdkb.cleanup import clean_run
 
-    clean_run(store, run)
+    clean_run(store, run, preserve=retained)
     return {**result, "exit_code": code}
 
 
@@ -44,6 +68,8 @@ def main(argv=None):
     parser = parser_for("sync")
     try:
         args = parser.parse_args(argv)
+        if args.retry_graph and (not args.resume or args.stop_after):
+            parser.error("--retry-graph requires --resume and cannot use --stop-after")
     except SystemExit as error:
         return 64 if error.code == 2 else error.code
     run = None
@@ -54,7 +80,7 @@ def main(argv=None):
         with store.lock():
             if args.resume:
                 previous = Run.load(store, args.resume)
-                if previous.data.get("cleanup"):
+                if previous.data.get("cleanup") and not args.retry_graph:
                     raise ValueError("run has been cleaned; start a new run")
                 run = previous
             else:
@@ -75,6 +101,7 @@ def main(argv=None):
                     run,
                     stop_after=args.stop_after,
                     resume=bool(args.resume),
+                    retry_graph=args.retry_graph,
                 )
             except InterruptedError as error:
                 record_interruption(store, run, error.args[0])

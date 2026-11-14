@@ -42,7 +42,8 @@ Skylark, mdcompare, mdocr and Graphify own their tool algorithms and runtime.
 - Keep Web publication separate from sync. Completed/partial sync cleans only
   its own wash, retaining failed Markdown/images/reports. Manual purge deletes
   selected wash only; preserve durable state, inputs and tool caches. Historical
-  failure handling stays with an external agent; add no migration or retry layers.
+  failure handling stays with an external agent. Explicit `--retry-graph`
+  recovery revalidates the saved batch; add no automatic migration or retry layers.
 
 When changing an integration, read `docs/orchestrator-tool-contracts.md`,
 `docs/orchestrator-skylark-contract.md` or `docs/orchestrator-graphify-contract.md`

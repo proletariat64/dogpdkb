@@ -23,6 +23,16 @@ native manifest.json; missing native baseline stops before extraction. New graph
 cannot silently pull unselected historical Markdown into extraction. A graph
 attempt failed/unknown at a current version blocks subsequent directory scans
 until an external agent resolves it or a new version arrives.
+After fixing its cause, --retry-graph explicitly authorizes only failed/unknown
+or abandoned in-flight graph versions belonging to this saved run and present
+in the validated manifest. Other blocked sources remain protected. It never
+clears suppression before execution or bypasses target locks, frozen input,
+metadata or newer-version validation. Each attempt uses a new report/workspace;
+previous failure evidence remains. Only actual success clears its graph block.
+
+```text
+dogpdkb update-graph --config instance/dogpdkb.toml --book funds --input manifest.json --retry-graph
+```
 
 Compilation scans the complete book corpus in a run-owned workspace copied from
 the existing graph/manifest/cache. Frozen inputs are rechecked after extraction.

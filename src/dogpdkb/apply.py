@@ -889,6 +889,8 @@ def parser_for(command="apply"):
         selection.add_argument("--input", type=Path)
     selection.add_argument("--resume")
     parser.add_argument("--stop-after", choices=["plan"])
+    if command == "sync":
+        parser.add_argument("--retry-graph", action="store_true")
     return parser
 
 
