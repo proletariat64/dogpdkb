@@ -33,7 +33,8 @@ def _manifest(settings, book, store, run, reference):
         if (
             not doc_id
             or doc_id in seen
-            or row.get("action") not in {"compile", "metadata", "reuse"}
+            or row.get("action")
+            not in {"compile", "metadata", "reuse", "retain", "defer"}
         ):
             raise ValueError("duplicate source or invalid compile action")
         seen.add(doc_id)
@@ -83,14 +84,127 @@ def _graph(path):
     return data
 
 
+def _previous_graph_input(store, doc_id, document):
+    descriptor = dict(document.get("graph_baseline", {}))
+    graph = document.get("graph", {})
+    step = store.step(doc_id, "graph") or {}
+    if (
+        graph.get("status") == "completed"
+        and step.get("status") == "completed"
+        and version_key(graph.get("version")) == version_key(step.get("version"))
+    ):
+        descriptor.update(
+            path=step.get("input_copy"),
+            source_file=graph.get("source_file"),
+            version=graph.get("version"),
+        )
+    return descriptor
+
+
+def _retained_corpus(settings, book, store, run, data, pending, workspace):
+    """Freeze previous full graph bodies without excluding their native sources."""
+    selected = {row["document_id"] for row in pending}
+    rows = {row["document_id"]: row for row in data["documents"]}
+    retained = []
+    for doc_id, document in store.data["documents"].items():
+        if doc_id in selected:
+            continue
+        current = document.get("corpus", {}).get("path")
+        if not current:
+            continue
+        current = Path(current).resolve()
+        if not current.is_absolute() or not current.resolve().is_relative_to(
+            book.corpus
+        ):
+            continue
+        descriptor = _previous_graph_input(store, doc_id, document)
+        witness, source_file = descriptor.get("path"), descriptor.get("source_file")
+        required = rows.get(doc_id, {}).get("action") in {
+            "retain",
+            "defer",
+            "reuse",
+            "metadata",
+        }
+        if not witness or not source_file or not Path(witness).is_file():
+            if required or descriptor:
+                run.failure(
+                    document_id=doc_id,
+                    step="graph",
+                    reason="GRAPHIFY_RETAINED_INPUT_REQUIRED",
+                )
+                return None, []
+            continue
+        relative = Path(source_file)
+        if relative.is_absolute() or ".." in relative.parts or relative == Path("."):
+            raise ValueError("retained graph source must have a relative corpus path")
+        retained.append((current.relative_to(book.corpus), relative, Path(witness)))
+    if not retained:
+        return book.corpus, []
+
+    native_manifest = read_json(settings.graph_for(book) / "manifest.json")
+    if any(Path(key).is_absolute() for key in native_manifest):
+        run.failure(step="graph", reason="GRAPHIFY_PORTABLE_BASELINE_REQUIRED")
+        return None, []
+
+    mirror = workspace / "corpus"
+    excluded = [settings.graph_for(book).resolve(), settings.staging.resolve()]
+
+    def ignore(folder, names):
+        if any((Path(folder) / name).is_symlink() for name in names):
+            raise ValueError(
+                "graph corpus mirror requires ordinary files and directories"
+            )
+        return [
+            name
+            for name in names
+            if name == ".dogpdkb.lock"
+            or any(
+                (Path(folder) / name).resolve().is_relative_to(path)
+                for path in excluded
+            )
+        ]
+
+    shutil.copytree(book.corpus, mirror, ignore=ignore, symlinks=True)
+    selected_paths = {
+        Path(row["path"]).resolve().relative_to(book.corpus) for row in pending
+    }
+    destinations = set()
+    witnesses = []
+    for current, relative, _witness in retained:
+        if current != relative:
+            (mirror / current).unlink(missing_ok=True)
+    for current, relative, witness in retained:
+        if relative in selected_paths or relative in destinations:
+            raise ValueError("retained graph source collides with another source")
+        destinations.add(relative)
+        target = mirror / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(witness, target)
+        witnesses.append((target, witness))
+    for row in pending:
+        witnesses.append(
+            (
+                mirror / Path(row["path"]).resolve().relative_to(book.corpus),
+                Path(row["input_copy"]),
+            )
+        )
+    run.data["artifacts"]["graph_corpus"] = str(mirror)
+    return mirror, witnesses
+
+
 def run_graph(settings, book, store, run, manifest=None, *, retry_graph=False) -> int:
     """Run native directory extraction; publish only a complete batch."""
     manifest = manifest or run.data["artifacts"].get("manifest")
     if not manifest:
         raise ValueError("a complete-source compile manifest is required")
     data = _manifest(settings, book, store, run, manifest)
+    partial = bool(data.get("failures")) or any(
+        row["action"] == "defer" for row in data["documents"]
+    )
     pending = []
     for row in data["documents"]:
+        if row["action"] != "compile":
+            continue
         previous = store.step(row["document_id"], "graph") or {}
         if (
             previous.get("status") == "completed"
@@ -104,12 +218,21 @@ def run_graph(settings, book, store, run, manifest=None, *, retry_graph=False) -
             continue
         pending.append(row)
     if not pending:
-        return 2 if data.get("failures") else 0
+        return 2 if partial else 0
     selected = {row["document_id"] for row in pending}
     # A directory scan could otherwise silently retry a blocked source from an
     # earlier batch, even when the new plan selected different documents.
     for doc_id, document in store.data["documents"].items():
         version = document.get("corpus", {}).get("version")
+        if doc_id not in selected:
+            previous_input = _previous_graph_input(store, doc_id, document)
+            witness = previous_input.get("path")
+            if (
+                witness
+                and previous_input.get("source_file")
+                and Path(witness).is_file()
+            ):
+                version = previous_input.get("version")
         if version and store.suppressed(doc_id, "graph", version):
             previous = store.step(doc_id, "graph") or {}
             # Explicit recovery authorizes only this run's frozen batch. Keep
@@ -150,6 +273,11 @@ def run_graph(settings, book, store, run, manifest=None, *, retry_graph=False) -
     candidate = workspace / "graphify-out"
     if graph_dir.exists():
         shutil.copytree(graph_dir, candidate)
+    corpus, witnesses = _retained_corpus(
+        settings, book, store, run, data, pending, workspace
+    )
+    if corpus is None:
+        return 2
     report = workspace / "result.json"
     run.data["artifacts"].update(
         graph_report=str(report), graph_candidate=str(candidate)
@@ -170,7 +298,7 @@ def run_graph(settings, book, store, run, manifest=None, *, retry_graph=False) -
     argv = [
         *settings.command("graphify"),
         "extract",
-        str(book.corpus),
+        str(corpus),
         "--out",
         str(workspace),
         "--no-cluster",
@@ -193,6 +321,11 @@ def run_graph(settings, book, store, run, manifest=None, *, retry_graph=False) -
                 raise TypeError("Graphify did not produce its manifest")
             # Extraction may take hours. Do not publish if an input changed.
             _manifest(settings, book, store, run, data)
+            if any(
+                not target.is_file() or target.read_bytes() != witness.read_bytes()
+                for target, witness in witnesses
+            ):
+                raise ValueError("graph corpus mirror changed during extraction")
             graph_dir.mkdir(parents=True, exist_ok=True)
             for artifact in candidate.iterdir():
                 if artifact.name in {"graph.json", "manifest.json", ".dogpdkb.lock"}:
@@ -248,6 +381,13 @@ def run_graph(settings, book, store, run, manifest=None, *, retry_graph=False) -
                 "run_id": run.id,
                 "report": str(retained_report),
             }
+            document["graph_baseline"] = {
+                "path": str(witness),
+                "source_file": str(Path(row["path"]).relative_to(book.corpus)),
+                "version": row["version"],
+                "metadata": row.get("metadata", {}),
+                **{key: row[key] for key in ("resources", "ocr") if key in row},
+            }
             observed = document.get("pending")
             if (
                 observed
@@ -295,7 +435,7 @@ def run_graph(settings, book, store, run, manifest=None, *, retry_graph=False) -
     return (
         code
         if code in {130, 143}
-        else (2 if data.get("failures") else 0)
+        else (2 if partial else 0)
         if status == "completed"
         else 2
         if status == "failed"
