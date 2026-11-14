@@ -1119,3 +1119,53 @@ def test_retained_body_is_not_selected_again_by_next_daily_discovery(tmp_path):
         "Historical old-only paragraph."
         in Path(document["graph_baseline"]["path"]).read_text()
     )
+
+
+def test_retry_after_interrupted_replan_preserves_active_selection_and_inputs(tmp_path):
+    config, differences = instance(tmp_path)
+    seed_body_baseline(tmp_path, config, "# Title\n\nPrevious different knowledge.\n")
+    graph = tmp_path / "graphify.py"
+    graph.write_text(
+        "import json,sys\nfrom pathlib import Path\n"
+        "flag=Path(__file__).with_suffix('.called')\n"
+        "if not flag.exists():\n    flag.touch()\n    raise SystemExit(130)\n"
+        "out=Path(sys.argv[sys.argv.index('--out')+1])/'graphify-out'\n"
+        "out.mkdir(parents=True,exist_ok=True)\n"
+        "(out/'graph.json').write_text(json.dumps({'nodes':[], 'links':[]}))\n"
+        "(out/'manifest.json').write_text('{}')\n"
+    )
+    config.write_text(
+        config.read_text()
+        + "graphify="
+        + json.dumps([sys.executable, str(graph)])
+        + "\n"
+    )
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 0, first.stderr
+    run_path = Path(json.loads(first.stdout)["run"])
+    interrupted = cli(
+        "sync", "--config", config, "--resume", run_path, "--retry-graph", "--replan"
+    )
+    assert interrupted.returncode == 130, interrupted.stderr
+    saved = json.loads(run_path.read_text())
+    assert "cleanup" not in saved
+    manifest = Path(saved["artifacts"]["manifest"])
+    assert manifest.parent.name.startswith("replan-")
+    dependencies = {
+        Path(saved["artifacts"][key]) for key in ["plan", "knowledge", "compare"]
+    }
+    plan = json.loads(Path(saved["artifacts"]["plan"]).read_text())
+    dependencies.update(Path(row["input_copy"]) for row in plan["documents"])
+    dependencies.update(
+        Path(row["baseline_input_copy"])
+        for row in plan["documents"]
+        if row.get("baseline_input_copy")
+    )
+    succeeded = cli("sync", "--config", config, "--resume", run_path, "--retry-graph")
+    assert succeeded.returncode == 0, succeeded.stderr
+    latest = json.loads(run_path.read_text())
+    assert latest["cleanup"]["status"] == "completed"
+    assert latest["artifacts"]["manifest"] == str(manifest)
+    assert manifest.is_file()
+    assert all(path.is_file() for path in dependencies)
+    assert json.loads(manifest.read_text())["documents"][0]["action"] == "compile"

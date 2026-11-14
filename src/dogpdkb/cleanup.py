@@ -116,9 +116,27 @@ def clean_run(store, run, *, preserve=()):
             for path in protected
         ):
             raise ValueError("wash overlaps protected data")
-        keep = {run.path, run.directory / "manifest.json", *preserve} | failure_files(
-            store, run
+        manifest_path = Path(
+            run.data["artifacts"].get("manifest", root / "manifest.json")
         )
+        keep = {
+            run.path,
+            root / "manifest.json",
+            manifest_path,
+            *preserve,
+        } | failure_files(store, run)
+        # Explicit replan can be interrupted before any cleanup marker exists.
+        # Its active selection and frozen comparison inputs remain recovery data
+        # even when the next retry does not repeat --replan.
+        comparison = manifest_path.parent
+        if comparison.parent == root and comparison.name.startswith("replan-"):
+            if comparison.is_symlink():
+                raise ValueError("refusing replan cleanup through a symlink")
+            keep.update(
+                path
+                for path in comparison.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            )
         run.save()
 
         def prune(directory):
@@ -136,9 +154,6 @@ def clean_run(store, run, *, preserve=()):
                 report = read_json(path)
                 report["candidate"] = None
                 atomic_json(path, report)
-        manifest_path = Path(
-            run.data["artifacts"].get("manifest", run.directory / "manifest.json")
-        )
         if manifest_path.is_file():
             manifest = read_json(manifest_path)
             manifest["failures"] = run.data["failures"]

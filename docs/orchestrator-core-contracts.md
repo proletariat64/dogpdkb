@@ -187,3 +187,8 @@ Explicit reselection of an already published batch uses the same rule. This
 prevents unchanged daily listings from repeatedly comparing handled documents;
 it neither advances graph extraction facts nor discards the previous graph
 baseline. Deferred comparison failures remain unknown and suppressed.
+
+Cleanup retains the active compile manifest and its run-owned replan comparison
+workspace independently of any earlier cleanup marker. An interrupted explicit
+replan followed by an ordinary graph-only retry therefore keeps the revised
+selection, reports and original body/baseline copies available for recovery.
