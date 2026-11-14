@@ -12,6 +12,10 @@ An all-retained batch makes no Graphify call. A deferred row keeps the result
 partial even when all selected compilation succeeds.
 
 For a mixed batch, the orchestrator freezes a run-owned complete corpus mirror.
+The mirror is a sibling of the native output workspace, never its descendant.
+Graphify 0.9.96 anchors relative manifest keys to the output parent when the
+scan root is underneath it; keeping separate siblings preserves the original
+corpus-relative keys across extraction and publication.
 Selected sources contain current complete bytes. Unselected registered sources
 with retained graph evidence contain their previous complete graph input bytes,
 at their previous relative `source_file` location; a newly published rename is
@@ -23,6 +27,8 @@ Missing required retained evidence stops the batch with
 `GRAPHIFY_RETAINED_INPUT_REQUIRED` before any external call. Selected and
 substituted source bytes are rechecked after extraction, before publication.
 The public corpus is never rewritten to construct this view.
+The orchestrator's execution report records its actual `corpus` input root.
+Failed mirrors remain run-owned evidence; successful mirrors are disposable.
 
 Graphify's own manifest and cache decide which files need extraction and perform
 the native incremental merge. The orchestrator does not submit diff fragments,

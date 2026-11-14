@@ -146,7 +146,9 @@ def _retained_corpus(settings, book, store, run, data, pending, workspace):
         run.failure(step="graph", reason="GRAPHIFY_PORTABLE_BASELINE_REQUIRED")
         return None, []
 
-    mirror = workspace / "corpus"
+    # Newer Graphify anchors manifests to --out's parent when the scan root
+    # lives beneath it. A sibling keeps the original corpus-relative keys.
+    mirror = workspace.with_name(workspace.name + "-corpus")
     excluded = [settings.graph_for(book).resolve(), settings.staging.resolve()]
 
     def ignore(folder, names):
@@ -352,6 +354,7 @@ def run_graph(settings, book, store, run, manifest=None, *, retry_graph=False) -
             "argv": diagnostic_argv(argv),
             "graph": str(graph_path),
             "candidate": str(candidate),
+            "corpus": str(corpus),
             "reason": reason,
         },
     )

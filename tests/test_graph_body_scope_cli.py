@@ -66,6 +66,7 @@ def test_native_scan_uses_prior_held_body_and_keeps_held_graph_truth(
         "base=Path(sys.argv[1]); args=sys.argv[3:]; root=Path(args[0])\n"
         "out=Path(args[args.index('--out')+1])/'graphify-out'\n"
         "assert root!=base/'corpus'\n"
+        "assert not root.is_relative_to(out.parent), 'native manifest anchor would change'\n"
         "assert (root/'Held.md').read_text()=='# Old held source\\nKnown historical wording.\\n'\n"
         "assert not (root/'Renamed.md').exists()\n"
         "assert (root/'assets/image.png').read_bytes()==b'retained resource'\n"
