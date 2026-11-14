@@ -8,6 +8,7 @@ proposes a revision for review, never semantic equivalence.
 import json
 import re
 from collections import Counter
+from dataclasses import replace
 from typing import Any
 
 from .io import InputError, InputReader
@@ -71,17 +72,28 @@ def _graphify_plan(row: dict[str, Any]) -> dict[str, Any]:
         index
         for index, unit in enumerate(row["units"])
         if unit["new"] is not None
-        and unit["unit_type"] != "heading"
-        and not unit["body_seen_before"]
-        and not unit["presentation_seen_before"]
         and (
-            unit["kind"] in {"add", "revise"}
+            unit["subject_context_changed"]
             or (
-                unit["kind"] == "unresolved"
-                and unit["basis"] == "AMBIGUOUS_BODY_ALIGNMENT"
+                unit["unit_type"] != "heading"
+                and not unit["body_seen_before"]
+                and not unit["presentation_seen_before"]
+                and (
+                    unit["kind"] in {"add", "revise"}
+                    or (
+                        unit["kind"] == "unresolved"
+                        and unit["basis"] == "AMBIGUOUS_BODY_ALIGNMENT"
+                    )
+                )
             )
         )
     ]
+    if not candidates:
+        candidates = [
+            index
+            for index, unit in enumerate(row["units"])
+            if unit["new"] is not None and unit["body_context_changed"]
+        ]
     context_review = [
         index
         for index, unit in enumerate(row["units"])
@@ -105,8 +117,28 @@ def _graphify_plan(row: dict[str, Any]) -> dict[str, Any]:
         if row["status"] == "REUSE"
         else "HOLD_EXISTING"
     )
+    hold_reasons = []
+    if action == "HOLD_EXISTING":
+        if row["status"] == "UNKNOWN":
+            hold_reasons.append("COMPARISON_UNAVAILABLE")
+        elif not row["comparison_complete"]:
+            hold_reasons.append("COMPARISON_INCOMPLETE")
+        if "BASELINE_BODY_INCOMPLETE" in row["reason_codes"]:
+            hold_reasons.append("BASELINE_BODY_INCOMPLETE")
+        if not unavailable:
+            if row["counts"]["old_only_review"]:
+                hold_reasons.append("OLD_BODY_ONLY")
+            if context_review:
+                hold_reasons.append("CONTEXT_REVIEW")
+            if presentation_review:
+                hold_reasons.append("PRESENTATION_REVIEW")
+            if row["status"] == "NO_BODY":
+                hold_reasons.append("NO_BODY")
+        if not hold_reasons:
+            hold_reasons.append("NO_NEW_BODY_CANDIDATE")
     return {
         "action": action,
+        "hold_reason_codes": hold_reasons,
         "plan_only": True,
         "automatic_extraction_allowed": False,
         "full_document_fallback": False,
@@ -130,7 +162,39 @@ def _read_units(document: Document, reader: InputReader) -> list[Unit]:
     except UnicodeDecodeError as exc:
         raise InputError("TEXT_ENCODING_UNSUPPORTED") from exc
     try:
-        return extract_units(text, document.body_scope)
+        lines = text.splitlines(keepends=True)
+        exporter_header = (
+            len(lines) >= 2
+            and document.metadata["name"]
+            and lines[0].rstrip("\r\n") == "# " + document.metadata["name"]
+            and re.fullmatch(
+                r"doc_id: "
+                + re.escape(document.document_id)
+                + r" · book: [^\r\n]+ \(book_id [0-9]+\) · word_count: [0-9]+",
+                lines[1].rstrip("\r\n"),
+            )
+        )
+        if exporter_header:
+            # Preserve all source line coordinates and the title's subject scope.
+            lines[1] = lines[1][len(lines[1].rstrip("\r\n")) :]
+            text = "".join(lines)
+        units = extract_units(text, document.body_scope)
+        if (
+            units
+            and units[0].kind == "heading"
+            and units[0].start_line == 1
+            and units[0].text == document.metadata["name"]
+        ):
+            title = units[0]
+            # Renderer title is carried by document metadata, not an added body
+            # scope around every existing business heading and rule.
+            units = [replace(title, exporter_title=bool(exporter_header))] + [
+                replace(unit, context=unit.context[1:])
+                if unit.context and unit.context[0] == title.key
+                else unit
+                for unit in units[1:]
+            ]
+        return units
     except BodyScopeError as exc:
         raise InputError(exc.reason_code) from exc
 
@@ -242,6 +306,9 @@ def compare_knowledge_documents(
             for unit in old_units.get(document.identity, [])
             if (key := _rich_layout_key(unit)) is not None
         }
+        old_headings = any(
+            unit.kind == "heading" for unit in old_units.get(document.identity, [])
+        )
         evidence_remaining = options.max_evidence_chars
         for item in aligned["items"]:
             previous = item["old"]
@@ -266,7 +333,11 @@ def compare_knowledge_documents(
                         else "INCOMING_CONTEXTUAL_BODY_REUSE"
                     )
                     similarity = 1.0
-                elif kind == "add" and document.knowledge_base in incomplete_books:
+                elif (
+                    kind == "add"
+                    and old is None
+                    and document.knowledge_base in incomplete_books
+                ):
                     kind = "unresolved"
                     basis = "BASELINE_BODY_INCOMPLETE"
             if (
@@ -292,6 +363,30 @@ def compare_knowledge_documents(
             entry = {
                 "kind": kind,
                 "unit_type": located.kind,
+                "subject_context_changed": bool(
+                    current is not None
+                    and (
+                        basis == "DOCUMENT_SUBJECT_CONTEXT_CHANGED"
+                        or (
+                            current.kind == "heading"
+                            and not current.exporter_title
+                            and old_headings
+                            and (current.kind, current.key) not in observed_old_body
+                        )
+                    )
+                ),
+                "body_context_changed": bool(
+                    current is not None
+                    and current.kind != "heading"
+                    and kind != "reuse"
+                    and (
+                        previous_body := observed_old_body.get(
+                            (current.kind, current.key)
+                        )
+                    )
+                    is not None
+                    and previous_body.context != current.context
+                ),
                 "new_body_chars": len(current.text) if current is not None else 0,
                 # Identical wording in another context is not knowledge
                 # equivalence. Preserve context review without re-extracting
@@ -372,9 +467,10 @@ def compare_knowledge_documents(
         "schema_version": "knowledge-1.0",
         "scope": "body_only",
         "rules": {
-            "version": "body-units-v4",
+            "version": "body-units-v5",
             "reuse": "contextual_normalized_body_equality",
             "generated_regions": "outside_code_or_verified_generated_regions_v1",
+            "exporter_header": "matching_title_and_document_id_v1",
             "similarity": "revision_candidate_only",
             "images_and_ocr": "excluded",
             "cross_document": "same_book_name_path_and_unit_context",

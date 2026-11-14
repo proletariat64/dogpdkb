@@ -79,11 +79,22 @@ approving the remaining prefix. An unpaired transcription label follows the same
 rule. Unmarked passages remain observable body and are
 never removed by inferred provenance.
 
-The current `body-units-v4` comparison and the reusable character-statistics
+The current `body-units-v5` comparison and the reusable character-statistics
 scripts establish this same source scope before any statistics-only display
 cleanup. Those scripts may subsequently normalize code presentation for size
 estimates, but that does not authorize unit reuse. Strict `compare` does not
 consume `body_scope`; its file/resource/OCR evidence contract is unchanged.
+
+A complete exporter metadata line at line 2 is excluded when line 1 is exactly
+`# <metadata.name>` and the complete `doc_id: <id> · book: <display name>
+(book_id <integer>) · word_count: <integer>` renderer format contains the
+manifest document ID. The displayed book name and numeric book ID are renderer
+fields, not independently verified source-book identity. Recognition is symmetric
+for baseline and incoming documents, leaves all source line numbers intact and
+never rewrites input files. Other locations, literal code, mismatched titles or
+IDs and incomplete/lookalike lines remain observable body. The title remains a
+located heading and a document subject; its redundant document-name scope is
+canonicalized consistently on both sides.
 
 ## Knowledge units and decisions
 
@@ -186,31 +197,35 @@ silently become extraction permission:
 | --- | --- |
 | `KEEP_EXISTING` | The document is reusable; retain existing graph knowledge. |
 | `HOLD_EXISTING` | No concrete new-side body candidate is available, or comparison is unavailable/incomplete. Keep existing knowledge and the stated uncertainty. |
-| `BODY_DELTA_CANDIDATE` | New-side non-heading additions, revision candidates or ambiguous alignment units whose normalized wording was not seen in the paired old body need assessment. This is a candidate list, not confirmed new knowledge or an extraction command. |
+| `BODY_DELTA_CANDIDATE` | New-side additions, revision candidates, alignment uncertainty or meaningful subject/context changes need assessment. This is a candidate list, not confirmed new knowledge or an extraction command. |
 
 All plans declare `plan_only: true`, `automatic_extraction_allowed: false` and
-`full_document_fallback: false`. Historical old-only content, title/subject
-uncertainty alone, and unknown or work-budget-limited comparisons do not authorize
-automatic model calls. Mixed documents can retain those uncertainties while
-listing independently observed new-side candidates.
+`full_document_fallback: false`. The caller owns execution policy; these reports
+never invoke a model or authorize fragment replacement.
 
-`candidate_unit_indexes` contains zero-based indexes into the document's `units`
-array. `context_review_unit_indexes` separately lists non-reused units whose
-wording was already observed in the paired old body, plus changed heading units.
-`presentation_review_unit_indexes` lists non-reused units with the supported
-presentation match. Both sets are excluded from new-body candidates. The plan
-retains context or presentation review and holds existing knowledge when there
-are no other candidates; it does not automatically skip business-scope changes
-or declare those units reusable.
+`hold_reason_codes` is empty for KEEP/candidate actions. HOLD distinguishes
+`COMPARISON_UNAVAILABLE`, `COMPARISON_INCOMPLETE` and
+`BASELINE_BODY_INCOMPLETE` from complete comparisons with `OLD_BODY_ONLY`,
+`CONTEXT_REVIEW`, `PRESENTATION_REVIEW`, `NO_BODY` or
+`NO_NEW_BODY_CANDIDATE`. Reasons can overlap. A missing unrelated baseline does
+not downgrade a readable paired document's additions. An unpaired document still
+retains incomplete cross-document baseline evidence rather than claiming global
+novelty.
 
-For example, changing a section from USD to EUR while retaining its rule text
-requires context review and holds existing knowledge; it does not queue the whole
-document for re-extraction. Changing a condition in a paragraph from A to B can
-produce one new-body candidate for that paragraph, while unchanged child wording
-goes to context review instead of being repeatedly counted as new body.
+`candidate_unit_indexes` contains zero-based indexes into `units`.
+`context_review_unit_indexes` and `presentation_review_unit_indexes` retain
+separate diagnostic evidence. A changed document subject or business heading,
+such as USD to EUR, remains a candidate even when its child wording occurred
+before. A verified added renderer title alone does not create such a candidate.
+If no other concrete candidate accounts for a changed body scope, the affected
+body unit remains a candidate. Changing a condition paragraph can instead provide
+one concrete candidate while unchanged child wording remains context evidence.
+Unit fields `subject_context_changed` and `body_context_changed` expose these
+observations; neither declares semantic equivalence.
 
-`candidate_body_chars` counts the complete new-side text of candidate units,
-excluding headings and additional context payload. It is not a minimal text diff.
+`candidate_body_chars` counts complete new-side candidate-unit text, including
+subject-heading candidates when present and excluding additional review context.
+It is not a minimal text diff or an actual Graphify input/cost measurement.
 The summary's `graphify_plan` contains action counts, the combined candidate
 character count, `context_review_documents`, `presentation_review_documents` and
 `automatic_full_document_extractions: 0`. Character counts are neither actual
