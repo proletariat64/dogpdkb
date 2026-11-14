@@ -24,6 +24,7 @@ class Unit:
     context: tuple[str, ...]
     start_line: int
     end_line: int
+    exporter_title: bool = False
 
 
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")

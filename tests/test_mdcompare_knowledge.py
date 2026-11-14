@@ -70,8 +70,8 @@ def test_same_id_title_subject_change_does_not_reuse_generic_fact(tmp_path):
     assert row["status"] == "REVIEW"
     assert row["counts"]["reuse"] == 0
     assert row["reason_codes"] == ["DOCUMENT_SUBJECT_CONTEXT_CHANGED"]
-    assert row["graphify_plan"]["action"] == "HOLD_EXISTING"
-    assert row["graphify_plan"]["candidate_unit_indexes"] == []
+    assert row["graphify_plan"]["action"] == "BODY_DELTA_CANDIDATE"
+    assert row["graphify_plan"]["candidate_unit_indexes"]
 
 
 def test_cross_document_blank_subject_is_not_reuse_evidence(tmp_path):
@@ -190,14 +190,14 @@ def test_budget_exhaustion_holds_existing_knowledge(tmp_path):
     assert not row["graphify_plan"]["full_document_fallback"]
 
 
-def test_existing_body_in_changed_section_requires_context_not_reextraction(tmp_path):
+def test_existing_body_in_changed_subject_section_remains_a_candidate(tmp_path):
     old = doc(tmp_path, "1", "# USD\n\n- 单笔限额100。")
     new = doc(tmp_path, "1", "# EUR\n\n- 单笔限额100。", suffix="new")
     row = compare([old], [new])["results"][0]
     assert row["status"] == "REVIEW"
     plan = row["graphify_plan"]
-    assert plan["action"] == "HOLD_EXISTING"
-    assert plan["candidate_unit_indexes"] == []
+    assert plan["action"] == "BODY_DELTA_CANDIDATE"
+    assert plan["candidate_unit_indexes"]
     assert plan["context_review_unit_indexes"]
     child = next(
         unit for unit in row["units"] if unit["unit_type"] == "bullet" and unit["new"]
