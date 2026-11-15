@@ -1,8 +1,9 @@
 # dogpdkb
 
-dogpdkb 是供 crontab 调用的知识库 CLI 编排器：选择增量、生成计划、串行调用
-Skylark、mdcompare、mdocr 和 Graphify，保存真实结果，并提供只读状态观察。
-Web 发布与软件生命周期独立。
+dogpdkb is a knowledge-base CLI orchestrator for crontab: it selects increments,
+plans whole-batch stages, calls Skylark, mdcompare, mdocr and Graphify through their
+public CLIs, records actual outcomes and provides read-only status. Web publication
+and software lifecycle remain separate.
 
 ## Local help
 
@@ -50,6 +51,31 @@ dogpdkb status --config ./instance/dogpdkb.toml --book funds --watch --json
 Markdown 语料；`update-graph --input MANIFEST` 编译。`sync` 共用这套实现，顺序为
 全批扫描 → 全批下载 → 全批比较 → 计划 → 全批 OCR → 语料落盘 → 图谱更新。
 详见[操作合同](docs/unattended-sync.md)与[状态说明](docs/sync-state-design.md)。
+
+### Download concurrency
+
+`sync` and `apply` accept `--concurrency N` for document exports only. The default
+is **2**; allowed values are **1, 2 or 3**, with a hard maximum of three. Use one
+for serial downloads. Invalid values fail before run creation or tool calls.
+
+```bash
+dogpdkb sync --config ./instance/dogpdkb.toml --book funds --concurrency 3
+dogpdkb apply --config ./instance/dogpdkb.toml --book funds --input differences.json --concurrency 2
+dogpdkb sync --config ./instance/dogpdkb.toml --book funds --resume RUN --concurrency 1
+```
+
+Each document uses its own Skylark export process and request/report files. The
+main coordinator records settled results and checkpoints while other exports may
+still run. A single export failure does not stop eligible downloads; existing
+identity/version checks and same-version failure suppression remain in force.
+All downloads settle before comparison starts. Listing, comparison, OCR and
+Graphify concurrency are unchanged.
+
+A resume can use a different value without invalidating completed downloads or
+authorizing retries of suppressed failures. SIGINT/SIGTERM stops in-flight export
+process groups, starts no queued exports and preserves truthful checkpoints.
+This is a per-invocation option, not a TOML setting or a Skylark argument. Graph-only
+recovery with `--retry-graph` does not restart downloads.
 
 返回码：0 完成、无工作或停在计划；2 可用集合完成但有部分失败；1 整批失败；
 64 参数错误；130/143 中断。stdout 是结果，stderr 实时输出进度与工具诊断，

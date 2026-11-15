@@ -16,6 +16,20 @@ corpus publication. Resume checks saved inputs/witnesses and cannot repair
 deleted/changed plan inputs by downloading them again. A source change or
 intervening incompatible publication requires a fresh discovery and plan.
 
+--concurrency N limits simultaneous document exports to 1, 2 or 3 (default 2).
+Use 1 for serial downloads. Invalid values fail before run creation or tool calls.
+Each export remains an independent Skylark CLI call. The main coordinator records
+settled results and checkpoints; one export failure does not stop other eligible
+exports. Identity/version checks and same-version failure suppression still apply.
+All exports settle before comparison begins; catalog/comparison, OCR and corpus
+publication retain their stage order. This option changes neither OCR nor graph
+concurrency and is not a Skylark argument or configuration setting.
+
+Resume may use a different --concurrency without invalidating completed downloads
+or authorizing retries of suppressed failures. SIGINT/SIGTERM stops all in-flight
+export process groups and starts no queued exports, preserving settled results
+and recording unfinished attempts without inventing success.
+
 The dogpdkb-compile-1 JSON contains schema, book (key), run_id, documents and
 failures. Minimal shape (paths and witnesses must actually be produced by apply):
 

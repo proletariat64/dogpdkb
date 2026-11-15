@@ -36,6 +36,18 @@ token, so concurrent same-count edits remain a tool limitation.
 {"schema":"skylark-export-request-1","documents":[{"document_id":"123","path":"/tmp/123.md","format":"md"}]}
 ```
 
+The orchestrator's `sync` and `apply --concurrency N` schedule up to N independent
+single-document export calls at once: default 2, allowed values 1, 2 and 3 only.
+This is a dogpdkb runtime option, not a Skylark flag or TOML setting. Each call has
+its own request/report/raw destination. The main coordinator alone records
+attempts and settled outcomes, validates source identity/version and checkpoints
+successful inputs before further stages. An isolated failure does not cancel
+other eligible exports. All exports settle before comparison starts. SIGINT or
+SIGTERM stops all in-flight process groups and prevents queued dispatch. Changing
+the value on resume does not refetch completed inputs or clear failed-version
+suppression; graph-only recovery never re-enters export. Skylark transport retries
+and connection management are unchanged.
+
 Use `format: table` or `laketable` for native table export. Skylark owns MCP,
 table/record traversal, Markdown rendering, image URL rewriting and atomic raw
 output. Failed exports never publish error text as Markdown. Output starts with
