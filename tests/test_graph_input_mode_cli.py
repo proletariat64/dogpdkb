@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_orchestrator_graph_cli import ROOT, fixture
+from tests.test_graph_body_scope_cli import held_source
+from tests.test_orchestrator_graph_cli import ROOT, cli, fixture
 
 
 @pytest.mark.parametrize("command", ["sync", "update-graph"])
@@ -94,3 +95,42 @@ def test_invalid_graphify_input_mode_is_rejected_before_work(tmp_path, command):
     assert result.returncode == 64
     assert "invalid choice" in result.stderr
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("broken", [False, True])
+@pytest.mark.parametrize("retained", [False, True])
+def test_excluded_image_symlink_does_not_block_text_graph(tmp_path, broken, retained):
+    config, manifest, source = fixture(tmp_path)
+    if retained:
+        held_source(tmp_path, manifest)
+    target = tmp_path / "outside.png"
+    if not broken:
+        target.write_bytes(b"outside image")
+    image = source.parent / "assets/image.png"
+    image.parent.mkdir()
+    image.symlink_to(target)
+
+    result = cli(config, manifest)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert image.is_symlink()
+    assert target.exists() != broken
+    if not broken:
+        assert target.read_bytes() == b"outside image"
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    report = json.loads(Path(state["documents"]["42"]["graph"]["report"]).read_text())
+    assert not (Path(report["corpus"]) / "assets/image.png").is_symlink()
+    assert not (Path(report["corpus"]) / "assets/image.png").exists()
+
+
+def test_markdown_symlink_still_stops_before_external_call(tmp_path):
+    config, manifest, source = fixture(tmp_path)
+    alias = source.parent / "alias.md"
+    alias.symlink_to(source)
+
+    result = cli(config, manifest)
+
+    assert result.returncode == 1
+    assert "ordinary files and directories" in result.stderr
+    assert not (tmp_path / "calls.jsonl").exists()
+    assert alias.is_symlink()

@@ -212,17 +212,13 @@ def _retained_corpus(
     excluded = [settings.graph_for(book).resolve(), settings.staging.resolve()]
 
     def ignore(folder, names):
-        if any((Path(folder) / name).is_symlink() for name in names):
-            raise ValueError(
-                "graph corpus mirror requires ordinary files and directories"
-            )
-        return [
+        ignored = {
             name
             for name in names
             if name == ".dogpdkb.lock"
             or (
                 graphify_inputs == "text"
-                and (Path(folder) / name).is_file()
+                and not (Path(folder) / name).is_dir()
                 and Path(name).suffix.lower() != ".md"
                 and name not in {".gitignore", ".graphifyignore"}
             )
@@ -230,7 +226,12 @@ def _retained_corpus(
                 (Path(folder) / name).resolve().is_relative_to(path)
                 for path in excluded
             )
-        ]
+        }
+        if any((Path(folder) / name).is_symlink() for name in set(names) - ignored):
+            raise ValueError(
+                "graph corpus mirror requires ordinary files and directories"
+            )
+        return ignored
 
     shutil.copytree(book.corpus, mirror, ignore=ignore, symlinks=True)
     for relative in omitted_paths:
