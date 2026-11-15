@@ -144,7 +144,7 @@ if mode=='mutate': next(Path(args[0]).glob('*.md')).write_text('changed during e
     return config, manifest, source
 
 
-def cli(config, manifest, environment=None, *, retry_graph=False):
+def cli(config, manifest, environment=None, *, retry_graph=False, graphify_inputs=None):
     return subprocess.run(
         [
             sys.executable,
@@ -156,6 +156,7 @@ def cli(config, manifest, environment=None, *, retry_graph=False):
             "--input",
             str(manifest),
             *(["--retry-graph"] if retry_graph else []),
+            *(["--graphify-inputs", graphify_inputs] if graphify_inputs else []),
         ],
         env=environment or {**os.environ, "PYTHONPATH": str(ROOT / "src")},
         check=False,
@@ -173,7 +174,8 @@ def test_complete_source_calls_only_public_graphify_and_records_success(tmp_path
         json.loads(line) for line in (tmp_path / "calls.jsonl").read_text().splitlines()
     ]
     assert [row[0] for row in calls] == ["extract"]
-    assert Path(calls[0][1]) == source.parent
+    assert Path(calls[0][1]) != source.parent
+    assert (Path(calls[0][1]) / source.name).read_bytes() == source.read_bytes()
     assert "--no-cluster" in calls[0]
     state = json.loads((tmp_path / "state/funds/state.json").read_text())["documents"][
         "42"

@@ -34,8 +34,17 @@ previous failure evidence remains. Only actual success clears its graph block.
 dogpdkb update-graph --config instance/dogpdkb.toml --book funds --input manifest.json --retry-graph
 ```
 
-Compilation scans the complete book corpus in a run-owned workspace copied from
-the existing graph/manifest/cache. Frozen inputs are rechecked after extraction.
+--graphify-inputs {all,text} defaults to text. Graphify receives a run-owned
+Markdown-only (.md, case-insensitive) mirror with original scan controls. Images,
+PDF, code and other non-Markdown files are excluded from extraction, while original
+corpus resources remain unchanged. OCR text already in Markdown is retained.
+all restores the complete-tree scan, including images and other resources.
+The choice applies to this invocation, including --retry-graph. Native Graphify
+may prune existing non-Markdown graph records when switching to text; dogpdkb
+does not rewrite graph/manifest/cache records to hide that transition.
+
+Compilation uses a run-owned workspace copied from the existing graph/manifest/cache.
+Frozen inputs are rechecked after extraction.
 Only exit-zero valid graph+manifest output is published; native graph identities,
 relations, metadata and auxiliary cache are preserved. Public graph and native
 manifest remain unchanged on extraction failure. Publication interruption is
@@ -44,7 +53,8 @@ unknown evidence, not success. Already published corpus is never rolled back.
 stdout has run_id, exit_code, status and report (absolute execution-report path
 or null). The report fields are schema (dogpdkb-graph-result-1), status, exit_code
 (native child exit), argv (sanitized strings), graph (published target), candidate
-(workspace path) and reason when applicable. Its native exit_code differs from
+(workspace path), corpus (actual scan root), graphify_inputs (text or all),
+and reason when applicable. Its native exit_code differs from
 stdout orchestration exit_code: native 0 can still yield status unknown and CLI 1
 when required output validation fails. This is not a Graphify-specific result
 protocol. Native graph JSON must contain nodes and links (or edges) arrays; the

@@ -5,13 +5,22 @@ imports, custom commands or foreign merge/replacement algorithms are permitted.
 
 ## Invocation and scope
 
-`graphify extract CORPUS --out WORKSPACE --no-cluster` scans a complete Markdown
-source tree. Only `compile` manifest rows request a new graph attempt; `reuse`,
+`sync` and `update-graph` accept `--graphify-inputs {all,text}` (default `text`).
+`text` passes a run-owned mirror containing only Markdown (`.md`, case-insensitive)
+and the original `.gitignore` / `.graphifyignore` scan controls. Images, PDF,
+code and other non-Markdown files are not copied into that input tree. Original
+corpus resources remain unchanged for OCR and publication; OCR text already in
+Markdown is preserved byte for byte. `all` keeps the previous complete-tree scan,
+including resources. The choice applies per invocation, including explicit graph
+recovery; the execution report records `graphify_inputs`.
+
+`graphify extract CORPUS --out WORKSPACE --no-cluster` scans that source tree.
+Only `compile` manifest rows request a new graph attempt; `reuse`,
 `metadata`, `retain` and `defer` do not claim extraction or advance graph facts.
 An all-retained batch makes no Graphify call. A deferred row keeps the result
 partial even when all selected compilation succeeds.
 
-For a mixed batch, the orchestrator freezes a run-owned complete corpus mirror.
+For text mode or a mixed batch, the orchestrator freezes a run-owned corpus mirror.
 The mirror is a sibling of the native output workspace, never its descendant.
 Graphify 0.9.96 anchors relative manifest keys to the output parent when the
 scan root is underneath it; keeping separate siblings preserves the original
@@ -20,7 +29,8 @@ Selected sources contain current complete bytes. Unselected registered sources
 with retained graph evidence contain their previous complete graph input bytes,
 at their previous relative `source_file` location; a newly published rename is
 removed from the mirror so it does not create a duplicate source. Other source
-files and resources remain in the complete tree. The actual completed graph
+Markdown files remain in the tree; all mode also retains other files and resources.
+The actual completed graph
 step's input witness is preferred; otherwise `graph_baseline.path` and
 `graph_baseline.source_file` provide the frozen pre-publication descriptor.
 Missing required retained evidence stops the batch with
@@ -41,10 +51,14 @@ the native incremental merge. The orchestrator does not submit diff fragments,
 select graph records or reproduce cache identities.
 `update` is AST-only and is not a document compilation command.
 
-No temporary ignore/exclude rules implement selection: native Graphify prunes
-excluded graph sources. The mirror preserves the full source universe instead.
-Native zero-node recovery and resource/cache decisions can still dispatch files
-beyond the requested body candidates; candidate counts are not a guarantee of
+No temporary ignore/exclude rules implement document selection. The mirror
+preserves the full Markdown source universe. Text mode intentionally omits
+non-Markdown sources: Graphify may natively prune their existing graph records
+when the mode changes from all to text. No graph/manifest/cache records are
+rewritten by the orchestrator to hide that transition, and publication still
+requires native extraction success. Choose all to retain the prior source scope.
+Native zero-node recovery can still dispatch Markdown beyond the requested body
+candidates; all mode also allows resource/cache work. Candidate counts do not bound
 model-call counts. Frozen previous bodies prevent the latest uncertain held
 body from being submitted as an implicit full-document fallback. Native baseline
 and ownership semantics remain authoritative; no hash or manifest is fabricated.

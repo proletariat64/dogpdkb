@@ -24,6 +24,7 @@ def sync_run(
     retry_graph=False,
     replan=False,
     concurrency=2,
+    graphify_inputs="text",
 ):
     from dogpdkb.discover import discover
 
@@ -67,6 +68,7 @@ def sync_run(
         run,
         manifest=Path(result["manifest"]),
         retry_graph=retry_graph,
+        graphify_inputs=graphify_inputs,
     )
     if graph_code in {130, 143}:
         record_interruption(store, run, graph_code)
@@ -123,6 +125,7 @@ def main(argv=None):
                     retry_graph=args.retry_graph,
                     replan=args.replan,
                     concurrency=args.concurrency,
+                    graphify_inputs=args.graphify_inputs,
                 )
             except InterruptedError as error:
                 record_interruption(store, run, error.args[0])

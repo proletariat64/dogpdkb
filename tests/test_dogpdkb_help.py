@@ -51,6 +51,16 @@ def test_sync_full_help_is_a_local_execution_contract(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
+@pytest.mark.parametrize("command", ["sync", "update-graph"])
+def test_graphify_input_mode_is_documented_locally(tmp_path, command):
+    result = invoke(tmp_path, command, "--help", "--full")
+    assert result.returncode == 0, result.stderr
+    assert "--graphify-inputs {all,text}" in result.stdout
+    assert "Markdown" in result.stdout
+    assert "default" in result.stdout
+    assert not list(tmp_path.iterdir())
+
+
 COMMANDS = (
     "",
     "discover",

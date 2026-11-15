@@ -150,7 +150,9 @@ def _unowned_deferred_sources(settings, book, store, data):
     }
 
 
-def _retained_corpus(settings, book, store, run, data, pending, workspace, omitted):
+def _retained_corpus(
+    settings, book, store, run, data, pending, workspace, omitted, graphify_inputs
+):
     """Freeze previous full graph bodies without excluding their native sources."""
     selected = {row["document_id"] for row in pending}
     rows = {row["document_id"]: row for row in data["documents"]}
@@ -190,11 +192,16 @@ def _retained_corpus(settings, book, store, run, data, pending, workspace, omitt
         relative = Path(source_file)
         if relative.is_absolute() or ".." in relative.parts or relative == Path("."):
             raise ValueError("retained graph source must have a relative corpus path")
+        if graphify_inputs == "text" and relative.suffix.lower() != ".md":
+            raise ValueError("text Graphify inputs require Markdown retained sources")
         retained.append((current.relative_to(book.corpus), relative, Path(witness)))
-    if not retained and not omitted_paths:
+    if graphify_inputs == "all" and not retained and not omitted_paths:
         return book.corpus, []
 
-    native_manifest = read_json(settings.graph_for(book) / "manifest.json")
+    native_manifest_path = settings.graph_for(book) / "manifest.json"
+    native_manifest = (
+        read_json(native_manifest_path) if native_manifest_path.is_file() else {}
+    )
     if any(Path(key).is_absolute() for key in native_manifest):
         run.failure(step="graph", reason="GRAPHIFY_PORTABLE_BASELINE_REQUIRED")
         return None, []
@@ -213,6 +220,12 @@ def _retained_corpus(settings, book, store, run, data, pending, workspace, omitt
             name
             for name in names
             if name == ".dogpdkb.lock"
+            or (
+                graphify_inputs == "text"
+                and (Path(folder) / name).is_file()
+                and Path(name).suffix.lower() != ".md"
+                and name not in {".gitignore", ".graphifyignore"}
+            )
             or any(
                 (Path(folder) / name).resolve().is_relative_to(path)
                 for path in excluded
@@ -249,12 +262,27 @@ def _retained_corpus(settings, book, store, run, data, pending, workspace, omitt
     return mirror, witnesses
 
 
-def run_graph(settings, book, store, run, manifest=None, *, retry_graph=False) -> int:
+def run_graph(
+    settings,
+    book,
+    store,
+    run,
+    manifest=None,
+    *,
+    retry_graph=False,
+    graphify_inputs="text",
+) -> int:
     """Run native directory extraction; publish only a complete batch."""
+    if graphify_inputs not in {"all", "text"}:
+        raise ValueError("graphify inputs must be 'all' or 'text'")
     manifest = manifest or run.data["artifacts"].get("manifest")
     if not manifest:
         raise ValueError("a complete-source compile manifest is required")
     data = _manifest(settings, book, store, run, manifest)
+    if graphify_inputs == "text" and any(
+        Path(row["path"]).suffix.lower() != ".md" for row in data["documents"]
+    ):
+        raise ValueError("text Graphify inputs require Markdown (.md) sources")
     partial = bool(data.get("failures")) or any(
         row["action"] == "defer" for row in data["documents"]
     )
@@ -341,7 +369,7 @@ def run_graph(settings, book, store, run, manifest=None, *, retry_graph=False) -
     if graph_dir.exists():
         shutil.copytree(graph_dir, candidate)
     corpus, witnesses = _retained_corpus(
-        settings, book, store, run, data, pending, workspace, omitted
+        settings, book, store, run, data, pending, workspace, omitted, graphify_inputs
     )
     if corpus is None:
         return 2
@@ -420,6 +448,7 @@ def run_graph(settings, book, store, run, manifest=None, *, retry_graph=False) -
             "graph": str(graph_path),
             "candidate": str(candidate),
             "corpus": str(corpus),
+            "graphify_inputs": graphify_inputs,
             "omitted_deferred_sources": sorted(omitted),
             "reason": reason,
         },
@@ -517,6 +546,7 @@ def main(argv=None) -> int:
     parser.add_argument("--config", type=Path)
     parser.add_argument("--book")
     parser.add_argument("--retry-graph", action="store_true")
+    parser.add_argument("--graphify-inputs", choices=["all", "text"], default="text")
     parser.add_argument(
         "-i",
         "--input",
@@ -543,7 +573,13 @@ def main(argv=None) -> int:
             run.data.update(status="running", pid=os.getpid(), ended_at=None)
             run.save()
             code = run_graph(
-                settings, book, store, run, manifest, retry_graph=args.retry_graph
+                settings,
+                book,
+                store,
+                run,
+                manifest,
+                retry_graph=args.retry_graph,
+                graphify_inputs=args.graphify_inputs,
             )
             run.finish(
                 "interrupted"
