@@ -133,3 +133,122 @@ def run_command(
             if child.poll() is None:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
+
+
+def run_commands(commands, *, concurrency, log=None, env=None):
+    """Yield settled (index, exit code) pairs; coordinate children on one thread.
+
+    The command iterator may checkpoint an attempt before yielding its argv.
+    Close this iterator when abandoning its results to stop every active group.
+    """
+    if concurrency not in {1, 2, 3}:
+        raise ValueError("download concurrency must be between 1 and 3")
+    if log is not None:
+        log = Path(log)
+        log.parent.mkdir(parents=True, exist_ok=True)
+    active, previous = {}, {}
+    received, terminating = 0, None
+
+    def stop(signum, _frame):
+        nonlocal received, terminating
+        received = received or signum
+        terminating = terminating or time.monotonic()
+        for job in active.values():
+            job["interrupted"] = job["interrupted"] or job["child"].poll() is None
+            try:
+                os.killpg(job["child"].pid, signum)
+            except ProcessLookupError:
+                pass
+
+    with (
+        log.open("a", encoding="utf-8") if log else nullcontext(None) as stream,
+        selectors.DefaultSelector() as selector,
+    ):
+        try:
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                previous[signum] = signal.signal(signum, stop)
+            pending = enumerate(commands)
+            exhausted = False
+            while active or not exhausted:
+                while not received and not exhausted and len(active) < concurrency:
+                    try:
+                        index, argv = next(pending)
+                    except StopIteration:
+                        exhausted = True
+                        break
+                    if received:
+                        break
+                    if not argv or any(not isinstance(arg, str) for arg in argv):
+                        raise ValueError("command must be a nonempty argv list")
+                    if stream:
+                        stream.write(f"command: {shlex.join(diagnostic_argv(argv))}\n")
+                        stream.flush()
+                    try:
+                        child = subprocess.Popen(
+                            argv,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            start_new_session=True,
+                            pass_fds=lock_fds() + runtime_lock_fds(),
+                            env={**os.environ, **(env or {})},
+                        )
+                    except OSError as error:
+                        message = f"cannot start {argv[0]}: {error}\n"
+                        sys.stderr.write(message)
+                        if stream:
+                            stream.write(message)
+                            stream.flush()
+                        yield index, 127
+                        continue
+                    active[index] = {
+                        "child": child,
+                        "decoder": codecs.getincrementaldecoder("utf-8")("replace"),
+                        "interrupted": False,
+                    }
+                    selector.register(child.stdout, selectors.EVENT_READ, index)
+                    if received:
+                        stop(received, None)
+                if received:
+                    exhausted = True
+                if terminating is not None and time.monotonic() - terminating >= 2:
+                    for job in active.values():
+                        try:
+                            os.killpg(job["child"].pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                for key, _ in selector.select(0.1) if active else []:
+                    job = active[key.data]
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                    text = job["decoder"].decode(chunk, final=not chunk)
+                    sys.stderr.write(text)
+                    sys.stderr.flush()
+                    if stream:
+                        stream.write(text)
+                        stream.flush()
+                for index, job in list(active.items()):
+                    child = job["child"]
+                    if (
+                        child.poll() is None
+                        or child.stdout.fileno() in selector.get_map()
+                    ):
+                        continue
+                    code = child.wait()
+                    child.stdout.close()
+                    del active[index]
+                    if not job["interrupted"]:
+                        yield index, 128 - code if code < 0 else code
+            if received:
+                raise InterruptedError(128 + received)
+        finally:
+            for job in active.values():
+                child = job["child"]
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
+                child.stdout.close()
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)

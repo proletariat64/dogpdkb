@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import time
+from contextlib import closing
 from pathlib import Path
 
 from dogpdkb.help import HelpParser
@@ -21,7 +22,7 @@ from dogpdkb.planning import (
     validate_inputs,
     validate_plan,
 )
-from dogpdkb.processes import diagnostic_argv, run_command
+from dogpdkb.processes import diagnostic_argv, run_command, run_commands
 from dogpdkb.records import Run, Store, atomic_json, read_json, version_key
 from dogpdkb.settings import load_config, select_book
 
@@ -57,7 +58,7 @@ def failure(run, row, step, reason, *, persist=True, **details):
     )
 
 
-def prepare_inputs(settings, book, store, run, differences):
+def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
     if (
         differences.get("schema") != "dogpdkb-differences-1"
         or differences.get("book", {}).get("key") != book.key
@@ -171,82 +172,132 @@ def prepare_inputs(settings, book, store, run, differences):
         kept = {row["document_id"] for row in rows} - {
             item["document_id"] for item in requests
         }
-        for index, item in enumerate(requests):
-            row = by_id[item["document_id"]]
-            request = run.directory / f"export-{row['slot']}-request.json"
-            report = run.directory / f"export-{row['slot']}-report.json"
-            atomic_json(
-                request, {"schema": "skylark-export-request-1", "documents": [item]}
-            )
-            store.attempt(
-                row["document_id"],
-                "export",
-                row["version"],
-                run.id,
-                input=str(request),
-                report=str(report),
-            )
-            code = call_tool(
-                settings,
-                run,
-                "skylark",
-                ["export", "--request", request, "--output", report],
-            )
-            result = {}
-            try:
-                payload = read_json(report)
-                if payload.get("schema") != "skylark-export-result-1" or code not in {
-                    0,
-                    2,
-                }:
-                    raise ValueError("unreliable export report")
-                results = payload["documents"]
-                if (
-                    len(results) != 1
-                    or str(results[0]["document_id"]) != row["document_id"]
-                ):
-                    raise ValueError("export source mismatch")
-                result = results[0]
-            except (ValueError, KeyError, TypeError):
-                pass
-            valid = (
-                result.get("status") == "completed" and Path(row["raw_path"]).is_file()
-            )
-            try:
-                valid = valid and same_version(result.get("version"), row["version"])
-            except ValueError:
-                valid = False
-            status = "completed" if valid else "failed" if result else "unknown"
-            if valid:
-                store.document(row["document_id"])["raw"] = {
-                    "version": row["version"],
-                    "path": row["raw_path"],
-                    "metadata": descriptor(book, row, row["raw_path"])["metadata"],
-                }
-            store.complete(
-                row["document_id"],
-                "export",
-                row["version"],
-                status,
-                run.id,
-                report=str(report),
-                exit_code=code,
-                path=row["raw_path"],
-            )
-            if valid:
-                freeze_input(row)
-                kept.add(row["document_id"])
-            else:
-                failure(
-                    run,
-                    row,
+
+        def commands():
+            for item in requests:
+                row = by_id[item["document_id"]]
+                request = run.directory / f"export-{row['slot']}-request.json"
+                report = run.directory / f"export-{row['slot']}-report.json"
+                atomic_json(
+                    request, {"schema": "skylark-export-request-1", "documents": [item]}
+                )
+                store.attempt(
+                    row["document_id"],
                     "export",
-                    "EXPORT_FAILED_OR_VERSION_MISMATCH",
-                    exit_code=code,
+                    row["version"],
+                    run.id,
+                    input=str(request),
                     report=str(report),
                 )
-            if code not in {0, 2}:
-                raise ValueError(f"Skylark export unavailable ({code}); see {report}")
+                argv = settings.command("skylark") + [
+                    "export",
+                    "--request",
+                    str(request),
+                    "--output",
+                    str(report),
+                ]
+                run.data["tool"] = {"name": "skylark", "argv": diagnostic_argv(argv)}
+                run.save()
+                yield argv
+
+        unavailable = []
+        try:
+            with closing(
+                run_commands(
+                    commands(),
+                    concurrency=concurrency,
+                    log=run.directory / "skylark.log",
+                    env=settings.skylark_environment(),
+                )
+            ) as outcomes:
+                for index, code in outcomes:
+                    row = by_id[requests[index]["document_id"]]
+                    report = run.directory / f"export-{row['slot']}-report.json"
+                    argv = settings.command("skylark") + [
+                        "export",
+                        "--request",
+                        str(run.directory / f"export-{row['slot']}-request.json"),
+                        "--output",
+                        str(report),
+                    ]
+                    run.data["tool"] = {
+                        "name": "skylark",
+                        "argv": diagnostic_argv(argv),
+                    }
+                    if code in {130, 143}:
+                        raise InterruptedError(code)
+                    result = {}
+                    try:
+                        payload = read_json(report)
+                        if payload.get(
+                            "schema"
+                        ) != "skylark-export-result-1" or code not in {
+                            0,
+                            2,
+                        }:
+                            raise ValueError("unreliable export report")
+                        documents = payload["documents"]
+                        if (
+                            len(documents) != 1
+                            or str(documents[0]["document_id"]) != row["document_id"]
+                        ):
+                            raise ValueError("export source mismatch")
+                        result = documents[0]
+                    except (OSError, ValueError, KeyError, TypeError):
+                        pass
+                    valid = (
+                        result.get("status") == "completed"
+                        and Path(row["raw_path"]).is_file()
+                    )
+                    try:
+                        valid = valid and same_version(
+                            result.get("version"), row["version"]
+                        )
+                    except ValueError:
+                        valid = False
+                    status = "completed" if valid else "failed" if result else "unknown"
+                    if valid:
+                        store.document(row["document_id"])["raw"] = {
+                            "version": row["version"],
+                            "path": row["raw_path"],
+                            "metadata": descriptor(book, row, row["raw_path"])[
+                                "metadata"
+                            ],
+                        }
+                    store.complete(
+                        row["document_id"],
+                        "export",
+                        row["version"],
+                        status,
+                        run.id,
+                        report=str(report),
+                        exit_code=code,
+                        path=row["raw_path"],
+                    )
+                    if valid:
+                        freeze_input(row)
+                        kept.add(row["document_id"])
+                    else:
+                        failure(
+                            run,
+                            row,
+                            "export",
+                            "EXPORT_FAILED_OR_VERSION_MISMATCH",
+                            exit_code=code,
+                            report=str(report),
+                        )
+                    if code not in {0, 2}:
+                        unavailable.append((code, report))
+        except InterruptedError:
+            raise
+        except Exception:
+            record_interruption(
+                store, run, 1, reason="EXPORT_BATCH_ABORTED", finish=False
+            )
+            raise
+        if unavailable:
+            code, report = unavailable[0]
+            raise ValueError(f"Skylark export unavailable ({code}); see {report}")
         catalog_failed_exports(settings, book, run, by_id)
         rows = [row for row in rows if row["document_id"] in kept]
     return rows
@@ -849,7 +900,15 @@ def publish_corpus(book, store, run, plan, publication):
 
 
 def apply_run(
-    settings, book, store, run, differences=None, *, stop_after=None, resume=False
+    settings,
+    book,
+    store,
+    run,
+    differences=None,
+    *,
+    stop_after=None,
+    resume=False,
+    concurrency=2,
 ):
     if resume and not run.data.get("artifacts", {}).get("plan"):
         frozen = run.data.get("artifacts", {}).get("differences")
@@ -880,7 +939,9 @@ def apply_run(
     else:
         if isinstance(differences, (str, Path)):
             differences = read_json(Path(differences))
-        rows = prepare_inputs(settings, book, store, run, differences)
+        rows = prepare_inputs(
+            settings, book, store, run, differences, concurrency=concurrency
+        )
         knowledge, comparison = compare_inputs(settings, book, store, run, rows)
         run.stage("plan", total=len(rows))
         plan = make_plan(book, run, rows, knowledge, comparison)
@@ -1012,7 +1073,7 @@ def replan_published(settings, book, store, run):
     return target
 
 
-def record_interruption(store, run, code):
+def record_interruption(store, run, code, *, reason="CALL_INTERRUPTED", finish=True):
     outcomes = []
     for identifier, document in store.data["documents"].items():
         for step, record in list(document.get("steps", {}).items()):
@@ -1037,19 +1098,21 @@ def record_interruption(store, run, code):
                         "document_id": identifier,
                         "version": record["version"],
                         "step": step,
-                        "reason": "CALL_INTERRUPTED",
+                        "reason": reason,
                         "exit_code": code,
                         **details,
                     }
                 )
     store.complete_batch(outcomes)
-    run.finish("interrupted", code)
+    if finish:
+        run.finish("interrupted", code)
 
 
 def parser_for(command="apply"):
     parser = HelpParser(prog=f"dogpdkb {command}")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--book")
+    parser.add_argument("--concurrency", type=int, choices=[1, 2, 3], default=2)
     selection = parser.add_mutually_exclusive_group(required=command == "apply")
     if command == "apply":
         selection.add_argument("--input", type=Path)
@@ -1095,6 +1158,7 @@ def main(argv=None):
                     args.input,
                     stop_after=args.stop_after,
                     resume=bool(args.resume),
+                    concurrency=args.concurrency,
                 )
             except InterruptedError as error:
                 record_interruption(store, run, error.args[0])

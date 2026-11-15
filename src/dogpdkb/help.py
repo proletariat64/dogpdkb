@@ -22,6 +22,7 @@ SUMMARIES = {
 }
 
 ARGUMENTS = {
+    "concurrency": "maximum simultaneous Skylark document exports: 1–3; default: 2; download stage only; may change when resuming",
     "config": "TOML instance file: explicit option > DOGPDKB_CONFIG > source default.toml or installed cwd/dogpdkb.toml",
     "book": "enabled source key in books.json (not its display name); optional only when exactly one source matches",
     "listing": "offline skylark-listing-1 JSON file; omitted: call configured Skylark listing; CLI paths use cwd",

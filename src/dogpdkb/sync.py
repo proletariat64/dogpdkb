@@ -23,6 +23,7 @@ def sync_run(
     resume=False,
     retry_graph=False,
     replan=False,
+    concurrency=2,
 ):
     from dogpdkb.discover import discover
 
@@ -51,6 +52,7 @@ def sync_run(
             differences,
             stop_after=stop_after,
             resume=resume,
+            concurrency=concurrency,
         )
     if result["paused"]:
         return result
@@ -120,6 +122,7 @@ def main(argv=None):
                     resume=bool(args.resume),
                     retry_graph=args.retry_graph,
                     replan=args.replan,
+                    concurrency=args.concurrency,
                 )
             except InterruptedError as error:
                 record_interruption(store, run, error.args[0])
