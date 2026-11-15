@@ -140,6 +140,12 @@ skylark = ["node", "/opt/pi-skylark/dist/cli.mjs"]
 - [Graphify 原版 CLI](docs/orchestrator-graphify-contract.md)：目录级增量、原生 manifest/cache 和整批发布。
 - [Skylark listing/export](docs/orchestrator-skylark-contract.md)：已恢复的独立 CLI 与构建方法。
 
+`sync` and `update-graph` default to `--graphify-inputs text`: only Markdown
+(`.md`, case-insensitive) is passed to Graphify. OCR text remains in Markdown;
+images and other resources remain in the corpus without being sent for extraction.
+Use `--graphify-inputs all` for the previous complete-tree scan. Switching to text
+can natively remove non-Markdown sources from the graph; source files are retained.
+
 Graphify 直接使用未修改的已发布 CLI；已有图缺少其原生 manifest 时停止，
 不自动回填历史。Skylark 使用已恢复的独立 CLI，配置它的真实可执行路径。
 

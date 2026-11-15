@@ -46,6 +46,26 @@ Bootstrap also runs on `RETRY=1`, so pulling a version bump cannot leave the
 development environment reporting the previous `dogpdkb`/`mdocr` version during
 checks. It reuses the existing environment and retains extra installed packages.
 
+### Reuse checks performed in CI
+
+To keep full checks in CI, wait for the merged `master` push's CI workflow to
+finish successfully, then pass its GitHub Actions run ID:
+
+```bash
+make release TARGET=antcode CI_RUN_ID=123456789
+```
+
+The release command verifies the run belongs to this repository, the standard
+`.github/workflows/ci.yml` workflow, a `master` push, and the exact freshly fetched
+HEAD. The run and its `check` job must both have completed successfully. PR merge
+refs, another commit, pending/failed/skipped jobs and other workflows are refused
+before building or tagging. No unverified skip-checks option is provided.
+
+After verification, release runs `make bootstrap` and `make build`, then the same
+tag/publication/homepage steps. It does not rerun local `make check` or `make smoke`.
+Omitting `CI_RUN_ID` retains the existing local gates. The Python entry point also
+accepts `--ci-run-id ID`; retries can reuse that same successful exact-commit run.
+
 ## Choose the release target
 
 ```bash

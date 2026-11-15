@@ -23,6 +23,15 @@ groups, starts no queued exports and preserves truthful checkpoints. The option
 is per invocation, not a TOML setting or a Skylark argument. --retry-graph skips
 downloads entirely, regardless of --concurrency.
 
+Graphify inputs
+--graphify-inputs {all,text} defaults to text: Graphify scans a run-owned mirror
+containing only Markdown (.md, case-insensitive). OCR text in Markdown is kept;
+images and other non-Markdown files stay in the public corpus but are not sent
+for extraction. Existing scan controls are preserved. all restores the previous
+complete-tree scan, including images and other resources. The option also applies
+to --resume RUN --retry-graph. Native Graphify may prune old non-Markdown graph
+records when switching to text; graph/cache artifacts are not manually rewritten.
+
 ```text
 dogpdkb sync --config instance/dogpdkb.toml --book funds --stop-after plan --concurrency 3
 dogpdkb status --config instance/dogpdkb.toml --book funds --run RUN --json

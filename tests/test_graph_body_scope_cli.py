@@ -52,8 +52,9 @@ def held_source(tmp_path, manifest, action="retain", *, witness=True, renamed=Fa
 
 @pytest.mark.parametrize("action", ["retain", "defer", "reuse"])
 @pytest.mark.parametrize("renamed", [False, True])
+@pytest.mark.parametrize("graphify_inputs", ["all", "text"])
 def test_native_scan_uses_prior_held_body_and_keeps_held_graph_truth(
-    tmp_path, action, renamed
+    tmp_path, action, renamed, graphify_inputs
 ):
     config, manifest, selected = fixture(tmp_path)
     source, old_graph = held_source(tmp_path, manifest, action, renamed=renamed)
@@ -69,7 +70,7 @@ def test_native_scan_uses_prior_held_body_and_keeps_held_graph_truth(
         "assert not root.is_relative_to(out.parent), 'native manifest anchor would change'\n"
         "assert (root/'Held.md').read_text()=='# Old held source\\nKnown historical wording.\\n'\n"
         "assert not (root/'Renamed.md').exists()\n"
-        "assert (root/'assets/image.png').read_bytes()==b'retained resource'\n"
+        f"assert (root/'assets/image.png').exists()=={graphify_inputs == 'all'}\n"
         f"assert (root/{selected.name!r}).read_text().startswith('# Complete current')\n"
         "assert json.loads((out/'manifest.json').read_text())=={'native':'unchanged'}\n"
         "graph=json.loads((out/'graph.json').read_text())\n"
@@ -78,13 +79,14 @@ def test_native_scan_uses_prior_held_body_and_keeps_held_graph_truth(
         "(base/'scope-checked').touch()\n"
     )
 
-    result = cli(config, manifest)
+    result = cli(config, manifest, graphify_inputs=graphify_inputs)
 
     assert result.returncode == (2 if action == "defer" else 0), (
         result.stdout + result.stderr
     )
     assert (tmp_path / "scope-checked").exists()
     assert source.read_text().startswith("# New held source")
+    assert image.read_bytes() == b"retained resource"
     state = json.loads((tmp_path / "state/funds/state.json").read_text())["documents"]
     assert state["held"]["graph"] == old_graph
     assert not state["held"]["steps"]

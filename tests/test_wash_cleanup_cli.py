@@ -148,12 +148,13 @@ def test_failed_graph_keeps_input_and_report_without_candidate_graph(tmp_path):
             str(tool),
             "graphify",
             "extract",
-            str(tmp_path / "corpus"),
+            report["corpus"],
             "--out",
             str(Path(failure["report"]).parent),
             "--no-cluster",
         ]
         assert failure["argv"] == expected
+        assert report["graphify_inputs"] == "text"
         assert report["argv"] == expected
     assert not list(run.parent.glob("graphify-*/graphify-out"))
 

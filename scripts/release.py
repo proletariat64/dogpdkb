@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -82,6 +83,47 @@ def remote_tag(root: Path, tag: str) -> str | None:
     return refs.get(f"refs/tags/{tag}^{{}}") or refs.get(f"refs/tags/{tag}")
 
 
+def verify_ci(root: Path, commit: str, run_id: str) -> None:
+    """Require successful trusted master CI for this exact release commit."""
+    if not re.fullmatch(r"[1-9][0-9]*", run_id):
+        raise ValueError("CI_RUN_ID must be a positive GitHub Actions run ID")
+    endpoint = f"repos/proletariat64/dogpdkb/actions/runs/{run_id}"
+    result = json.loads(run(["gh", "api", endpoint], root))
+    expected = {
+        "head_sha": commit,
+        "head_branch": "master",
+        "event": "push",
+        "path": ".github/workflows/ci.yml",
+        "status": "completed",
+        "conclusion": "success",
+    }
+    if (
+        not isinstance(result, dict)
+        or any(result.get(key) != value for key, value in expected.items())
+        or not isinstance(result.get("repository"), dict)
+        or not isinstance(result.get("head_repository"), dict)
+        or result.get("repository", {}).get("full_name") != "proletariat64/dogpdkb"
+        or result.get("head_repository", {}).get("full_name") != "proletariat64/dogpdkb"
+    ):
+        raise ValueError(
+            "CI_RUN_ID must identify successful trusted master CI for HEAD"
+        )
+    jobs = json.loads(run(["gh", "api", endpoint + "/jobs?per_page=100"], root))
+    if (
+        not isinstance(jobs, dict)
+        or not isinstance(jobs.get("jobs"), list)
+        or not any(
+            isinstance(job, dict)
+            and job.get("name") == "check"
+            and job.get("status") == "completed"
+            and job.get("conclusion") == "success"
+            for job in jobs.get("jobs", [])
+        )
+    ):
+        raise ValueError("CI_RUN_ID has no successful check job")
+    print(f"release: verified CI run {run_id} for {commit}", flush=True)
+
+
 def release(
     root: Path = ROOT,
     *,
@@ -89,6 +131,7 @@ def release(
     dry_run: bool = False,
     retry: bool = False,
     provider: str = "antcode",
+    ci_run_id: str | None = None,
 ) -> str:
     if provider not in {"antcode", "github"}:
         raise ValueError("target must be antcode or github")
@@ -116,7 +159,12 @@ def release(
         )
         print(
             f"Current merged version: {version}. Plan: fetch origin/master; verify HEAD; "
-            "make bootstrap; make check; make smoke; create/push GitHub tag only; publish locally"
+            + (
+                f"verify CI run {ci_run_id} for HEAD; make bootstrap; make build; "
+                if ci_run_id is not None
+                else "make bootstrap; make check; make smoke; "
+            )
+            + "create/push GitHub tag only; publish locally"
             + ("; update homepage." if provider == "antcode" else ".")
         )
         return tag
@@ -148,11 +196,16 @@ def release(
         raise ValueError("remote tag points elsewhere; refusing to replace it")
     if not retry and (local or existing):
         raise ValueError(f"{tag} already exists; use make release RETRY=1")
+    if ci_run_id is not None:
+        verify_ci(root, commit, ci_run_id)
     # Pulling a version bump leaves editable-install metadata at the old version.
     # Refresh it before test collection imports and caches CLI version strings.
     run(["make", "bootstrap"], root)
-    run(["make", "check"], root)
-    run(["make", "smoke"], root)
+    if ci_run_id is None:
+        run(["make", "check"], root)
+        run(["make", "smoke"], root)
+    else:
+        run(["make", "build"], root)
     if run(["git", "status", "--porcelain"], root):
         raise ValueError("working tree changed during checks; refusing publication")
     if not local:
@@ -202,6 +255,11 @@ def main() -> int:
         help="retry the current version's local build, tag push and publication",
     )
     parser.add_argument("--target", choices=["antcode", "github"], default="antcode")
+    parser.add_argument(
+        "--ci-run-id",
+        default=os.environ.get("CI_RUN_ID") or None,
+        help="reuse successful master CI for exact HEAD; build locally without rerunning check/smoke",
+    )
     args = parser.parse_args()
     try:
         release(
@@ -209,6 +267,7 @@ def main() -> int:
             dry_run=args.dry_run,
             retry=args.retry,
             provider=args.target,
+            ci_run_id=args.ci_run_id,
         )
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
         print(f"release: FAIL: {error}")
