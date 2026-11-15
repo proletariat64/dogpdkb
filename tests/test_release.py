@@ -1,5 +1,6 @@
 """Exercise GitHub-only source tagging against disposable Git repositories."""
 
+import json
 import subprocess
 
 import pytest
@@ -30,7 +31,7 @@ def repository(tmp_path, monkeypatch, commands):
     (root / "pyproject.toml").write_text('[project]\nversion = "0.1.0"\n')
     (root / "uv.lock").write_text("version = 1\n")
     (root / "Makefile").write_text(
-        "bootstrap:\n\t@true\ncheck:\n\t@true\nsmoke:\n\t@true\npublish-release:\n\t@true\n"
+        "bootstrap:\n\t@true\ncheck:\n\t@true\nsmoke:\n\t@true\nbuild:\n\t@true\npublish-release:\n\t@true\n"
         "publish-site-release:\n\t@true\n"
     )
     git(root, "add", ".")
@@ -226,3 +227,102 @@ def test_github_target_skips_antcode_homepage(repository, commands):
     commands.clear()
     assert tool.release(repository[0], provider="github", retry=True) == "v0.1.0"
     assert not any("push" in args for args in commands)
+
+
+@pytest.fixture
+def ci_run(repository, monkeypatch, commands):
+    root, _, original = repository
+    result = {
+        "head_sha": git(root, "rev-parse", "HEAD"),
+        "head_branch": "master",
+        "event": "push",
+        "path": ".github/workflows/ci.yml",
+        "status": "completed",
+        "conclusion": "success",
+        "repository": {"full_name": "proletariat64/dogpdkb"},
+        "head_repository": {"full_name": "proletariat64/dogpdkb"},
+    }
+    jobs = {"jobs": [{"name": "check", "status": "completed", "conclusion": "success"}]}
+
+    def run(arguments, directory):
+        if arguments[:2] == ["gh", "api"]:
+            commands.append(arguments)
+            return json.dumps(jobs if "/jobs?" in arguments[2] else result)
+        return original(arguments, directory)
+
+    monkeypatch.setattr(tool, "run", run)
+    return result, jobs
+
+
+def test_ci_release_builds_without_repeating_local_gates(repository, ci_run, commands):
+    root, remote, _ = repository
+    assert tool.release(root, ci_run_id="42") == "v0.1.0"
+    assert git(remote, "rev-parse", "v0.1.0^{commit}") == ci_run[0]["head_sha"]
+    assert ["make", "bootstrap"] in commands
+    assert ["make", "build"] in commands
+    assert ["make", "check"] not in commands
+    assert ["make", "smoke"] not in commands
+    verification = next(
+        i for i, args in enumerate(commands) if args[:2] == ["gh", "api"]
+    )
+    assert verification < commands.index(["make", "bootstrap"])
+    assert commands.index(["make", "build"]) < next(
+        i for i, args in enumerate(commands) if args[:3] == ["git", "tag", "-a"]
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("head_sha", "0" * 40),
+        ("head_branch", "feature"),
+        ("event", "pull_request"),
+        ("path", ".github/workflows/other.yml"),
+        ("status", "in_progress"),
+        ("conclusion", "failure"),
+        ("repository", {"full_name": "other/repo"}),
+        ("head_repository", {"full_name": "other/repo"}),
+        ("head_repository", None),
+    ],
+)
+def test_ci_release_rejects_untrusted_or_stale_evidence(
+    repository, ci_run, commands, field, value
+):
+    ci_run[0][field] = value
+    root, remote, _ = repository
+    with pytest.raises(ValueError, match="successful trusted master CI"):
+        tool.release(root, ci_run_id="42")
+    assert not any(args[0] == "make" or "push" in args for args in commands)
+    assert git(root, "tag", "--list") == git(remote, "tag", "--list") == ""
+
+
+@pytest.mark.parametrize(
+    "jobs", [None, [], [{"name": "check", "conclusion": "skipped"}]]
+)
+def test_ci_release_requires_the_quality_job(repository, ci_run, commands, jobs):
+    ci_run[1]["jobs"] = jobs
+    with pytest.raises(ValueError, match="no successful check job"):
+        tool.release(repository[0], ci_run_id="42")
+    assert not any(args[0] == "make" or "push" in args for args in commands)
+
+
+@pytest.mark.parametrize("run_id", ["0", "-1", "42/other", "", "abc"])
+def test_ci_release_rejects_invalid_run_id(repository, ci_run, commands, run_id):
+    with pytest.raises(ValueError, match="positive GitHub Actions run ID"):
+        tool.release(repository[0], ci_run_id=run_id)
+    assert not any(args[0] in {"make", "gh"} or "push" in args for args in commands)
+
+
+def test_ci_release_build_failure_prevents_tag(repository, ci_run, monkeypatch):
+    root, remote, _ = repository
+    original = tool.run
+
+    def run(args, directory):
+        if args == ["make", "build"]:
+            raise RuntimeError("build failed")
+        return original(args, directory)
+
+    monkeypatch.setattr(tool, "run", run)
+    with pytest.raises(RuntimeError, match="build failed"):
+        tool.release(root, ci_run_id="42")
+    assert git(root, "tag", "--list") == git(remote, "tag", "--list") == ""

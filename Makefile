@@ -24,7 +24,7 @@ doctor:
 	$(DEV_PYTHON) -m dogpdkb doctor $(DOCTOR_ARGS)
 
 release:
-	VERSION="$(VERSION)" DRY_RUN="$(DRY_RUN)" RETRY="$(RETRY)" \
+	VERSION="$(VERSION)" DRY_RUN="$(DRY_RUN)" RETRY="$(RETRY)" CI_RUN_ID="$(CI_RUN_ID)" \
 		$(DEV_PYTHON) scripts/release.py --target "$(TARGET)"
 
 publish-release:
