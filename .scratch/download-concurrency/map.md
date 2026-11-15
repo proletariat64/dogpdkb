@@ -13,3 +13,7 @@ Whole-batch stages and public CLI boundary remain. Main coordinator owns durable
 ## Fog
 
 None in the product contract. Implementation must account for main-thread signal ownership and existing child lock inheritance.
+
+## Acceptance
+
+Tickets 01–03 are resolved. PR #27 implementation head 87a7231 passed both ordinary CI jobs and first-round Greptile 5/5 with no findings. Twenty-one new public CLI regressions, related focused checks, Ruff and the 156-document guard passed. Release/deployment and modifying existing production jobs are outside this feature delivery.
