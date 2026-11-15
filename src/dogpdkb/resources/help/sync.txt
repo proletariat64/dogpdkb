@@ -1,4 +1,4 @@
-# Serial sync contract
+# Whole-batch sync contract
 
 sync needs no manifest argument: it validates the complete source listing and
 executes whole-batch discovery, downloads, comparison, fixed planning, OCR,
@@ -8,8 +8,23 @@ source, subscription, corpus and graph targets must still match. --stop-after
 plan pauses after complete raw inputs/comparisons and the fixed plan, before
 OCR, corpus and graph writes. Remove that option on resume to continue.
 
+--concurrency N applies only to document exports. It accepts 1, 2 or 3, defaults
+to 2 and never permits more than 3 in-flight exports; 1 selects serial downloads.
+Invalid values fail before run creation or tool calls. Exports remain independent
+Skylark CLI processes. Only the main coordinator records settled results and
+checkpoints. One export failure does not stop other eligible downloads; identity,
+version and same-version suppression checks remain mandatory. The whole download
+batch settles before comparison; listing, comparison, OCR and Graphify retain
+their current stage order and concurrency.
+
+On --resume, a different --concurrency does not invalidate completed downloads or
+authorize a suppressed retry. SIGINT/SIGTERM stops all in-flight export process
+groups, starts no queued exports and preserves truthful checkpoints. The option
+is per invocation, not a TOML setting or a Skylark argument. --retry-graph skips
+downloads entirely, regardless of --concurrency.
+
 ```text
-dogpdkb sync --config instance/dogpdkb.toml --book funds --stop-after plan
+dogpdkb sync --config instance/dogpdkb.toml --book funds --stop-after plan --concurrency 3
 dogpdkb status --config instance/dogpdkb.toml --book funds --run RUN --json
 dogpdkb sync --config instance/dogpdkb.toml --book funds --resume RUN
 ```

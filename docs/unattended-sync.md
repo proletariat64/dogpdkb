@@ -22,6 +22,13 @@ dogpdkb sync --config /srv/kb/dogpdkb.toml --book funds --resume /path/run-direc
 恢复只处理原范围；输入缺失、改变或会回退更晚成功版本时需重新生成计划。
 失败或不明步骤不靠恢复自动重试。
 
+`sync` and `apply` use download concurrency 2 by default; `--concurrency 1`, `2`
+or `3` selects the per-invocation limit, capped at three. The download batch still
+settles before comparison. Resume can change the value without refetching verified
+completed inputs or clearing failure suppression. Interruption stops all in-flight
+exports and starts no queued work. See [download concurrency](../README.md#download-concurrency)
+for examples and the full scope; this is not a Skylark flag or TOML setting.
+
 ## cron 与日志
 
 先配置工具公开入口并执行 doctor；首次运行前以 init-state 登记现有语料。首次

@@ -22,6 +22,24 @@ then `DOGPDKB_CONFIG`, then checkout `default.toml` / caller `dogpdkb.toml`.
 - Existing `[source] books_file`, `[paths]` and `[skylark]` sections remain
   convenient configuration, without importing mdocr's configuration model.
 
+## Download scheduling
+
+`sync` and `apply` accept the runtime option `--concurrency` with integer choices
+1, 2 and 3, default 2. It is not a Settings/TOML field and does not participate in
+source identity or version checks. Invalid values fail before operational writes
+or subprocess dispatch. Each in-flight document retains a separate public Skylark
+request/report and raw destination. The coordinator alone updates Store/Run and
+persists settled results while other exports may still be active. An isolated
+export failure does not stop eligible peers. The complete export batch settles
+before comparison begins; later whole-batch stages are unchanged.
+
+Resume may select a different concurrency while reusing verified completed
+inputs and preserving same-version suppression. The main-thread signal owner
+stops all active export process groups on SIGINT/SIGTERM, dispatches no queued
+work afterward and retains truthful completed/failed/unknown outcomes. Child lock
+inheritance, termination escalation and signal exit conventions remain unchanged.
+Graph-only recovery does not re-enter the export scheduler.
+
 ## Durable records
 
 `dogpdkb.records.Store(settings, book)` reads/writes the new state file at
