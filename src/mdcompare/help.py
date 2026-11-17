@@ -16,12 +16,12 @@ MANIFEST_EXAMPLE = """{
 ROOT = """Start here:
   1. Capture immutable local Markdown snapshots.
   2. Describe them in JSON manifests (not Markdown command arguments).
-  3. Use catalog to discover resources; knowledge for body-only reuse;
-     compare for strict text, resource, metadata and OCR-evidence decisions.
+  3. Use catalog to discover resources; semantic for authored-body routing;
+     knowledge for diagnostics and compare for strict evidence decisions.
 
 Example:
   mdcompare catalog --input descriptors.json --output manifest.json
-  mdcompare knowledge --baseline old.json --incoming new.json --output report.json
+  mdcompare semantic --baseline old.json --incoming new.json --output report.json --diff-output diff.json
 
 Prerequisites and effects:
   No configuration, login, token, network or model is required. Inputs are
@@ -78,6 +78,16 @@ Exit codes and next steps:
   fetch missing evidence, run models, process resources or authorize publication.
 
 Full schema: mdcompare compare --help --full
+"""
+
+SEMANTIC = """Offline authored-body routing; no OCR, network or model calls.
+Pair by (knowledge_base, document_id). New/changed/uncertain incoming documents COMPILE;
+only paired contextual normalized equality SKIPs; unavailable body DEFERs.
+Baseline-only identities are advisory and never produce deletion compilation.
+Outputs: semantic-1.0 report and complete mdcompare-semantic-diff-1 evidence.
+Optional --recovery accepts mdcompare-body-recovery-1 insertion-only repair evidence.
+
+Full schema: mdcompare semantic --help --full
 """
 
 KNOWLEDGE = f"""Inputs:
@@ -153,6 +163,7 @@ NORMAL = {
     "mdcompare": ROOT,
     "compare": COMPARE,
     "knowledge": KNOWLEDGE,
+    "semantic": SEMANTIC,
     "catalog": CATALOG,
 }
 
@@ -164,6 +175,8 @@ def full_contract(command: str) -> str:
         names += ["compare.txt", "resources.txt", "ocr.txt", "history.txt"]
     elif command == "knowledge":
         names += ["knowledge.txt"]
+    elif command == "semantic":
+        names += ["semantic.txt"]
     elif command == "catalog":
         names += ["catalog.txt", "resources.txt"]
     return "\nComplete local contract\n=======================\n\n" + "\n\n".join(
