@@ -332,3 +332,20 @@ def test_eof_repair_footer_does_not_create_a_nonexistent_original_source_line(tm
         unit["end_line"] <= len(original.splitlines())
         for unit in diff["documents"][0]["old_units"]
     )
+
+
+def test_context_move_does_not_steal_a_baseline_occurrence_reserved_for_revision(
+    tmp_path,
+):
+    before = (
+        "# A\nOther unrelated rule.\n# B\nApproval requires finance review every day.\n"
+    )
+    after = "# C\nApproval requires finance review every day.\n# B\nApproval requires finance review every week.\n"
+    result, _, diff = pair(tmp_path, before, after)
+    assert result.returncode == 0
+    refs = [
+        change["old_ref"]
+        for change in diff["documents"][0]["changes"]
+        if change["old_ref"] is not None
+    ]
+    assert len(refs) == len(set(refs))

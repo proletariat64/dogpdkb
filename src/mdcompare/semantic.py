@@ -159,6 +159,13 @@ def _unit_evidence(unit, coordinates):
 def _changes(before, after, aligned, indexes):
     """Reference canonical evidence once; exact matches consume occurrences once."""
     used = set()
+    # A moved exact-text candidate must not consume an occurrence that the
+    # contextual aligner has already assigned to a later revision.
+    reserved = {
+        id(item["old"])
+        for item in aligned["items"][: len(after)]
+        if item["old"] is not None
+    }
     operations = []
     for position, item in enumerate(aligned["items"][: len(after)]):
         previous = item["old"]
@@ -192,6 +199,7 @@ def _changes(before, after, aligned, indexes):
                 unit
                 for unit in before
                 if id(unit) not in used
+                and id(unit) not in reserved
                 and (unit.kind, unit.key) == (after[position].kind, after[position].key)
             ]
             if len(matches) == 1:
