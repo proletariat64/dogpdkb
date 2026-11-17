@@ -309,3 +309,26 @@ def test_duplicate_occurrence_removal_has_a_delete_operation(tmp_path):
         )
         == 1
     )
+
+
+def test_eof_repair_footer_does_not_create_a_nonexistent_original_source_line(tmp_path):
+    original = "正文。\n\n"
+    old, witness, new = (
+        tmp_path / "before.md",
+        tmp_path / "witness.md",
+        tmp_path / "after.md",
+    )
+    old.write_text(original)
+    witness.write_text(original)
+    new.write_text("正文。\n")
+    path = recovery(
+        tmp_path,
+        witness,
+        [{"byte_offset": len(original.encode()), "text": "> 转写说明：\n"}],
+    )
+    result, _, diff = run(tmp_path, [doc(old)], [doc(new)], ("--recovery", str(path)))
+    assert result.returncode == 0
+    assert all(
+        unit["end_line"] <= len(original.splitlines())
+        for unit in diff["documents"][0]["old_units"]
+    )

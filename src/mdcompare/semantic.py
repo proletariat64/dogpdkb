@@ -132,7 +132,15 @@ def _coordinate_map(original, repaired, repairs):
             inserted += size
         else:
             source_position = position - inserted
-        result.append(bisect_right(original_offsets, source_position))
+        # An inserted EOF footer can extend a unit across ignored generated
+        # lines. Its source endpoint is the last real line, not a new line
+        # invented past the immutable original's end.
+        result.append(
+            min(
+                bisect_right(original_offsets, source_position),
+                max(1, len(original_offsets) - 1),
+            )
+        )
     return result
 
 
