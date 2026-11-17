@@ -24,6 +24,7 @@ from dogpdkb.planning import (
 )
 from dogpdkb.processes import diagnostic_argv, run_command, run_commands
 from dogpdkb.records import Run, Store, atomic_json, read_json, version_key
+from dogpdkb.semantic import freeze_recovery, read_semantic_artifacts
 from dogpdkb.settings import load_config, select_book
 
 
@@ -133,12 +134,12 @@ def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
             }
         elif document.get("graph_baseline"):
             baseline = document["graph_baseline"]
+        elif document.get("baseline"):
+            # Only explicit init-state facts may bootstrap an unknown graph.
+            # Capturing/publishing an uncompiled new body is NOT a baseline.
+            baseline = document.get("corpus", {})
         else:
-            baseline = (
-                previous
-                if Path(previous.get("path", "")).is_file()
-                else document.get("corpus", {})
-            )
+            baseline = {}
         row["baseline"] = dict(baseline)
         row["previous_corpus"] = dict(document.get("corpus", {}))
         row["previous_graph"] = dict(document.get("graph", {}))
@@ -356,6 +357,22 @@ def catalog_failed_exports(settings, book, run, rows):
 
 
 def compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=False):
+    try:
+        return _compare_inputs(
+            settings, book, store, run, rows, workspace=workspace, replan=replan
+        )
+    except InterruptedError:
+        raise
+    except (OSError, ValueError):
+        # A launched batch with unusable public evidence has unknown outcomes,
+        # not permanently running work and not permission to retry silently.
+        record_interruption(
+            store, run, 1, reason="SEMANTIC_COMPARISON_UNAVAILABLE", finish=False
+        )
+        raise
+
+
+def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=False):
     workspace = workspace or run.directory
     run.stage("compare", total=len(rows), phase="prepare")
     active = []
@@ -367,15 +384,23 @@ def compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=F
         ):
             active.append(row)
     if not active:
-        return {}, {}
+        return (
+            {},
+            {},
+            {"schema_version": "semantic-1.0", "scope": "authored_body", "results": []},
+        )
     baseline, incoming = [], []
     for row in active:
         old = row["baseline"]
-        if Path(old.get("path", "")).is_file():
+        if old.get("path"):
             baseline.append(
                 descriptor(
                     book,
-                    {**row, "metadata": old.get("metadata", row.get("metadata", {}))},
+                    {
+                        **row,
+                        "version": old.get("version", row.get("version")),
+                        "metadata": old.get("metadata", row.get("metadata", {})),
+                    },
                     old["path"],
                     historical="ocr" in old,
                     evidence=old,
@@ -434,6 +459,32 @@ def compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=F
             store.save()
         except (ValueError, KeyError, TypeError):
             valid = False
+    semantic_root = store.path.parent / "semantic" / run.id
+    semantic_root.mkdir(parents=True, exist_ok=True)
+    recovery_path = freeze_recovery(settings.body_recovery, semantic_root / "recovery")
+    semantic_dir = Path(tempfile.mkdtemp(prefix="comparison-", dir=semantic_root))
+    semantic_report_path = semantic_dir / "semantic-report.json"
+    semantic_diff_path = semantic_dir / "semantic-diff.json"
+    semantic_args = [
+        "semantic",
+        "--baseline",
+        sources[0],
+        "--incoming",
+        sources[1],
+        "--output",
+        semantic_report_path,
+        "--diff-output",
+        semantic_diff_path,
+    ]
+    if recovery_path is not None:
+        semantic_args += ["--recovery", recovery_path]
+        run.data["artifacts"]["body_recovery"] = str(recovery_path)
+    semantic_code = call_tool(settings, run, "mdcompare", semantic_args)
+    semantic = read_semantic_artifacts(
+        semantic_code, semantic_report_path, semantic_diff_path, active, book.key
+    )
+    run.data["artifacts"]["semantic"] = str(semantic_report_path)
+    run.data["artifacts"]["semantic_diff"] = str(semantic_diff_path)
     reports = []
     for mode in ("knowledge", "compare"):
         output = workspace / f"{mode}-report.json"
@@ -470,22 +521,14 @@ def compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=F
         run.data["artifacts"][mode] = str(output)
     run.stage("compare", total=len(active), phase="record-results")
     outcomes = []
-    indexed = [
-        {str(item.get("document_id")): item for item in report.get("results", [])}
-        for report in reports
-    ]
+    semantic_by_id = {item["document_id"]: item for item in semantic["results"]}
     for row in active:
         identifier = row["document_id"]
-        body = indexed[0].get(identifier, {})
-        advice = body.get("graphify_plan", {})
-        status = (
-            "completed" if all(identifier in items for items in indexed) else "failed"
-        )
-        if status == "completed" and (
-            body.get("status") == "UNKNOWN"
-            or not body.get("comparison_complete", False)
-            or "BASELINE_BODY_INCOMPLETE" in advice.get("hold_reason_codes", [])
-            or "BASELINE_BODY_INCOMPLETE" in body.get("reason_codes", [])
+        semantic_item = semantic_by_id.get(identifier)
+        status = "completed" if semantic_item is not None else "failed"
+        if (
+            semantic_item is not None
+            and semantic_item["semantic_status"] == "UNAVAILABLE"
         ):
             status = "unknown"
         if status == "failed":
@@ -512,11 +555,13 @@ def compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=F
                 "run_id": run.id,
                 "knowledge": run.data["artifacts"]["knowledge"],
                 "comparison": run.data["artifacts"]["compare"],
+                "semantic": str(semantic_report_path),
+                "semantic_diff": str(semantic_diff_path),
             }
         )
     store.complete_batch(outcomes)
     run.save()
-    return reports
+    return (*reports, semantic)
 
 
 def ocr_inputs(settings, book, store, run, rows):
@@ -526,7 +571,7 @@ def ocr_inputs(settings, book, store, run, rows):
     for index, row in enumerate(rows):
         validate_inputs([row])
         identifier, version = row["document_id"], row["version"]
-        if row["action"] in {"retain", "defer"}:
+        if row["action"] in {"retain", "defer", "reuse", "metadata"}:
             continue
         previous = store.step(identifier, "ocr")
         if (
@@ -737,17 +782,6 @@ def prepare_publication(book, store, run, rows, results):
                 if resource.get("resource_id") in images:
                     resource["path"] = images[resource["resource_id"]]["source_path"]
         action = row["action"]
-        before = {
-            r["resource_id"]: r.get("artifact")
-            for r in previous.get("ocr", {}).get("images", [])
-        }
-        if action not in {"retain", "defer"} and any(
-            r.get("status") == "success"
-            or r.get("status") == "reused"
-            and before.get(r["resource_id"]) != r.get("artifact")
-            for r in result.get("resources", [])
-        ):
-            action = "compile"
         metadata = descriptor(book, row, output)["metadata"]
         document = {
             "version": row["version"],
@@ -767,9 +801,7 @@ def prepare_publication(book, store, run, rows, results):
                 "previous_graph": row["previous_graph"],
                 "baseline_version": row["baseline"].get("version"),
                 "pending_metadata": row.get("metadata", {}),
-                "pending_steps": ["ocr"]
-                if result.get("status") == "unattempted"
-                else [],
+                "pending_steps": [],  # Image/OCR enrichment is advisory.
                 "reason_codes": row["reason_codes"],
             }
         )
@@ -942,9 +974,11 @@ def apply_run(
         rows = prepare_inputs(
             settings, book, store, run, differences, concurrency=concurrency
         )
-        knowledge, comparison = compare_inputs(settings, book, store, run, rows)
+        knowledge, comparison, semantic = compare_inputs(
+            settings, book, store, run, rows
+        )
         run.stage("plan", total=len(rows))
-        plan = make_plan(book, run, rows, knowledge, comparison)
+        plan = make_plan(book, run, rows, knowledge, comparison, semantic)
     if stop_after == "plan":
         run.finish("paused")
         return {"exit_code": 0, "paused": True, "manifest": None}
@@ -1025,7 +1059,7 @@ def replan_published(settings, book, store, run):
             frozen_inputs.append((source, target))
             row["baseline_input_copy"] = str(target)
             row["baseline"] = {**row["baseline"], "path": str(target)}
-    knowledge, comparison = compare_inputs(
+    knowledge, comparison, semantic = compare_inputs(
         settings, book, store, run, rows, workspace=workspace, replan=True
     )
     if any(
@@ -1033,7 +1067,9 @@ def replan_published(settings, book, store, run):
     ):
         raise ValueError("original comparison snapshots changed during replan")
     _manifest(settings, book, store, run, original)
-    refreshed = make_plan(book, run, rows, knowledge, comparison, workspace=workspace)
+    refreshed = make_plan(
+        book, run, rows, knowledge, comparison, semantic, workspace=workspace
+    )
     # A body comparison changes selection, not the published corpus/OCR payload.
     decisions = {r["document_id"]: r for r in refreshed["documents"]}
     manifest = deepcopy(original)

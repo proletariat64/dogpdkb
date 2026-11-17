@@ -9,7 +9,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 from urllib.parse import urlsplit
 
 if sys.version_info >= (3, 11):
@@ -48,6 +48,7 @@ class Settings:
     ocr_budget_seconds: float
     tools: dict[str, tuple[str, ...]] = field(default_factory=dict)
     web_options: dict[str, Any] = field(default_factory=dict)
+    body_recovery: Path | None = None
 
     def graph_for(self, book: Book) -> Path:
         return self.graph_dir or book.corpus / "graphify-out"
@@ -115,7 +116,17 @@ def load_config(path: Path | str | None = None) -> Settings:
     if any(not isinstance(v, dict) for v in data.values()):
         raise ConfigError("configuration sections must be tables")
 
-    def configured_path(name: str, default=None, env=None):
+    @overload
+    def configured_path(name: str, default: str, env: str | None = None) -> Path: ...
+
+    @overload
+    def configured_path(
+        name: str, default: None = None, env: str | None = None
+    ) -> Path | None: ...
+
+    def configured_path(
+        name: str, default: str | None = None, env: str | None = None
+    ) -> Path | None:
         value = os.environ.get(env) if env else None
         base = Path.cwd() if value is not None else selected.parent
         value = value if value is not None else data.get("paths", {}).get(name, default)
@@ -173,6 +184,7 @@ def load_config(path: Path | str | None = None) -> Settings:
         proxy_bin=proxy,
         timeout_seconds=number("skylark", "timeout_seconds", 60),
         ocr_budget_seconds=number("ocr", "budget_seconds", 1800),
+        body_recovery=configured_path("body_recovery"),
         tools=tools,
         web_options=data.get("web", {}),
     )

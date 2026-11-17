@@ -71,19 +71,19 @@ def test_compare_writes_state_three_times_independent_of_batch_size(
         f"assert json.loads(Path({str(run.path)!r}).read_text())['phase']=='tools'\n"
         "os.execv(sys.executable,[sys.executable,'-m','mdcompare',*sys.argv[1:]])\n"
     )
-    settings.tools["mdcompare"] = [sys.executable, str(wrapper)]
+    settings.tools["mdcompare"] = (sys.executable, str(wrapper))
     writes = count_state_writes(monkeypatch, store)
     # Real public subprocesses import the source in this worktree.
     monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1] / "src"))
     with store.lock():
-        knowledge, detail = compare_inputs(settings, book, store, run, rows)
+        knowledge, detail, semantic = compare_inputs(settings, book, store, run, rows)
     assert len(writes) == 3
     assert len(knowledge["results"]) == len(detail["results"]) == count
+    assert len(semantic["results"]) == count
     reloaded = Store(settings, book)
-    assert all(
-        reloaded.step(row["document_id"], "compare")["status"] == "completed"
-        for row in rows
-    )
+    for row in rows:
+        step = reloaded.step(row["document_id"], "compare")
+        assert step is not None and step["status"] == "completed"
     status = snapshot(store, str(run.path))
     assert status["phase"] == "record-results"
     assert "phase=record-results" in report(status)
@@ -130,7 +130,8 @@ def test_batch_preserves_other_version_blocks_and_rejects_invalid_versions(tmp_p
     with pytest.raises(ValueError):
         store.complete_batch(invalid)
     assert store.path.read_bytes() == before
-    assert store.step("0", "compare")["version"] == "old"
+    old_step = store.step("0", "compare")
+    assert old_step is not None and old_step["version"] == "old"
     store.complete_batch(batch)
     assert all(store.suppressed(row["document_id"], "compare", VERSION) for row in rows)
     store.complete_batch({**item, "status": "completed"} for item in batch)
@@ -158,11 +159,11 @@ def test_interruption_records_whole_batch_with_one_state_save(tmp_path, monkeypa
     record_interruption(store, run, 143)
     assert len(writes) == 1
     reloaded = Store(settings, book)
-    assert all(
-        reloaded.step(row["document_id"], "compare")["status"] == "unknown"
-        for row in rows
-    )
-    assert reloaded.step("other-run", "export")["status"] == "running"
+    for row in rows:
+        step = reloaded.step(row["document_id"], "compare")
+        assert step is not None and step["status"] == "unknown"
+    other_step = reloaded.step("other-run", "export")
+    assert other_step is not None and other_step["status"] == "running"
     assert len(records.read_json(run.path)["failures"]) == len(rows)
 
 
@@ -275,7 +276,6 @@ def test_graph_batch_writes_state_twice_for_actual_tool_result(
         mode
     ]
     reloaded = Store(settings, book)
-    assert all(
-        reloaded.step(row["document_id"], "graph")["status"] == expected
-        for row in data["documents"]
-    )
+    for row in data["documents"]:
+        step = reloaded.step(row["document_id"], "graph")
+        assert step is not None and step["status"] == expected

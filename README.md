@@ -15,6 +15,7 @@ invocation, and `--help --full` for the complete local contract:
 dogpdkb --help
 dogpdkb sync --help
 dogpdkb sync --help --full
+mdcompare semantic -h --full
 mdcompare knowledge -h --full
 mdocr batch -h --full
 skylark export -h --full
@@ -107,6 +108,40 @@ dogpdkb purge --config ./instance/dogpdkb.toml --book funds --run RUN --force
 purge 只删除所选 book 的 wash，包括失败材料和运行记录；正式语料、图谱、持久
 版本事实、必要比较输入和工具缓存保留。它不解除失败抑制、不触发重试或历史回填。
 
+## Authored-text routing and durable diffs
+
+`apply`/`sync` consume the independent offline `mdcompare semantic` CLI as the
+body-routing authority: **NEW / CHANGED / UNCERTAIN → compile; demonstrated
+EQUIVALENT → reuse/metadata; UNAVAILABLE → defer**. Authored deletions compile.
+Image changes and OCR failures/results are advisory and never promote equivalent
+body text to compilation. Equivalent documents do not start fresh OCR. Usable
+uncertainty compiles without a model, manual approval or hidden network call.
+Missing or malformed authoritative reports stop explicitly rather than falling
+back to legacy knowledge advice. Baseline-only IDs never imply remote deletion.
+
+Complete `mdcompare-semantic-diff-1` evidence is streamed per document and indexed
+outside wash under `state/<book>/semantic/<run>/`. Preserve the index and its
+referenced evidence directory together. Full text, source versions, heading
+context, original coordinates and add/delete/modify/move evidence are not clipped
+by human-report limits. Skips and failed compilation never advance the actual
+successful graph baseline; capturing raw or publishing a new document alone is
+not a compiled baseline. Explicit `init-state` facts remain the bootstrap for an
+existing corpus, without inventing successful graph steps.
+
+For previously established marker repairs, optionally configure
+`[paths] body_recovery = "body-recovery.json"` relative to the instance TOML.
+The public `mdcompare-body-recovery-1` artifact binds identity/side to immutable
+source-copy bytes and ordered UTF-8 byte-offset marker insertions. dogpdkb freezes
+this artifact and witnesses once per run and validates them on resume. Changing
+live configuration does not rewrite an existing plan; changed frozen evidence
+requires a new plan. Invalid/unresolved body scope defers its document; recovery
+never itself proves semantic equality. No automatic rescue or model call occurs.
+See [tool contracts](docs/orchestrator-tool-contracts.md) and
+[core routing contract](docs/orchestrator-core-contracts.md).
+
+This routing does **not** change Graphify's text-input projection described below:
+whole published Markdown, including existing inline images/OCR, remains its input.
+
 ## 小订阅
 
 在独立 `books.json` 来源中设置 `document_ids`，并使用独立 key 和目标目录：
@@ -136,7 +171,7 @@ skylark = ["node", "/opt/pi-skylark/dist/cli.mjs"]
 编排器对工具只调用公开 CLI、读取公开产物，不导入工具包或复刻其内部算法。
 本轮新增能力必须先提供给所选工具入口：
 
-- [mdcompare catalog、mdocr batch](docs/orchestrator-tool-contracts.md)，随本仓库 wheel 提供。
+- [mdcompare semantic/catalog、mdocr batch](docs/orchestrator-tool-contracts.md)，随本仓库 wheel 提供。
 - [Graphify 原版 CLI](docs/orchestrator-graphify-contract.md)：目录级增量、原生 manifest/cache 和整批发布。
 - [Skylark listing/export](docs/orchestrator-skylark-contract.md)：已恢复的独立 CLI 与构建方法。
 

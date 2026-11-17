@@ -13,6 +13,9 @@ web = "web-output"
 results = "sync-results"
 # Tool-owned successful OCR cache; dogpdkb does not inspect its layout.
 ocr_cache = "ocr-cache"
+# Optional explicit mdcompare-body-recovery-1 marker repairs; no automatic rescue.
+# Frozen once per run with byte witnesses; paths resolve relative to this config.
+# body_recovery = "body-recovery.json"
 # graph_dir defaults to <selected corpus>/graphify-out
 
 [tools]

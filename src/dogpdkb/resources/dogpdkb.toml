@@ -12,6 +12,9 @@ web = "web"
 results = "sync-results"
 # Tool-owned successful OCR cache; never inspect its layout from dogpdkb.
 ocr_cache = "ocr-cache"
+# Optional explicit mdcompare-body-recovery-1 marker repairs; no automatic rescue.
+# Frozen once per run with byte witnesses; paths resolve relative to this config.
+# body_recovery = "body-recovery.json"
 
 [ocr]
 # Passed to mdocr's best-effort batch CLI; in-flight calls retain tool timeouts.
