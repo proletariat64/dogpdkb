@@ -1,5 +1,7 @@
 # dogpdkb
 
+<!-- CI/PR flow smoke-tested from Poolab host -->
+
 dogpdkb is a knowledge-base CLI orchestrator for crontab: it selects increments,
 plans whole-batch stages, calls Skylark, mdcompare, mdocr and Graphify through their
 public CLIs, records actual outcomes and provides read-only status. Web publication
