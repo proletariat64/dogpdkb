@@ -1,6 +1,6 @@
 # Public semantic report integration
 
-Status: implemented
+Status: resolved
 Type: task
 Blocked by: 01
 

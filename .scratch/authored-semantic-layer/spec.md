@@ -1,6 +1,6 @@
 # Authored-text semantic routing and durable diffs
 
-Status: ready-for-agent
+Status: implemented; full offline filtering passed; awaiting user acceptance
 
 ## Problem Statement
 
