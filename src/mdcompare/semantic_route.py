@@ -27,7 +27,14 @@ def _generation(report, index, directory, inputs):
     if root.parent != directory or not root.is_dir():
         raise ValueError
     inputs.add(root)
-    inputs.update(Path(value) for value in index["sources"].values())
+    protected = index["protected_inputs"]
+    if not isinstance(protected, list) or not protected:
+        raise ValueError
+    for value in protected:
+        path = Path(value)
+        if not path.is_absolute():
+            raise ValueError
+        inputs.add(path)
     bindings = {}
     for row in index["documents"]:
         key = _identity(row)
@@ -46,9 +53,6 @@ def _generation(report, index, directory, inputs):
         sidecar = json.loads(data)
         if _identity(sidecar) != key or row["sha256"] != digest:
             raise ValueError
-        for source in sidecar["source_inputs"].values():
-            if source is not None:
-                inputs.add(Path(source["path"]))
         bindings[key] = row["evidence"], digest
     identities = []
     for row in report["results"]:

@@ -75,6 +75,9 @@ def publish_semantic(args):
         if reader.changed_paths():
             raise InputError("INPUT_CHANGED")
         diff["evidence_directory"] = directory.name
+        diff["protected_inputs"] = sorted(
+            {str(path.absolute()) for path in protected | reader.paths}
+        )
         report_bytes = (
             json.dumps(report, ensure_ascii=False, indent=2) + "\n"
         ).encode()

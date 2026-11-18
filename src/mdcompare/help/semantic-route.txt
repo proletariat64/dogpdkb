@@ -24,7 +24,7 @@ With ambiguity intercept yes, an ambiguous score at/below threshold compiles;
 it never changes a high-score route. No/missing scores stay COMPILE. All other
 deterministic statuses keep the original route. Output is separate and does not
 modify semantic-1.0 or invoke an LLM, network, Graphify or compiler. Inputs and
-the indexed source manifests, Markdown paths and evidence are protected from
-output aliasing.
+the comparison's recorded absolute input paths (including recovery witnesses)
+and indexed evidence are protected from output aliasing across working directories.
 
 Exit codes: 0 route report published; 1 invalid binding/input or publication failure.

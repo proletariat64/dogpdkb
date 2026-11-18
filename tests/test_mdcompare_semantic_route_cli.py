@@ -11,6 +11,7 @@ from pathlib import Path
 def invoke(tmp_path, command, *args):
     return subprocess.run(
         [sys.executable, "-m", "mdcompare", command, *map(str, args)],
+        cwd=tmp_path,
         capture_output=True,
         text=True,
         check=False,
@@ -18,7 +19,7 @@ def invoke(tmp_path, command, *args):
     )
 
 
-def prepared(tmp_path):
+def prepared(tmp_path, *, relative=False, recovery=False):
     old, new = tmp_path / "old.md", tmp_path / "new.md"
     old.write_text("old rule\n")
     new.write_text("new rule\n")
@@ -34,7 +35,7 @@ def prepared(tmp_path):
                             "knowledge_base": "book",
                             "document_id": "1",
                             "content_kind": "raw",
-                            "path": str(body),
+                            "path": body.name if relative else str(body),
                             "metadata": {
                                 "name": "Rule",
                                 "logical_path": "",
@@ -48,17 +49,39 @@ def prepared(tmp_path):
         )
         manifests.append(path)
     report, index = tmp_path / "semantic.json", tmp_path / "diff.json"
+    extra = ()
+    if recovery:
+        witness = tmp_path / "witness.md"
+        witness.write_bytes(old.read_bytes())
+        (tmp_path / "recovery.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "mdcompare-body-recovery-1",
+                    "documents": [
+                        {
+                            "knowledge_base": "book",
+                            "document_id": "1",
+                            "side": "baseline",
+                            "source_copy": witness.name,
+                            "insertions": [{"byte_offset": 0, "text": "\n"}],
+                        }
+                    ],
+                }
+            )
+        )
+        extra = ("--recovery", "recovery.json")
     result = invoke(
         tmp_path,
         "semantic",
         "--baseline",
-        manifests[0],
+        manifests[0].name if relative else manifests[0],
         "--incoming",
-        manifests[1],
+        manifests[1].name if relative else manifests[1],
         "--output",
         report,
         "--diff-output",
         index,
+        *extra,
     )
     assert result.returncode == 0, result.stderr
     index_doc = json.loads(index.read_text())
@@ -213,3 +236,28 @@ def test_updated_score_cannot_bless_modified_sidecar(tmp_path):
     result = route(tmp_path, report, index, scores)
     assert result.returncode == 1 and "SCORE_BINDING_INVALID" in result.stderr
     assert not (tmp_path / "route.json").exists()
+
+
+def test_relative_source_and_recovery_witness_are_protected_across_cwd(tmp_path):
+    report, index, sidecar, digest = prepared(tmp_path, relative=True, recovery=True)
+    scores = scorefile(tmp_path, sidecar, digest, 3)
+    other = tmp_path / "another-cwd"
+    other.mkdir()
+    for name in ("new.md", "witness.md"):
+        protected = tmp_path / name
+        original = protected.read_bytes()
+        result = invoke(
+            other,
+            "semantic-route",
+            "--report",
+            report,
+            "--diff-index",
+            index,
+            "--scores",
+            scores,
+            "--output",
+            protected,
+        )
+        assert result.returncode == 1 and "REPORT_INPUT_COLLISION" in result.stderr
+        assert protected.read_bytes() == original
+    assert route(tmp_path, report, index, scores).returncode == 0
