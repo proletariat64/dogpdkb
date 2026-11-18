@@ -3,6 +3,10 @@
 import argparse
 import json
 import sys
+from collections.abc import Iterable
+from typing import TypeVar, cast
+
+_N = TypeVar("_N", bound=argparse.Namespace)
 from pathlib import Path
 
 from . import __version__
@@ -19,6 +23,8 @@ from .io import (
 from .knowledge import compare_knowledge_documents, render_knowledge_report
 from .manifest import ManifestError, load_manifest
 from .model import CompareOptions
+from .semantic_io import publish_semantic
+from .semantic_route import publish_semantic_route
 
 
 class ArgumentParser(argparse.ArgumentParser):
@@ -33,7 +39,9 @@ class ArgumentParser(argparse.ArgumentParser):
             help="show the complete local contract with -h/--help",
         )
 
-    def parse_known_args(self, args=None, namespace=None):
+    def parse_known_args(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, args: Iterable[str] | None = None, namespace: _N | None = None
+    ) -> tuple[_N, list[str]]:
         arguments = list(sys.argv[1:] if args is None else args)
         self.full_help = "--full" in arguments
         if self.full_help and self.prog == "mdcompare":
@@ -47,7 +55,8 @@ class ArgumentParser(argparse.ArgumentParser):
                 )
         if self.full_help and not any(flag in arguments for flag in ("-h", "--help")):
             self.error("--full requires -h or --help")
-        return super().parse_known_args(arguments, namespace)
+        parsed, remaining = super().parse_known_args(arguments, namespace)
+        return cast(_N, parsed), remaining
 
     def format_help(self):
         text = super().format_help()
@@ -200,6 +209,44 @@ def main(argv=None) -> int:
         default=CompareOptions.max_evidence_chars,
         help="Maximum body evidence characters per document (default: 8000)",
     )
+    semantic = sub.add_parser(
+        "semantic",
+        help="Route authored-body changes for compilation",
+        description="Offline authored-text routing with complete durable diff evidence.",
+        epilog=NORMAL["semantic"],
+    )
+    for name, help_text in (
+        ("baseline", "baseline descriptor manifest"),
+        ("incoming", "incoming descriptor manifest"),
+        ("output", "semantic-1.0 report path"),
+        ("diff-output", "complete mdcompare-semantic-diff-1 path"),
+    ):
+        semantic.add_argument("--" + name, type=Path, required=True, help=help_text)
+    semantic.add_argument(
+        "--recovery", type=Path, help="optional body recovery manifest"
+    )
+    semantic.add_argument(
+        "--max-file-bytes",
+        type=_positive_file_limit,
+        default=CompareOptions.max_file_bytes,
+    )
+    semantic.add_argument(
+        "--max-diff-work", type=nonnegative_int, default=CompareOptions.max_diff_work
+    )
+    route_parser = sub.add_parser(
+        "semantic-route",
+        help="Route changed documents from bound offline scores",
+        description="Validate score bindings and publish a distinct score-route report.",
+        epilog=NORMAL["semantic-route"],
+    )
+    for name in ("report", "diff-index", "scores", "output"):
+        route_parser.add_argument("--" + name, type=Path, required=True)
+    route_parser.add_argument(
+        "--compile-threshold", type=int, choices=range(1, 6), default=3
+    )
+    route_parser.add_argument(
+        "--skip-ambiguity-intercept", choices=("yes", "no"), default="no"
+    )
     catalog = sub.add_parser(
         "catalog",
         help="Build an offline resource manifest from Markdown",
@@ -226,6 +273,30 @@ def main(argv=None) -> int:
             print(f"mdcompare: {exc}", file=sys.stderr)
             return 1
         return 0
+    if args.command == "semantic-route":
+        try:
+            publish_semantic_route(args)
+        except InputError as exc:
+            print(
+                f"mdcompare: {getattr(exc, 'reason_code', str(exc))}", file=sys.stderr
+            )
+            return 1
+        except OSError:
+            print("mdcompare: REPORT_WRITE_FAILED", file=sys.stderr)
+            return 1
+        return 0
+    if args.command == "semantic":
+        try:
+            report = publish_semantic(args)
+        except (InputError, ManifestError) as exc:
+            print(
+                f"mdcompare: {getattr(exc, 'reason_code', str(exc))}", file=sys.stderr
+            )
+            return 1
+        except OSError:
+            print("mdcompare: REPORT_WRITE_FAILED", file=sys.stderr)
+            return 1
+        return 2 if any(row["action"] == "DEFER" for row in report["results"]) else 0
     options = CompareOptions(
         include_evidence=args.include_evidence,
         max_file_bytes=args.max_file_bytes,

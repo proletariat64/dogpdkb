@@ -161,6 +161,11 @@ def _read_units(document: Document, reader: InputReader) -> list[Unit]:
         text = reader.read_bytes(document.path).decode("utf-8")
     except UnicodeDecodeError as exc:
         raise InputError("TEXT_ENCODING_UNSUPPORTED") from exc
+    return extract_document_units(document, text)
+
+
+def extract_document_units(document: Document, text: str) -> list[Unit]:
+    """Project one captured text view with the existing exporter/context rules."""
     try:
         lines = text.splitlines(keepends=True)
         exporter_header = (

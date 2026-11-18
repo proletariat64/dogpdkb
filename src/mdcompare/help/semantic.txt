@@ -1,0 +1,74 @@
+Authored-text semantic routing (semantic-1.0)
+============================================
+
+mdcompare semantic --baseline OLD.json --incoming NEW.json --output report.json
+                   --diff-output diff.json [--recovery recovery.json]
+                   [--max-file-bytes 16777216] [--max-diff-work 2000000]
+
+Both inputs use the descriptor manifest in manifest.txt. Documents pair only by
+(knowledge_base, document_id). Baseline-only IDs are advisory, not deletions.
+An authored deletion inside a present incoming document is a real change.
+Command-line paths resolve from cwd; descriptor paths resolve from their JSON
+manifest. Create output parent directories first. Outputs cannot alias each
+other or any declared/read source, manifest, resource or repair witness.
+
+The semantic-1.0 report has scope authored_body and results containing identity,
+semantic_status, action, reason_codes, extraction and comparison_complete.
+Routes:
+  NEW          COMPILE even if another document has identical content.
+  EQUIVALENT   SKIP only proven paired contextual sequence equality.
+  CHANGED      COMPILE additions, deletions, order/context or subject changes.
+  UNCERTAIN    COMPILE usable bodies with incomplete or ambiguous alignment.
+  UNAVAILABLE  DEFER unreliable/missing/unreadable body extraction, per document.
+Image URLs/alt text and bounded marked OCR regions do not decide body routing.
+No resource files, OCR artifacts, login, network or model are needed. A reliable
+empty body is explicit NO_TEXT evidence, never successful graph compilation.
+Existing compare/knowledge commands remain separate diagnostic contracts.
+
+The mdcompare-semantic-diff-1 JSON indexes complete per-document evidence files,
+never subject to human excerpt limits. Each documents record has identity and
+an evidence path relative to the index. Retain/copy the evidence_directory with
+the index. A new unique evidence directory is written per invocation, keeping
+older indexes valid; unused older generations need explicit operator cleanup.
+Each evidence file includes source_inputs (paths, metadata, optional
+provenance.version), full old_units/new_units and changes with operation
+(add/delete/modify/move/equal/uncertain), zero-based old_ref/new_ref into those
+canonical unit arrays (null for an absent side), and basis. Text is not repeated
+inside operations. Per-document streaming keeps full-corpus memory bounded.
+Units preserve kind, text, key, heading context and original one-based start_line
+and end_line. Applied repairs additionally expose projected_start_line and
+projected_end_line; recovery records retain original byte_offset, text and
+source_line. The report does not pretend ambiguous alignment is an exact patch.
+Input drift prevents stale equivalence claims. Successful publication stages
+both private mode-0600 outputs together before replacing them; caught publication
+failures roll back ordinary replacements. This is not a crash-proof transaction.
+Inputs are never changed. Repeating reads immutable snapshots again and replaces
+only requested reports. No compilation or baseline advancement occurs.
+
+Explicit body recovery (mdcompare-body-recovery-1)
+------------------------------------------------
+Optional recovery JSON:
+{
+  "schema_version": "mdcompare-body-recovery-1",
+  "documents": [{
+    "knowledge_base": "example-book", "document_id": "42", "side": "baseline",
+    "source_copy": "immutable-old.md",
+    "insertions": [{"byte_offset": 120, "text": "> 转写说明：\n"}]
+  }]
+}
+side is baseline or incoming. source_copy resolves relative to the recovery
+manifest and must match that descriptor's original bytes exactly. Insertions
+are ordered nonnegative UTF-8 byte offsets into the ORIGINAL source; no content
+replacement/removal is accepted. Only standalone mdocr begin/end comments,
+legacy transcription-end markers, legacy comment closers and newlines can be
+inserted. Existing authored content cannot be supplied as replacement text.
+Projection is in memory. The explicit artifact is a trusted operator statement
+of already-established boundaries, not automatic recovery or proof of body
+semantic equivalence. Unmatched records do not imply documents are missing.
+Malformed whole-manifest shape is CLI error 1. Invalid replay/witness drift
+DEFERs its document, while healthy documents continue. No heuristic rescue runs.
+
+Exit codes: 0 complete routing (differences/uncertainty allowed); 2 complete
+report with one or more DEFER results; 1 invalid manifest/arguments or global
+publication failure. Inspect the JSON and stderr, not the exit number alone.
+Stdout is silent. Do not consume an old report as newly completed after error 1.
