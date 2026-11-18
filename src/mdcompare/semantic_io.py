@@ -1,5 +1,6 @@
 """Bounded-memory publication of full per-document semantic evidence."""
 
+import hashlib
 import json
 import os
 import shutil
@@ -73,9 +74,11 @@ def publish_semantic(args):
         if reader.changed_paths():
             raise InputError("INPUT_CHANGED")
         diff["evidence_directory"] = directory.name
+        report_bytes = (json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode()
+        diff["report_sha256"] = hashlib.sha256(report_bytes).hexdigest()
         publish_reports(
             [
-                (args.output, json.dumps(report, ensure_ascii=False, indent=2) + "\n"),
+                (args.output, report_bytes.decode()),
                 (
                     args.diff_output,
                     json.dumps(diff, ensure_ascii=False, indent=2) + "\n",

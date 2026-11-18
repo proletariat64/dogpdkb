@@ -80,6 +80,17 @@ Exit codes and next steps:
 Full schema: mdcompare compare --help --full
 """
 
+SEMANTIC_ROUTE = """Offline score routing after mdcompare semantic and external scoring.
+Requires the exact semantic report, diff index, and mdcompare-semantic-scores-1 JSON.
+Score rows bind (knowledge_base, document_id) to evidence path and SHA-256 bytes.
+Only CHANGED documents are score-routed; missing scores remain COMPILE. Score >
+--compile-threshold compiles (default 3); scores at or below skip unless
+--skip-ambiguity-intercept yes and ambiguous, which compiles. No model/network.
+Outputs semantic-route-1.0 separately; invalid bindings publish nothing.
+
+Full schema: mdcompare semantic-route --help --full
+"""
+
 SEMANTIC = """Offline authored-body routing; no OCR, network or model calls.
 Pair by (knowledge_base, document_id). New/changed/uncertain incoming documents COMPILE;
 only paired contextual normalized equality SKIPs; unavailable body DEFERs.
@@ -164,6 +175,7 @@ NORMAL = {
     "compare": COMPARE,
     "knowledge": KNOWLEDGE,
     "semantic": SEMANTIC,
+    "semantic-route": SEMANTIC_ROUTE,
     "catalog": CATALOG,
 }
 
@@ -177,6 +189,8 @@ def full_contract(command: str) -> str:
         names += ["knowledge.txt"]
     elif command == "semantic":
         names += ["semantic.txt"]
+    elif command == "semantic-route":
+        names += ["semantic-route.txt"]
     elif command == "catalog":
         names += ["catalog.txt", "resources.txt"]
     return "\nComplete local contract\n=======================\n\n" + "\n\n".join(

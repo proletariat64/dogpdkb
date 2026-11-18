@@ -107,6 +107,20 @@ dogpdkb purge --config ./instance/dogpdkb.toml --book funds --run RUN --force
 purge 只删除所选 book 的 wash，包括失败材料和运行记录；正式语料、图谱、持久
 版本事实、必要比较输入和工具缓存保留。它不解除失败抑制、不触发重试或历史回填。
 
+## Optional offline semantic score routing
+
+After `mdcompare semantic`, an external operator/scorer may create a
+`mdcompare-semantic-scores-1` manifest, then call
+`mdcompare semantic-route --report semantic.json --diff-index diff.json --scores scores.json --output route.json`.
+This is a separate policy stage: it never calls a model, network, Graphify or
+compiler and does not alter the deterministic `semantic-1.0` report or dogpdkb
+consumer. Scores bind exact sidecar bytes using SHA-256 and must match the index
+report digest; invalid/duplicate/stale bindings fail without publishing. Default
+threshold 3 means strictly greater scores compile, lower/equal scores skip;
+`--skip-ambiguity-intercept yes` only converts ambiguous lower/equal skips to
+compile. Missing scores never enable skips. See
+`mdcompare semantic-route --help --full` for the complete schema and path rules.
+
 ## 小订阅
 
 在独立 `books.json` 来源中设置 `document_ids`，并使用独立 key 和目标目录：

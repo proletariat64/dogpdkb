@@ -24,6 +24,7 @@ from .knowledge import compare_knowledge_documents, render_knowledge_report
 from .manifest import ManifestError, load_manifest
 from .model import CompareOptions
 from .semantic_io import publish_semantic
+from .semantic_route import publish_semantic_route
 
 
 class ArgumentParser(argparse.ArgumentParser):
@@ -232,6 +233,15 @@ def main(argv=None) -> int:
     semantic.add_argument(
         "--max-diff-work", type=nonnegative_int, default=CompareOptions.max_diff_work
     )
+    route_parser = sub.add_parser(
+        "semantic-route", help="Route changed documents from bound offline scores",
+        description="Validate score bindings and publish a distinct score-route report.",
+        epilog=NORMAL["semantic-route"],
+    )
+    for name in ("report", "diff-index", "scores", "output"):
+        route_parser.add_argument("--" + name, type=Path, required=True)
+    route_parser.add_argument("--compile-threshold", type=int, choices=range(1, 6), default=3)
+    route_parser.add_argument("--skip-ambiguity-intercept", choices=("yes", "no"), default="no")
     catalog = sub.add_parser(
         "catalog",
         help="Build an offline resource manifest from Markdown",
@@ -256,6 +266,16 @@ def main(argv=None) -> int:
             catalog_manifest(args.input, args.output)
         except (InputError, ManifestError, OSError, ValueError) as exc:
             print(f"mdcompare: {exc}", file=sys.stderr)
+            return 1
+        return 0
+    if args.command == "semantic-route":
+        try:
+            publish_semantic_route(args)
+        except InputError as exc:
+            print(f"mdcompare: {getattr(exc, 'reason_code', str(exc))}", file=sys.stderr)
+            return 1
+        except OSError:
+            print("mdcompare: REPORT_WRITE_FAILED", file=sys.stderr)
             return 1
         return 0
     if args.command == "semantic":
