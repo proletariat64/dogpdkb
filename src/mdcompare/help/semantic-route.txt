@@ -12,7 +12,7 @@ index.report_sha256 must match the exact report bytes. Score input schema:
  "evidence":"evidence/000000.json","evidence_sha256":"<sha256>",
  "score":1,"ambiguous":false}]}
 Each score identifies exactly one indexed sidecar by the same relative evidence
-path and its SHA-256 digest over exact sidecar bytes. Duplicate, malformed,
+path and its SHA-256 digest over exact sidecar bytes as recorded in the index. Duplicate, malformed,
 non-integer/out-of-range score, missing identity, escaping evidence path or bad
 binding rejects the entire invocation and publishes nothing. Score paths are
 relative to the score manifest; evidence paths are relative to the diff index.
@@ -24,6 +24,7 @@ With ambiguity intercept yes, an ambiguous score at/below threshold compiles;
 it never changes a high-score route. No/missing scores stay COMPILE. All other
 deterministic statuses keep the original route. Output is separate and does not
 modify semantic-1.0 or invoke an LLM, network, Graphify or compiler. Inputs and
-all declared artifacts are protected from output aliasing.
+the indexed source manifests, Markdown paths and evidence are protected from
+output aliasing.
 
 Exit codes: 0 route report published; 1 invalid binding/input or publication failure.

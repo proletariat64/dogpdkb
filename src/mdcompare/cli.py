@@ -234,14 +234,19 @@ def main(argv=None) -> int:
         "--max-diff-work", type=nonnegative_int, default=CompareOptions.max_diff_work
     )
     route_parser = sub.add_parser(
-        "semantic-route", help="Route changed documents from bound offline scores",
+        "semantic-route",
+        help="Route changed documents from bound offline scores",
         description="Validate score bindings and publish a distinct score-route report.",
         epilog=NORMAL["semantic-route"],
     )
     for name in ("report", "diff-index", "scores", "output"):
         route_parser.add_argument("--" + name, type=Path, required=True)
-    route_parser.add_argument("--compile-threshold", type=int, choices=range(1, 6), default=3)
-    route_parser.add_argument("--skip-ambiguity-intercept", choices=("yes", "no"), default="no")
+    route_parser.add_argument(
+        "--compile-threshold", type=int, choices=range(1, 6), default=3
+    )
+    route_parser.add_argument(
+        "--skip-ambiguity-intercept", choices=("yes", "no"), default="no"
+    )
     catalog = sub.add_parser(
         "catalog",
         help="Build an offline resource manifest from Markdown",
@@ -272,7 +277,9 @@ def main(argv=None) -> int:
         try:
             publish_semantic_route(args)
         except InputError as exc:
-            print(f"mdcompare: {getattr(exc, 'reason_code', str(exc))}", file=sys.stderr)
+            print(
+                f"mdcompare: {getattr(exc, 'reason_code', str(exc))}", file=sys.stderr
+            )
             return 1
         except OSError:
             print("mdcompare: REPORT_WRITE_FAILED", file=sys.stderr)

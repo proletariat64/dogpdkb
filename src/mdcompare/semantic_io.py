@@ -51,13 +51,14 @@ def publish_semantic(args):
         path = directory / f"{count:06d}.json"
         count += 1
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(evidence, stream, ensure_ascii=False)
-            stream.write("\n")
+        data = (json.dumps(evidence, ensure_ascii=False) + "\n").encode()
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
         return {
             "knowledge_base": evidence["knowledge_base"],
             "document_id": evidence["document_id"],
             "evidence": str(path.relative_to(args.diff_output.parent)),
+            "sha256": hashlib.sha256(data).hexdigest(),
         }
 
     try:
@@ -74,7 +75,9 @@ def publish_semantic(args):
         if reader.changed_paths():
             raise InputError("INPUT_CHANGED")
         diff["evidence_directory"] = directory.name
-        report_bytes = (json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode()
+        report_bytes = (
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+        ).encode()
         diff["report_sha256"] = hashlib.sha256(report_bytes).hexdigest()
         publish_reports(
             [
