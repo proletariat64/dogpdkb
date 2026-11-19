@@ -28,7 +28,37 @@ def score_runtime(tmp_path, monkeypatch):
     (sdk / "dist").mkdir()
     (sdk / "dist/index.js").write_text("""
 import assert from 'node:assert/strict';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { setTimeout } from 'node:timers/promises';
+
+const marker = (kind, id) => `${process.env.SCORE_CALLS}.${kind}.${id}`;
+async function until(predicate) {
+  for (let i=0; i<250; i++) {
+    if (predicate()) return;
+    await setTimeout(20);
+  }
+  throw Error('synthetic provider barrier did not open');
+}
+async function waveStatus(evidence) {
+  if (!process.env.SCORE_WAVES) return {};
+  const waves = JSON.parse(process.env.SCORE_WAVES);
+  const id = evidence.new_units.map(x=>x.text).join(' ').match(/case-(\\d+)/)[1];
+  const wave = waves.findIndex(group => group.includes(id));
+  assert.notEqual(wave, -1);
+  for (const previous of waves.slice(0, wave).flat()) {
+    assert.ok(existsSync(marker('finished', previous)), 'must drain old tier');
+  }
+  const journal = JSON.parse(readFileSync(process.env.SCORE_JOURNAL, 'utf8'));
+  assert.equal(journal.attempts.find(row=>row.document_id===id)?.status,'admitted');
+  writeFileSync(marker('started', id), '');
+  await until(() => waves[wave].every(item => existsSync(marker('started',item))));
+  const rates = JSON.parse(process.env.SCORE_429 || '[]');
+  if (rates.length && !rates.includes(id)) {
+    await until(() => JSON.parse(readFileSync(process.env.SCORE_JOURNAL, 'utf8')).concurrency === 2-wave);
+  }
+  writeFileSync(marker('finished', id), '');
+  return {status:rates.includes(id) ? 429 : 200};
+}
 export class ModelRuntime {
  static async create(opts) { assert.equal(opts.allowModelNetwork,false); return new ModelRuntime(); }
  getPhysicalModel(provider,id) { assert.equal(provider,'openai'); assert.equal(id,'gpt-6.1-terra'); return {provider,id,api:'openai-responses',reasoning:true}; }
@@ -42,9 +72,13 @@ export class ModelRuntime {
   assert.ok(evidence.operations.every(x=>Number.isInteger(x.operation_id)));
   assert.ok(!('source_inputs' in evidence));
   globalThis.fetch=async ()=>{appendFileSync(process.env.SCORE_CALLS,'submitted\\n');
+    if(process.env.SCORE_TEST_REPLY==='crash') {process.kill(process.ppid,'SIGKILL'); process.exit(0);}
     if(process.env.SCORE_TEST_REPLY==='unknown') throw TypeError('synthetic disconnect');
-    return new Response('{}',{status:process.env.SCORE_TEST_REPLY==='429'?429:200});};
-  try {await opts.fetch('https://api.openai.com/v1/responses');} catch {return {stopReason:'error'};}
+    const {status} = await waveStatus(evidence);
+    return new Response('{}',{status:status ?? (process.env.SCORE_TEST_REPLY==='429'?429:200)});};
+  let response;
+  try {response=await opts.fetch('https://api.openai.com/v1/responses');} catch {return {stopReason:'error'};}
+  if (response.status === 429 && process.env.SCORE_429) throw Error('synthetic SDK error');
   const value=process.env.SCORE_TEST_REPLY || JSON.stringify({evaluation_status:'evaluated',change_score:3,
     checked_operations:evidence.operations.map(x=>x.operation_id),changes:[{operation_id:0,before:'previous',after:'new',ambiguity:'uncertain'}],reason:'possible difference',missing_evidence:[]});
   return {stopReason:'stop',content:[{type:'text',text:value}],usage:{input:7,output:3,cacheRead:0,cacheWrite:0}};
@@ -61,7 +95,44 @@ export class ModelRuntime {
     return calls
 
 
-def run_score(tmp_path, report, index, *extra):
+def changed_batch(tmp_path, size):
+    manifests = []
+    for side, text in (("old", "Rule expires in April"), ("new", "Rule lasts until May")):
+        documents = []
+        for n in range(1, size + 1):
+            body = tmp_path / f"{side}-{n}.md"
+            body.write_text(f"case-{n}: {text}.\n")
+            documents.append(
+                {
+                    "knowledge_base": "book",
+                    "document_id": str(n),
+                    "content_kind": "raw",
+                    "path": str(body),
+                    "metadata": {"name": "Rule", "logical_path": "", "source_ref": f"book:{n}"},
+                    "resources": [],
+                }
+            )
+        path = tmp_path / f"{side}.json"
+        path.write_text(json.dumps({"schema_version": "1.0", "documents": documents}))
+        manifests.append(path)
+    report, index = tmp_path / "semantic.json", tmp_path / "diff.json"
+    result = invoke(
+        tmp_path,
+        "semantic",
+        "--baseline",
+        manifests[0],
+        "--incoming",
+        manifests[1],
+        "--output",
+        report,
+        "--diff-output",
+        index,
+    )
+    assert result.returncode == 0, result.stderr
+    return report, index
+
+
+def run_score(tmp_path, report, index, *extra, budget=1):
     return invoke(
         tmp_path,
         "semantic-score",
@@ -72,9 +143,75 @@ def run_score(tmp_path, report, index, *extra):
         "--output",
         tmp_path / "scores.json",
         "--request-budget",
-        "1",
+        str(budget),
         *extra,
     )
+
+
+def test_score_default_overlaps_three_requests_without_exceeding_budget(
+    tmp_path, score_runtime, monkeypatch
+):
+    report, index = changed_batch(tmp_path, 4)
+    monkeypatch.setenv("SCORE_WAVES", json.dumps([["1", "2", "3"]]))
+    monkeypatch.setenv("SCORE_JOURNAL", str(tmp_path / "scores.json.execution.json"))
+    result = run_score(tmp_path, report, index, budget=3)
+    assert result.returncode == 2, result.stderr
+    output = tmp_path / "scores.json"
+    original = output.read_bytes()
+    saved = json.loads(original)
+    assert [row["document_id"] for row in saved["scores"]] == ["1", "2", "3"]
+    assert [(row["document_id"], row["reason"]) for row in saved["unscored"]] == [
+        ("4", "REQUEST_BUDGET_EXHAUSTED")
+    ]
+    assert run_score(tmp_path, report, index, budget=3).returncode == 2
+    assert output.read_bytes() == original
+    assert score_runtime.read_text().splitlines() == ["submitted"] * 3
+
+
+def test_score_drains_each_rate_limited_tier_and_stops_at_one(
+    tmp_path, score_runtime, monkeypatch
+):
+    report, index = changed_batch(tmp_path, 7)
+    monkeypatch.setenv("SCORE_WAVES", json.dumps([["1", "2", "3"], ["4", "5"], ["6"]]))
+    monkeypatch.setenv("SCORE_429", json.dumps(["1", "2", "4", "6"]))
+    monkeypatch.setenv("SCORE_JOURNAL", str(tmp_path / "scores.json.execution.json"))
+    for _ in range(2):
+        result = run_score(tmp_path, report, index, budget=7)
+        assert result.returncode == 2, result.stderr
+    saved = json.loads((tmp_path / "scores.json").read_text())
+    assert saved["execution"]["stop"] == "rate_limited"
+    assert saved["execution"]["concurrency"] == 1
+    assert [row["document_id"] for row in saved["scores"]] == ["3", "5"]
+    assert [(row["document_id"], row["reason"]) for row in saved["unscored"]] == [
+        (str(n), "rate_limited") for n in (1, 2, 4, 6, 7)
+    ]
+    assert score_runtime.read_text().splitlines() == ["submitted"] * 6
+
+
+def test_score_resume_never_replays_interrupted_admission_or_refunds_budget(
+    tmp_path, score_runtime, monkeypatch
+):
+    import signal
+
+    report, index = changed_batch(tmp_path, 3)
+    monkeypatch.setenv("SCORE_TEST_REPLY", "crash")
+    args = (tmp_path, report, index, "--concurrency", "1")
+    assert run_score(*args, budget=2).returncode == -signal.SIGKILL
+    journal = tmp_path / "scores.json.execution.json"
+    assert [row["status"] for row in json.loads(journal.read_text())["attempts"]] == [
+        "admitted"
+    ]
+    assert not (tmp_path / "scores.json").exists()
+    monkeypatch.delenv("SCORE_TEST_REPLY")
+    for _ in range(2):
+        assert run_score(*args, budget=2).returncode == 2
+    saved = json.loads((tmp_path / "scores.json").read_text())
+    assert [row["document_id"] for row in saved["scores"]] == ["2"]
+    assert [(row["document_id"], row["reason"]) for row in saved["unscored"]] == [
+        ("1", "unknown_outcome"),
+        ("3", "REQUEST_BUDGET_EXHAUSTED"),
+    ]
+    assert score_runtime.read_text().splitlines() == ["submitted"] * 2
 
 
 def test_score_defaults_route_ambiguous_three_to_skip_and_resume_without_replay(
