@@ -298,15 +298,13 @@ def _settled_report(root, seal):
     return None
 
 
-def _saved_ocr(previous, row):
+def _previous_ocr_evidence(previous, row):
     root = Path(previous["input"]).parent
     seal_path = root / "settled.json"
     if file_digest(seal_path) != previous["seal_sha256"]:
         raise ValueError("OCR checkpoint changed")
     seal = read_json(seal_path)
     payload = _settled_report(root, seal)
-    if payload is None:
-        raise ValueError("Previous OCR report unavailable")
     request = read_json(root / "request.json")
     entry = _index(request["documents"])[row["document_id"]]
     if file_digest(row["raw_path"]) != entry["source_sha256"]:
@@ -315,14 +313,24 @@ def _saved_ocr(previous, row):
     for asset in entry["assets"].values():
         if file_digest(resources[asset["resource_id"]]["path"]) != asset["sha256"]:
             raise ValueError("Raw resource changed at the same version")
+    if not same_version(entry["version"], row["version"]):
+        raise ValueError("OCR checkpoint version changed")
+    if payload is None:
+        if not seal["dispatched"]:
+            return None, "skipped", "not_sent", seal["reason"]
+        raise ValueError("Previous OCR report unavailable")
     plan, docs = _load_plan(root, request)
-    result, *_ = _verified_result(
+    return _verified_result(
         root,
         plan,
         docs[entry["path"]],
         entry,
         _index(payload["documents"])[entry["path"]],
     )
+
+
+def _saved_ocr(previous, row):
+    result, *_ = _previous_ocr_evidence(previous, row)
     if not result:
         raise ValueError("Previous OCR success no longer verifies")
     return result
@@ -494,6 +502,7 @@ def _execute(root, request, store, run, call_tool, *, allow_dispatch=True):
                 "input": str(req_path),
                 "report": str(report_path),
                 "send_state": "unknown",
+                "input_sha256": entry["source_sha256"],
             }
             for entry in request["documents"]
         )
@@ -542,9 +551,10 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
     candidates = [
         row for row in rows if row["action"] == "compile" or row.get("retry_ocr")
     ]
-    run.stage("ocr", total=len(candidates))
     if not candidates:
+        run.stage("ocr", total=0, completed=0, failed=0)
         return {}
+    run.stage("ocr", total=len(candidates))
     results, pending, observed = {}, [], {}
     existing = read_json(request_path) if request_path.exists() else None
     enrolled = _index(existing["documents"]) if existing else {}
@@ -624,6 +634,27 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
             continue
         if existing:
             raise ValueError("Saved OCR batch does not cover the frozen candidates")
+        if (
+            previous
+            and previous.get("run_id") != run.id
+            and previous.get("send_state") == "not_sent"
+            and same_version(previous["version"], version)
+        ):
+            try:
+                if _previous_ocr_evidence(previous, row)[1:3] != (
+                    "skipped",
+                    "not_sent",
+                ):
+                    raise ValueError("Previous OCR evidence does not prove unsent work")
+            except _INVALID:
+                note(
+                    row,
+                    "unknown",
+                    "unknown",
+                    "OCR_PREVIOUS_EVIDENCE_INVALID",
+                    report=previous.get("report"),
+                )
+                continue
         pending.append(row)
     if existing is None and pending:
         original_ids = [row["document_id"] for row in pending]
@@ -762,6 +793,6 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
         "ocr",
         total=len(candidates),
         completed=sum(r["status"] == "completed" for r in results.values()),
-        failed=sum(r["status"] != "completed" for r in results.values()),
+        failed=sum(r["status"] in {"failed", "unknown"} for r in results.values()),
     )
     return results

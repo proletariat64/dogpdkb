@@ -8,8 +8,8 @@ and software lifecycle remain separate.
 ## Local help
 
 All installed CLI help is in English and works offline without configuration or
-authentication. Use root help to choose a command, command help for a first
-invocation, and `--help --full` for the complete local contract:
+authentication. Root help shows run, watch and resume. Use command help for
+common options and `--help --full` for advanced options and the local contract:
 
 ```bash
 dogpdkb --help
@@ -104,7 +104,7 @@ process groups, starts no queued exports and preserves truthful checkpoints.
 This is a per-invocation option, not a TOML setting or a Skylark argument. Graph-only
 recovery with `--retry-graph` does not restart downloads.
 
-返回码：0 完成、无工作或停在计划；2 可用集合完成但有部分失败；1 整批失败；
+返回码：0 完成（含有依据的策略跳过）、无工作或按要求暂停；2 有待处理项；1 致命配置、身份或状态错误；
 64 参数错误；130/143 中断。stdout 是结果，stderr 实时输出进度与工具诊断，
 可直接由 shell 重定向和系统 logrotate 管理。没有工具公开计数时不推算百分比。
 
@@ -116,13 +116,23 @@ recovery with `--retry-graph` does not restart downloads.
 相关图片、报告和简要运行记录。计划暂停、整批失败和中断不自动清理；清理错误
 进入 stderr，不改变同步退出码。普通 resume 不恢复已清理批次。
 
-For a diagnosed graph failure, fix the provider/environment first, then run
-`dogpdkb sync --config ./instance/dogpdkb.toml --book funds --resume RUN --retry-graph`.
-This explicit recovery revalidates the retained final compile manifest, including
-after cleanup, and repeats only Graphify. It preserves earlier failure reports;
-target locks, source/version checks and frozen byte witnesses still apply.
-Unrelated failed batches remain blocked. Historical failures may keep exit 2
-even after graph recovery; inspect the current graph stage and its report.
+`status` separates corpus and graph publication, shows the last completed phase,
+and points to the next action. `status --run RUN --json` exposes observed, raw,
+corpus and graph facts with available SHA-256 witnesses; even equal source
+versions can have different corpus and graph bytes. `--watch` is read-only.
+Ctrl-C in the observer does not stop a separately running sync.
+
+Use `handoff.items` in the JSON to locate a document, version, phase, transmission
+state and evidence. `unknown` does not authorize replay. A proven-unsent OCR
+item can join a later eligible batch only after its evidence and bytes are
+revalidated. There is no document-level force retry.
+
+After diagnosing a graph failure, use
+`dogpdkb sync --config ./instance/dogpdkb.toml --book funds --resume RUN --retry-graph`
+only for the exact saved batch. Recovery checks the manifest, input mode, prior
+graph generation, versions and byte witnesses. Earlier failures remain visible;
+resolved graph failures alone do not keep a new sync run partial. See the
+[operator contract](docs/orchestrator-core-contracts.md#processes-and-observation).
 
 ```bash
 dogpdkb purge --config ./instance/dogpdkb.toml --book funds --run RUN

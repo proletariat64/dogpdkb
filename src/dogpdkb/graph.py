@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -13,6 +14,7 @@ import unicodedata
 from pathlib import Path, PureWindowsPath
 
 from dogpdkb.help import HelpParser
+from dogpdkb.phases import check_graph_manifest, graph_generation
 from dogpdkb.planning import reject_rollback
 from dogpdkb.processes import diagnostic_argv, run_command
 from dogpdkb.records import Run, Store, atomic_json, read_json, version_key
@@ -66,10 +68,12 @@ def _manifest(settings, book, store, run, reference):
                 f"corpus version changed for {doc_id}; generate a new plan"
             )
         witness = row.get("input_copy") or current.get("input_copy")
+        expected = row.get("input_copy_sha256")
         if (
             not witness
             or not Path(witness).is_file()
             or Path(witness).read_bytes() != path.read_bytes()
+            or (expected is not None and _digest(path) != expected)
         ):
             raise ValueError(
                 f"corpus input changed or missing for {doc_id}; generate a new plan"
@@ -233,13 +237,17 @@ def _portable_manifest(path):
     return data
 
 
+def _input_name(relative):
+    return unicodedata.normalize("NFC", relative.as_posix())
+
+
 def _tree_files(root):
     files = {}
     for path in root.rglob("*"):
         if path.is_symlink() or not (path.is_file() or path.is_dir()):
             raise ValueError("Graphify requires an ordinary file tree")
         if path.is_file():
-            name = unicodedata.normalize("NFC", path.relative_to(root).as_posix())
+            name = _input_name(path.relative_to(root))
             if name in files:
                 raise ValueError(
                     "Graphify input names collide after Unicode normalization"
@@ -534,14 +542,22 @@ def run_graph(
     manifest=None,
     *,
     retry_graph=False,
-    graphify_inputs="text",
+    graphify_inputs=None,
+    replan=False,
 ) -> int:
     """Run native directory extraction; publish only a complete batch."""
-    if graphify_inputs not in {"all", "text"}:
-        raise ValueError("graphify inputs must be 'all' or 'text'")
     manifest = manifest or run.data["artifacts"].get("manifest")
     if not manifest:
         raise ValueError("a complete-source compile manifest is required")
+    if "graph_retry" in run.data:
+        frozen = Path(manifest).read_bytes()
+        graphify_inputs = check_graph_manifest(
+            run, manifest, graphify_inputs, content=frozen
+        )
+        manifest = json.loads(frozen)
+    graphify_inputs = graphify_inputs or "text"
+    if graphify_inputs not in {"all", "text"}:
+        raise ValueError("graphify inputs must be 'all' or 'text'")
     data = _manifest(settings, book, store, run, manifest)
     if graphify_inputs == "text" and any(
         Path(row["path"]).suffix.lower() != ".md" for row in data["documents"]
@@ -551,6 +567,7 @@ def run_graph(
         row["action"] == "defer" for row in data["documents"]
     )
     pending = []
+    reconciled = 0
     for row in data["documents"]:
         if row["action"] != "compile":
             continue
@@ -564,10 +581,29 @@ def run_graph(
             and Path(previous["input_copy"]).read_bytes()
             == Path(row["path"]).read_bytes()
         ):
+            reconciled += 1
             continue
         pending.append(row)
     if not pending:
+        run.data["graph_publication"] = "published" if reconciled else "no_work"
+        run.stage("graphify", total=reconciled, completed=reconciled, failed=0)
         return 2 if partial else 0
+    binding = run.data.get("graph_retry")
+    if (
+        retry_graph
+        and binding is not None
+        and not (replan or binding.get("input_tree_sha256"))
+    ):
+        raise ValueError(
+            "no frozen graph input tree to retry; resume the phase or generate a new plan"
+        )
+    if (
+        retry_graph
+        and "graph_generation" in run.data
+        and (graph_generation(store, book) != run.data["graph_generation"])
+    ):
+        run.failure(step="graph", reason="STALE_GRAPH_HANDOFF", send_state="not_sent")
+        return 2
     selected = {row["document_id"] for row in pending}
     manifest_ids = {row["document_id"] for row in data["documents"]}
     omitted = _unowned_deferred_sources(settings, book, store, data)
@@ -677,6 +713,19 @@ def run_graph(
         )
         return 2
     snapshot = _snapshot(corpus)
+    input_digests = {
+        row["document_id"]: snapshot[
+            _input_name(Path(row["path"]).relative_to(book.corpus))
+        ]
+        for row in pending
+    }
+    if binding is not None:
+        scope = hashlib.sha256(
+            json.dumps(snapshot, sort_keys=True).encode()
+        ).hexdigest()
+        if binding.setdefault("input_tree_sha256", scope) != scope:
+            raise ValueError("saved graph input tree changed; generate a new plan")
+        run.save(durable=True)
     command = settings.command("graphify")
     preflight, preflight_log = _native_preflight(command, workspace)
     if preflight:
@@ -688,6 +737,7 @@ def run_graph(
                 else "GRAPHIFY_NATIVE_PROOF_UNSUPPORTED"
             ),
             report=str(preflight_log),
+            send_state="not_sent",
         )
         return preflight
     candidate = workspace / "graphify-out"
@@ -714,6 +764,7 @@ def run_graph(
                 "run_id": run.id,
                 "input": row["path"],
                 "report": str(report),
+                "input_sha256": input_digests[row["document_id"]],
             }
             for row in pending
         ),
@@ -728,6 +779,7 @@ def run_graph(
         env=_NATIVE_ENV,
     )
     status, reason = "failed", None
+    publication_attempted = False
     if code in {124, 130, 143}:
         status, reason = "unknown", "Graphify interrupted before a known result"
     elif code:
@@ -748,6 +800,7 @@ def run_graph(
             _tree_files(candidate)
             if _snapshot(graph_dir) != public_snapshot:
                 raise ValueError("public Graphify generation changed during extraction")
+            publication_attempted = True
             _publish_generation(candidate, graph_dir, exchange)
             status = "completed"
         except IncompleteExtraction as error:
@@ -806,7 +859,8 @@ def run_graph(
             document["graph"] = {
                 "status": "completed",
                 "version": row["version"],
-                "source_file": str(Path(row["path"]).relative_to(book.corpus)),
+                "source_file": str(source_file),
+                "sha256": input_digests[doc_id],
                 "run_id": run.id,
                 "report": str(retained_report),
             }
@@ -854,11 +908,16 @@ def run_graph(
                 log=str(log),
                 exit_code=code,
                 argv=diagnostic_argv(argv),
+                input_sha256=input_digests[doc_id],
             )
     if status == "completed":
         _sync_path(retained_report.parent)
     store.complete_batch(outcomes, durable=True)
     complete = len(pending) if status == "completed" else 0
+    run.data["graph_result"] = status
+    run.data["graph_publication"] = (
+        "published" if complete else "unknown" if publication_attempted else "retained"
+    )
     run.stage(
         "graphify",
         total=len(pending),
@@ -881,7 +940,7 @@ def main(argv=None) -> int:
     parser.add_argument("--config", type=Path)
     parser.add_argument("--book")
     parser.add_argument("--retry-graph", action="store_true")
-    parser.add_argument("--graphify-inputs", choices=["all", "text"], default="text")
+    parser.add_argument("--graphify-inputs", choices=["all", "text"])
     parser.add_argument(
         "-i",
         "--input",
@@ -912,7 +971,7 @@ def main(argv=None) -> int:
                 book,
                 store,
                 run,
-                manifest,
+                args.input,
                 retry_graph=args.retry_graph,
                 graphify_inputs=args.graphify_inputs,
             )
@@ -926,8 +985,6 @@ def main(argv=None) -> int:
                 else "failed",
                 code,
             )
-            import json
-
             print(
                 json.dumps(
                     {

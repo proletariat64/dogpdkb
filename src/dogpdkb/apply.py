@@ -17,6 +17,7 @@ from dogpdkb.help import HelpParser
 from dogpdkb.ocr_batch import file_digest, ocr_inputs, verify_completed_ocr
 from dogpdkb.phases import (
     SYNC_PHASES,
+    bind_graph_manifest,
     graph_generation,
     pause,
     read_checkpoint,
@@ -69,6 +70,8 @@ def failure(run, row, step, reason, *, persist=True, **details):
     expected = {"export": "skylark", "ocr": "mdocr", "compare": "mdcompare"}
     if "exit_code" in details and tool.get("name") == expected.get(step):
         details.setdefault("argv", tool.get("argv"))
+    details.setdefault("source_key", row.get("source_key"))
+    details.setdefault("input_sha256", row.get("raw_sha256"))
     run.failure(
         persist=persist,
         document_id=row["document_id"],
@@ -281,6 +284,7 @@ def prepare_inputs(
             document["raw"] = {
                 "version": row["version"],
                 "path": str(raw),
+                "sha256": file_digest(raw),
                 "metadata": desired_metadata,
                 "resources": catalog_paths(snapshot, row),
             }
@@ -312,6 +316,7 @@ def prepare_inputs(
         store.save()
         save_prepared()
     if requests:
+        run.data["progress_export_ids"] = [item["document_id"] for item in requests]
         run.stage("download", total=len(requests))
         by_id = {row["document_id"]: row for row in rows}
         kept = {row["document_id"] for row in rows} - {
@@ -412,6 +417,7 @@ def prepare_inputs(
                         store.document(row["document_id"])["raw"] = {
                             "version": row["version"],
                             "path": row["raw_path"],
+                            "sha256": file_digest(Path(row["raw_path"])),
                             "metadata": descriptor(book, row, row["raw_path"])[
                                 "metadata"
                             ],
@@ -583,6 +589,7 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
             "version": row["version"],
             "status": "running",
             "run_id": run.id,
+            "input_sha256": row.get("raw_sha256"),
         }
         for row in active
     )
@@ -1056,12 +1063,17 @@ def publish_corpus(book, store, run, plan, publication, *, verify_ocr=False):
     path = run.directory / "manifest.json"
     atomic_json(path, manifest)
     run.data["artifacts"]["manifest"] = str(path)
-    run.save()
+    run.data["corpus_publication"] = "published" if documents else "no_work"
+    run.stage("corpus", total=len(documents), completed=len(documents))
     return path
 
 
 def seal_corpus(book, store, run):
     run.data["graph_generation"] = graph_generation(store, book)
+    manifest = Path(run.data["artifacts"]["manifest"])
+    bind_graph_manifest(
+        run, manifest, read_json(manifest), run.data["sync_policy"]["graphify_inputs"]
+    )
     seal_phase(run, "corpus", "manifest")
 
 
@@ -1111,6 +1123,8 @@ def apply_run(
                 differences = read_json(Path(artifacts["differences"]))
             if isinstance(differences, (str, Path)):
                 differences = read_json(Path(differences))
+            if not isinstance(differences, dict):
+                raise ValueError("a difference scope is required")
             rows = prepare_inputs(
                 settings, book, store, run, differences, concurrency=concurrency
             )
@@ -1120,6 +1134,13 @@ def apply_run(
                 path = run.directory / "prepared-inputs.json"
                 atomic_json(path, {row["document_id"]: row for row in rows})
                 artifacts["prepared_inputs"] = str(path)
+                total = len(differences["documents"])
+                run.stage(
+                    "collect",
+                    total=total,
+                    completed=len(rows),
+                    failed=total - len(rows),
+                )
                 seal_phase(run, "collect", "differences", "prepared_inputs")
         if result := pause(run, "collect", stop_after):
             return result
@@ -1129,8 +1150,8 @@ def apply_run(
         knowledge, comparison, semantic = compare_inputs(
             settings, book, store, run, rows
         )
-        run.stage("plan", total=len(rows))
         plan = make_plan(book, run, rows, knowledge, comparison, semantic)
+        run.stage("plan", total=len(rows), completed=len(rows))
         if sync:
             seal_phase(run, "plan", "plan")
     if stop_after == "plan":
@@ -1278,7 +1299,9 @@ def replan_published(settings, book, store, run):
                 "source_file": source,
             }
     # Retain historical failures as evidence; recovery does not clear a graph block.
-    manifest["failures"] = list(run.data["failures"])
+    manifest["failures"] = [
+        row for row in run.data["failures"] if row.get("step") != "graph"
+    ]
     target = workspace / "manifest.json"
     atomic_json(target, manifest)
     run.data.setdefault("replans", []).append(
@@ -1289,8 +1312,12 @@ def replan_published(settings, book, store, run):
         }
     )
     run.data["artifacts"]["manifest"] = str(target)
+    if "graph_retry" in run.data:
+        bind_graph_manifest(
+            run, target, manifest, run.data["graph_retry"]["input_mode"]
+        )
     store.save()
-    run.save()
+    run.save(durable=True)
     return target
 
 
@@ -1350,9 +1377,7 @@ def parser_for(command="apply"):
         inputs = parser.add_mutually_exclusive_group()
         inputs.add_argument("--source", action="append", metavar="KEY")
         inputs.add_argument("--dir", type=Path, metavar="PATH")
-        parser.add_argument(
-            "--graphify-inputs", choices=["all", "text"], default="text"
-        )
+        parser.add_argument("--graphify-inputs", choices=["all", "text"])
         parser.add_argument("--retry-graph", action="store_true")
         parser.add_argument("--replan", action="store_true")
     return parser

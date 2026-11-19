@@ -12,8 +12,9 @@ and the original `.gitignore` / `.graphifyignore` scan controls. Images, PDF,
 code and other non-Markdown files are not copied into that input tree. Original
 corpus resources remain unchanged for OCR and publication; OCR text already in
 Markdown is preserved byte for byte. `all` keeps the previous complete-tree scan,
-including resources. The choice applies per invocation, including explicit graph
-recovery; the execution report records `graphify_inputs`.
+including resources. For a newly sealed sync batch, recovery inherits the saved
+mode and refuses a different one. Apply and older unbound batches retain their
+per-invocation option. The execution report records `graphify_inputs`.
 
 `graphify extract CORPUS --out WORKSPACE --no-cluster --backend openai-oauth --max-concurrency 3`
 scans that source tree, with `GRAPHIFY_OPENAI_OAUTH_PARALLEL=1` and force mode
@@ -146,7 +147,10 @@ for subsequent comparison and mixed-batch mirrors. Retained/deferred graph
 facts and their extraction witnesses stay unchanged.
 A nonzero extraction fails the entire batch; there is no per-source success
 claim. `dogpdkb-graph-result-1` is the orchestrator's own execution evidence, not a
-schema required from Graphify. Directory scans are not remote atomic snapshots.
+schema required from Graphify. Graph facts include SHA-256 of the actual input
+bytes. An unsuccessful wrapper exit is not evidence about provider transmission;
+only a proven pre-dispatch failure is `not_sent` in the handoff. Directory scans
+are not remote atomic snapshots.
 Execution evidence includes the actual sanitized argv, exit code and native log.
 Successful graph witnesses and reports live outside wash in attempt-specific
 paths; completed/partial sync reclaims the duplicate candidate workspace while

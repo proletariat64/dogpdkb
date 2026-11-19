@@ -404,7 +404,9 @@ def discover(settings, book, store, run, listing=None, *, sources=None):
                 )
     run.stage("discover")
     seen, selected, absent, ignored, listings, cutoffs = {}, [], [], [], {}, {}
-    for source in sources:
+    for index, source in enumerate(sources):
+        run.data["collect_source"] = source.key
+        run.stage("discover", total=len(sources), completed=index)
         yuque = isinstance(source, YuqueSource)
         try:
             if yuque:
@@ -486,6 +488,7 @@ def discover(settings, book, store, run, listing=None, *, sources=None):
     store.save()
     atomic_json(path, differences)
     run.data["artifacts"]["differences"] = str(path)
+    run.data.pop("collect_source", None)
     run.stage(
         "discover",
         observed=sum(len(scan["documents"]) for scan in seen.values()),

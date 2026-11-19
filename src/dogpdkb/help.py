@@ -10,7 +10,7 @@ from typing import TypeVar, overload
 _NamespaceT = TypeVar("_NamespaceT")
 
 SUMMARIES = {
-    "": "Synchronize selected Yuque knowledge through independent public tools.",
+    "": "Sync selected sources into a knowledge book, watch progress, or resume a saved run.",
     "discover": "Validate a complete source listing and select recent changes; no body export.",
     "apply": "Route authored-text changes, retain complete diffs, optionally OCR, then publish usable corpus Markdown.",
     "update-graph": "Compile published complete sources with the original Graphify CLI.",
@@ -50,7 +50,7 @@ EXAMPLES = {
     "discover": "dogpdkb discover --config instance/dogpdkb.toml --book funds",
     "apply": "dogpdkb apply --config instance/dogpdkb.toml --book funds --input differences.json --stop-after plan\n  dogpdkb apply --config instance/dogpdkb.toml --book funds --resume RUN",
     "update-graph": "dogpdkb update-graph --config instance/dogpdkb.toml --book funds --input manifest.json",
-    "sync": "dogpdkb sync --config instance/dogpdkb.toml --book funds --stop-after plan\n  dogpdkb sync --config instance/dogpdkb.toml --book funds --resume RUN",
+    "sync": "dogpdkb sync --book funds --dir ./incoming\n  dogpdkb sync --book funds --resume RUN",
     "status": "dogpdkb status --config instance/dogpdkb.toml --book funds --watch --json",
     "purge": "dogpdkb purge --config instance/dogpdkb.toml --book funds --run RUN\n  dogpdkb purge --config instance/dogpdkb.toml --book funds --all --force",
     "doctor": "dogpdkb doctor --package --json\n  dogpdkb doctor --config instance/dogpdkb.toml --book funds --json",
@@ -64,9 +64,9 @@ EXAMPLES = {
 DETAILS = {
     "discover": "Inputs: complete Skylark listing JSON, not Markdown. Writes a new wash run, listing, differences.json and durable observations, never corpus/graph. Missing baseline: use init-state first. stdout: JSON pointer with run/differences/counts; stderr: diagnostics. Exit codes: 0 selected/no changes; 1 failure; 64 usage; 130/143 interruption. Repeating creates a new listing observation; absent IDs never delete local data.",
     "apply": "Inputs: dogpdkb-differences-1 JSON from discover, or --resume (exclusive). Offline mdcompare semantic routes NEW/CHANGED/UNCERTAIN to COMPILE, EQUIVALENT to reuse/metadata, UNAVAILABLE to DEFER; images/OCR are advisory. Complete semantic diffs survive wash cleanup; optional [paths].body_recovery freezes explicit marker repair witnesses. Uses configured Skylark/mdcompare/mdocr and their existing authentication; may download and call OCR. Writes run reports, persistent inputs, state and corpus; emits dogpdkb-compile-1 manifest, not a graph update. stdout: exit_code/paused/manifest/run JSON; stderr: live tool diagnostics. Exit codes: 0 complete/plan pause; 2 usable set with failures; 1 batch failure; 64 usage; 130/143 interruption. Inspect reports before recovery: same-version failed/unknown steps remain suppressed. Resume validates saved inputs; it does not repair missing frozen inputs.",
-    "sync": "Inputs: configured enabled book, or saved run via --resume. Uses Skylark SSO, mdocr token for new OCR and configured Graphify provider. Writes wash, durable state/inputs, OCR cache, corpus and graph; Web publication is separate. stdout: exit_code/paused/manifest/run JSON; stderr: live progress/diagnostics. Exit codes: 0 complete/no work/requested pause; 2 usable set completed with failures; 1 batch failure; 64 usage; 130/143 interruption. Completed/partial sync cleans successful wash copies and retains failure evidence. After fixing a graph failure, --resume RUN --retry-graph revalidates its retained final compile manifest and repeats only Graphify, including after cleanup. Add --replan to recompute body selection from retained original snapshots without repeating export/OCR or rewriting corpus; missing original snapshots stop recovery. Other cleaned resumes are refused. Ordinary repeats never retry failed/unknown same-version steps; historical failures remain recorded.",
+    "sync": "Runs all phases unattended unless you request a stop. Use status --watch to observe. stdout: result JSON; stderr: tool progress and diagnostics. Exit codes: 0 complete/no work/paused; 2 unresolved work; 1 fatal error; 64 usage; 130/143 interruption.",
     "update-graph": "Inputs: dogpdkb-compile-1 JSON from apply with complete corpus paths and frozen witnesses. Requires configured original Graphify CLI/provider and an existing graph's native manifest.json. Writes isolated graph workspace, execution report, durable graph facts and successful graph/manifest publication. stdout: run_id/exit_code/status/report JSON; stderr: tool progress. Exit codes: 0 complete/no work; 2 recorded extraction failures or blocked work (possibly no graph published); 1 graph/batch failure; 64 usage; 130/143 interruption. Failed compile retains the public graph and does not roll back corpus. Inspect report; do not blindly repeat a suppressed failed/unknown version.",
-    "status": "Inputs: selected instance/book; optional run reference. Default: newest active run, otherwise newest recorded run. stdout: readable snapshot, JSON with --json, or JSONL with --watch --json; stderr: errors. No files, corpus, graph, caches or state are written; no tools/authentication are used. Exit codes: 0 snapshot/no-runs; 1 unreadable configuration/run; 64 usage; 130 interrupted watch. Repeating only observes; a stale recorded running run is shown as interrupted when its owner is no longer active.",
+    "status": "Default: newest active run, otherwise newest recorded run. stdout: snapshot, JSON with --json, or JSONL with --watch --json; stderr: diagnostics. Ctrl-C stops only the observer. Exit codes: 0 snapshot/no runs; 1 read error; 64 usage; 130 interrupted watch.",
     "purge": "Inputs: exactly one of --run and --all; no remote authentication. Deletes only selected book wash directories, including failed Markdown/images/reports and compact run records. Preserves corpus, graph, durable state, persistent comparison inputs and tool caches. Active runs/locks and unsafe paths remain protected even with --force. stdout: book/purged-paths JSON; stderr: errors. Exit codes: 0 deletion/no targets; 1 refusal/I/O failure; 64 usage. Repeating --run after removal fails because the run no longer exists; --all can return an empty list. Purge never resets suppression, retries work or backfills history.",
     "doctor": "Inputs: optional instance/book, or --package without instance settings. Checks selected directories and necessary tools' --help, without authenticating, synchronizing or proving remote availability. stdout: readable checks or a JSON check array; stderr: diagnostics. No corpus/graph/state publication; repeated checks may repeat tool probes. Exit codes: 0 all checks pass; 1 any failed check; 64 usage; 130/143 interrupted probe. Fix the failed check before business execution.",
     "init-config": "Inputs: output directory (default: cwd). Writes dogpdkb.toml and books.json examples with the source disabled. Existing files or symlinks cause refusal without overwrite. No credentials, tools or network required. stdout: creation message; stderr: error. Exit codes: 0 created; 1 I/O/collision; 64 usage. Edit the gateway/tool settings, source URL and enabled flag; repeat with a new empty directory rather than overwriting a configured instance.",
@@ -159,6 +159,17 @@ class HelpParser(argparse.ArgumentParser):
         return super().parse_known_args(arguments, namespace)
 
     def format_help(self):
+        if not self.full_help:
+            for action in self._actions:
+                if isinstance(action, argparse._SubParsersAction) and not self.scope:
+                    action.help = argparse.SUPPRESS
+                if self.scope == "sync" and action.dest in {
+                    "concurrency",
+                    "graphify_inputs",
+                    "retry_graph",
+                    "replan",
+                }:
+                    action.help = argparse.SUPPRESS
         if self.scope:
             self.epilog = (
                 "Example:\n  "
@@ -166,24 +177,20 @@ class HelpParser(argparse.ArgumentParser):
                 + "\n\n"
                 + textwrap.fill(DETAILS[self.scope], width=88)
             )
-            if self.scope not in {"init-config", "update", "uninstall"}:
+            if self.full_help and self.scope not in {
+                "init-config",
+                "update",
+                "uninstall",
+            }:
                 self.epilog += "\n\n" + CONFIGURATION
         else:
-            self.epilog = (
-                """Start here:
-  dogpdkb init-config --output instance
-  Edit instance/dogpdkb.toml and books.json; enable your chosen source.
-  dogpdkb doctor --config instance/dogpdkb.toml --book KEY
-  dogpdkb init-state --config instance/dogpdkb.toml --book KEY
-  dogpdkb sync --config instance/dogpdkb.toml --book KEY --stop-after plan
+            self.epilog = """Start here (add --config PATH for a named instance):
+  Run     dogpdkb sync --book BOOK
+  Watch   dogpdkb status --book BOOK --watch
+  Resume  dogpdkb sync --book BOOK --resume RUN
 
-Choose discover for selection, apply for corpus, update-graph for graph, or sync
-for the serial chain. status observes; purge deletes wash; publish-web is separate.
-stdout carries results, stderr diagnostics. Business exits are command-specific;
-read the selected command's Exit codes before deciding how to recover.
+Use dogpdkb sync --help or dogpdkb status --help for common options.
 """
-                + CONFIGURATION
-            )
         self.epilog += f"\nLocal contract: {self.prog} --help --full (or -h --full)."
         if self.full_help:
             root = Path(__file__).with_name("resources") / "help"

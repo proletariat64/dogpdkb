@@ -51,6 +51,23 @@ def test_sync_full_help_is_a_local_execution_contract(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
+def test_quick_help_teaches_run_watch_resume_before_advanced_options(tmp_path):
+    root = invoke(tmp_path, "--help")
+    overview = invoke(tmp_path, "sync", "--help")
+    details = invoke(tmp_path, "sync", "--help", "--full")
+    assert root.returncode == overview.returncode == details.returncode == 0
+    for example in (
+        "dogpdkb sync --book BOOK",
+        "dogpdkb status --book BOOK --watch",
+        "--resume RUN",
+    ):
+        assert example in root.stdout
+    for flag in ("--replan", "--graphify-inputs", "--concurrency"):
+        assert flag not in overview.stdout and flag in details.stdout
+    assert "dogpdkb-handoff-1" in details.stdout
+    assert not list(tmp_path.iterdir())
+
+
 @pytest.mark.parametrize("command", ["sync", "update-graph"])
 def test_graphify_input_mode_is_documented_locally(tmp_path, command):
     result = invoke(tmp_path, command, "--help", "--full")

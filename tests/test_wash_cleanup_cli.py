@@ -267,7 +267,7 @@ def test_graph_recovery_preserves_cleaned_unknown_ocr_failure_bundle(tmp_path):
         )
         .replace(
             "if tool in ('mdcompare', 'mdocr'):",
-            "if tool == 'mdocr': raise SystemExit(1)\nif tool in ('mdcompare', 'mdocr'):",
+            "if tool == 'mdocr' and args[0] == 'run': raise SystemExit(1)\nif tool in ('mdcompare', 'mdocr'):",
         )
         .replace(
             "    graph=flag('--out')",
@@ -285,7 +285,20 @@ def test_graph_recovery_preserves_cleaned_unknown_ocr_failure_bundle(tmp_path):
         if path.is_file() and path.name not in {"run.json", "manifest.json"}
     }
     assert (run.parent / "raw/2.png") in retained
-    assert any(path.name.endswith("-request.json") for path in retained)
+    snapshot = json.loads(
+        cli("status", "--config", config, "--run", run, "--json").stdout
+    )
+    [failure] = [
+        item
+        for item in snapshot["handoff"]["items"]
+        if item["phase"] == "ocr" and item["source_document_id"] == "2"
+    ]
+    assert failure["send_state"] == "unknown" and failure["retry_scope"] == "none"
+    [request] = [
+        Path(path) for path in failure["evidence"] if Path(path).name == "request.json"
+    ]
+    assert request.is_relative_to(tmp_path / "state/funds/ocr")
+    retained[request] = request.read_bytes()
     tool.write_text(original)
 
     result = cli("sync", "--config", config, "--resume", run, "--retry-graph")
@@ -323,8 +336,8 @@ def test_cleanup_failure_reports_stderr_without_changing_sync_result(tmp_path, f
             directory.chmod(0o755)
 
 
-@pytest.mark.parametrize("mode,expected", [("invalid", 1), ("interrupt", 130)])
-def test_whole_batch_failure_or_interruption_keeps_run_untouched(
+@pytest.mark.parametrize("mode,expected", [("invalid", 2), ("interrupt", 130)])
+def test_invalid_or_interrupted_graph_retains_failure_evidence(
     tmp_path, mode, expected
 ):
     config, tool = instance(tmp_path)
@@ -346,9 +359,16 @@ def test_whole_batch_failure_or_interruption_keeps_run_untouched(
         else next((tmp_path / "runs/funds").glob("run-*/run.json"))
     )
     record = json.loads(run.read_text())
-    assert "cleanup" not in record
-    assert (run.parent / "raw/0.md").is_file()
-    assert list(run.parent.glob("graphify-*"))
+    assert not (tmp_path / "corpus/graphify-out/graph.json").exists()
+    if mode == "interrupt":
+        assert "cleanup" not in record
+        assert (run.parent / "raw/0.md").is_file()
+    else:
+        assert (
+            record["status"] == "partial" and record["cleanup"]["status"] == "completed"
+        )
+    [report] = {row["report"] for row in record["failures"] if row["step"] == "graph"}
+    assert json.loads(Path(report).read_bytes())["status"] == "unknown"
 
 
 @pytest.mark.parametrize("image_target", ["2.png", "../images/2.png"])

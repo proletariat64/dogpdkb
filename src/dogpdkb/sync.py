@@ -11,7 +11,13 @@ from pathlib import Path
 from dogpdkb.apply import apply_run, corpus_fact, parser_for, record_interruption
 from dogpdkb.discover import DiscoverError
 from dogpdkb.ocr_batch import file_digest
-from dogpdkb.phases import SYNC_PHASES, graph_generation, read_checkpoint, seal_phase
+from dogpdkb.phases import (
+    SYNC_PHASES,
+    check_graph_manifest,
+    graph_generation,
+    read_checkpoint,
+    seal_phase,
+)
 from dogpdkb.records import Run, Store
 from dogpdkb.semantic import freeze_recovery
 from dogpdkb.settings import (
@@ -94,6 +100,42 @@ def graph_handoff_current(book, store, run):
     return not pending or run.data["graph_generation"] == graph_generation(store, book)
 
 
+def _settle_graph(
+    settings, book, store, run, manifest, retry_graph, graphify_inputs, *, replan=False
+):
+    from dogpdkb.graph import run_graph
+
+    if not retry_graph and "graph_exit_code" in run.data:
+        return run.data["graph_exit_code"]
+    if (
+        not retry_graph
+        and "graph_generation" in run.data
+        and not graph_handoff_current(book, store, run)
+    ):
+        run.data["graph_publication"] = "retained"
+        run.failure(step="graph", reason="STALE_GRAPH_HANDOFF", send_state="not_sent")
+        return 2
+    run.data["graph_publication"] = "pending"
+    run.data.pop("graph_result", None)
+    run.stage("graphify", phase="prepare")
+    graph_code = run_graph(
+        settings,
+        book,
+        store,
+        run,
+        manifest=manifest,
+        retry_graph=retry_graph,
+        graphify_inputs=graphify_inputs,
+        replan=replan,
+    )
+    if run.data["graph_publication"] == "pending":
+        run.data["graph_publication"] = "retained"
+    if run.data.get("graph_result") == "unknown" and graph_code == 1:
+        # An unproven tool result leaves unresolved work, not a fatal instance error.
+        return 2
+    return graph_code
+
+
 def sync_run(
     settings,
     book,
@@ -105,7 +147,7 @@ def sync_run(
     retry_graph=False,
     replan=False,
     concurrency=DEFAULT_DOWNLOAD_CONCURRENCY,
-    graphify_inputs="text",
+    graphify_inputs=None,
     sources=None,
 ):
     from dogpdkb.discover import discover
@@ -115,16 +157,23 @@ def sync_run(
         if retry_graph and (run.data.get("cleanup") or replan)
         else set()
     )
-    if replan:
-        from dogpdkb.apply import replan_published
-
-        replan_published(settings, book, store, run)
-        retained.update(path for path in run.directory.rglob("*") if path.is_file())
     if retry_graph:
         manifest = run.data["artifacts"].get("manifest")
         if not manifest:
             raise ValueError("graph recovery requires a saved final compile manifest")
-        result = {"exit_code": 0, "paused": False, "manifest": manifest}
+        graphify_inputs = check_graph_manifest(run, manifest, graphify_inputs)
+        if replan:
+            from dogpdkb.apply import replan_published
+
+            manifest = str(replan_published(settings, book, store, run))
+            retained.update(path for path in run.directory.rglob("*") if path.is_file())
+        result = {
+            "exit_code": 2
+            if any(f.get("step") != "graph" for f in run.data["failures"])
+            else 0,
+            "paused": False,
+            "manifest": manifest,
+        }
     else:
         completed = run.data.get("completed_phase")
         if (
@@ -133,7 +182,9 @@ def sync_run(
             and SYNC_PHASES.index(stop_after) < SYNC_PHASES.index(completed)
         ):
             raise ValueError("cannot stop before the last completed phase")
-        settings, graphify_inputs = freeze_policy(settings, store, run, graphify_inputs)
+        settings, graphify_inputs = freeze_policy(
+            settings, store, run, graphify_inputs or "text"
+        )
         differences = (
             None if resume else discover(settings, book, store, run, sources=sources)
         )
@@ -149,34 +200,21 @@ def sync_run(
         )
     if result["paused"]:
         return result
-    from dogpdkb.graph import run_graph
-
-    run.data.update(status="running", ended_at=None, exit_code=None, reason=None)
-    run.save()
-    if not retry_graph and "graph_exit_code" in run.data:
-        graph_code = run.data["graph_exit_code"]
-    elif (
-        not retry_graph
-        and "graph_generation" in run.data
-        and not graph_handoff_current(book, store, run)
-    ):
-        run.failure(step="graph", reason="STALE_GRAPH_HANDOFF")
-        graph_code = 2
-    else:
-        graph_code = run_graph(
-            settings,
-            book,
-            store,
-            run,
-            manifest=Path(result["manifest"]),
-            retry_graph=retry_graph,
-            graphify_inputs=graphify_inputs,
-        )
+    graph_code = _settle_graph(
+        settings,
+        book,
+        store,
+        run,
+        Path(result["manifest"]),
+        retry_graph,
+        graphify_inputs,
+        replan=replan,
+    )
     if graph_code in {130, 143}:
         record_interruption(store, run, graph_code)
         return {**result, "exit_code": graph_code}
     code = 1 if graph_code == 1 else 2 if 2 in {graph_code, result["exit_code"]} else 0
-    if not retry_graph and code != 1:
+    if code != 1:
         run.data["graph_exit_code"] = graph_code
         seal_phase(run, "graph")
     run.finish("failed" if code == 1 else "partial" if code == 2 else "completed", code)
@@ -184,6 +222,65 @@ def sync_run(
 
     clean_run(store, run, preserve=retained)
     return {**result, "exit_code": code}
+
+
+def _select_run(store, args, sources):
+    if not args.resume:
+        return Run.create(store, "sync", sources=sources)
+    run = Run.load(store, args.resume)
+    if not args.retry_graph:
+        if run.data.get("command") != "sync":
+            raise ValueError("ordinary resume requires a sync run")
+        if run.data.get("cleanup"):
+            raise ValueError("run has been cleaned; start a new run")
+    else:
+        manifest = run.data["artifacts"].get("manifest")
+        if not manifest:
+            raise ValueError("graph recovery requires a saved final compile manifest")
+        args.graphify_inputs = check_graph_manifest(run, manifest, args.graphify_inputs)
+    return run
+
+
+def _execute_sync(settings, book, store, run, args, sources):
+    run.data.update(
+        status="running",
+        pid=os.getpid(),
+        command="sync",
+        ended_at=None,
+        exit_code=None,
+        reason=None,
+    )
+    try:
+        result = sync_run(
+            settings,
+            book,
+            store,
+            run,
+            stop_after=args.stop_after,
+            resume=bool(args.resume),
+            retry_graph=args.retry_graph,
+            replan=args.replan,
+            concurrency=args.concurrency,
+            graphify_inputs=args.graphify_inputs,
+            sources=sources,
+        )
+    except InterruptedError as error:
+        record_interruption(store, run, error.args[0])
+        return error.args[0]
+    except DiscoverError as error:
+        code = error.exit_code
+        run.finish("interrupted" if code in {130, 143} else "failed", code, str(error))
+        raise
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        run.finish("failed", 1, str(error))
+        raise
+    print(
+        json.dumps(
+            {**result, "run": str(run.path), "status": run.data["status"]},
+            ensure_ascii=False,
+        )
+    )
+    return result["exit_code"]
 
 
 def main(argv=None):
@@ -200,7 +297,6 @@ def main(argv=None):
             parser.error("--retry-graph requires --resume and cannot use --stop-after")
     except SystemExit as error:
         return 64 if error.code == 2 else error.code
-    run = None
     try:
         settings = load_config(args.config)
         book = select_book(settings, args.book)
@@ -211,52 +307,11 @@ def main(argv=None):
         )
         store = Store(settings, book)
         with store.lock():
-            if args.resume:
-                previous = Run.load(store, args.resume)
-                if not args.retry_graph and previous.data.get("command") != "sync":
-                    raise ValueError("ordinary resume requires a sync run")
-                if previous.data.get("cleanup") and not args.retry_graph:
-                    raise ValueError("run has been cleaned; start a new run")
-                run = previous
-            else:
-                run = Run.create(store, "sync", sources=sources)
-            run.data.update(
-                status="running",
-                pid=os.getpid(),
-                command="sync",
-                ended_at=None,
-                exit_code=None,
-                reason=None,
-            )
-            try:
-                result = sync_run(
-                    settings,
-                    book,
-                    store,
-                    run,
-                    stop_after=args.stop_after,
-                    resume=bool(args.resume),
-                    retry_graph=args.retry_graph,
-                    replan=args.replan,
-                    concurrency=args.concurrency,
-                    graphify_inputs=args.graphify_inputs,
-                    sources=sources,
-                )
-            except InterruptedError as error:
-                record_interruption(store, run, error.args[0])
-                return error.args[0]
-            print(json.dumps({**result, "run": str(run.path)}, ensure_ascii=False))
-            return result["exit_code"]
+            run = _select_run(store, args, sources)
+            return _execute_sync(settings, book, store, run, args, sources)
     except DiscoverError as error:
-        code = error.exit_code
-        if run:
-            run.finish(
-                "interrupted" if code in {130, 143} else "failed", code, str(error)
-            )
         print(f"dogpdkb sync: {error}", file=sys.stderr)
-        return code
+        return error.exit_code
     except (OSError, ValueError, KeyError, TypeError) as error:
-        if run:
-            run.finish("failed", 1, str(error))
         print(f"dogpdkb sync: {error}", file=sys.stderr)
         return 1

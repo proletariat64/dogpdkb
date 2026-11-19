@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -26,12 +27,12 @@ def write(path, value):
     path.write_text(json.dumps(value))
 
 
-def fixture(tmp_path):
+def fixture(tmp_path, *, title="Title"):
     corpus = tmp_path / "corpus"
     corpus.mkdir()
     run = tmp_path / "runs/funds/run-graph"
     run.mkdir(parents=True)
-    source = corpus / "Title-2026-11-12-[42].md"
+    source = corpus / f"{title}-2026-11-12-[42].md"
     source.write_text(
         "# Complete current source\n\nReal full Markdown, never a diff fragment.\n"
     )
@@ -189,6 +190,18 @@ def cli(config, manifest, environment=None, *, retry_graph=False, graphify_input
         text=True,
         timeout=10,
     )
+
+
+def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):
+    config, manifest, source = fixture(tmp_path, title="Cafe\u0301")
+    result = cli(config, manifest)
+    assert result.returncode == 0, result.stdout + result.stderr
+    graph = json.loads((tmp_path / "state/funds/state.json").read_bytes())["documents"][
+        "42"
+    ]["graph"]
+    report = json.loads(Path(graph["report"]).read_bytes())
+    assert graph["sha256"] == report["input_sha256"]["Café-2026-11-12-[42].md"]
+    assert graph["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
 
 
 def test_complete_source_calls_only_public_graphify_and_records_success(tmp_path):

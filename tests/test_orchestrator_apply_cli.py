@@ -1075,7 +1075,10 @@ def test_graph_replan_rejects_missing_original_baseline_before_tools(tmp_path):
         "--replan",
     )
     assert recovered.returncode == 1
-    assert "original baseline snapshot unavailable" in recovered.stderr
+    assert (
+        f"plan input missing or changed for {plan['documents'][0]['document_id']}"
+        in recovered.stderr
+    )
     assert not list(Path(output["run"]).parent.glob("replan-*"))
 
 

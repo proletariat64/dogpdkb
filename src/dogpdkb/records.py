@@ -337,6 +337,175 @@ def initialize(settings: Settings, book: Book) -> dict:
     }
 
 
+_PHASE = {
+    "discover": "collect",
+    "download": "collect",
+    "export": "collect",
+    "compare": "plan",
+    "graphify": "graph",
+}
+
+
+def _matching_version(left, right):
+    return (
+        left is not None
+        and right is not None
+        and version_key(left) == version_key(right)
+    )
+
+
+def _failure_items(store, run, *, interrupted=False):
+    """Normalize attempt evidence. A tool exit or missing report is not a send receipt."""
+    run_id = run["run_id"]
+    failures = list(run.get("failures", []))
+    if interrupted:
+        recorded = {(f.get("document_id"), f.get("step")) for f in failures}
+        failures.extend(
+            {
+                **step,
+                "document_id": key,
+                "step": name,
+                "reason": "OWNER_LOST_DURING_ATTEMPT",
+            }
+            for key, doc in store.data["documents"].items()
+            for name, step in doc.get("steps", {}).items()
+            if step.get("run_id") == run_id
+            and step["status"] == "running"
+            and (key, name) not in recorded
+        )
+    binding = run.get("graph_retry", {})
+    graph_retriable = bool(binding.get("input_tree_sha256")) and not any(
+        f.get("reason") == "STALE_GRAPH_HANDOFF" for f in failures
+    )
+    items = []
+    for failure in failures:
+        identifier = failure.get("document_id")
+        doc = store.data["documents"].get(identifier, {})
+        name = failure.get("step")
+        step = doc.get("steps", {}).get(name, {})
+        frozen = (
+            binding.get("documents", {}).get(identifier, {}) if name == "graph" else {}
+        )
+        version = failure.get("version", frozen.get("version"))
+        if not _matching_version(version, frozen.get("version")):
+            frozen = {}
+        matching_step = step.get("run_id") == run_id and _matching_version(
+            version, step.get("version")
+        )
+        input_sha = failure.get("input_sha256") or frozen.get("input_sha256")
+        send = failure.get("send_state", "unknown")
+        retry = "none"
+        resolved = False
+        if name == "ocr" and matching_step:
+            resolved = (
+                step["status"] == "completed" and step.get("input_sha256") == input_sha
+            )
+            if (
+                send == "not_sent"
+                and step.get("send_state") == "not_sent"
+                and step["status"] == "skipped"
+                and input_sha
+                and step.get("input_sha256") == input_sha
+            ):
+                retry = "document_next_batch"
+        if name == "graph" and frozen and matching_step:
+            resolved = (
+                step["status"] == "completed"
+                and doc.get("graph", {}).get("sha256") == input_sha
+            )
+            if (
+                not resolved
+                and graph_retriable
+                and step["status"] in {"failed", "unknown", "running"}
+            ):
+                retry = "graph_batch"
+            if (
+                frozen.get("action") in {"reuse", "retain", "metadata"}
+                and run["status"] == "completed"
+            ):
+                resolved = True
+        if name == "graph" and not identifier:
+            # A pre-dispatch or batch-level error has no individual send evidence.
+            # Only a later published batch, not an arbitrary new run, resolves it.
+            resolved = run.get("graph_publication") == "published"
+            if not resolved and graph_retriable:
+                retry = "graph_batch"
+        evidence = [
+            failure.get("report"),
+            *failure.get("reports", []),
+            failure.get("log"),
+        ]
+        if name == "graph" and binding:
+            evidence.extend([binding["manifest"], frozen.get("input_copy")])
+        elif name != "graph":
+            evidence.append(failure.get("input"))
+        if matching_step:
+            if name != "graph":
+                evidence.append(step.get("input"))
+            evidence.append(step.get("report"))
+            if name == "ocr" and step.get("seal_sha256") and step.get("input"):
+                evidence.append(str(Path(step["input"]).with_name("settled.json")))
+        items.append(
+            {
+                "run_id": run_id,
+                "source_key": failure.get("source_key") or doc.get("source_key"),
+                "source_document_id": doc.get("source_document_id"),
+                "document_id": identifier,
+                "version": version,
+                "phase": _PHASE.get(name, name),
+                "step": name,
+                "send_state": send,
+                "input_sha256": input_sha,
+                "reason": failure.get("reason"),
+                "message": failure.get("message"),
+                "exit_code": failure.get("exit_code"),
+                "evidence": list(
+                    dict.fromkeys(p for p in evidence if p and Path(p).is_file())
+                ),
+                "resolution": "resolved" if resolved else "unresolved",
+                "retry_scope": "none" if resolved else retry,
+            }
+        )
+    return items
+
+
+def describe_handoff(store, run, path, *, interrupted=False):
+    items = _failure_items(store, run, interrupted=interrupted)
+    if run.get("reason") and not any(item["reason"] == run["reason"] for item in items):
+        items.append(
+            {
+                "run_id": run["run_id"],
+                "source_key": run.get("collect_source"),
+                "source_document_id": None,
+                "document_id": None,
+                "version": None,
+                "phase": _PHASE.get(run.get("stage"), run.get("stage")),
+                "step": run.get("stage"),
+                "send_state": "unknown",
+                "input_sha256": None,
+                "reason": run["reason"],
+                "message": None,
+                "exit_code": run.get("exit_code"),
+                "evidence": [],
+                "resolution": "unresolved",
+                "retry_scope": "none",
+            }
+        )
+    if not items:
+        return None
+    return {
+        "schema": "dogpdkb-handoff-1",
+        "run_id": run["run_id"],
+        "run": str(path),
+        "sources": run.get("sources", list(run.get("targets", {}).get("sources", {}))),
+        "items": items,
+        "unresolved": sum(item["resolution"] == "unresolved" for item in items),
+        "graph_retry": run.get("graph_retry")
+        if any(item["retry_scope"] == "graph_batch" for item in items)
+        else None,
+    }
+
+
 class Run:
     def __init__(self, store: Store, directory: Path, data: dict):
         self.store, self.directory, self.data = store, directory, data
@@ -445,4 +614,8 @@ class Run:
         self.data.update(
             status=status, exit_code=exit_code, reason=reason, ended_at=now_iso()
         )
-        self.save()
+        if self.data.get("command") == "sync":
+            self.data["handoff"] = describe_handoff(self.store, self.data, self.path)
+            self.save(durable=True)
+        else:
+            self.save()

@@ -154,7 +154,9 @@ def clean_run(store, run, *, preserve=()):
                 report = read_json(path)
                 report["candidate"] = None
                 atomic_json(path, report)
-        if manifest_path.is_file():
+        # A sealed compile manifest authorizes graph scope, not the mutable
+        # failure log. New sync runs keep subsequent failures in run.json.
+        if manifest_path.is_file() and "graph_retry" not in run.data:
             manifest = read_json(manifest_path)
             manifest["failures"] = run.data["failures"]
             atomic_json(manifest_path, manifest)

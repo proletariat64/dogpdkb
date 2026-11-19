@@ -13,10 +13,15 @@ schema dogpdkb-status-1, recorded_status (saved status), status (observed status
 alive (boolean), elapsed_seconds (nonnegative number or null if dates are
 unparseable), and run_directory (absolute path). A recorded running run becomes
 observationally interrupted when its owner is not live and holding its lock.
-Counts and artifacts are only recorded facts; missing totals are not estimated.
-Human output lists stage, counts, elapsed time and artifact pointers.
+progress shows current/last completed phase, completed/in_flight/pending/failed
+and last progress time. Counts may be null: neither limits nor a missing report
+prove how much work is in flight. publication separates corpus from graph;
+next_action describes what to do next. facts reflects current state for the
+run's selected sources. Observed, raw, corpus and graph facts are independent;
+corpus_vs_graph compares saved SHA-256 witnesses, even at the same version.
 
-Repeated calls only observe; they do not resume/retry. Inspect run failures and
-the pointed reports to choose recovery. A cleaned completed/partial sync run
-supports only explicit --retry-graph recovery from its retained final compile
-manifest; deleting wash cannot clear its durable failures.
+handoff (dogpdkb-handoff-1) records versioned failure/evidence rows and scope.
+unknown is not unsent. none authorizes nothing; document_next_batch is for
+proved-unsent OCR; graph_batch is for exact saved graph scope. eligibility is
+advisory; writers revalidate. Abrupt owner loss can show provisional evidence.
+The watch never retries. Purge can delete the handoff, not version suppression.
