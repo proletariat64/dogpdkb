@@ -3,7 +3,11 @@
 import argparse
 import sys
 import textwrap
+from collections.abc import Iterable
 from pathlib import Path
+from typing import TypeVar, overload
+
+_NamespaceT = TypeVar("_NamespaceT")
 
 SUMMARIES = {
     "": "Synchronize selected Yuque knowledge through independent public tools.",
@@ -13,7 +17,7 @@ SUMMARIES = {
     "sync": "Run serial discovery, export, comparison, planning, OCR, corpus and graph publication.",
     "status": "Observe a run without write locks or mutation; optionally stream snapshots.",
     "purge": "Explicitly delete selected book wash runs, preserving durable data and tool caches.",
-    "doctor": "Check the package or configured tool entry points offline; no remote acceptance.",
+    "doctor": "Check the package or selected configuration, paths and tool entry points offline.",
     "init-config": "Create disabled portable example configuration without overwriting files.",
     "init-state": "Register an existing corpus baseline without rewriting Markdown or graph.",
     "publish-web": "Build local Web catalog/map snapshots independently of synchronization.",
@@ -22,10 +26,12 @@ SUMMARIES = {
 }
 
 ARGUMENTS = {
-    "concurrency": "maximum simultaneous Skylark document exports: 1–3; default: 2; download stage only; may change when resuming",
+    "concurrency": "maximum simultaneous Skylark document exports: 1–3; default: 3; download stage only; may change when resuming",
     "graphify_inputs": "Graphify scan inputs: text (default) passes only Markdown (.md); all includes images and other corpus files; original corpus resources are preserved",
     "config": "TOML instance file: explicit option > DOGPDKB_CONFIG > source default.toml or installed cwd/dogpdkb.toml",
-    "book": "enabled source key in books.json (not its display name); optional only when exactly one source matches",
+    "book": "enabled book key in books.json; optional only when exactly one book is enabled",
+    "source": "select one enabled registered source; repeat for more",
+    "dir": "scan only this Markdown directory (paths resolve from cwd); cannot use with --source",
     "listing": "offline skylark-listing-1 JSON file; omitted: call configured Skylark listing; CLI paths use cwd",
     "replan": "with --resume RUN --retry-graph, recompute selection from retained original comparison snapshots; preserve published corpus/OCR and earlier evidence",
     "resume": "saved run ID, run directory or run.json path; reuse frozen inputs; cleaned sync runs support only explicit --retry-graph recovery",
@@ -62,7 +68,7 @@ DETAILS = {
     "update-graph": "Inputs: dogpdkb-compile-1 JSON from apply with complete corpus paths and frozen witnesses. Requires configured original Graphify CLI/provider and an existing graph's native manifest.json. Writes isolated graph workspace, execution report, durable graph facts and successful graph/manifest publication. stdout: run_id/exit_code/status/report JSON; stderr: tool progress. Exit codes: 0 complete/no work; 2 recorded extraction failures or blocked work (possibly no graph published); 1 graph/batch failure; 64 usage; 130/143 interruption. Failed compile retains the public graph and does not roll back corpus. Inspect report; do not blindly repeat a suppressed failed/unknown version.",
     "status": "Inputs: selected instance/book; optional run reference. Default: newest active run, otherwise newest recorded run. stdout: readable snapshot, JSON with --json, or JSONL with --watch --json; stderr: errors. No files, corpus, graph, caches or state are written; no tools/authentication are used. Exit codes: 0 snapshot/no-runs; 1 unreadable configuration/run; 64 usage; 130 interrupted watch. Repeating only observes; a stale recorded running run is shown as interrupted when its owner is no longer active.",
     "purge": "Inputs: exactly one of --run and --all; no remote authentication. Deletes only selected book wash directories, including failed Markdown/images/reports and compact run records. Preserves corpus, graph, durable state, persistent comparison inputs and tool caches. Active runs/locks and unsafe paths remain protected even with --force. stdout: book/purged-paths JSON; stderr: errors. Exit codes: 0 deletion/no targets; 1 refusal/I/O failure; 64 usage. Repeating --run after removal fails because the run no longer exists; --all can return an empty list. Purge never resets suppression, retries work or backfills history.",
-    "doctor": "Inputs: optional instance/book, or --package without instance settings. Default preflight calls configured tools' --help, but does not authenticate, synchronize or prove remote availability. stdout: readable checks or a JSON check array; stderr: diagnostics. No corpus/graph/state publication; repeated checks may repeat tool probes. Exit codes: 0 all checks pass; 1 any failed check; 64 usage; 130/143 interrupted probe. Fix the failed check before business execution.",
+    "doctor": "Inputs: optional instance/book, or --package without instance settings. Checks selected directories and necessary tools' --help, without authenticating, synchronizing or proving remote availability. stdout: readable checks or a JSON check array; stderr: diagnostics. No corpus/graph/state publication; repeated checks may repeat tool probes. Exit codes: 0 all checks pass; 1 any failed check; 64 usage; 130/143 interrupted probe. Fix the failed check before business execution.",
     "init-config": "Inputs: output directory (default: cwd). Writes dogpdkb.toml and books.json examples with the source disabled. Existing files or symlinks cause refusal without overwrite. No credentials, tools or network required. stdout: creation message; stderr: error. Exit codes: 0 created; 1 I/O/collision; 64 usage. Edit the gateway/tool settings, source URL and enabled flag; repeat with a new empty directory rather than overwriting a configured instance.",
     "init-state": "Inputs: configured book and existing title-YYYY-MM-DD-[ID].md corpus. Registers day-precision baseline facts in state/<book>/state.json under write locks; does not rewrite Markdown/graph, import old runs, extract knowledge or invent graph success. Existing records remain; duplicate IDs fail before registration. stdout: initialization JSON counts; stderr: error. Exit codes: 0 registered; 1 invalid baseline/configuration/I/O; 64 usage. Safe repeat preserves registered facts; inspect duplicate IDs before retrying.",
     "publish-web": "Inputs: corpus directory and Graphify graph.json, defaulting to configured book. Requires TOML configuration even with explicit paths; no remote authentication. Writes local catalog/map snapshots and current Web outputs; does not upload/deploy, synchronize or compile. stdout: status/documents/nodes/edges/communities/catalog/map JSON; stderr: error. Exit codes: 0 published locally; 2 parser/configuration/path/JSON-read errors; 1 rendering/schema/publication failure. Repeating builds a new snapshot and replaces current pointers; retain snapshots according to your operational policy.",
@@ -73,7 +79,7 @@ DETAILS = {
 CONFIGURATION = """Configuration:
   --config > DOGPDKB_CONFIG > checkout default.toml / installed cwd/dogpdkb.toml.
   TOML paths use its directory; book corpus paths use books.json. CLI file paths
-  use cwd. --book is an enabled key; omit only with exactly one matching source.
+  use cwd. --book is an enabled key; omit only with exactly one enabled book.
   Optional [paths].body_recovery is an explicit mdcompare-body-recovery-1 JSON
   path relative to config, frozen with byte witnesses per run. No automatic rescue.
   Tool authentication stays in existing tool environments; help needs none.
@@ -96,7 +102,24 @@ class HelpParser(argparse.ArgumentParser):
         )
         self.full_help = False
 
-    def parse_known_args(self, args=None, namespace=None):
+    @overload
+    def parse_known_args(
+        self, args: Iterable[str] | None = None, namespace: None = None
+    ) -> tuple[argparse.Namespace, list[str]]: ...
+
+    @overload
+    def parse_known_args(
+        self, args: Iterable[str] | None, namespace: _NamespaceT
+    ) -> tuple[_NamespaceT, list[str]]: ...
+
+    @overload
+    def parse_known_args(
+        self, *, namespace: _NamespaceT
+    ) -> tuple[_NamespaceT, list[str]]: ...
+
+    def parse_known_args(
+        self, args: Iterable[str] | None = None, namespace: _NamespaceT | None = None
+    ) -> tuple[argparse.Namespace | _NamespaceT, list[str]]:
         arguments = list(sys.argv[1:] if args is None else args)
         self.full_help = "--full" in arguments
         if self.full_help and not self.scope:
@@ -131,6 +154,8 @@ class HelpParser(argparse.ArgumentParser):
                     "book_name": "display name override; default: selected book name or explicit book URL",
                     "book_url": "source URL override; default: selected book URL",
                 }.get(action.dest, action.help)
+        if namespace is None:
+            return super().parse_known_args(arguments)
         return super().parse_known_args(arguments, namespace)
 
     def format_help(self):

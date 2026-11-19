@@ -45,7 +45,8 @@ Optional document_ids is a nonempty unique list of nonblank string IDs; omission
 subscribes to the whole Yuque book. A complete listing is validated before
 filtering. A directory source requires path and scans Markdown recursively.
 --book selects a subscription; omission requires exactly one enabled subscription.
---source KEY can repeat on sync and discover, selecting only enabled sources.
+--source KEY can repeat on sync, discover and doctor, selecting enabled sources.
+--dir PATH on sync or doctor selects a single directory without changing this file.
 Without --source, all enabled sources are scanned. Reusing a recorded source
 key with a different URL, scope or directory path is refused.
 
@@ -87,7 +88,7 @@ schema, run_id, command, book (key/name/sources), pid, lock (absolute corpus-loc
 path), status, stage, counts, started_at, updated_at, ended_at, exit_code, reason,
 artifacts (named absolute paths), failures and targets. targets holds source
 bindings and absolute corpus and graph paths. Loading a saved run checks all
-bindings and targets; resume does not accept a new --source selection.
+bindings and targets; resume accepts neither --source nor --dir.
 lock is the recorded corpus-lock path used by
 status for liveness observation; its presence does not itself prove a held lock.
 Optional stage/checkpoint fields are added as work progresses. Statuses include

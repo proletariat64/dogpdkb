@@ -122,7 +122,7 @@ def test_invalid_concurrency_has_no_instance_side_effects(tmp_path, command, val
     assert not list((tmp_path / "started").iterdir())
 
 
-@pytest.mark.parametrize("value, expected", [(None, 2), ("1", 1), ("2", 2), ("3", 3)])
+@pytest.mark.parametrize("value, expected", [(None, 3), ("1", 1), ("2", 2), ("3", 3)])
 def test_downloads_overlap_with_a_hard_configured_bound(tmp_path, value, expected):
     config, differences, ids = downloads(tmp_path)
     process = start(
@@ -188,10 +188,10 @@ def check_comparison_gate(config, tmp_path, count):
     )
 
 
-def test_sync_propagates_concurrency_and_waits_for_download_batch(tmp_path):
+def test_sync_defaults_to_three_exports_and_waits_for_download_batch(tmp_path):
     config, differences, ids = downloads(tmp_path)
     check_comparison_gate(config, tmp_path, len(ids))
-    process = start(config, differences, "--concurrency", "3", command="sync")
+    process = start(config, differences, command="sync")
     try:
         wait_for(lambda: len(list((tmp_path / "started").iterdir())) == 3, process)
         assert not (tmp_path / "compare-called").exists()

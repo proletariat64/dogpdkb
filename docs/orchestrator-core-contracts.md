@@ -17,6 +17,12 @@ when the key is omitted.
   the subscriptions JSON. Source keys are unique within the subscription.
   `Book.select_sources` defaults to all enabled sources and rejects unknown,
   disabled or duplicate explicit keys. Old top-level URL/scope is rejected.
+- For sync and doctor, `--dir PATH` selects only a Markdown directory, excludes
+  `--source`, and resolves PATH from the caller's cwd. A unique configured
+  directory binding at this canonical root is reused; otherwise a new identity
+  binds the canonical root to the selected book without changing subscriptions.
+  Multiple matching bindings require an explicit registered source selection.
+  Resume accepts neither `--source` nor `--dir`.
 - `Settings`: `file`, `books_file`, `corpus`, `staging`, `state`, `web`,
   `graph_dir` (optional), `mcp_url`, `proxy_bin`, `timeout_seconds`,
   `ocr_budget_seconds`, `ocr_cache`, `results`, optional `body_recovery`.
@@ -32,7 +38,7 @@ when the key is omitted.
 ## Download scheduling
 
 `sync` and `apply` accept the runtime option `--concurrency` with integer choices
-1, 2 and 3, default 2. It is not a Settings/TOML field and does not participate in
+1, 2 and 3, default 3. It is not a Settings/TOML field and does not participate in
 source identity or version checks. Invalid values fail before operational writes
 or subprocess dispatch. Each in-flight document retains a separate public Skylark
 request/report and raw destination. The coordinator alone updates Store/Run and
@@ -101,8 +107,10 @@ registered. Ambiguous ownership or duplicate IDs fail before registration.
 
 ## Run record
 
-`Run.create(store, command) -> Run` creates a new `run-*` directory under
-`settings.staging / book.key`, regardless of old interrupted records.
+`Run.create(store, command, *, sources=None) -> Run` creates a new `run-*`
+directory under `settings.staging / book.key`, regardless of old interrupted
+records. Sync supplies the selected sources; ad hoc bindings are registered
+under the write lock without recording observations or acquired inputs.
 `Run.load(store, reference)` accepts a run ID, run directory or run JSON path.
 
 - `run.directory`, `run.path`, `run.id`, `run.data`; `run.save()`.
@@ -124,10 +132,11 @@ registered. Ambiguous ownership or duplicate IDs fail before registration.
 - `run.data['artifacts']` maps public artifact names to paths. Other product
   metadata such as selected inputs, stop-after and plan paths stays in this record.
 
-Run JSON is schema `dogpdkb-run-1`, containing run_id, command, book, pid, status,
+Run JSON is schema `dogpdkb-run-2`, containing run_id, command, book, pid, status,
 stage, counts, started_at, updated_at, ended_at, exit_code, reason, artifacts and
 failures. Status is observationally interrupted when `running` has no live owner.
-`targets` freezes the source book URL and absolute corpus/graph targets. Loading
+`targets` freezes source bindings and absolute corpus/graph targets. A new sync
+freezes only selected sources and checks them against durable bindings. Loading
 a run for execution rejects changed targets before any tool call or publication;
 use a newly generated plan for a different source or target.
 Corpus publication saves `publication.json` (`dogpdkb-publication-1`) before
@@ -160,8 +169,8 @@ pruned. Newly created disposable graph workspace files can still be reclaimed.
 Manual `purge` deletes only
 selected wash; force permits discarding unfinished runs but never bypasses locks
 or clears durable facts, corpus, graphs, persistent inputs or tool caches.
-Purge validates saved schema, book key/source URL and run ID against the selected
-wash; it does not require the saved corpus/graph execution targets to match the
+Purge validates the saved schema, book key, source bindings and run ID against
+the selected wash; it does not require the saved corpus/graph execution targets to match the
 current configuration. Protected-path and live-owner checks still apply.
 Saved corpus/graph targets must be absolute and cannot overlap selected wash.
 Purge acquires their locks in addition to current target locks before deleting
