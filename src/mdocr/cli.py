@@ -61,7 +61,9 @@ def build_parser(*, full: bool = False) -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=False)
 
-    plan = sub.add_parser("plan", help="create an immutable, inference-free conversion plan")
+    plan = sub.add_parser(
+        "plan", help="create an immutable, inference-free conversion plan"
+    )
     plan.add_argument("--mode", choices=("paddle", "llm"), required=True)
     shape = plan.add_mutually_exclusive_group(required=True)
     shape.add_argument("--input", help="one Markdown file")

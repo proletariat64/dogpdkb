@@ -606,7 +606,12 @@ class Execution:
                 }
                 if context is not None:
                     ocr["context_sha256"] = context
-                row.update(status="completed", output=str(output), ocr=ocr)
+                row.update(
+                    status="completed",
+                    output=str(output),
+                    output_sha256=_sha(content),
+                    ocr=ocr,
+                )
             rows.append(row)
         self.state["documents"] = rows
         if self.stop and self.stop not in self.state["causes"]:

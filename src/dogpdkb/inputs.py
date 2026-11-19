@@ -1,5 +1,6 @@
 """Keep immutable publication inputs outside disposable run directories."""
 
+import hashlib
 import os
 import re
 import shutil
@@ -108,6 +109,13 @@ def retain_ocr_files(directory, run, result, output, resources, original_paths):
             artifact.write_text(
                 relocate(artifact.read_text(encoding="utf-8")), encoding="utf-8"
             )
+    for item in records:
+        if item.get("artifact_sha256") and item.get("artifact"):
+            item["artifact_sha256"] = hashlib.sha256(
+                Path(item["artifact"]).read_bytes()
+            ).hexdigest()
+    if result.get("output_sha256"):
+        result["output_sha256"] = hashlib.sha256(retained.read_bytes()).hexdigest()
     return retained
 
 
