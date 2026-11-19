@@ -47,27 +47,25 @@ no additional hash/fingerprint mechanism is introduced. `baseline_version` state
 the version used for body comparison. A reusable body does not certify a missing
 or older uncompiled graph version; graph policy must account for that difference.
 
-Exports and OCR run one document per serial CLI invocation within their whole
-batch stage. Only the current document is recorded as attempted, so interruption
-cannot suppress later unstarted documents. A shared OCR cause stops new OCR
-invocations; those documents still publish usable body and carry
-`pending_steps: ["ocr"]`. Graph publication must retain their discover pending
-fact. Failed/unknown actual attempts remain suppressed; unstarted work remains
-eligible for an explicit resume or the next ordinary batch. `pending_metadata`
-contains the frozen raw discover metadata and controls acknowledgement together
-with the version. Export has no whole-batch timeout derived from Skylark's
-per-request timeout; Skylark owns request/retry limits. OCR consumes its explicit
-batch budget across serial documents.
-The orchestrator passes `resources: null`: mdocr owns image selection and checks
-its successful cache. An absent/unusable cache makes necessary OCR work eligible;
-an unchanged comparison report is not permission to discard old OCR silently.
-The orchestrator does not normalize a foreign tool's URL selector format.
-Latest raw baselines, catalogued local resources and usable OCR outputs are kept
-outside wash. A tool-facing Markdown copy may relocate catalog-declared local
-destinations; canonical raw bytes and original resource identities are preserved.
-Published Markdown must not depend on a disposable success copy. Completed/partial
-sync cleans its own wash and no longer promises resume of that run; failed
-Markdown, local images and reports remain available until explicit purge.
+Export invokes Skylark for each document and waits for all selected exports before
+comparison. OCR freezes one policy and one mdocr plan for the whole selected batch.
+The default is LLM via OpenAI Pi OAuth (`openai/gpt-6.1-terra`, medium, concurrency
+3); `[ocr].mode = "paddle"` is an explicit override. `[ocr].request_budget` is a
+nonnegative OCR admission limit for the batch, independent of scoring. Omission
+means unlimited requests; zero allows cache hits but no new requests. The native
+journal, not the absence of a result, is the authority for continuing a running
+batch. Failed and unknown same-version requests remain suppressed. Unattempted
+rows publish usable raw Markdown and are eligible for a later batch; verified OCR
+added later can make the document eligible for compilation.
+
+Tool originals live under `state/<book>/ocr/<run>/`: request mapping, plan, result,
+journal, staged Markdown, exact raw Markdown and images, output, and OCR blocks.
+The tool-facing Markdown can relocate catalogued local targets. Links are rewritten
+only in a separate publication copy, whose digest is recorded separately from the
+mdocr output. A report must bind the plan and its complete identity set; an invalid
+row does not invalidate its verified peers. Publication and evidence remain usable
+when completed/partial sync cleans its own wash. Failed wash artifacts remain
+available until explicit purge.
 
 A plan freezes `previous_corpus` and `previous_graph`; a difference freezes its
 `local` facts. The compile manifest carries `previous_graph` through to graph

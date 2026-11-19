@@ -346,9 +346,10 @@ class Execution:
         token_limit = self.settings["token_budget"]
         if token_limit is None:
             return 0
-        bound = self.client.token_upper_bound(
-            job.body, job.images, self.settings["prompt"]
-        )
+        client = self.client
+        if not isinstance(client, LlmClient):
+            raise TypeError("only LLM supports token reservations")
+        bound = client.token_upper_bound(job.body, job.images, self.settings["prompt"])
         if type(bound) is not int or bound <= 0:
             self.stop = "OCR_TOKEN_BOUND_UNAVAILABLE"
         elif (
@@ -361,15 +362,20 @@ class Execution:
 
     def convert(self, job):
         image = job.images[0]
+        client = self.client
         if self.mode == "llm":
+            if not isinstance(client, LlmClient):
+                raise TypeError("LLM job admitted before preflight")
             images = [{"id": im["id"], "path": im["source_path"]} for im in job.images]
             for im in job.images:
                 _text(im["source_path"], im["sha256"], "IMAGE_DRIFT")
-            result = self.client.convert(job.body, images, self.settings["prompt"])
+            result = client.convert(job.body, images, self.settings["prompt"])
             patches = _patches(result["patches"], len(images))
             if [p.get("id") for p in patches] != [im["id"] for im in images]:
                 raise NotCompleted("OCR_RESPONSE_INVALID")
             return patches, result["usage_tokens"]
+        if not isinstance(client, str):
+            raise TypeError("Paddle job admitted without a token")
         data = _text(image["source_path"], image["sha256"], "IMAGE_DRIFT")
         try:
             jpeg = normalize_image(data)
@@ -381,20 +387,20 @@ class Execution:
         ):
             path = Path(tmp) / "prepared.jpg"
             path.write_bytes(jpeg)
-            client = PaddleClient(
-                self.client,
+            paddle = PaddleClient(
+                client,
                 session=session,
                 endpoint=self.settings["endpoint"],
                 adaptive=True,
             )
             try:
-                text = client.convert(path)
+                text = paddle.convert(path)
             except OcrRequestOutcome as exc:
                 reason = {
                     401: "OCR_AUTH_UNAVAILABLE",
                     403: "OCR_QUOTA_EXHAUSTED",
                     429: "OCR_RATE_LIMITED",
-                }.get(exc.status, "OCR_PROVIDER_FAILED")
+                }.get(exc.status or 0, "OCR_PROVIDER_FAILED")
                 raise NotCompleted(
                     reason, status=exc.status, unknown=exc.unknown
                 ) from exc
@@ -485,22 +491,18 @@ class Execution:
                 if self.stop:
                     continue
                 if self.client is None:
+                    # Zero new requests is evaluated before checking credentials.
+                    if self.settings["request_budget"] == 0:
+                        self.stop = "OCR_REQUEST_BUDGET_EXHAUSTED"
+                        continue
                     if self.mode == "paddle":
                         self.client = os.environ.get("PADDLEOCR_TOKEN")
                         if not self.client:
                             self.stop = "OCR_AUTH_UNAVAILABLE"
                             continue
                     else:
-                        # Cheap terminal caps need no credentials or model runtime.
-                        if (
-                            self.settings["request_budget"] == 0
-                            or self.settings["token_budget"] == 0
-                        ):
-                            self.stop = (
-                                "OCR_REQUEST_BUDGET_EXHAUSTED"
-                                if self.settings["request_budget"] == 0
-                                else "OCR_TOKEN_BUDGET_EXHAUSTED"
-                            )
+                        if self.settings["token_budget"] == 0:
+                            self.stop = "OCR_TOKEN_BUDGET_EXHAUSTED"
                             continue
                         self.client = LlmClient(
                             self.settings["model"], self.settings["effort"]

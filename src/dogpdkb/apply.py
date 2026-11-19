@@ -832,7 +832,8 @@ def validate_publication_target(document):
         raise ValueError("refusing corpus symlink replacement")
     expected = Path(document["input_copy"]).read_bytes()
     if document.get("input_copy_sha256") not in (
-        None, hashlib.sha256(expected).hexdigest()
+        None,
+        hashlib.sha256(expected).hexdigest(),
     ):
         raise ValueError("publication witness changed; generate a new plan")
     if output.is_file():

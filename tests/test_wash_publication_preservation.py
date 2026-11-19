@@ -101,10 +101,12 @@ def image_instance(tmp_path):
     remote["42"]["body"] += "\n![diagram](image.png)\n"
     remote_path.write_text(json.dumps(remote))
     tool = tmp_path / "skylark.py"
-    tool.write_text(tool.read_text().replace(
-        "path.write_text(doc['body'])",
-        "path.write_text(doc['body']); (path.parent/'image.png').write_bytes(doc['version'].encode())",
-    ))
+    tool.write_text(
+        tool.read_text().replace(
+            "path.write_text(doc['body'])",
+            "path.write_text(doc['body']); (path.parent/'image.png').write_bytes(doc['version'].encode())",
+        )
+    )
     return config, differences
 
 
@@ -154,6 +156,10 @@ def test_failed_asset_retention_keeps_previous_published_image(tmp_path):
     image = Path(document["ocr"]["images"][0]["source_path"])
     old_image = image.read_bytes()
     next_version(tmp_path, differences)
+    remote_path = tmp_path / "remote.json"
+    remote = json.loads(remote_path.read_bytes())
+    remote["42"]["body"] += "\n![replacement diagram](image.png)\n"
+    remote_path.write_text(json.dumps(remote))
     failed = fault_cli(
         ["apply", "--config", config, "--input", differences],
         """def deny_retention(event,args):
@@ -305,6 +311,7 @@ def test_later_run_uses_new_publication_generation(tmp_path):
         '<img srcset="ABSOLUTE_IMAGE 1x, ../images/diagram.png 2x">',
         "<img alt=\"literal src='../images/diagram.png'\" src='../images/diagram.png'>",
         '<img alt="literal ![example](../images/diagram.png)" src="../images/diagram.png">',
+        'Inline <img alt="literal ![example](../images/diagram.png)" src="../images/diagram.png">',
         '<img srcset="1x 1x, ../images/diagram.png 2x">',
     ],
 )
@@ -344,6 +351,7 @@ def test_catalogued_noninline_resource_survives_wash_purge(tmp_path, markup):
         assert "alt=\"literal src='../images/diagram.png'\"" in published
     if "literal ![example]" in markup:
         assert 'alt="literal ![example](../images/diagram.png)"' in published
+        assert document["ocr"]["images"] == []
     if 'srcset="1x 1x,' in markup:
         import re
 

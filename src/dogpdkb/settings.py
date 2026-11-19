@@ -251,8 +251,6 @@ def load_config(path: Path | str | None = None) -> Settings:
         raise ConfigError("ocr.mode: expected llm or paddle")
     if ocr_requests is not None and (type(ocr_requests) is not int or ocr_requests < 0):
         raise ConfigError("ocr.request_budget: expected a nonnegative integer")
-    if ocr_mode == "paddle" and ocr_requests is not None:
-        raise ConfigError("ocr.request_budget: only supported in llm mode")
     return Settings(
         file=selected,
         books_file=(selected.parent / Path(books).expanduser()).resolve(),

@@ -313,8 +313,9 @@ if name == 'mdcompare' and args[0] == 'catalog' and 'incoming' in args[args.inde
     assert len(documents) == 2 and all(Path(d['path']).is_file() for d in documents)
 if name == 'mdocr' and args[0] == 'run':
     planned = Path(args[args.index('--plan')+1])
-    assert (planned.parent/'plan.json').is_file()
-    assert len(json.loads(planned.read_text())['documents']) == 1
+    [business_plan] = (root/'runs'/'funds').glob('run-*/plan.json')
+    assert len(json.loads(business_plan.read_bytes())['documents']) == 2
+    assert len(json.loads(planned.read_bytes())['documents']) == 2
 module = 'mdcompare' if name == 'mdcompare' else 'mdocr.cli'
 raise SystemExit(subprocess.call([sys.executable,'-m',module,*args]))
 """)
@@ -617,13 +618,11 @@ def test_missing_historical_ocr_input_does_not_abort_fresh_apply(tmp_path):
 
 @pytest.mark.parametrize("suffix", ["#width=600", ""])
 def test_image_selection_is_owned_by_mdocr(tmp_path, monkeypatch, suffix):
-    from PIL import Image
-
     monkeypatch.delenv("PADDLEOCR_TOKEN", raising=False)
     config, differences = instance(tmp_path)
     config.write_text(config.read_text() + '\n[ocr]\nmode="paddle"\n')
     image = tmp_path / "image space.png"
-    Image.new("RGB", (8, 8), "red").save(image)
+    image.write_bytes(b"local image witness; no provider configured")
     remote = json.loads((tmp_path / "remote.json").read_text())
     remote["42"]["body"] += f"\n![image](../../../../image%20space.png{suffix})\n"
     (tmp_path / "remote.json").write_text(json.dumps(remote))
@@ -851,11 +850,6 @@ raise SystemExit(2)
 
 def test_resumed_run_status_clears_pause_end_time_and_elapsed_keeps_advancing(tmp_path):
     config, differences = instance(tmp_path)
-    paused = cli(
-        "apply", "--config", config, "--input", differences, "--stop-after", "plan"
-    )
-    assert paused.returncode == 0, paused.stderr
-    run_path = json.loads(paused.stdout)["run"]
     tool = tmp_path / "slow_ocr.py"
     tool.write_text(
         'import pathlib,time\npathlib.Path(__file__).with_suffix(".started").touch()\ntime.sleep(60)\n'
@@ -866,6 +860,11 @@ def test_resumed_run_status_clears_pause_end_time_and_elapsed_keeps_advancing(tm
             "mdocr=" + json.dumps([sys.executable, str(tool)]),
         )
     )
+    paused = cli(
+        "apply", "--config", config, "--input", differences, "--stop-after", "plan"
+    )
+    assert paused.returncode == 0, paused.stderr
+    run_path = json.loads(paused.stdout)["run"]
     with subprocess.Popen(
         [
             sys.executable,

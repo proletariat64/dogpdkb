@@ -170,6 +170,114 @@ raise SystemExit(main())
     return config, differences
 
 
+def test_native_result_with_wrong_context_uses_raw_fallback(tmp_path):
+    config, differences = _native_instance(tmp_path)
+    driver = tmp_path / "offline_mdocr.py"
+    driver.write_text(
+        driver.read_text().replace(
+            "raise SystemExit(main())",
+            """code = main()
+if sys.argv[1] == 'run':
+    import json
+    result = Path(sys.argv[sys.argv.index('--result') + 1])
+    plan = Path(sys.argv[sys.argv.index('--plan') + 1])
+    payload = json.loads(result.read_bytes())
+    row = next(row for row in payload['documents'] if row['status'] == 'completed')
+    row['ocr']['context_sha256'] = '0' * 64
+    for path in (result, plan.with_name(plan.name + '.execution.json')):
+        path.write_text(json.dumps(payload))
+raise SystemExit(code)""",
+        )
+    )
+    outcome = cli("apply", "--config", config, "--input", differences)
+    assert outcome.returncode == 2, outcome.stderr
+    manifest = json.loads(Path(json.loads(outcome.stdout)["manifest"]).read_bytes())
+    docs = {row["document_id"]: row for row in manifest["documents"]}
+    assert docs[team_id("42")]["ocr_status"] == "unknown"
+    assert b"Recognized offline." not in Path(docs[team_id("42")]["path"]).read_bytes()
+    assert docs[team_id("43")]["ocr_status"] == "unattempted"
+
+
+def test_zero_frozen_budget_prevents_explicit_paddle_requests(tmp_path, monkeypatch):
+    monkeypatch.delenv("PADDLEOCR_TOKEN", raising=False)
+    config, differences = _native_instance(tmp_path)
+    config.write_text(
+        config.read_text().replace(
+            "request_budget=1", 'mode="paddle"\nrequest_budget=0'
+        )
+    )
+    paused = cli(
+        "apply", "--config", config, "--input", differences, "--stop-after", "plan"
+    )
+    assert paused.returncode == 0, paused.stderr
+    run_path = Path(json.loads(paused.stdout)["run"])
+    config.write_text(
+        config.read_text().replace("request_budget=0", "request_budget=9")
+    )
+    resumed = cli("apply", "--config", config, "--resume", run_path)
+    assert resumed.returncode == 2, resumed.stderr
+    run = json.loads(run_path.read_bytes())
+    report = json.loads(Path(run["artifacts"]["ocr_report"]).read_bytes())
+    assert report["budget"]["requests"] == 0
+    assert report["causes"] == ["OCR_REQUEST_BUDGET_EXHAUSTED"]
+    assert not (tmp_path / "requests").exists()
+
+
+def test_mixed_batch_downloads_only_for_remote_sources(tmp_path):
+    config, differences = _native_instance(tmp_path)
+    source = tmp_path / "local"
+    source.mkdir()
+    (source / "note.md").write_text(
+        "# Local\n\n![snapshot](https://example.invalid/local.png)\n"
+    )
+    books = tmp_path / "books.json"
+    contents = json.loads(books.read_bytes())
+    contents[0]["sources"].append(
+        {"key": "local", "type": "directory", "path": str(source)}
+    )
+    books.write_text(json.dumps(contents))
+    discovered = cli("discover", "--config", config, "--source", "local")
+    assert discovered.returncode == 0, discovered.stderr
+    local = json.loads(Path(json.loads(discovered.stdout)["differences"]).read_bytes())
+    remote = json.loads(differences.read_bytes())
+    remote["documents"].extend(local["documents"])
+    remote["sources"].extend(local["sources"])
+    remote["book"]["sources"].update(local["book"]["sources"])
+    remote["run_id"] = local["run_id"]
+    differences.write_text(json.dumps(remote))
+    remote_path = tmp_path / "remote.json"
+    docs = json.loads(remote_path.read_bytes())
+    docs["42"]["body"] += "![live](https://example.invalid/remote.png)\n"
+    remote_path.write_text(json.dumps(docs))
+    driver = tmp_path / "offline_mdocr.py"
+    driver.write_text(
+        driver.read_text()
+        .replace("from mdocr import runner", "from mdocr import plan, runner")
+        .replace(
+            "runner.LlmClient = SyntheticLLM",
+            """def offline_fetch(url, session):
+    with (root / 'downloads').open('a') as log:
+        log.write(url + '\\n')
+    return b'remote fixture image'
+plan._fetch_remote = offline_fetch
+runner.LlmClient = SyntheticLLM""",
+        )
+    )
+    outcome = cli("apply", "--config", config, "--input", differences)
+    assert outcome.returncode == 2, outcome.stderr
+    assert (tmp_path / "downloads").read_text().splitlines() == [
+        "https://example.invalid/remote.png"
+    ]
+    run = json.loads(Path(json.loads(outcome.stdout)["run"]).read_bytes())
+    report = json.loads(Path(run["artifacts"]["ocr_report"]).read_bytes())
+    assert len(report["documents"]) == 3
+    assert any(
+        row.get("reason") == "REMOTE_IMAGE_NOT_DOWNLOADED"
+        for doc in report["documents"]
+        for row in doc["resources"]
+    )
+
+
 def test_native_resume_keeps_original_admission_after_result_loss(tmp_path):
     config, differences = _native_instance(tmp_path, crash=True)
     first = cli("apply", "--config", config, "--input", differences)
@@ -196,6 +304,54 @@ def test_native_resume_keeps_original_admission_after_result_loss(tmp_path):
         "unknown",
         "unattempted",
     }
+
+
+def test_terminal_resume_checks_staged_damage_per_document(tmp_path):
+    config, differences = _native_instance(tmp_path)
+    config.write_text(
+        config.read_text().replace("request_budget=1", "request_budget=2")
+    )
+    driver = tmp_path / "offline_mdocr.py"
+    driver.write_text(
+        driver.read_text().replace(
+            "raise SystemExit(main())",
+            """code = main()
+raise SystemExit(143 if sys.argv[1] == 'run' and code == 0 else code)""",
+        )
+    )
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 143, first.stderr
+    (run,) = (tmp_path / "runs/funds").glob("run-*/run.json")
+    (report,) = (tmp_path / "state/funds/ocr").glob("*/result.json")
+    first_row = json.loads(report.read_bytes())["documents"][0]
+    Path(first_row["ocr"]["images"][0]["source_path"]).write_bytes(b"changed")
+
+    resumed = cli("apply", "--config", config, "--resume", run)
+    assert resumed.returncode == 2, resumed.stderr
+    assert (tmp_path / "commands").read_text().splitlines() == ["plan", "run"]
+    manifest = json.loads(Path(json.loads(resumed.stdout)["manifest"]).read_bytes())
+    docs = {row["document_id"]: row for row in manifest["documents"]}
+    assert docs[team_id("42")]["ocr_status"] == "unknown"
+    assert docs[team_id("43")]["ocr_status"] == "completed"
+
+
+def test_resume_rejects_journal_that_erases_budget_use(tmp_path):
+    config, differences = _native_instance(tmp_path, crash=True)
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 143, first.stderr
+    (run,) = (tmp_path / "runs/funds").glob("run-*/run.json")
+    (journal,) = (tmp_path / "state/funds/ocr").glob("*/plan.json.execution.json")
+    report = json.loads(journal.read_bytes())
+    assert len(report["requests"]) == report["budget"]["requests"] == 1
+    report["budget"]["requests"] = 0
+    journal.write_text(json.dumps(report))
+
+    resumed = cli("apply", "--config", config, "--resume", run)
+    assert resumed.returncode == 2, resumed.stderr
+    assert (tmp_path / "commands").read_text().splitlines() == ["plan", "run"]
+    assert len((tmp_path / "requests").read_text().splitlines()) == 1
+    manifest = json.loads(Path(json.loads(resumed.stdout)["manifest"]).read_bytes())
+    assert {row["ocr_status"] for row in manifest["documents"]} == {"unknown"}
 
 
 def test_native_exact_image_and_block_witnesses_survive_wash(tmp_path):

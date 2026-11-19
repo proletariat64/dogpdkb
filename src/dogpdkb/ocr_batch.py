@@ -1,6 +1,7 @@
 """Orchestrate one public mdocr execution; keep its originals outside wash."""
 
 import hashlib
+import json
 import re
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -81,6 +82,7 @@ def _prepare(root, row):
         "source_sha256": digest(body),
         "assets": assets,
         "selection": selection,
+        "download": "directory_snapshot" not in row,
     }
 
 
@@ -224,18 +226,24 @@ def _verified_result(root, plan, doc, entry, row):
                 f"<!-- mdocr:meta mode={config['mode']} sha256={im['sha256']} -->\n"
             ).encode()
             if prefix not in output:
-                raise ValueError("OCR completed output does not contain its planned block")
+                raise ValueError(
+                    "OCR completed output does not contain its planned block"
+                )
         elif state != "unselected":
             raise ValueError("OCR completed row changed planned image selection")
     images = _index(evidence["images"], "resource_id")
     if images.keys() != selected.keys():
         raise ValueError("OCR evidence does not cover the selected images")
-    if (
-        selected
-        and config["mode"] == "llm"
-        and not re.fullmatch(r"[a-f0-9]{64}", evidence.get("context_sha256", ""))
-    ):
-        raise ValueError("OCR evidence is missing the LLM context digest")
+    if selected and config["mode"] == "llm":
+        context = [
+            doc["sha256"],
+            [[im["id"], im["sha256"]] for im in doc["images"] if im["selected"]],
+        ]
+        canonical = (
+            json.dumps(context, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        )
+        if evidence.get("context_sha256") != digest(canonical.encode("utf-8")):
+            raise ValueError("OCR evidence does not bind the planned LLM context")
     for key, image in images.items():
         im = selected[key]
         if image["status"] != "success" or (
@@ -343,8 +351,8 @@ def _start_args(root, request):
     ]
     if policy["mode"] == "llm":
         args += ["--model", policy["model"], "--effort", policy["effort"]]
-        if policy["request_budget"] is not None:
-            args += ["--request-budget", policy["request_budget"]]
+    if policy["request_budget"] is not None:
+        args += ["--request-budget", policy["request_budget"]]
     if any(entry["selection"] is not None for entry in docs):
         # A missing selection means all occurrences, not an empty list. The
         # mdocr CLI only accepts a whole-batch selection when all rows specify it.
@@ -354,9 +362,39 @@ def _start_args(root, request):
             root / "selection.json", {doc["path"]: doc["selection"] for doc in docs}
         )
         args += ["--selection", root / "selection.json"]
-    if request["download"]:
+    downloads = [entry["path"] for entry in docs if entry["download"]]
+    if downloads:
         args.append("--download")
+        if len(downloads) < len(docs):
+            scope = root / "download-list.json"
+            atomic_json(scope, downloads)
+            args += ["--download-list", scope]
     return args
+
+
+def _verify_running_journal(state, budget, mirror=None):
+    attempts = state["requests"]
+    count = state["budget"]["requests"]
+    if (
+        state["status"] != "running"
+        or not isinstance(attempts, list)
+        or type(count) is not int
+        or count != len(attempts)
+        or (budget is not None and count > budget)
+        or len(_index(attempts, "key")) != count
+        or any(
+            item["status"] not in {"admitted", "success", "failed", "unknown"}
+            for item in attempts
+        )
+    ):
+        raise ValueError("OCR journal cannot prove prior admissions")
+    if mirror is not None:
+        prior = mirror["requests"]
+        if len(prior) > count or any(
+            old["key"] != new["key"] or (old["status"] != "admitted" and old != new)
+            for old, new in zip(prior, attempts)
+        ):
+            raise ValueError("OCR journal lost observed admissions or outcomes")
 
 
 def _execute(root, request, store, run, call_tool):
@@ -380,8 +418,6 @@ def _execute(root, request, store, run, call_tool):
             initial["plan.json"] = plan_sha = file_digest(plan_path)
             if dispatched and read_json(start_path) != initial:
                 raise ValueError("OCR immutable plan or request changed")
-            for entry in request["documents"]:
-                _verify_input(root, entry, docs[entry["path"]])
             if dispatched:
                 if journal.exists():
                     state = _tool_result(root, journal, plan_sha)
@@ -396,20 +432,15 @@ def _execute(root, request, store, run, call_tool):
                                 report = report_path
                         else:
                             report = journal
-                    elif (
-                        state["status"] != "running"
-                        or not isinstance(state["requests"], list)
-                        or not isinstance(state["budget"], dict)
-                    ):
-                        raise ValueError("OCR journal cannot prove prior admissions")
-                    elif report_path.exists():
-                        mirror = _tool_result(root, report_path, plan_sha)
-                        prior = [attempt["key"] for attempt in mirror["requests"]]
-                        if prior != [
-                            attempt["key"]
-                            for attempt in state["requests"][: len(prior)]
-                        ]:
-                            raise ValueError("OCR journal lost observed admissions")
+                    else:
+                        mirror = (
+                            _tool_result(root, report_path, plan_sha)
+                            if report_path.exists()
+                            else None
+                        )
+                        _verify_running_journal(
+                            state, request["policy"]["request_budget"], mirror
+                        )
                 elif report_path.exists():
                     # A terminal result is sufficient to inspect completed rows,
                     # but an absent journal never authorizes execution again.
@@ -418,6 +449,11 @@ def _execute(root, request, store, run, call_tool):
                     raise ValueError("OCR execution journal is missing")
             elif report_path.exists() or journal.exists():
                 raise ValueError("unowned OCR execution artifacts")
+            if report is None:
+                # Native execution needs every staged input intact. A terminal
+                # batch is no longer executed and can be checked per document.
+                for entry in request["documents"]:
+                    _verify_input(root, entry, docs[entry["path"]])
         except _INVALID:
             reason = (
                 "OCR_EXECUTION_UNVERIFIABLE"
@@ -587,8 +623,6 @@ def ocr_inputs(settings, book, store, run, rows):
             "initial_ids": original_ids,
             "documents": prepared,
             "rejected": rejected,
-            # Directory-source snapshots must not introduce live resource reads.
-            "download": any("directory_snapshot" not in row for row in pending),
         }
         atomic_json(request_path, existing, durable=True)
         enrolled = _index(prepared)
@@ -684,7 +718,8 @@ def ocr_inputs(settings, book, store, run, rows):
             )
         store.complete_batch(observed.values())
         run.data["failures"] = [
-            item for item in run.data["failures"]
+            item
+            for item in run.data["failures"]
             if not (
                 item.get("step") == "ocr"
                 and item.get("reason") == "CALL_INTERRUPTED"

@@ -51,8 +51,9 @@ def _complete(row, doc):
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(body)
     evidence = dict(contract='mdocr-ocr-2', configuration=config, images=list(images.values()))
-    if images:
-        evidence['context_sha256'] = _sha(body)
+    if images and config['mode'] == 'llm':
+        context = [doc['sha256'], [[im['id'], im['sha256']] for im in doc['images'] if im['selected']]]
+        evidence['context_sha256'] = _sha((json.dumps(context, ensure_ascii=False, sort_keys=True, indent=2) + '\n').encode())
     row.update(output=str(output), output_sha256=_sha(body), resources=resources, ocr=evidence)
 
 def fixture_result(payload):
