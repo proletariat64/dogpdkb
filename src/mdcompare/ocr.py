@@ -10,6 +10,7 @@ from .model import Document
 from .prepared_image import is_prepared_jpeg
 
 CONTRACT = "prepared-jpeg-ocr-v1"
+V2_CONTRACT = "mdocr-ocr-2"
 
 
 def _outcome(status: str, reason: str) -> dict[str, Any]:
@@ -27,7 +28,7 @@ def _settings(value: Any) -> str | None:
 
 def _records(document: Document) -> dict[str, dict[str, Any]] | None:
     evidence = document.ocr
-    if not evidence or evidence.get("contract") != CONTRACT:
+    if not evidence or evidence.get("contract") not in {CONTRACT, V2_CONTRACT}:
         return None
     images = evidence.get("images")
     if not isinstance(images, list):
