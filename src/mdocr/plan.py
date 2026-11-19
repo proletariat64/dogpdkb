@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import requests
+from markdown_it import MarkdownIt
 
 from .markdown import IMAGE_RE, parse_image_match
 from .prepare import (
@@ -41,89 +42,49 @@ def _atomic_json(path: Path, value: dict) -> None:
             os.unlink(name)
 
 
-_ATX = re.compile(r" {0,3}#{1,6}(?:[ \t]|$)")
-_LIST_ITEM = re.compile(r" {0,3}(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]|$)")
-_BLOCK_SEPARATOR = re.compile(
-    r" {0,3}(?:=+|-+|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})[ \t]*$"
-)
+_MARKDOWN_BLOCKS = MarkdownIt("commonmark")
 
 
-def _inline_blocks(segment: str):
-    """Yield offset and text of each run eligible for inline-code matching."""
-    beginning = offset = 0
-    for full_line in segment.splitlines(keepends=True):
-        line = full_line.rstrip("\r\n")
-        end = offset + len(full_line)
-        heading = _ATX.match(line)
-        separator = not line.strip() or _BLOCK_SEPARATOR.fullmatch(line)
-        if heading or separator or _LIST_ITEM.match(line):
-            if beginning < offset:
-                yield beginning, segment[beginning:offset]
-            if heading:
-                yield offset, full_line
-            beginning = end if heading or separator else offset
-        offset = end
-    if beginning < offset:
-        yield beginning, segment[beginning:offset]
+def _inline_code_ranges(text, offset):
+    runs = list(re.finditer(r"`+", text))
+    next_run, closing = {}, {}
+    for i in reversed(range(len(runs))):
+        width = len(runs[i].group())
+        if width in next_run:
+            closing[i] = next_run[width]
+        next_run[width] = i
+    i = 0
+    while i < len(runs):
+        start = runs[i].start()
+        escape = start
+        while escape > 0 and text[escape - 1] == "\\":
+            escape -= 1
+        if i in closing and (start - escape) % 2 == 0:
+            j = closing[i]
+            yield offset + start, offset + runs[j].end()
+            i = j + 1
+        else:
+            i += 1
 
 
 def _masked_ranges(markdown: str) -> list[tuple[int, int]]:
-    """Ranges within which image syntax is literal or already generated."""
-    ranges = []
-    fences = re.compile(r"(?m)^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n")
-    opened = None
-    marker = None
-    width = 0
-    for match in fences.finditer(markdown):
-        token = match.group(1)
-        if opened is None:
-            opened, marker, width = match.start(), token[0], len(token)
-        elif (
-            token[0] == marker
-            and len(token) >= width
-            and not match.group()[match.end(1) - match.start() :].strip()
-        ):
-            ranges.append((opened, match.end()))
-            opened = marker = None
-    if opened is not None:
-        ranges.append((opened, len(markdown)))
-    ranges.extend(
+    """Use CommonMark block boundaries and preserve original source offsets."""
+    line_offsets = [0, *(m.end() for m in re.finditer(r"\r\n|\r|\n", markdown))]
+    line_offsets.append(len(markdown))
+    ranges = [
         m.span()
         for m in re.finditer(
             r"<!-- mdocr:ocr-begin\b.*?<!-- mdocr:ocr-end -->", markdown, re.DOTALL
         )
-    )
-
-    # Inline code may span lines but cannot cross a block boundary. Delimiters
-    # are whole runs: a literal shorter run cannot close a longer opener.
-    def inline(segment, offset):
-        for block_start, text in _inline_blocks(segment):
-            runs = list(re.finditer(r"`+", text))
-            next_run, closing = {}, {}
-            for i in reversed(range(len(runs))):
-                width = len(runs[i].group())
-                if width in next_run:
-                    closing[i] = next_run[width]
-                next_run[width] = i
-            i = 0
-            while i < len(runs):
-                start = runs[i].start()
-                prefix = text[:start] if start and text[start - 1] == "\\" else ""
-                escaped = (len(prefix) - len(prefix.rstrip("\\"))) % 2
-                if i in closing and not escaped:
-                    j = closing[i]
-                    beginning = offset + block_start
-                    yield beginning + start, beginning + runs[j].end()
-                    i = j + 1
-                else:
-                    i += 1
-
-    offset = 0
-    for start, end in sorted(ranges):
-        if offset < start:
-            ranges.extend(inline(markdown[offset:start], offset))
-        offset = max(offset, end)
-    ranges.extend(inline(markdown[offset:], offset))
+    ]
+    for token in _MARKDOWN_BLOCKS.parse(markdown):
+        if not token.map:
+            continue
+        start, end = (line_offsets[line] for line in token.map)
+        if token.type in {"fence", "code_block"}:
+            ranges.append((start, end))
+        elif token.type == "inline":
+            ranges.extend(_inline_code_ranges(markdown[start:end], start))
     return sorted(ranges)
 
 

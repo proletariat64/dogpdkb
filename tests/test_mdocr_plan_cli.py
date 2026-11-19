@@ -298,3 +298,35 @@ def test_indented_list_like_line_inside_code_does_not_schedule_ocr(tmp_path):
     ]
     text = (tmp_path / "source.md").read_text()
     assert text[image["start"] : image["end"]] == "![real](same.png)"
+
+
+def test_nested_list_siblings_are_separate_blocks_with_exact_crlf_spans(tmp_path):
+    text = (
+        "- Parent\r\n"
+        "    - First `\r\n"
+        "    - ![real](same.png)\r\n"
+        "    - Third `\r\n\r\n"
+        "    - Example:\r\n\r\n"
+        "      ~~~md\r\n"
+        "      ![literal](same.png)\r\n"
+        "      ~~~\r\n"
+    )
+    (tmp_path / "source.md").write_bytes(text.encode())
+    (tmp_path / "same.png").write_bytes(b"fixture")
+    result = cli(
+        tmp_path,
+        "plan",
+        "--mode",
+        "paddle",
+        "--input",
+        "source.md",
+        "--output",
+        "out.md",
+        "--plan",
+        "plan.json",
+    )
+    assert result.returncode == 0, result.stderr
+    (image,) = json.loads((tmp_path / "plan.json").read_text())["documents"][0][
+        "images"
+    ]
+    assert text[image["start"] : image["end"]] == "![real](same.png)"
