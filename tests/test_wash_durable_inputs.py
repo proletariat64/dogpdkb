@@ -126,7 +126,7 @@ def test_raw_relative_images_remain_readable_after_wash_deletion(tmp_path):
     )
     next_raw = json.loads((tmp_path / "state/funds/state.json").read_text())[
         "documents"
-    ]["42"]["raw"]
+    ][team_id("42")]["raw"]
     assert (
         Path(next_raw["resources"][0]["path"]).read_bytes()
         == Path(raw["resources"][0]["path"]).read_bytes()

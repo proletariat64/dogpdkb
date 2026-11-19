@@ -429,7 +429,8 @@ raise SystemExit(2)
     manifest = json.loads(Path(json.loads(result.stdout)["manifest"]).read_text())
     assert manifest["documents"][1]["pending_steps"] == []
     assert any(
-        f["step"] == "ocr" and f["document_id"] == "43" for f in manifest["failures"]
+        f["step"] == "ocr" and f["document_id"] == team_id("43")
+        for f in manifest["failures"]
     )
     state = json.loads((tmp_path / "state" / "funds" / "state.json").read_text())
     assert state["documents"][team_id("42")]["steps"]["ocr"]["status"] == "failed"
