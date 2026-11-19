@@ -9,6 +9,7 @@ from urllib.parse import unquote, urlsplit
 
 import pytest
 
+from tests.ocr_fixture import write_ocr_fixture
 from tests.test_orchestrator_apply_cli import cli
 from tests.test_wash_durable_inputs import enriched_instance
 
@@ -94,20 +95,21 @@ def test_local_fragments_survive_ocr_input_publication_and_purge(
 
 def image_instance(tmp_path):
     config, differences = enriched_instance(tmp_path)
-    (tmp_path / "enrich.py").write_text(
+    write_ocr_fixture(
+        (tmp_path / "enrich.py"),
         """import json,sys
 from pathlib import Path
 from urllib.parse import quote
 args=sys.argv[1:]
 def option(name): return Path(args[args.index(name)+1])
-doc=json.loads(option('--manifest').read_text())['documents'][0]
-output=option('--output-dir')/'enriched.md';output.parent.mkdir(parents=True,exist_ok=True)
+doc=json.loads(fixture_request.read_text())['documents'][0]
+output=fixture_output;output.parent.mkdir(parents=True,exist_ok=True)
 body=Path(doc['path']).read_text()
 image=output.parent/'prepared image.png';image.write_bytes(body.encode())
 output.write_text(body+'\\n![prepared]('+quote(str(image),safe='/')+')\\n')
 resource={'resource_id':'image','status':'success','source_path':str(image),'prepared_image':str(image)}
-option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[resource],'ocr':{'images':[resource]}}]}))
-"""
+fixture_result({'schema_version':'mdocr-result-2','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[resource],'ocr':{'images':[resource]}}]})
+""",
     )
     return config, differences
 
@@ -271,8 +273,8 @@ def test_later_run_uses_new_publication_generation(tmp_path):
     two_sources(tmp_path, differences)
     tool = tmp_path / "enrich.py"
     script = tool.read_text().replace(
-        "'schema_version':'mdocr-batch-1.0','documents'",
-        "'schema_version':'mdocr-batch-1.0','causes':"
+        "'schema_version':'mdocr-result-2','documents'",
+        "'schema_version':'mdocr-result-2','causes':"
         "(['OCR_AUTH_UNAVAILABLE'] if not Path(__file__).with_name('allow').exists() else []),"
         "'documents'",
     )

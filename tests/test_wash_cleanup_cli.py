@@ -68,13 +68,14 @@ def test_partial_ocr_keeps_failed_markdown_image_report_but_cleans_success(tmp_p
     script = tool.read_text()
     script = script.replace(
         "if tool in ('mdcompare', 'mdocr'):",
-        """if tool == 'mdocr':
+        """if tool == 'mdocr' and args[0] == 'run':
+    import hashlib
     def flag(name): return pathlib.Path(args[args.index(name)+1])
-    doc=json.loads(flag('--manifest').read_text())['documents'][0]
-    if doc['document_id']=='2':
-        output=flag('--output-dir')/'failed.md'; output.parent.mkdir(parents=True,exist_ok=True)
-        output.write_text(pathlib.Path(doc['path']).read_text())
-        flag('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','status':'partial','documents':[{'document_id':'2','status':'partial','output':str(output),'resources':[{'resource_id':'2.png','status':'failed','source_path':str(pathlib.Path(doc['path']).parent/'2.png')}]}]}))
+    plan=flag('--plan'); doc=json.loads(plan.read_text())['documents'][0]
+    wrapper=plan.with_name(plan.name.replace('-plan.json','-request.json'))
+    requested=json.loads(wrapper.read_text())['documents'][0]
+    if requested['document_id']=='2':
+        flag('--result').write_text(json.dumps({'schema_version':'mdocr-result-2','plan_sha256':hashlib.sha256(plan.read_bytes()).hexdigest(),'status':'partial','documents':[{'document_id':doc['document_id'],'status':'partial','output':None,'resources':[{'resource_id':'2.png','status':'failed','source_path':str(pathlib.Path(doc['path']).parent/'2.png')}]}]}))
         raise SystemExit(2)
 if tool in ('mdcompare', 'mdocr'):""",
     )

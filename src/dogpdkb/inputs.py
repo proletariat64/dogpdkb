@@ -380,17 +380,14 @@ def ocr_request_input(row, run):
         and resource.get("path")
         and Path(resource["path"]).is_file()
     }
-    if not any(
-        Path(target).is_absolute() and target != retained
-        for target, retained in local.items()
-    ):
+    if not any(Path(target).is_absolute() for target in local):
         return str(source), row["ocr_resources"], {}
     copy = run.directory / "ocr-inputs" / f"{row['slot']}.md"
     # mdocr accepts relative local targets; keep selections in the same spelling.
     replacements = {
         before: os.path.relpath(after, copy.parent) for before, after in local.items()
     }
-    text = source.read_text(encoding="utf-8")
+    text = source.read_bytes().decode("utf-8")
     text = relocate_targets(
         text,
         {
@@ -399,7 +396,7 @@ def ocr_request_input(row, run):
         },
     )
     copy.parent.mkdir(parents=True, exist_ok=True)
-    copy.write_text(text, encoding="utf-8")
+    copy.write_bytes(text.encode("utf-8"))
     selected = row["ocr_resources"]
     if selected is not None:
         selected = [replacements.get(target, target) for target in selected]

@@ -366,10 +366,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"mdocr: plan: {exc}", file=sys.stderr)
             return 1
     if args.command == "run":
-        from .runner import run_command
+        from .runner import run_command as execute_plan
 
         try:
-            return run_command(args)
+            return execute_plan(args)
         except (OSError, ValueError, TypeError) as exc:
             print(f"mdocr: run: {exc}", file=sys.stderr)
             return 1

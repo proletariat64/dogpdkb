@@ -7,22 +7,26 @@ from pathlib import Path
 
 import pytest
 
+from tests.ocr_fixture import write_ocr_fixture
 from tests.test_orchestrator_apply_cli import cli, instance
 
 
 def enriched_instance(tmp_path):
     config, differences = instance(tmp_path)
     tool = tmp_path / "enrich.py"
-    tool.write_text("""import json,sys
+    write_ocr_fixture(
+        tool,
+        """import json,sys
 from pathlib import Path
 args=sys.argv[1:]
 def option(name):return Path(args[args.index(name)+1])
-doc=json.loads(option('--manifest').read_text())['documents'][0]
-output=option('--output-dir')/'enriched.md';output.parent.mkdir(parents=True,exist_ok=True)
+doc=json.loads(fixture_request.read_text())['documents'][0]
+output=fixture_output;output.parent.mkdir(parents=True,exist_ok=True)
 output.write_text(Path(doc['path']).read_text()+'\\nTool-added evidence.\\n')
-option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','status':'completed','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[]}]}))
+fixture_result({'schema_version':'mdocr-result-2','status':'completed','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[]}]})
 with Path(__file__).with_name('ocr-calls').open('a') as log: log.write('call\\n')
-""")
+""",
+    )
     config.write_text(
         config.read_text().replace(
             "mdocr=" + json.dumps([sys.executable, "-m", "mdocr.cli"]),
@@ -139,18 +143,21 @@ def test_successful_graph_witness_and_report_survive_wash_deletion(tmp_path):
 def test_declared_ocr_images_are_relocated_before_corpus_publication(tmp_path):
     config, differences = enriched_instance(tmp_path)
     tool = tmp_path / "enrich.py"
-    tool.write_text("""import json,sys
+    write_ocr_fixture(
+        tool,
+        """import json,sys
 from pathlib import Path
 from urllib.parse import quote
 args=sys.argv[1:]
 def option(name):return Path(args[args.index(name)+1])
-doc=json.loads(option('--manifest').read_text())['documents'][0]
-output=option('--output-dir')/'enriched.md';output.parent.mkdir(parents=True,exist_ok=True)
+doc=json.loads(fixture_request.read_text())['documents'][0]
+output=fixture_output;output.parent.mkdir(parents=True,exist_ok=True)
 image=output.parent/'prepared image.png';image.write_bytes(b'original image bytes')
 output.write_text(Path(doc['path']).read_text()+'\\n![prepared]('+quote(str(image),safe='/')+')\\n')
 resource={'resource_id':'image','status':'success','source_path':str(image),'prepared_image':str(image)}
-option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[resource],'ocr':{'images':[resource]}}]}))
-""")
+fixture_result({'schema_version':'mdocr-result-2','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[resource],'ocr':{'images':[resource]}}]})
+""",
+    )
     first = cli("apply", "--config", config, "--input", differences)
     assert first.returncode == 0, first.stderr
     manifest = json.loads(Path(json.loads(first.stdout)["manifest"]).read_text())
@@ -182,21 +189,24 @@ def test_unattempted_ocr_reads_retained_absolute_image_after_old_wash_deleted(tm
         )
     )
     ocr = tmp_path / "enrich.py"
-    ocr.write_text("""import json,sys
+    write_ocr_fixture(
+        ocr,
+        """import json,sys
 from pathlib import Path
 args=sys.argv[1:]
 def option(name):return Path(args[args.index(name)+1])
-doc=json.loads(option('--manifest').read_text())['documents'][0]
+doc=json.loads(fixture_request.read_text())['documents'][0]
 body=Path(doc['path']).read_text()
 if not Path(__file__).with_name('allow').exists():
- option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','causes':['OCR_AUTH_UNAVAILABLE'],'documents':[{'document_id':doc['document_id'],'status':'partial','output':None,'resources':[]}]}));raise SystemExit(2)
+ fixture_result({'schema_version':'mdocr-result-2','causes':['OCR_AUTH_UNAVAILABLE'],'documents':[{'document_id':doc['document_id'],'status':'partial','output':None,'resources':[]}]});raise SystemExit(2)
 if doc['document_id']=='43':
  target=body.split('](')[1].split(')')[0]
  assert (Path(doc['path']).parent/target).is_file(),target
  with Path(__file__).with_name('valid-images').open('a') as log:log.write('43\\n')
-output=option('--output-dir')/'enriched.md';output.parent.mkdir(parents=True,exist_ok=True);output.write_text(body)
-option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[]}]}))
-""")
+output=fixture_output;output.parent.mkdir(parents=True,exist_ok=True);output.write_text(body)
+fixture_result({'schema_version':'mdocr-result-2','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[]}]})
+""",
+    )
     first = cli("apply", "--config", config, "--input", differences)
     assert first.returncode == 2, first.stderr
     run = Path(json.loads(first.stdout)["run"]).parent
@@ -390,7 +400,10 @@ def test_real_mdocr_retained_mixed_image_targets_remain_supported(
     report = next(
         json.loads(p.read_text())
         for p in directory.glob("ocr-*-report.json")
-        if json.loads(p.read_text())["documents"][0]["document_id"] == "43"
+        if json.loads(
+            p.with_name(p.name.replace("-report.json", "-request.json")).read_text()
+        )["documents"][0]["document_id"]
+        == "43"
     )
     assert report.get("causes"), report
     resources = report["documents"][0]["resources"]
