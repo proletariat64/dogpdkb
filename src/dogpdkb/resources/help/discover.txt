@@ -12,8 +12,9 @@ subscription filtering. Existing unregistered Yuque corpus requires init-state.
 ```
 
 A directory source recursively scans regular Markdown, ignoring symlinks,
-hidden entries, and _inventory. Selected Markdown bytes are frozen in wash;
-originals are not changed. Versions are content digests, not timestamps.
+hidden entries, and _inventory. Selected Markdown and referenced local files
+inside the source root are frozen in wash; originals are not changed. Versions
+bind those bytes, not timestamps. Apply owns a separate copy before pausing.
 
 The persisted dogpdkb-differences-2 contains schema, book (key/name/sources),
 run_id, captured_at, selected source keys, per-source listings and cutoffs,

@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import unquote
 
 from scripts.smoke_install import REMOTE_CLI
 
@@ -234,7 +235,9 @@ def test_mixed_subscription_publishes_once_and_directory_refresh_stays_offline(
     before = log.read_bytes()
     unchanged = cli(tmp_path, config, "sync", "--source", "inbox", remote=True)
     assert unchanged.returncode == 0, unchanged.stderr
-    assert log.read_bytes() == before
+    added = log.read_bytes()[len(before) :].splitlines()
+    assert [json.loads(line)[:2] for line in added] == [["mdcompare", "catalog"]]
+    before = log.read_bytes()
     note.unlink()
     absent = cli(tmp_path, config, "sync", "--source", "inbox", remote=True)
     assert absent.returncode == 0, absent.stderr
@@ -308,3 +311,63 @@ def test_directory_destination_conflict_is_visible_in_plan_and_does_not_overwrit
     assert conflict["reason"] == "CORPUS_DESTINATION_CONFLICT"
     assert Path(conflict["path"]) == destination
     assert destination.read_text() == "# Existing unregistered corpus file\n"
+
+
+def test_paused_apply_owns_snapshot_after_purging_discovery(tmp_path):
+    inbox = tmp_path / "inbox"
+    (inbox / "images").mkdir(parents=True)
+    from PIL import Image
+
+    original = inbox / "images" / "chart.png"
+    Image.new("RGB", (2, 2), "red").save(original)
+    original_bytes = original.read_bytes()
+    note = inbox / "notes.md"
+    note.write_text('# Chart\n\n<img src="images/chart.png" alt="Chart">\n')
+    config = {
+        "key": "funds",
+        "sources": [{"key": "inbox", "type": "directory", "path": "./inbox"}],
+    }
+    discovery = cli(tmp_path, config, "discover", remote=True)
+    assert discovery.returncode == 0, discovery.stderr
+    observed = json.loads(discovery.stdout)
+    paused = cli(
+        tmp_path,
+        config,
+        "apply",
+        "--input",
+        observed["differences"],
+        "--stop-after",
+        "plan",
+        remote=True,
+    )
+    assert paused.returncode == 0, paused.stderr
+    run_path = Path(json.loads(paused.stdout)["run"])
+    plan = json.loads((run_path.parent / "plan.json").read_text())
+    [document] = plan["documents"]
+    assert Path(document["raw_path"]).is_relative_to(run_path.parent)
+    [image] = document["resources"]
+    assert Path(image["path"]).read_bytes() == original_bytes
+
+    purged = cli(tmp_path, config, "purge", "--run", observed["run"], remote=True)
+    assert purged.returncode == 0, purged.stderr
+    assert not Path(observed["run"]).exists()
+    frozen_image = Path(image["path"])
+    frozen_image.write_bytes(b"modified frozen image")
+    invalid = cli(tmp_path, config, "apply", "--resume", str(run_path), remote=True)
+    assert invalid.returncode == 1
+    assert "plan input missing or changed" in invalid.stderr
+    frozen_image.write_bytes(original_bytes)
+    Image.new("RGB", (2, 2), "blue").save(original)
+    completed = cli(tmp_path, config, "apply", "--resume", str(run_path), remote=True)
+    assert completed.returncode == 0, completed.stderr
+    [published] = list((tmp_path / "corpus/funds").glob("*.md"))
+    rendered = published.read_text()
+    retained = Path(unquote(rendered.split('src="', 1)[1].split('"', 1)[0]))
+    assert retained.read_bytes() == original_bytes
+    assert original.read_bytes() != original_bytes
+
+    new_scan = cli(tmp_path, config, "discover", remote=True)
+    assert new_scan.returncode == 0, new_scan.stderr
+    source = json.loads(new_scan.stdout)
+    [incoming] = json.loads(Path(source["differences"]).read_text())["documents"]
+    assert incoming["version"] != document["version"]

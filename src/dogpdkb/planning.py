@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
 from datetime import datetime
 from pathlib import Path
 
+from dogpdkb.directory_snapshot import validate_snapshot
 from dogpdkb.records import UTC8, atomic_json, read_json, version_key
 
 
@@ -198,15 +198,8 @@ def validate_inputs(documents, *, check_baseline=False):
             body = Path(row["raw_path"]).read_bytes()
             if body != Path(row["input_copy"]).read_bytes():
                 raise ValueError("changed")
-            version = row.get("version")
-            if (
-                isinstance(version, dict)
-                and version.get("precision") == "content"
-                and (
-                    f"sha256:{hashlib.sha256(body).hexdigest()}" != version_key(version)
-                )
-            ):
-                raise ValueError("content version changed")
+            if "directory_snapshot" in row:
+                validate_snapshot(Path(row["directory_snapshot"]), row, body)
             if (
                 check_baseline
                 and row.get("baseline_input_copy")

@@ -181,7 +181,8 @@ a resume does not call the scorer again. Ambiguity is advisory.
 ```
 
 `directory` 路径相对 `books.json`，递归接收 `.md`（不区分大小写），跳过隐藏项、
-`_inventory` 和符号链接；不移动或删除原件。非 Markdown 文件不作为独立文档输入。
+`_inventory` 和符号链接；不移动或删除原件。非 Markdown 文件不作为独立文档输入；
+Markdown 引用的目录内资源随正文冻结，资源变更也计入版本。
 默认扫描所有启用来源；可重复传 `--source KEY` 选子集，未选来源不访问也不判为缺失。
 任何选中来源扫描失败则不生成计划。`--resume` 不接受 `--source`，只使用冻结输入。
 

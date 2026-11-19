@@ -13,6 +13,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 
+from dogpdkb.directory_snapshot import catalog_paths, copy_snapshot
 from dogpdkb.help import HelpParser
 from dogpdkb.planning import (
     descriptor,
@@ -166,7 +167,11 @@ def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
             owners[output] = {None}
         owners.setdefault(output, set()).add(identity)
     frozen = None
-    if any(isinstance(sources[row["source_key"]], DirectorySource) for row in selected):
+    if any(
+        isinstance(sources[row["source_key"]], DirectorySource)
+        and row["document_id"] not in prepared
+        for row in selected
+    ):
         discovery_id = differences.get("run_id")
         if not isinstance(discovery_id, str) or not re.fullmatch(
             r"run-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}", discovery_id
@@ -186,7 +191,10 @@ def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
                 sources[row["source_key"]], DirectorySource
             ):
                 row["raw_path"] = str(
-                    frozen.directory / "directory-inputs" / f"{identifier}.md"
+                    frozen.directory
+                    / "directory-inputs"
+                    / identifier
+                    / row["source_document_id"]
                 )
             failure(run, row, "plan", "CORPUS_DESTINATION_CONFLICT", path=str(output))
             continue
@@ -228,19 +236,17 @@ def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
         desired_metadata = descriptor(book, row, existing)["metadata"]
         if isinstance(sources[row["source_key"]], DirectorySource):
             assert frozen is not None
-            raw = frozen.directory / "directory-inputs" / f"{identifier}.md"
-            if str(raw) != row.get("frozen_input") or raw.is_symlink():
+            frozen_root = frozen.directory / "directory-inputs" / identifier
+            if str(frozen_root / row["source_document_id"]) != row.get("frozen_input"):
                 raise ValueError(f"invalid frozen directory input: {identifier}")
-            body = raw.read_bytes()
-            if f"sha256:{hashlib.sha256(body).hexdigest()}" != version_key(
-                row["version"]
-            ):
-                raise ValueError(f"frozen directory input changed: {identifier}")
-            row["raw_path"] = str(raw)
+            snapshot = run.directory / "raw" / "directory" / identifier
+            raw = copy_snapshot(frozen_root, snapshot, row)
+            row.update(raw_path=str(raw), directory_snapshot=str(snapshot))
             document["raw"] = {
                 "version": row["version"],
                 "path": str(raw),
                 "metadata": desired_metadata,
+                "resources": catalog_paths(snapshot, row),
             }
             freeze_input(row, persist=False)
             local_prepared = True

@@ -15,10 +15,14 @@ counts are validated before observations or a runnable plan are committed.
 
 A directory scan recursively discovers regular Markdown files; it excludes
 hidden entries, `_inventory` and symlinks. A directory must not overlap managed
-paths. Its document ID is the root-relative POSIX path, version is the content
-SHA-256, and provenance is the file URI. Changed selected bytes are frozen in
-wash; if the bytes change while freezing the scan fails. Metadata and path alone
-are not proof of a successful publication. The source files are not modified.
+paths. Its document ID is the root-relative POSIX path and provenance is the file
+URI. The public `mdcompare catalog` identifies references on the original page.
+Referenced local files inside the source root are hashed with the Markdown and
+copied in the same relative layout; a resolved resource outside the source root
+or through a symlink is rejected. Remote resources are not fetched by discovery.
+Selected inputs are verified while freezing; originals are not modified. A
+separate `apply --input` stages its own copy so a paused apply remains usable
+after purging the completed discovery run.
 
 If any selected scan fails, no observations are committed and no combined
 executable differences are saved. Unselected sources are untouched. Missing

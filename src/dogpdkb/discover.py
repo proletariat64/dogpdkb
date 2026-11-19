@@ -11,7 +11,13 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
+from dogpdkb.directory_snapshot import (
+    copy_snapshot,
+    observe_resources,
+    snapshot_version,
+)
 from dogpdkb.help import HelpParser
+from dogpdkb.planning import descriptor
 from dogpdkb.processes import diagnostic_argv, run_command
 from dogpdkb.records import UTC8, Run, Store, atomic_json, now_iso, read_json
 from dogpdkb.settings import YuqueSource, document_identity, load_config, select_book
@@ -202,7 +208,7 @@ def _with_source(rows, source_key):
     return current
 
 
-def _directory_listing(settings, book, source):
+def _directory_listing(settings, book, run, source):
     root = source.path
     if not root.is_dir():
         raise DiscoverError(
@@ -245,7 +251,7 @@ def _directory_listing(settings, book, source):
             relative = path.relative_to(root).as_posix()
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             rows[relative] = {
-                "version": {"value": f"sha256:{digest}", "precision": "content"},
+                "directory_body_sha256": digest,
                 "title": path.stem,
                 "name": path.stem,
                 "path": relative,
@@ -256,7 +262,63 @@ def _directory_listing(settings, book, source):
                 "type": "md",
                 "metadata": {"relative_path": relative},
             }
-    return _with_source(rows, source.key), now_iso(), None
+    current = _with_source(rows, source.key)
+    if current:
+        _catalog_directory(settings, book, run, source, current)
+    return current, now_iso(), None
+
+
+def _catalog_directory(settings, book, run, source, documents):
+    request = run.directory / f"directory-{source.key}-descriptors.json"
+    report = run.directory / f"directory-{source.key}-catalog.json"
+    atomic_json(
+        request,
+        {
+            "schema_version": "1.0",
+            "documents": [
+                descriptor(book, row, source.path / row["source_document_id"])
+                for row in documents.values()
+            ],
+        },
+    )
+    argv = [
+        *settings.command("mdcompare"),
+        "catalog",
+        "--input",
+        str(request),
+        "--output",
+        str(report),
+    ]
+    code = run_command(argv, log=report.with_suffix(".log"))
+    if code:
+        raise DiscoverError(
+            f"directory resource catalog failed with exit {code}",
+            code if code in {130, 143} else 1,
+        )
+    result = read_json(report)
+    if (
+        not isinstance(result, dict)
+        or result.get("schema_version") != "1.0"
+        or not isinstance(result.get("documents"), list)
+    ):
+        raise DiscoverError("invalid directory resource catalog")
+    seen = set()
+    for item in result["documents"]:
+        identity = item.get("document_id") if isinstance(item, dict) else None
+        row = documents.get(identity)
+        if row is None or identity in seen or item.get("knowledge_base") != book.key:
+            raise DiscoverError("directory resource catalog document mismatch")
+        seen.add(identity)
+        path = source.path / row["source_document_id"]
+        resources = item.get("resources")
+        if item.get("path") != str(path) or not isinstance(resources, list):
+            raise DiscoverError("invalid directory resource catalog entry")
+        row["directory_resources"] = observe_resources(source.path, path, resources)
+        row["version"] = snapshot_version(
+            row["directory_body_sha256"], row["directory_resources"]
+        )
+    if seen != set(documents):
+        raise DiscoverError("incomplete directory resource catalog")
 
 
 def _select(current, prior, documents, *, yuque):
@@ -351,7 +413,9 @@ def discover(settings, book, store, run, listing=None, *, sources=None):
                     settings, run, source, listing
                 )
             else:
-                current, captured, artifact = _directory_listing(settings, book, source)
+                current, captured, artifact = _directory_listing(
+                    settings, book, run, source
+                )
             local = {
                 key: doc
                 for key, doc in documents.items()
@@ -361,21 +425,9 @@ def discover(settings, book, store, run, listing=None, *, sources=None):
             rows, skipped, cutoff = _select(current, prior, local, yuque=yuque)
             if not yuque:
                 for row in rows:
-                    body = (source.path / row["source_document_id"]).read_bytes()
-                    if (
-                        f"sha256:{hashlib.sha256(body).hexdigest()}"
-                        != row["version"]["value"]
-                    ):
-                        raise DiscoverError(
-                            f"directory input changed while scanning: {row['source_document_id']}"
-                        )
-                    target = (
-                        run.directory / "directory-inputs" / f"{row['document_id']}.md"
-                    )
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(body)
-                    row["frozen_input"] = str(target)
-        except (OSError, ValueError) as error:
+                    target = run.directory / "directory-inputs" / row["document_id"]
+                    row["frozen_input"] = str(copy_snapshot(source.path, target, row))
+        except (OSError, ValueError, TypeError) as error:
             raise DiscoverError(
                 f"source {source.key}: {error}", getattr(error, "exit_code", 1)
             ) from error
