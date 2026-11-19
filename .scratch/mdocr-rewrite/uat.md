@@ -15,3 +15,10 @@ Test an installed wheel in an isolated workspace; nothing in the workstation pro
 | Repository | Required tests, Ruff, docs, wheel and sdist, installed help/read-only smoke, `git diff --check`. Inspect Greptile only for the exact current PR head; reverify after fixes. |
 
 Live routes planned: `openai/gpt-6.1-terra` and `openai-codex/gpt-6.1-terra`; a successful Codex-OAuth inference verifies the route, but proves Device Code enrollment only if that enrollment was observed. No authentic corpora or credentials in screenshots, fixtures or PR evidence.
+
+## First installed real-route probe
+
+- Built wheel and sdist offline and installed the wheel in a disposable Python 3.12 virtualenv. Planned only a generated PNG with two labelled boxes and an arrow, and synthetic Markdown. No corpus content.
+- The two allowed plans each admitted one medium-effort Terra job, one plan per Pi OAuth route. Each CLI returned incomplete, with one durable `unknown_outcome` and no usage or published Markdown. The shell harness itself exited zero; do not report either route as accepted.
+- Diagnosis without inference: native Node fetch timed out on unauthenticated HEAD checks to both service origins; the configured HTTPS proxy reached them (OpenAI 401 / Codex 405). The bridge now honors the configured HTTPS proxy for inference and token refresh, without a direct fallback. Local mocked transport tests verify the route and preserve the rate-limit status.
+- Leave both unknown plans unchanged. Further live probes require fresh bounded authorization, use new isolated plans and run the rebuilt wheel; never retry the two old journals. Device Code enrollment itself has not been observed in this UAT.
