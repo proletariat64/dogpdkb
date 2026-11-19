@@ -1,6 +1,8 @@
 # ocr-batch
 
-Status: ready-for-agent
+Status: in-progress
+
+Progress: Batch OCR is being finished in the independent ticket 02 worktree; not integrated.
 
 Blocked by: none
 

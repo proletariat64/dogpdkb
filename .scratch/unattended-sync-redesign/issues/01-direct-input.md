@@ -1,6 +1,8 @@
 # direct-input
 
-Status: ready-for-agent
+Status: integrated
+
+Progress: Integrated in Draft PR #36 at `c9eea3b`; 85 focused offline tests passed.
 
 Blocked by: none
 

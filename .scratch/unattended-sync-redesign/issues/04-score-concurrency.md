@@ -1,6 +1,8 @@
 # score-concurrency
 
-Status: ready-for-agent
+Status: integrated
+
+Progress: Integrated in Draft PR #36 at `dc2f5f9`; 40 focused offline tests passed.
 
 Blocked by: none
 
