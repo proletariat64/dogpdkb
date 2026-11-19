@@ -1,6 +1,6 @@
 # acceptance
 
-Status: ready-for-agent
+Status: in-progress
 
 Blocked by: 04,06
 

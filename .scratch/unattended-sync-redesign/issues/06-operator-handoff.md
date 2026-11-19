@@ -1,6 +1,6 @@
 # operator-handoff
 
-Status: implemented
+Status: integrated
 
 Blocked by: none
 
