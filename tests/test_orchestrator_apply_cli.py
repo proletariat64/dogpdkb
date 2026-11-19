@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from tests.ocr_fixture import write_ocr_fixture
+from tests.source_fixture import team_id, team_row, yuque_binding
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = {
@@ -39,7 +40,13 @@ def instance(tmp_path):
                 {
                     "key": "funds",
                     "name": "Funds",
-                    "url": "https://example.invalid/team/book",
+                    "sources": [
+                        {
+                            "key": "team",
+                            "type": "yuque",
+                            "url": "https://example.invalid/team/book",
+                        }
+                    ],
                     "corpus": "corpus",
                 }
             ]
@@ -76,11 +83,15 @@ def instance(tmp_path):
     differences.write_text(
         json.dumps(
             {
-                "schema": "dogpdkb-differences-1",
-                "book": {"key": "funds", "url": "https://example.invalid/team/book"},
+                "schema": "dogpdkb-differences-2",
+                "sources": ["team"],
+                "book": {
+                    "key": "funds",
+                    "sources": yuque_binding("https://example.invalid/team/book"),
+                },
                 "documents": [
                     {
-                        "document_id": "42",
+                        **team_row("42"),
                         "version": VERSION,
                         "title": "Title",
                         "path": "folder",
@@ -130,8 +141,8 @@ def test_apply_resume_publishes_full_source_without_claiming_graph_success(tmp_p
     assert published.read_text() == "# Title\n\nFull current knowledge.\n"
     assert published.parent == tmp_path / "corpus"
     state = json.loads((tmp_path / "state" / "funds" / "state.json").read_text())
-    assert state["documents"]["42"]["corpus"]["version"] == VERSION
-    assert "version" not in state["documents"]["42"].get("graph", {})
+    assert state["documents"][team_id("42")]["corpus"]["version"] == VERSION
+    assert "version" not in state["documents"][team_id("42")].get("graph", {})
     assert (tmp_path / "events").read_text().splitlines() == ["export"]
 
 
@@ -269,7 +280,9 @@ rows=[]""",
     run = json.loads(Path(json.loads(result.stdout)["run"]).read_text())
     assert run["command"] == "sync"
     assert run["status"] == "paused"
-    assert set(run["artifacts"]) >= {"listing", "differences", "plan"}
+    assert set(run["artifacts"]) >= {"differences", "plan"}
+    difference = json.loads(Path(run["artifacts"]["differences"]).read_text())
+    assert Path(difference["listings"]["team"]).is_file()
     assert "ocr_report" not in run["artifacts"]
     assert not list((tmp_path / "corpus").glob("*.md"))
     assert (tmp_path / "events").read_text().splitlines() == ["listing", "export"]
@@ -285,7 +298,7 @@ def test_apply_finishes_each_whole_batch_stage_before_next_tool(tmp_path):
     (tmp_path / "remote.json").write_text(json.dumps(remote))
     selection = json.loads(differences.read_text())
     selection["documents"].append(
-        {**selection["documents"][0], "document_id": "43", "title": "Second"}
+        {**selection["documents"][0], **team_row("43"), "title": "Second"}
     )
     differences.write_text(json.dumps(selection))
     bridge = tmp_path / "tool_cli.py"
@@ -338,7 +351,7 @@ def two_sources(tmp_path, differences):
     (tmp_path / "remote.json").write_text(json.dumps(remote))
     selected = json.loads(differences.read_text())
     selected["documents"].append(
-        {**selected["documents"][0], "document_id": "43", "title": "Second"}
+        {**selected["documents"][0], **team_row("43"), "title": "Second"}
     )
     differences.write_text(json.dumps(selected))
 
@@ -377,13 +390,13 @@ def test_interrupted_export_does_not_suppress_later_unstarted_source(tmp_path):
         process.communicate(timeout=5)
         assert process.returncode == 143
     state = json.loads((tmp_path / "state" / "funds" / "state.json").read_text())
-    assert state["documents"]["42"]["steps"]["export"]["status"] == "unknown"
-    assert "export" not in state["documents"]["43"]["steps"]
+    assert state["documents"][team_id("42")]["steps"]["export"]["status"] == "unknown"
+    assert "export" not in state["documents"][team_id("43")]["steps"]
     tool.write_text(original)
     resumed = cli("apply", "--config", config, "--input", differences)
     assert resumed.returncode == 2, resumed.stderr
     manifest = json.loads(Path(json.loads(resumed.stdout)["manifest"]).read_text())
-    assert [row["document_id"] for row in manifest["documents"]] == ["43"]
+    assert [row["document_id"] for row in manifest["documents"]] == [team_id("43")]
     assert (tmp_path / "events").read_text().splitlines() == ["export"]
 
 
@@ -416,18 +429,19 @@ raise SystemExit(2)
     manifest = json.loads(Path(json.loads(result.stdout)["manifest"]).read_text())
     assert manifest["documents"][1]["pending_steps"] == []
     assert any(
-        f["step"] == "ocr" and f["document_id"] == "43" for f in manifest["failures"]
+        f["step"] == "ocr" and f["document_id"] == team_id("43")
+        for f in manifest["failures"]
     )
     state = json.loads((tmp_path / "state" / "funds" / "state.json").read_text())
-    assert state["documents"]["42"]["steps"]["ocr"]["status"] == "failed"
-    assert "ocr" not in state["documents"]["43"]["steps"]
+    assert state["documents"][team_id("42")]["steps"]["ocr"]["status"] == "failed"
+    assert "ocr" not in state["documents"][team_id("43")]["steps"]
     config.write_text(original)
     next_run = cli("apply", "--config", config, "--input", differences)
     assert next_run.returncode == 2, next_run.stderr
     manifest = json.loads(Path(json.loads(next_run.stdout)["manifest"]).read_text())
     assert manifest["documents"][1]["pending_steps"] == []
     state = json.loads((tmp_path / "state" / "funds" / "state.json").read_text())
-    assert state["documents"]["43"]["steps"]["ocr"]["status"] == "completed"
+    assert state["documents"][team_id("43")]["steps"]["ocr"]["status"] == "completed"
 
 
 @pytest.mark.parametrize("changed_document", [0, 1])
@@ -498,7 +512,7 @@ fixture_result({'schema_version':'mdocr-result-2','documents':[{'document_id':do
     assert process.returncode == 1, stderr
     assert "generate a new plan" in stderr
     assert not list((tmp_path / "corpus").glob("*.md"))
-    assert (tmp_path / "ocr-calls").read_text().splitlines() == ["42"]
+    assert (tmp_path / "ocr-calls").read_text().splitlines() == [team_id("42")]
 
 
 def test_opaque_versions_advance_by_frozen_facts_and_old_plan_is_refused(tmp_path):
@@ -517,7 +531,7 @@ def test_opaque_versions_advance_by_frozen_facts_and_old_plan_is_refused(tmp_pat
     first = cli("apply", "--config", config, "--input", differences)
     assert first.returncode == 0, first.stderr
     state = json.loads((tmp_path / "state" / "funds" / "state.json").read_text())
-    data["documents"][0]["local"] = state["documents"]["42"]
+    data["documents"][0]["local"] = state["documents"][team_id("42")]
     data["documents"][0]["version"] = {"value": "v10", "precision": "opaque"}
     differences.write_text(json.dumps(data))
     remote["42"].update(version="v10", body="# Advanced opaque version\n")
@@ -539,7 +553,7 @@ def test_frozen_success_facts_do_not_authorize_timestamp_rollback(tmp_path):
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
     selected = json.loads(differences.read_text())
     selected["documents"][0].update(
-        local=state["documents"]["42"],
+        local=state["documents"][team_id("42")],
         version={"value": "2026-11-11T10:00:00Z"},
     )
     differences.write_text(json.dumps(selected))
@@ -606,7 +620,7 @@ def test_missing_historical_ocr_input_does_not_abort_fresh_apply(tmp_path):
     first = cli("apply", "--config", config, "--input", differences)
     assert first.returncode == 0, first.stderr
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
-    Path(state["documents"]["42"]["raw"]["path"]).unlink()
+    Path(state["documents"][team_id("42")]["raw"]["path"]).unlink()
     second = cli("apply", "--config", config, "--input", differences)
     assert second.returncode == 0, second.stdout + second.stderr
 
@@ -674,8 +688,8 @@ def test_resume_before_plan_keeps_original_scope_and_processes_unstarted_source(
     result = cli("apply", "--config", config, "--resume", run_path)
     assert result.returncode == 2, result.stderr
     manifest = json.loads(Path(json.loads(result.stdout)["manifest"]).read_text())
-    assert [row["document_id"] for row in manifest["documents"]] == ["43"]
-    assert any(row["document_id"] == "42" for row in manifest["failures"])
+    assert [row["document_id"] for row in manifest["documents"]] == [team_id("43")]
+    assert any(row["document_id"] == team_id("42") for row in manifest["failures"])
     assert not any("44" in path.name for path in (tmp_path / "corpus").glob("*.md"))
 
 
@@ -719,7 +733,7 @@ def test_resume_before_plan_refuses_changed_prepared_input(tmp_path, mutation):
         assert process.returncode == 143
     run_path = next((tmp_path / "runs/funds").glob("*/run.json"))
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
-    raw = Path(state["documents"]["42"]["raw"]["path"])
+    raw = Path(state["documents"][team_id("42")]["raw"]["path"])
     if mutation == "missing":
         raw.unlink()
     else:
@@ -791,11 +805,10 @@ def test_paused_run_refuses_changed_source_or_write_target(tmp_path, change):
     if change in {"corpus", "source"}:
         books = tmp_path / "books.json"
         rows = json.loads(books.read_text())
-        rows[0]["corpus" if change == "corpus" else "url"] = (
-            "new-corpus"
-            if change == "corpus"
-            else "https://example.invalid/another-book"
-        )
+        if change == "corpus":
+            rows[0]["corpus"] = "new-corpus"
+        else:
+            rows[0]["sources"][0]["url"] = "https://example.invalid/another-book"
         books.write_text(json.dumps(rows))
     else:
         config.write_text(
@@ -803,7 +816,7 @@ def test_paused_run_refuses_changed_source_or_write_target(tmp_path, change):
         )
     rejected = cli("apply", "--config", config, "--resume", run_path)
     assert rejected.returncode == 1
-    assert "source book" in rejected.stderr or "targets changed" in rejected.stderr
+    assert "binding changed" in rejected.stderr or "targets changed" in rejected.stderr
     assert (tmp_path / "events").read_text().splitlines() == ["export"]
     assert run_path.read_bytes() == before
     assert not list((tmp_path / "new-corpus").glob("*.md"))
@@ -905,11 +918,11 @@ def test_resumed_run_status_clears_pause_end_time_and_elapsed_keeps_advancing(tm
 def test_imported_difference_rejects_another_source_book_before_export(tmp_path):
     config, differences = instance(tmp_path)
     payload = json.loads(differences.read_text())
-    payload["book"]["url"] = "https://example.invalid/other/book"
+    payload["book"]["sources"]["team"]["url"] = "https://example.invalid/other/book"
     differences.write_text(json.dumps(payload))
     result = cli("apply", "--config", config, "--input", differences)
     assert result.returncode == 1
-    assert "book mismatch" in result.stderr
+    assert "source binding mismatch" in result.stderr
     assert not (tmp_path / "events").exists()
     assert not list((tmp_path / "corpus").glob("*.md"))
 
@@ -921,11 +934,12 @@ def test_apply_rejects_unsubscribed_difference_before_export_or_saved_inputs(
     config, differences = instance(tmp_path)
     books_path = tmp_path / "books.json"
     books = json.loads(books_path.read_text())
-    books[0]["document_ids"] = ["43"]
+    books[0]["sources"][0]["document_ids"] = ["43"]
     books_path.write_text(json.dumps(books))
     data = json.loads(differences.read_text())
+    data["book"]["sources"]["team"]["document_ids"] = ["43"]
     if include_subscribed:
-        subscribed = {**data["documents"][0], "document_id": "43"}
+        subscribed = {**data["documents"][0], **team_row("43")}
         data["documents"].insert(0, subscribed)
         remote_path = tmp_path / "remote.json"
         remote = json.loads(remote_path.read_text())
@@ -965,8 +979,8 @@ def test_complete_hold_retains_graph_without_manual_gate(tmp_path):
     assert row["action"] == "compile"
     assert "AUTHORED_BODY_CHANGED" in row["reason_codes"]
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
-    assert "version" not in state["documents"]["42"]["graph"]
-    assert state["documents"]["42"]["steps"]["ocr"]["status"] == "completed"
+    assert "version" not in state["documents"][team_id("42")]["graph"]
+    assert state["documents"][team_id("42")]["steps"]["ocr"]["status"] == "completed"
 
 
 def test_unavailable_body_defers_without_ocr_and_keeps_old_comparison_basis(tmp_path):
@@ -982,7 +996,7 @@ def test_unavailable_body_defers_without_ocr_and_keeps_old_comparison_basis(tmp_
     assert manifest["documents"][0]["action"] == "defer"
     state_path = tmp_path / "state/funds/state.json"
     state = json.loads(state_path.read_text())
-    doc = state["documents"]["42"]
+    doc = state["documents"][team_id("42")]
     assert doc["steps"]["compare"]["status"] == "unknown"
     assert "ocr" not in doc["steps"]
     assert "unknown tail" in Path(doc["graph_baseline"]["path"]).read_text()
@@ -998,7 +1012,7 @@ def test_unavailable_body_defers_without_ocr_and_keeps_old_comparison_basis(tmp_
     result = json.loads(Path(json.loads(second.stdout)["manifest"]).read_text())
     assert result["documents"][0]["action"] == "defer"
     state = json.loads(state_path.read_text())
-    assert "version" not in state["documents"]["42"]["graph"]
+    assert "version" not in state["documents"][team_id("42")]["graph"]
 
 
 def test_explicit_graph_replan_preserves_original_reports_and_published_bytes(tmp_path):
@@ -1129,12 +1143,12 @@ def test_changed_body_stays_pending_until_actual_graph_compilation(tmp_path):
     selected = json.loads(Path(json.loads(next_day.stdout)["differences"]).read_text())[
         "documents"
     ]
-    assert [row["document_id"] for row in selected] == ["42"]
+    assert [row["source_document_id"] for row in selected] == ["42"]
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
-    assert "pending" in state["documents"]["42"]
-    assert "version" not in state["documents"]["42"]["graph"]
+    assert "pending" in state["documents"][team_id("42")]
+    assert "version" not in state["documents"][team_id("42")]["graph"]
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
-    document = state["documents"]["42"]
+    document = state["documents"][team_id("42")]
     assert "pending" in document
     assert "version" not in document["graph"]
     assert (

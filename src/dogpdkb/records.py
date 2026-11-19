@@ -13,10 +13,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from dogpdkb.settings import Book, Settings
+from dogpdkb.settings import Book, Settings, YuqueSource, document_identity
 
-STATE_SCHEMA = "dogpdkb-state-1"
-RUN_SCHEMA = "dogpdkb-run-1"
+STATE_SCHEMA = "dogpdkb-state-2"
+RUN_SCHEMA = "dogpdkb-run-2"
 UTC8 = timezone(timedelta(hours=8))
 _LOCK_FDS: list[int] = []
 
@@ -108,32 +108,41 @@ class Store:
         self.path = settings.state / book.key / "state.json"
         self.runs = settings.staging / book.key
         self.lock_path = book.corpus / ".dogpdkb.lock"
+        configured = book.source_bindings()
         if self.path.exists():
             self.data = read_json(self.path)
             if (
                 not isinstance(self.data, dict)
                 or self.data.get("schema") != STATE_SCHEMA
-                or self.data.get("book", {}).get("key") != book.key
+                or not isinstance(self.data.get("book"), dict)
+                or self.data["book"].get("key") != book.key
+                or not isinstance(self.data["book"].get("sources"), dict)
                 or not isinstance(self.data.get("documents"), dict)
             ):
                 raise ValueError(
                     "unsupported orchestrator state; initialize a new state"
                 )
-            scope = list(book.document_ids) if book.document_ids is not None else None
-            if self.data["book"].get("document_ids") != scope:
-                raise ValueError("subscription scope changed; use a new book key/state")
-            if self.data["book"].get("url") != book.url:
-                raise ValueError("durable state belongs to a different source book")
+            registered = self.data["book"]["sources"]
+            for key in configured.keys() & registered.keys():
+                if configured[key] != registered[key]:
+                    raise ValueError(
+                        f"binding changed for source {key}; use a new source key"
+                    )
+            registered.update(configured)
         else:
             self.data = {
                 "schema": STATE_SCHEMA,
-                "book": {"key": book.key, "name": book.name, "url": book.url},
+                "book": {"key": book.key, "name": book.name, "sources": configured},
                 "observation": None,
                 "documents": {},
             }
 
-        if book.document_ids is not None:
-            self.data["book"]["document_ids"] = list(book.document_ids)
+    def run_targets(self) -> dict:
+        return {
+            "sources": self.book.source_bindings(),
+            "corpus": str(self.book.corpus.resolve()),
+            "graph": str(self.settings.graph_for(self.book).resolve()),
+        }
 
     def input_directory(self, doc_id: str) -> Path:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", doc_id):
@@ -248,29 +257,50 @@ def initialize(settings: Settings, book: Book) -> dict:
     with store.lock():
         found = {}
         ignored = 0
+        owned = {
+            doc.get("corpus", {}).get("path")
+            for doc in store.data["documents"].values()
+        }
+        yuque_sources = [
+            source for source in book.sources if isinstance(source, YuqueSource)
+        ]
         for path in sorted(book.corpus.glob("*.md")):
             match = re.search(r"(\d{4}-\d{2}-\d{2})-\[(\d+)\]\.md$", path.name)
             if not match:
                 ignored += 1
                 continue
+            if str(path) in owned:
+                continue
             date, doc_id = match.groups()
-            if book.document_ids is not None and doc_id not in book.document_ids:
+            candidates = [
+                source
+                for source in yuque_sources
+                if source.document_ids is None or doc_id in source.document_ids
+            ]
+            if not candidates:
                 ignored += 1
                 continue
+            if len(candidates) != 1:
+                raise ValueError(
+                    f"ambiguous Yuque source for existing corpus filename: {path.name}"
+                )
+            source_key = candidates[0].key
+            identity = document_identity(source_key, doc_id)
             try:
                 datetime.strptime(date, "%Y-%m-%d")
             except ValueError as error:
                 raise ValueError(
                     f"invalid corpus filename date: {path.name}"
                 ) from error
-            if doc_id in found:
+            if identity in found:
                 raise ValueError(f"duplicate corpus source ID {doc_id}")
-            found[doc_id] = (path, date)
+            found[identity] = (source_key, doc_id, path, date)
         registered = 0
-        for doc_id, (path, date) in found.items():
-            if doc_id in store.data["documents"]:
+        for identity, (source_key, doc_id, path, date) in found.items():
+            if identity in store.data["documents"]:
                 continue
-            document = store.document(doc_id)
+            document = store.document(identity)
+            document.update(source_key=source_key, source_document_id=doc_id)
             document["baseline"] = {
                 "path": str(path),
                 "filename_date": date,
@@ -311,11 +341,7 @@ class Run:
             "run_id": run_id,
             "command": command,
             "book": store.data["book"],
-            "targets": {
-                "book_url": store.book.url,
-                "corpus": str(store.book.corpus.resolve()),
-                "graph": str(store.settings.graph_for(store.book).resolve()),
-            },
+            "targets": store.run_targets(),
             "pid": os.getpid(),
             "lock": str(store.lock_path),
             "status": "running",
@@ -329,8 +355,6 @@ class Run:
             "artifacts": {},
             "failures": [],
         }
-        if store.book.document_ids is not None:
-            data["targets"]["document_ids"] = list(store.book.document_ids)
         run = cls(store, directory, data)
         run.save()
         return run
@@ -349,14 +373,7 @@ class Run:
             or data.get("book", {}).get("key") != store.book.key
         ):
             raise ValueError("run does not belong to the selected book or schema")
-        expected = {
-            "book_url": store.book.url,
-            "corpus": str(store.book.corpus.resolve()),
-            "graph": str(store.settings.graph_for(store.book).resolve()),
-        }
-        if store.book.document_ids is not None:
-            expected["document_ids"] = list(store.book.document_ids)
-        if data.get("targets") != expected:
+        if data.get("targets") != store.run_targets():
             raise ValueError("run source or write targets changed; generate a new plan")
         return cls(store, path.resolve(), data)
 

@@ -284,7 +284,14 @@ def smoke(dist: Path) -> None:
                     {
                         "key": "funds",
                         "name": "Funds",
-                        "url": "https://example.invalid/team/book",
+                        "sources": [
+                            {
+                                "key": "team",
+                                "type": "yuque",
+                                "url": "https://example.invalid/team/book",
+                            },
+                            {"key": "inbox", "type": "directory", "path": "inbox"},
+                        ],
                         "corpus": "corpus",
                     }
                 ]
@@ -303,6 +310,10 @@ def smoke(dist: Path) -> None:
         status = json.loads(run([command, "status", "--config", config, "--json"]))
         assert status["status"] == "no-runs"
         (work / "corpus").mkdir()
+        (work / "inbox/2026-11-19").mkdir(parents=True)
+        note = work / "inbox/2026-11-19/local.md"
+        original = "# Manual settlement instructions\n\nApprove before settlement.\n"
+        note.write_text(original)
         run([command, "init-state", "--config", config])
         run([command, "sync", "--config", config, "--stop-after", "plan"])
         records = list((work / "runs/funds").glob("run-*/run.json"))
@@ -313,8 +324,12 @@ def smoke(dist: Path) -> None:
             for line in (work / "commands.jsonl").read_text().splitlines()
         ]
         assert not any(row[0] in {"mdocr", "graphify"} for row in calls)
+        note.write_text("# Revised instructions\n\nReject cancelled requests.\n")
         run([command, "sync", "--config", config, "--resume", records[0].parent])
-        assert len(list((work / "corpus").glob("*.md"))) == 2
+        published = list((work / "corpus").glob("*.md"))
+        assert len(published) == 3
+        assert any(path.read_text() == original for path in published)
+        note.write_text(original)
         assert (work / "corpus/graphify-out/graph.json").is_file()
         status = json.loads(run([command, "status", "--config", config, "--json"]))
         assert status["status"] == "completed", status
@@ -342,6 +357,15 @@ def smoke(dist: Path) -> None:
             assert sum(row[:2] == list(operation) for row in later_calls) == sum(
                 row[:2] == list(operation) for row in calls
             )
+        note.write_text("# Revised instructions\n\nReject cancelled requests.\n")
+        run([command, "sync", "--config", config, "--source", "inbox"])
+        refreshed_calls = [
+            json.loads(line)
+            for line in (work / "commands.jsonl").read_text().splitlines()
+        ][len(later_calls) :]
+        assert ["graphify", "extract"] in (row[:2] for row in refreshed_calls)
+        assert all(row[0] != "skylark" for row in refreshed_calls)
+        assert any(path.read_text() == note.read_text() for path in published)
         protected = {
             path: path.read_bytes()
             for directory in (work / "state", work / "corpus", work / "ocr-cache")
@@ -359,7 +383,7 @@ def smoke(dist: Path) -> None:
         run([command, "purge", "--config", config, "--run", paused["run"]], expected=1)
         run([command, "purge", "--config", config, "--run", paused["run"], "--force"])
         print(
-            "Installed CLI smoke passed: isolated wheel, plan/resume, cleanup/no-op/purge, real mdcompare/mdocr, external Skylark/Graphify fixtures."
+            "Installed CLI smoke passed: isolated wheel, mixed plan/resume, directory-only refresh, cleanup/no-op/purge, real mdcompare/mdocr, external Skylark/Graphify fixtures."
         )
 
 

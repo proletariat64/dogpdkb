@@ -1,8 +1,14 @@
 [
   {
     "name": "全球资金平台产品",
-    "url": "https://yuque.antfin.com/global-fund-platform/gom7xx",
     "key": "fund-platform",
-    "corpus": "../graphify_flatten_ready"
+    "corpus": "../graphify_flatten_ready",
+    "sources": [
+      {
+        "key": "yuque-main",
+        "type": "yuque",
+        "url": "https://yuque.antfin.com/global-fund-platform/gom7xx"
+      }
+    ]
   }
 ]

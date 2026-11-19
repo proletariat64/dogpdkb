@@ -1,12 +1,16 @@
 # Whole-batch sync contract
 
-sync needs no manifest argument: it validates the complete source listing and
-executes whole-batch discovery, downloads, comparison, fixed planning, OCR,
-corpus publication and native Graphify compilation. It never publishes the Web.
---resume accepts the same saved run instead of starting discovery again; the
-source, subscription, corpus and graph targets must still match. --stop-after
-plan pauses after complete raw inputs/comparisons and the fixed plan, before
-OCR, corpus and graph writes. Remove that option on resume to continue.
+sync scans all enabled sources of the selected subscription and runs one shared
+comparison, planning, OCR, corpus publication and Graphify compilation pipeline.
+Repeat --source KEY to scan only specified sources; the corpus and graph remain
+shared. An unsuccessful selected scan aborts planning and publication. Local
+Markdown is frozen from disk and does not call Skylark export. Sync never
+publishes the Web.
+
+--resume continues the saved run without rediscovery or a new --source selection;
+source bindings, corpus and graph targets must still match. --stop-after plan
+pauses after preparing raw inputs and comparisons, before OCR, corpus and graph
+writes. Remove that option on resume to continue.
 
 Authored-body routing uses the offline public mdcompare semantic CLI:
 NEW/CHANGED/UNCERTAIN -> COMPILE; demonstrated EQUIVALENT -> reuse/metadata;

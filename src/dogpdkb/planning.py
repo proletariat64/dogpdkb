@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+from dogpdkb.directory_snapshot import validate_snapshot
 from dogpdkb.records import UTC8, atomic_json, read_json, version_key
 
 
@@ -157,6 +158,12 @@ def make_plan(book, run, documents, knowledge, comparison, semantic, *, workspac
         "schema": "dogpdkb-plan-1",
         "book": book.key,
         "run_id": run.id,
+        "sources": run.data.get("sources", []),
+        "conflicts": [
+            item
+            for item in run.data["failures"]
+            if item.get("reason") == "CORPUS_DESTINATION_CONFLICT"
+        ],
         "documents": rows,
         "semantic_report": run.data["artifacts"].get("semantic"),
         "semantic_diff": run.data["artifacts"].get("semantic_diff"),
@@ -188,11 +195,11 @@ def validate_plan(plan, book, store, *, check_baseline=False):
 def validate_inputs(documents, *, check_baseline=False):
     for row in documents:
         try:
-            if (
-                Path(row["raw_path"]).read_bytes()
-                != Path(row["input_copy"]).read_bytes()
-            ):
+            body = Path(row["raw_path"]).read_bytes()
+            if body != Path(row["input_copy"]).read_bytes():
                 raise ValueError("changed")
+            if "directory_snapshot" in row:
+                validate_snapshot(Path(row["directory_snapshot"]), row, body)
             if (
                 check_baseline
                 and row.get("baseline_input_copy")

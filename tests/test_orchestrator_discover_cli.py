@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.source_fixture import team_id
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -36,7 +38,13 @@ def setup(tmp_path):
                 {
                     "key": "funds",
                     "name": "Funds",
-                    "url": "https://example.invalid/book",
+                    "sources": [
+                        {
+                            "key": "team",
+                            "type": "yuque",
+                            "url": "https://example.invalid/book",
+                        }
+                    ],
                     "corpus": "corpus",
                 }
             ]
@@ -108,10 +116,10 @@ def test_first_listing_uses_cutoff_but_compares_existing_same_day(tmp_path):
     )
     before = {p.name: p.read_bytes() for p in (tmp_path / "corpus").glob("*.md")}
     data = difference(cli("discover", "--config", config, "--listing", path))
-    assert data["schema"] == "dogpdkb-differences-1"
-    assert data["cutoff"] == "2026-11-10"
-    assert {row["document_id"] for row in data["documents"]} == {"2", "42", "43"}
-    assert data["ignored"] == ["1"]
+    assert data["schema"] == "dogpdkb-differences-2"
+    assert data["cutoffs"]["team"] == "2026-11-10"
+    assert {row["source_document_id"] for row in data["documents"]} == {"2", "42", "43"}
+    assert data["ignored"] == [team_id("1")]
     assert before == {
         p.name: p.read_bytes() for p in (tmp_path / "corpus").glob("*.md")
     }
@@ -140,7 +148,7 @@ def test_complete_snapshots_track_toc_move_and_absence_without_deletion(tmp_path
     path = listing(tmp_path, rows, toc=toc)
     first = difference(cli("discover", "--config", config, "--listing", path))
     assert first["documents"] == []
-    assert first["ignored"] == ["1"]
+    assert first["ignored"] == [team_id("1")]
     unchanged = difference(cli("discover", "--config", config, "--listing", path))
     assert unchanged["documents"] == []
     rows[0]["version"] = "2026-11-01T04:00:00Z"
@@ -149,10 +157,10 @@ def test_complete_snapshots_track_toc_move_and_absence_without_deletion(tmp_path
     moved = difference(cli("discover", "--config", config, "--listing", path))
     assert len(moved["documents"]) == 1
     selected = moved["documents"][0]
-    assert selected["document_id"] == "1"
+    assert selected["source_document_id"] == "1"
     assert selected["path"] == ["After", "Historical"]
     assert selected["reasons"] == ["path-changed"]
-    assert moved["absent"] == ["42", "43"]
+    assert moved["absent"] == sorted((team_id("42"), team_id("43")))
     assert (
         tmp_path / "corpus" / "Earlier-2026-11-01-[42].md"
     ).read_text() == "# Earlier knowledge\n"
@@ -184,7 +192,7 @@ print("listing complete", flush=True)
         )
     result = cli("discover", "--config", config, "--book", "funds")
     data = difference(result)
-    assert [row["document_id"] for row in data["documents"]] == ["2"]
+    assert [row["source_document_id"] for row in data["documents"]] == ["2"]
     assert "listing complete" in result.stderr
     assert [json.loads(line)[0] for line in calls.read_text().splitlines()] == [
         "listing"
@@ -219,10 +227,10 @@ def test_unattempted_selection_survives_run_cleanup(tmp_path):
         [{"document_id": "2", "title": "New", "version": "2026-11-12T10:00:00+08:00"}],
     )
     first = difference(cli("discover", "--config", config, "--listing", path))
-    assert [row["document_id"] for row in first["documents"]] == ["2"]
+    assert [row["source_document_id"] for row in first["documents"]] == ["2"]
     shutil.rmtree(tmp_path / "runs")
     next_run = difference(cli("discover", "--config", config, "--listing", path))
-    assert [row["document_id"] for row in next_run["documents"]] == ["2"]
+    assert [row["source_document_id"] for row in next_run["documents"]] == ["2"]
     assert next_run["documents"][0]["reasons"] == ["new"]
 
 
@@ -299,7 +307,7 @@ def test_saved_tool_log_keeps_recoverable_command_with_credential_values_redacte
         )
     result = cli("discover", "--config", config)
     data = difference(result)
-    log = (Path(data["listing"]).parent / "listing.log").read_text()
+    log = (Path(data["listings"]["team"]).with_suffix(".log")).read_text()
     assert "command:" in log and "listing --url" in log
     assert "--token" in log and "--password=" in log
     assert "[redacted]" in log
@@ -316,9 +324,15 @@ def test_document_subscription_filters_after_complete_listing_and_pins_scope(tmp
     source = {
         "key": "funds",
         "name": "Small subscription",
-        "url": "https://example.invalid/book",
+        "sources": [
+            {
+                "key": "team",
+                "type": "yuque",
+                "url": "https://example.invalid/book",
+                "document_ids": ["2"],
+            }
+        ],
         "corpus": "corpus",
-        "document_ids": ["2"],
     }
     books.write_text(json.dumps([source]))
     path = listing(
@@ -327,20 +341,20 @@ def test_document_subscription_filters_after_complete_listing_and_pins_scope(tmp
     )
     result = cli("discover", "--config", config, "--listing", path)
     diff = difference(result)
-    assert [r["document_id"] for r in diff["documents"]] == ["2"]
+    assert [r["source_document_id"] for r in diff["documents"]] == ["2"]
     # The full remote observation is not forged into a pretend one-document book.
-    frozen = json.loads(Path(diff["listing"]).read_text())
+    frozen = json.loads(Path(diff["listings"]["team"]).read_text())
     assert frozen["book"]["items_count"] == len(frozen["documents"]) == 3
     state_path = tmp_path / "state/funds/state.json"
     before = state_path.read_bytes()
     state = json.loads(before)
-    assert set(state["documents"]) == {"2"}
-    assert state["book"]["document_ids"] == ["2"]
-    source["document_ids"] = ["1", "2"]
+    assert set(state["documents"]) == {team_id("2")}
+    assert state["book"]["sources"]["team"]["document_ids"] == ["2"]
+    source["sources"][0]["document_ids"] = ["1", "2"]
     books.write_text(json.dumps([source]))
     changed = cli("discover", "--config", config, "--listing", path)
     assert changed.returncode == 1
-    assert "scope changed" in changed.stderr
+    assert "binding changed" in changed.stderr
     assert state_path.read_bytes() == before
 
 
@@ -374,9 +388,15 @@ def test_subscription_init_state_does_not_mark_other_corpus_ids_absent(tmp_path)
             [
                 {
                     "key": "funds",
-                    "url": "https://example.invalid/book",
+                    "sources": [
+                        {
+                            "key": "team",
+                            "type": "yuque",
+                            "url": "https://example.invalid/book",
+                            "document_ids": ["42"],
+                        }
+                    ],
                     "corpus": "corpus",
-                    "document_ids": ["42"],
                 }
             ]
         )
@@ -398,7 +418,7 @@ def test_subscription_init_state_does_not_mark_other_corpus_ids_absent(tmp_path)
     diff = difference(cli("discover", "--config", config, "--listing", path))
     assert diff["absent"] == []
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
-    assert set(state["documents"]) == {"42"}
+    assert set(state["documents"]) == {team_id("42")}
     assert (
         corpus / "Source-2026-11-12-[43].md"
     ).read_text() == "# Real corpus source\n"

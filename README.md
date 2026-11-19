@@ -38,7 +38,9 @@ dogpdkb init-config -o ./instance
 dogpdkb init-state --config ./instance/dogpdkb.toml --book funds
 
 dogpdkb sync --config ./instance/dogpdkb.toml --book funds
-# 全批下载、比较和计划；不会 OCR、写本批语料或编译
+# 只扫描指定来源；仍发布到同一个知识库，可重复传 --source
+dogpdkb sync --config ./instance/dogpdkb.toml --book funds --source inbox
+# 全批获取输入、比较和计划；不会 OCR、写本批语料或编译
 dogpdkb sync --config ./instance/dogpdkb.toml --book funds --stop-after plan
 # RUN 为输出中的 run ID 或目录；只推进未完成步骤
 dogpdkb sync --config ./instance/dogpdkb.toml --book funds --resume RUN
@@ -162,23 +164,37 @@ Enable bounded scoring in `dogpdkb apply/sync` with `[semantic_score]` and
 overrides the scorer default. Plans freeze the exact score and route artifacts;
 a resume does not call the scorer again. Ambiguity is advisory.
 
-## 小订阅
+## 多源订阅
 
-在独立 `books.json` 来源中设置 `document_ids`，并使用独立 key 和目标目录：
+`books.json` 中每个订阅有一个 corpus 和 graph，`sources` 显式列出输入：
 
 ```json
-[{"key":"small","url":"https://yuque.antfin.com/group/book","document_ids":["123","456"]}]
+[
+  {
+    "key": "funds",
+    "sources": [
+      {"key": "team", "type": "yuque", "url": "https://example.invalid/team/book", "document_ids": ["123", "456"]},
+      {"key": "inbox", "type": "directory", "path": "./inbox"}
+    ]
+  }
+]
 ```
 
-省略该字段订阅整本；显式列表必须非空且 ID 唯一。仍完整读取列表以验证来源，
-随后仅选择指定文档。已建立状态后变更 ID 范围需要新的 key/state，避免旧计划
-跨订阅恢复。小订阅同样使用普通 `sync`、`--stop-after plan` 和 `--resume`。
+`directory` 路径相对 `books.json`，递归接收 `.md`（不区分大小写），跳过隐藏项、
+`_inventory` 和符号链接；不移动或删除原件。非 Markdown 文件不作为独立文档输入；
+Markdown 引用的目录内资源随正文冻结，资源变更也计入版本。
+默认扫描所有启用来源；可重复传 `--source KEY` 选子集，未选来源不访问也不判为缺失。
+任何选中来源扫描失败则不生成计划。`--resume` 不接受 `--source`，只使用冻结输入。
+
+语雀来源可省略 `document_ids` 订阅整本；列表仍完整读取并验证，再按 ID 筛选。
+来源 key 在订阅内唯一，已记录状态后不允许换绑 URL、订阅范围或目录。
+旧的顶层 `url` / `document_ids` 配置不再接受；使用新版前请先升级实例配置。
 
 ## 配置与工具边界
 
 显式 `--config` 优先于 `DOGPDKB_CONFIG`；源码 checkout 默认读取 `default.toml`，
-安装包默认读取当前目录 `dogpdkb.toml`。TOML 路径相对配置文件，来源 `corpus`
-相对 books.json。多个 enabled 来源必须指定 `--book`。凭证只放工具既有环境。
+安装包默认读取当前目录 `dogpdkb.toml`。TOML 路径相对配置文件，订阅 `corpus`
+相对 books.json。多个启用的订阅必须指定 `--book`。凭证只放工具既有环境。
 
 ```toml
 [tools]

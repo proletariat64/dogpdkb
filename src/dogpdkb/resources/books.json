@@ -2,7 +2,10 @@
   {
     "key": "example",
     "name": "Configure your knowledge base",
-    "url": "https://example.invalid/team/book",
-    "enabled": false
+    "enabled": false,
+    "sources": [
+      {"key": "yuque-main", "type": "yuque", "url": "https://example.invalid/team/book"},
+      {"key": "inbox", "type": "directory", "path": "./inbox", "enabled": false}
+    ]
   }
 ]

@@ -25,7 +25,13 @@ def config(directory, *, corpus=None, graph=None, tool=None):
                 {
                     "key": "funds",
                     "name": "Funds",
-                    "url": "https://example.invalid/book",
+                    "sources": [
+                        {
+                            "key": "team",
+                            "type": "yuque",
+                            "url": "https://example.invalid/book",
+                        }
+                    ],
                     "corpus": str(corpus or directory / "corpus"),
                 }
             ]

@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.source_fixture import yuque_binding
+
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = {
     "utc": "2026-11-12T10:00:00+00:00",
@@ -58,16 +60,16 @@ def fixture(tmp_path):
     write(
         run / "run.json",
         {
-            "schema": "dogpdkb-run-1",
+            "schema": "dogpdkb-run-2",
             "run_id": run.name,
             "targets": {
-                "book_url": "https://example.invalid/book",
+                "sources": yuque_binding("https://example.invalid/book"),
                 "corpus": str(corpus),
                 "graph": str(corpus / "graphify-out"),
             },
             "book": {
                 "key": "funds",
-                "url": "https://example.invalid/book",
+                "sources": yuque_binding("https://example.invalid/book"),
                 "name": "Funds",
             },
             "pid": 999999999,
@@ -83,10 +85,10 @@ def fixture(tmp_path):
     write(
         tmp_path / "state/funds/state.json",
         {
-            "schema": "dogpdkb-state-1",
+            "schema": "dogpdkb-state-2",
             "book": {
                 "key": "funds",
-                "url": "https://example.invalid/book",
+                "sources": yuque_binding("https://example.invalid/book"),
                 "name": "Funds",
             },
             "documents": {
@@ -109,7 +111,13 @@ def fixture(tmp_path):
             {
                 "key": "funds",
                 "name": "Funds",
-                "url": "https://example.invalid/book",
+                "sources": [
+                    {
+                        "key": "team",
+                        "type": "yuque",
+                        "url": "https://example.invalid/book",
+                    }
+                ],
                 "corpus": "corpus",
             }
         ],

@@ -13,6 +13,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 
+from dogpdkb.directory_snapshot import catalog_paths, copy_snapshot
 from dogpdkb.help import HelpParser
 from dogpdkb.planning import (
     descriptor,
@@ -31,7 +32,12 @@ from dogpdkb.semantic import (
     read_score_route,
     read_semantic_artifacts,
 )
-from dogpdkb.settings import load_config, select_book
+from dogpdkb.settings import (
+    DirectorySource,
+    document_identity,
+    load_config,
+    select_book,
+)
 
 
 def call_tool(settings, run, name, arguments, *, timeout=None):
@@ -65,13 +71,33 @@ def failure(run, row, step, reason, *, persist=True, **details):
     )
 
 
+def corpus_destination(book, identity, previous):
+    old_path = Path(previous.get("path", ""))
+    return (
+        old_path
+        if old_path.parent == book.corpus
+        else book.corpus / f"source-[{identity}].md"
+    )
+
+
 def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
     if (
-        differences.get("schema") != "dogpdkb-differences-1"
+        differences.get("schema") != "dogpdkb-differences-2"
         or differences.get("book", {}).get("key") != book.key
-        or differences.get("book", {}).get("url") != book.url
     ):
         raise ValueError("difference schema or book mismatch")
+    source_keys = differences.get("sources")
+    if (
+        not isinstance(source_keys, list)
+        or not source_keys
+        or any(not isinstance(key, str) for key in source_keys)
+    ):
+        raise ValueError("difference requires selected sources")
+    sources = {source.key: source for source in book.select_sources(source_keys)}
+    old_bindings = differences["book"].get("sources", {})
+    bindings = book.source_bindings()
+    if any(old_bindings.get(key) != bindings[key] for key in sources):
+        raise ValueError("difference source binding mismatch")
     selected = differences.get("documents")
     if not isinstance(selected, list):
         raise TypeError("difference documents missing")
@@ -84,17 +110,35 @@ def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
         or len(set(identifiers)) != len(identifiers)
     ):
         raise ValueError("difference source IDs must be unique and nonempty")
-    if book.document_ids is not None and not set(identifiers).issubset(
-        book.document_ids
-    ):
-        raise ValueError("difference source IDs outside subscription")
+    for row in selected:
+        source = sources.get(row.get("source_key"))
+        source_id = row.get("source_document_id")
+        if (
+            source is None
+            or not isinstance(source_id, str)
+            or not source_id
+            or row["document_id"] != document_identity(source.key, source_id)
+        ):
+            raise ValueError("invalid difference document identity")
+        if (
+            not isinstance(source, DirectorySource)
+            and source.document_ids is not None
+            and source_id not in source.document_ids
+        ):
+            raise ValueError("difference source IDs outside subscription")
+    run.data["sources"] = source_keys
     atomic_json(run.directory / "differences.json", differences)
     run.data["artifacts"]["differences"] = str(run.directory / "differences.json")
     prepared_path = run.directory / "prepared-inputs.json"
     prepared = read_json(prepared_path) if prepared_path.exists() else {}
     validate_inputs(prepared.values(), check_baseline=True)
 
-    def freeze_input(row):
+    def save_prepared():
+        atomic_json(prepared_path, prepared)
+        run.data["artifacts"]["prepared_inputs"] = str(prepared_path)
+        run.save()
+
+    def freeze_input(row, *, persist=True):
         identifier = row["document_id"]
         if identifier not in prepared:
             witness = run.directory / "plan-inputs" / f"{row['slot']}.md"
@@ -108,15 +152,52 @@ def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
                 shutil.copyfile(baseline, expected)
                 row["baseline_input_copy"] = str(expected)
             prepared[identifier] = row
-            atomic_json(prepared_path, prepared)
-            run.data["artifacts"]["prepared_inputs"] = str(prepared_path)
-            run.save()
+            if persist:
+                save_prepared()
 
+    owners = {}
+    for identity, document in store.data["documents"].items():
+        if path := document.get("corpus", {}).get("path"):
+            owners.setdefault(Path(path), set()).add(identity)
+    for row in selected:
+        identity = row["document_id"]
+        previous = store.data["documents"].get(identity, {}).get("corpus", {})
+        output = corpus_destination(book, identity, previous)
+        if (output.exists() or output.is_symlink()) and output not in owners:
+            owners[output] = {None}
+        owners.setdefault(output, set()).add(identity)
+    frozen = None
+    if any(
+        isinstance(sources[row["source_key"]], DirectorySource)
+        and row["document_id"] not in prepared
+        for row in selected
+    ):
+        discovery_id = differences.get("run_id")
+        if not isinstance(discovery_id, str) or not re.fullmatch(
+            r"run-[0-9]{8}-[0-9]{6}-[a-f0-9]{8}", discovery_id
+        ):
+            raise ValueError("directory differences require a saved discovery run")
+        frozen = Run.load(store, discovery_id)
     rows, requests = [], []
+    local_prepared = False
     for index, selected_row in enumerate(selected):
         row = dict(selected_row)
         row["slot"] = index
-        identifier = row["document_id"] = str(row["document_id"])
+        identifier = row["document_id"]
+        document = store.document(identifier)
+        output = corpus_destination(book, identifier, document.get("corpus", {}))
+        if owners[output] != {identifier} or output.is_symlink():
+            if frozen is not None and isinstance(
+                sources[row["source_key"]], DirectorySource
+            ):
+                row["raw_path"] = str(
+                    frozen.directory
+                    / "directory-inputs"
+                    / identifier
+                    / row["source_document_id"]
+                )
+            failure(run, row, "plan", "CORPUS_DESTINATION_CONFLICT", path=str(output))
+            continue
         if identifier in prepared:
             reject_rollback(store, [prepared[identifier]])
             rows.append(prepared[identifier])
@@ -127,7 +208,9 @@ def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
             failure(run, row, "export", "SOURCE_VERSION_UNKNOWN")
             continue
         reject_rollback(store, [row])
-        document = store.document(identifier)
+        document.update(
+            source_key=row["source_key"], source_document_id=row["source_document_id"]
+        )
         previous = document.get("raw", {})
         graph_step = store.step(identifier, "graph") or {}
         graph_witness = graph_step.get("input_copy")
@@ -151,7 +234,23 @@ def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
         row["previous_graph"] = dict(document.get("graph", {}))
         existing = Path(previous.get("path", ""))
         desired_metadata = descriptor(book, row, existing)["metadata"]
-        if (
+        if isinstance(sources[row["source_key"]], DirectorySource):
+            assert frozen is not None
+            frozen_root = frozen.directory / "directory-inputs" / identifier
+            if str(frozen_root / row["source_document_id"]) != row.get("frozen_input"):
+                raise ValueError(f"invalid frozen directory input: {identifier}")
+            snapshot = run.directory / "raw" / "directory" / identifier
+            raw = copy_snapshot(frozen_root, snapshot, row)
+            row.update(raw_path=str(raw), directory_snapshot=str(snapshot))
+            document["raw"] = {
+                "version": row["version"],
+                "path": str(raw),
+                "metadata": desired_metadata,
+                "resources": catalog_paths(snapshot, row),
+            }
+            freeze_input(row, persist=False)
+            local_prepared = True
+        elif (
             previous.get("version")
             and same_version(previous["version"], row["version"])
             and existing.is_file()
@@ -173,6 +272,9 @@ def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
                 }
             )
         rows.append(row)
+    if local_prepared:
+        store.save()
+        save_prepared()
     if requests:
         run.stage("download", total=len(requests))
         by_id = {row["document_id"]: row for row in rows}
@@ -186,7 +288,13 @@ def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
                 request = run.directory / f"export-{row['slot']}-request.json"
                 report = run.directory / f"export-{row['slot']}-report.json"
                 atomic_json(
-                    request, {"schema": "skylark-export-request-1", "documents": [item]}
+                    request,
+                    {
+                        "schema": "skylark-export-request-1",
+                        "documents": [
+                            {**item, "document_id": row["source_document_id"]}
+                        ],
+                    },
                 )
                 store.attempt(
                     row["document_id"],
@@ -246,7 +354,8 @@ def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
                         documents = payload["documents"]
                         if (
                             len(documents) != 1
-                            or str(documents[0]["document_id"]) != row["document_id"]
+                            or str(documents[0]["document_id"])
+                            != row["source_document_id"]
                         ):
                             raise ValueError("export source mismatch")
                         result = documents[0]
@@ -841,13 +950,10 @@ def prepare_publication(book, store, run, rows, results):
         if not candidate.is_file():
             candidate = Path(row["raw_path"])
         previous = row["previous_corpus"]
-        old_path = Path(previous.get("path", ""))
-        output = (
-            old_path
-            if old_path.parent == book.corpus
-            else book.corpus
-            / f"source-{version_key(row['version'])[:10]}-[{identifier}].md"
-        )
+        output = corpus_destination(book, identifier, previous)
+        owner = store.document(identifier).get("corpus", {}).get("path")
+        if output.exists() and owner != str(output):
+            raise ValueError(f"corpus destination changed or unowned: {output}")
         if output.is_symlink():
             raise ValueError("refusing corpus symlink replacement")
         inputs = store.input_directory(identifier)
@@ -964,13 +1070,7 @@ def publish_corpus(book, store, run, plan, publication):
         raise ValueError("publication handoff does not match saved plan")
     validate_plan(plan, book, store)
     for row, document in zip(rows, documents):
-        previous = Path(row["previous_corpus"].get("path", ""))
-        expected = (
-            previous
-            if previous.parent == book.corpus
-            else book.corpus
-            / f"source-{version_key(row['version'])[:10]}-[{row['document_id']}].md"
-        )
+        expected = corpus_destination(book, row["document_id"], row["previous_corpus"])
         if Path(document["path"]) != expected:
             raise ValueError("publication target does not match saved plan")
         # A raw baseline remains immutable; a corpus baseline may be our own write.
@@ -1256,6 +1356,7 @@ def parser_for(command="apply"):
     selection.add_argument("--resume")
     parser.add_argument("--stop-after", choices=["plan"])
     if command == "sync":
+        parser.add_argument("--source", action="append", metavar="KEY")
         parser.add_argument(
             "--graphify-inputs", choices=["all", "text"], default="text"
         )

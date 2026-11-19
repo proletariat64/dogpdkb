@@ -25,6 +25,7 @@ def sync_run(
     replan=False,
     concurrency=2,
     graphify_inputs="text",
+    sources=None,
 ):
     from dogpdkb.discover import discover
 
@@ -44,7 +45,9 @@ def sync_run(
             raise ValueError("graph recovery requires a saved final compile manifest")
         result = {"exit_code": 0, "paused": False, "manifest": manifest}
     else:
-        differences = None if resume else discover(settings, book, store, run)
+        differences = (
+            None if resume else discover(settings, book, store, run, sources=sources)
+        )
         result = apply_run(
             settings,
             book,
@@ -85,6 +88,8 @@ def main(argv=None):
     parser = parser_for("sync")
     try:
         args = parser.parse_args(argv)
+        if args.resume and args.source is not None:
+            parser.error("--source cannot be used with --resume")
         if args.replan and (not args.resume or not args.retry_graph or args.stop_after):
             parser.error(
                 "--replan requires --resume and --retry-graph without --stop-after"
@@ -97,6 +102,7 @@ def main(argv=None):
     try:
         settings = load_config(args.config)
         book = select_book(settings, args.book)
+        sources = None if args.resume else book.select_sources(args.source)
         store = Store(settings, book)
         with store.lock():
             if args.resume:
@@ -126,6 +132,7 @@ def main(argv=None):
                     replan=args.replan,
                     concurrency=args.concurrency,
                     graphify_inputs=args.graphify_inputs,
+                    sources=sources,
                 )
             except InterruptedError as error:
                 record_interruption(store, run, error.args[0])

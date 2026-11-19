@@ -7,6 +7,7 @@ import pytest
 
 from dogpdkb import apply
 from dogpdkb.records import Store
+from tests.source_fixture import team_id
 from tests.test_orchestrator_apply_cli import VERSION, cli, instance, two_sources
 
 
@@ -44,7 +45,8 @@ def test_resume_after_replacement_without_repeating_tools(
     def fail_save(store):
         if (
             not save_facts
-            and store.document("42").get("corpus", {}).get("version") == VERSION
+            and store.document(team_id("42")).get("corpus", {}).get("version")
+            == VERSION
         ):
             raise OSError("injected state save interruption")
         return save(store)
@@ -76,7 +78,8 @@ def test_resume_after_replacement_without_repeating_tools(
     assert len(manifest["documents"]) == 2
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
     assert all(
-        state["documents"][key]["corpus"]["version"] == VERSION for key in ("42", "43")
+        state["documents"][team_id(key)]["corpus"]["version"] == VERSION
+        for key in ("42", "43")
     )
 
 
@@ -103,7 +106,7 @@ def test_resume_protects_targets_and_versions(tmp_path, monkeypatch, mutation):
     else:
         state_path = tmp_path / "state/funds/state.json"
         state = json.loads(state_path.read_text())
-        state["documents"]["43"]["corpus"]["version"] = {
+        state["documents"][team_id("43")]["corpus"]["version"] = {
             "value": "2026-11-14",
             "precision": "day",
         }

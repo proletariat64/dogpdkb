@@ -9,9 +9,14 @@ installed `dogpdkb` CLI; no private injection interfaces are added.
 
 `dogpdkb.settings.load_config(path=None) -> Settings` reads explicit `--config`,
 then `DOGPDKB_CONFIG`, then checkout `default.toml` / caller `dogpdkb.toml`.
-`select_book(settings, key=None) -> Book` requires one enabled source.
+`select_book(settings, key=None) -> Book` requires one enabled subscription
+when the key is omitted.
 
-- `Book`: `key`, `name`, `url`, `corpus`.
+- `Book`: `key`, `name`, `corpus`, `sources`. A source is `yuque` (URL and
+  optional document IDs) or `directory` (root path). Paths resolve relative to
+  the subscriptions JSON. Source keys are unique within the subscription.
+  `Book.select_sources` defaults to all enabled sources and rejects unknown,
+  disabled or duplicate explicit keys. Old top-level URL/scope is rejected.
 - `Settings`: `file`, `books_file`, `corpus`, `staging`, `state`, `web`,
   `graph_dir` (optional), `mcp_url`, `proxy_bin`, `timeout_seconds`,
   `ocr_budget_seconds`, `ocr_cache`, `results`, optional `body_recovery`.
@@ -46,10 +51,11 @@ Graph-only recovery does not re-enter the export scheduler.
 
 `dogpdkb.records.Store(settings, book)` reads/writes the new state file at
 `settings.state / book.key / state.json`. It never imports old run/state formats.
-Reusing the same key for a different source book URL is rejected.
-`store.data` is a plain dictionary with `schema`, `book`, `observation` and
-`documents`. Product stages own observation and document facts and call
-`store.save()` after factual changes.
+Rebinding a registered source key to a different type, URL, scope or path is
+rejected. State schema `dogpdkb-state-2` has `book`, `observation` and
+`documents`; observations are keyed by source. Document keys combine source
+key and underlying ID, preserving the components in record fields. Product
+stages own factual changes and persist them via `store.save()`.
 
 - `store.document(id)` returns/creates that source's dict, initially `steps={}`.
 - `store.step(id, name)` returns the latest public step record or None.
@@ -90,7 +96,8 @@ files without modifying Markdown or graph files. Each gets
 `baseline={path, filename_date, precision:'day'}` and
 `corpus={path, version:{value:date, precision:'day'}}`; `graph={status:'unknown'}`
 does not invent a graph/raw success version. Existing document records remain.
-Duplicate IDs fail before any durable registration.
+Each legacy numeric filename must have exactly one eligible Yuque source to be
+registered. Ambiguous ownership or duplicate IDs fail before registration.
 
 ## Run record
 
