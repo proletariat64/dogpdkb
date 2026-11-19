@@ -356,8 +356,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"mdocr: plan: {exc}", file=sys.stderr)
             return 1
     if args.command == "run":
-        print("mdocr: run execution is not available yet", file=sys.stderr)
-        return 1
+        from .runner import run_command
+
+        try:
+            return run_command(args)
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"mdocr: run: {exc}", file=sys.stderr)
+            return 1
     if args.command == "batch":
         from .batch import run_batch
 
