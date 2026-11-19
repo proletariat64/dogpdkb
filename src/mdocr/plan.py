@@ -42,7 +42,7 @@ def _atomic_json(path: Path, value: dict) -> None:
 
 
 _ATX = re.compile(r" {0,3}#{1,6}(?:[ \t]|$)")
-_LIST_ITEM = re.compile(r"[ \t]*(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]|$)")
+_LIST_ITEM = re.compile(r" {0,3}(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]|$)")
 _BLOCK_SEPARATOR = re.compile(
     r" {0,3}(?:=+|-+|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})[ \t]*$"
 )

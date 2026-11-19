@@ -271,3 +271,30 @@ def test_code_delimiters_do_not_cross_heading_or_list_item_boundaries(tmp_path):
         "![list image](same.png)",
         "![real](same.png)",
     ]
+
+
+def test_indented_list_like_line_inside_code_does_not_schedule_ocr(tmp_path):
+    (tmp_path / "source.md").write_bytes(
+        b"Run `first\n    - ![literal](same.png)\nlast`\n\n"
+        b"Run ``first\n\t1. ![literal with tab](same.png)\nlast``\n\n"
+        b"![real](same.png)\n"
+    )
+    (tmp_path / "same.png").write_bytes(b"fixture")
+    result = cli(
+        tmp_path,
+        "plan",
+        "--mode",
+        "paddle",
+        "--input",
+        "source.md",
+        "--output",
+        "out.md",
+        "--plan",
+        "plan.json",
+    )
+    assert result.returncode == 0, result.stderr
+    (image,) = json.loads((tmp_path / "plan.json").read_text())["documents"][0][
+        "images"
+    ]
+    text = (tmp_path / "source.md").read_text()
+    assert text[image["start"] : image["end"]] == "![real](same.png)"
