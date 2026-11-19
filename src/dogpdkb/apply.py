@@ -14,7 +14,14 @@ from pathlib import Path
 
 from dogpdkb.directory_snapshot import catalog_paths, copy_snapshot
 from dogpdkb.help import HelpParser
-from dogpdkb.ocr_batch import ocr_inputs
+from dogpdkb.ocr_batch import file_digest, ocr_inputs, verify_completed_ocr
+from dogpdkb.phases import (
+    SYNC_PHASES,
+    graph_generation,
+    pause,
+    read_checkpoint,
+    seal_phase,
+)
 from dogpdkb.planning import (
     descriptor,
     load_plan,
@@ -155,12 +162,17 @@ def prepare_inputs(
             witness.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(row["raw_path"], witness)
             row["input_copy"] = str(witness)
+            row["raw_sha256"] = file_digest(witness)
+            row["resources"] = (
+                store.document(identifier).get("raw", {}).get("resources")
+            )
             baseline = row["baseline"].get("path")
             if baseline and Path(baseline).is_file():
                 expected = run.directory / "baseline-inputs" / f"{row['slot']}.md"
                 expected.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(baseline, expected)
                 row["baseline_input_copy"] = str(expected)
+                row["baseline_input_sha256"] = file_digest(expected)
             prepared[identifier] = row
             if persist:
                 save_prepared()
@@ -210,7 +222,6 @@ def prepare_inputs(
             failure(run, row, "plan", "CORPUS_DESTINATION_CONFLICT", path=str(output))
             continue
         if identifier in prepared:
-            reject_rollback(store, [prepared[identifier]])
             rows.append(prepared[identifier])
             continue
         try:
@@ -218,7 +229,18 @@ def prepare_inputs(
         except ValueError:
             failure(run, row, "export", "SOURCE_VERSION_UNKNOWN")
             continue
-        reject_rollback(store, [row])
+        try:
+            reject_rollback(store, [row])
+            if run.data["command"] == "sync" and any(
+                document.get(stage, {}) != row.get("local", {}).get(stage, {})
+                for stage in ("corpus", "graph")
+            ):
+                raise ValueError("published facts changed since discovery")
+        except ValueError:
+            if run.data["command"] != "sync":
+                raise
+            failure(run, row, "collect", "STALE_DOCUMENT")
+            continue
         document.update(
             source_key=row["source_key"], source_document_id=row["source_document_id"]
         )
@@ -243,6 +265,9 @@ def prepare_inputs(
         row["baseline"] = dict(baseline)
         row["previous_corpus"] = dict(document.get("corpus", {}))
         row["previous_graph"] = dict(document.get("graph", {}))
+        row["previous_corpus_sha256"] = (
+            file_digest(output) if output.is_file() else None
+        )
         existing = Path(previous.get("path", ""))
         desired_metadata = descriptor(book, row, existing)["metadata"]
         if bindings[row["source_key"]]["type"] == "directory":
@@ -503,8 +528,10 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
     run.stage("compare", total=len(rows), phase="prepare")
     active = []
     for row in rows:
-        previous = store.document(row["document_id"]).get("raw", {})
-        row["resources"] = previous.get("resources")
+        if "resources" not in row:
+            row["resources"] = (
+                store.document(row["document_id"]).get("raw", {}).get("resources")
+            )
         if replan or not store.suppressed(
             row["document_id"], "compare", row["version"]
         ):
@@ -537,7 +564,7 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
                 book,
                 row,
                 row["raw_path"],
-                evidence=store.document(row["document_id"]).get("raw"),
+                evidence={"resources": row["resources"] or []},
             )
         )
     manifests, sources = [], []
@@ -729,10 +756,13 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
     return (*reports, semantic)
 
 
+def keep_catchup_body(row, result):
+    return row.get("retry_ocr") and not (result.get("ocr") or {}).get("images")
+
+
 def prepare_publication(book, store, run, rows, results):
     """Freeze the complete publication handoff before replacing any corpus file."""
     published = []
-    baseline_saved = False
     for index, row in enumerate(rows):
         identifier = row["document_id"]
         if not re.fullmatch(r"[A-Za-z0-9_-]+", identifier):
@@ -750,30 +780,24 @@ def prepare_publication(book, store, run, rows, results):
             raise ValueError("refusing corpus symlink replacement")
         inputs = store.input_directory(identifier)
         inputs.mkdir(parents=True, exist_ok=True)
-        document = store.document(identifier)
-        old_basis = row.get("baseline_input_copy")
-        if old_basis and not document.get("graph_baseline"):
-            basis = inputs / "graph-baseline.md"
-            shutil.copyfile(old_basis, basis)
-            source = row["previous_graph"].get("source_file")
-            old_source = Path(row["previous_corpus"].get("path", ""))
-            if source is None and old_source.is_relative_to(book.corpus):
-                source = str(old_source.relative_to(book.corpus))
-            document["graph_baseline"] = {
-                **row["baseline"],
-                "path": str(basis),
-                "source_file": source,
-            }
-            baseline_saved = True
-        witness = Path(tempfile.mkdtemp(prefix="corpus-", dir=inputs)) / "corpus.md"
-        shutil.copyfile(candidate, witness)
+        keep_body = keep_catchup_body(row, result)
+        if keep_body:
+            witness = Path(previous["input_copy"])
+            if file_digest(witness) != row["previous_corpus_sha256"]:
+                raise ValueError("published OCR fallback witness changed")
+        else:
+            witness = Path(tempfile.mkdtemp(prefix="corpus-", dir=inputs)) / "corpus.md"
+            shutil.copyfile(candidate, witness)
         before_copy = None
         if output.is_file():
             before = run.directory / "publication-before" / f"{index}.md"
             before.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(output, before)
             before_copy = str(before)
-        resources = [dict(resource) for resource in (row.get("resources") or [])]
+        source_resources = previous if keep_body else row
+        resources = [
+            dict(resource) for resource in (source_resources.get("resources") or [])
+        ]
         evidence = result.get("ocr")
         if evidence:
             images = {r["resource_id"]: r for r in evidence.get("images", [])}
@@ -782,7 +806,13 @@ def prepare_publication(book, store, run, rows, results):
                     resource["path"] = images[resource["resource_id"]]["source_path"]
         action = row["action"]
         reasons = row["reason_codes"]
-        if row.get("retry_ocr") and evidence and evidence["images"]:
+        if (
+            row.get("retry_ocr")
+            and evidence
+            and evidence["images"]
+            and before_copy
+            and witness.read_bytes() != Path(before_copy).read_bytes()
+        ):
             action = "compile"
             reasons = [*reasons, "OCR_ENRICHMENT_ADDED"]
         metadata = descriptor(book, row, output)["metadata"]
@@ -801,6 +831,9 @@ def prepare_publication(book, store, run, rows, results):
             {
                 **document,
                 "before_copy": before_copy,
+                "before_sha256": file_digest(Path(before_copy))
+                if before_copy
+                else None,
                 "document_id": identifier,
                 "action": action,
                 "previous_graph": row["previous_graph"],
@@ -810,8 +843,6 @@ def prepare_publication(book, store, run, rows, results):
                 "reason_codes": reasons,
             }
         )
-    if baseline_saved:
-        store.save()
     publication = {
         "schema": "dogpdkb-publication-1",
         "book": book.key,
@@ -839,7 +870,16 @@ def validate_publication_target(document):
     if output.is_file():
         current = output.read_bytes()
         before = document.get("before_copy")
-        if current == expected or before and current == Path(before).read_bytes():
+        if current == expected:
+            return
+        if (
+            before
+            and current == Path(before).read_bytes()
+            and (
+                "before_sha256" not in document
+                or hashlib.sha256(current).hexdigest() == document["before_sha256"]
+            )
+        ):
             return
     elif not output.exists() and not document.get("before_copy"):
         return
@@ -860,18 +900,105 @@ def acknowledge_comparison(record, document):
         record.pop("pending", None)
 
 
-def publish_corpus(book, store, run, plan, publication):
+_CORPUS_FIELDS = (
+    "version",
+    "path",
+    "metadata",
+    "input_copy",
+    "input_copy_sha256",
+    "ocr_status",
+    "resources",
+    "ocr",
+)
+
+
+def corpus_fact(document):
+    return {key: document[key] for key in _CORPUS_FIELDS if key in document}
+
+
+def current_rows(book, store, run, rows, step, *, expected=None):
+    """Only the frozen before-state or this publication's exact after-state can win."""
+    current = []
+    owners = {}
+    for identifier, record in store.data["documents"].items():
+        if path := record.get("corpus", {}).get("path"):
+            owners.setdefault(path, set()).add(identifier)
+    for row in rows:
+        identifier = row["document_id"]
+        record = store.document(identifier)
+        before = row["previous_corpus"]
+        after = expected.get(identifier) if expected is not None else None
+        live = record.get("corpus", {})
+        output = corpus_destination(book, identifier, before)
+        matches = (
+            record.get("graph", {}) == row["previous_graph"]
+            and not output.is_symlink()
+            and not (owners.get(str(output), set()) - {identifier})
+            and (live == before or (after is not None and live == corpus_fact(after)))
+        )
+        if matches and "previous_corpus_sha256" in row:
+            actual = file_digest(output) if output.is_file() else None
+            expected_bytes = after is not None and actual == after["input_copy_sha256"]
+            matches = expected_bytes or (
+                live == before
+                and (not output.exists() or output.is_file())
+                and actual == row["previous_corpus_sha256"]
+            )
+        raw = record.get("raw", {})
+        if matches and "raw_sha256" in row:
+            matches = bool(raw.get("version")) and same_version(
+                raw["version"], row["version"]
+            )
+        if matches:
+            current.append(row)
+        elif not any(
+            item.get("document_id") == identifier
+            and item.get("reason") == "STALE_DOCUMENT"
+            for item in run.data["failures"]
+        ):
+            failure(run, row, step, "STALE_DOCUMENT")
+    return current
+
+
+def preserve_graph_baseline(book, store, row):
+    identifier = row["document_id"]
+    document = store.document(identifier)
+    old_basis = row.get("baseline_input_copy")
+    if old_basis and not document.get("graph_baseline"):
+        basis = store.input_directory(identifier) / "graph-baseline.md"
+        shutil.copyfile(old_basis, basis)
+        source = row["previous_graph"].get("source_file")
+        old_source = Path(row["previous_corpus"].get("path", ""))
+        if source is None and old_source.is_relative_to(book.corpus):
+            source = str(old_source.relative_to(book.corpus))
+        document["graph_baseline"] = {
+            **row["baseline"],
+            "path": str(basis),
+            "source_file": source,
+        }
+
+
+def publish_corpus(book, store, run, plan, publication, *, verify_ocr=False):
     """Resume only frozen local publication work, including unrecorded replacements."""
-    rows, documents = plan["documents"], publication["documents"]
+    by_id = {row["document_id"]: row for row in plan["documents"]}
+    documents = publication["documents"]
+    published = {document["document_id"]: document for document in documents}
     if (
         publication.get("schema") != "dogpdkb-publication-1"
         or publication.get("book") != book.key
         or publication.get("run_id") != run.id
-        or [(r["document_id"], r["version"]) for r in rows]
-        != [(d["document_id"], d["version"]) for d in documents]
+        or len(published) != len(documents)
+        or any(
+            key not in by_id or by_id[key]["version"] != d["version"]
+            for key, d in published.items()
+        )
     ):
         raise ValueError("publication handoff does not match saved plan")
-    validate_plan(plan, book, store)
+    rows = [by_id[key] for key in published]
+    if run.data["command"] == "sync":
+        rows = current_rows(book, store, run, rows, "corpus", expected=published)
+        documents = [published[row["document_id"]] for row in rows]
+    validate_plan({**plan, "documents": rows}, book, store)
     for row, document in zip(rows, documents):
         expected = corpus_destination(book, row["document_id"], row["previous_corpus"])
         if Path(document["path"]) != expected:
@@ -881,11 +1008,14 @@ def publish_corpus(book, store, run, plan, publication):
         if baseline and Path(row["baseline"]["path"]) != expected:
             validate_inputs([row], check_baseline=True)
         validate_publication_target(document)
+        if verify_ocr and document.get("ocr_status") == "completed":
+            verify_completed_ocr(store, row, document.get("ocr"))
     run.stage("corpus", total=len(documents))
     dirty = False
     try:
-        for document in documents:
+        for row, document in zip(rows, documents):
             validate_publication_target(document)
+            preserve_graph_baseline(book, store, row)
             output, witness = Path(document["path"]), Path(document["input_copy"])
             output.parent.mkdir(parents=True, exist_ok=True)
             if not output.is_file() or output.read_bytes() != witness.read_bytes():
@@ -903,21 +1033,9 @@ def publish_corpus(book, store, run, plan, publication):
                     temporary.replace(output)
                 finally:
                     temporary.unlink(missing_ok=True)
-            store.document(document["document_id"])["corpus"] = {
-                key: document[key]
-                for key in (
-                    "version",
-                    "path",
-                    "metadata",
-                    "input_copy",
-                    "input_copy_sha256",
-                    "ocr_status",
-                    "resources",
-                    "ocr",
-                )
-                if key in document
-            }
-            acknowledge_comparison(store.document(document["document_id"]), document)
+            record = store.document(document["document_id"])
+            record["corpus"] = corpus_fact(document)
+            acknowledge_comparison(record, document)
             dirty = True
     finally:
         if dirty:
@@ -925,8 +1043,13 @@ def publish_corpus(book, store, run, plan, publication):
     manifest = {
         **publication,
         "schema": "dogpdkb-compile-1",
+        "failures": list(run.data["failures"]),
         "documents": [
-            {key: value for key, value in d.items() if key != "before_copy"}
+            {
+                key: value
+                for key, value in d.items()
+                if key not in {"before_copy", "before_sha256"}
+            }
             for d in documents
         ],
     }
@@ -935,6 +1058,11 @@ def publish_corpus(book, store, run, plan, publication):
     run.data["artifacts"]["manifest"] = str(path)
     run.save()
     return path
+
+
+def seal_corpus(book, store, run):
+    run.data["graph_generation"] = graph_generation(store, book)
+    seal_phase(run, "corpus", "manifest")
 
 
 def apply_run(
@@ -948,60 +1076,111 @@ def apply_run(
     resume=False,
     concurrency=DEFAULT_DOWNLOAD_CONCURRENCY,
 ):
-    if resume and not run.data.get("artifacts", {}).get("plan"):
-        frozen = run.data.get("artifacts", {}).get("differences")
-        if not frozen:
-            raise ValueError(
-                "run has no frozen difference scope; start a new discovery"
-            )
-        differences = read_json(Path(frozen))
-        resume = False
-    if resume:
-        plan = load_plan(run, book, store)
-        existing = run.data.get("artifacts", {}).get("manifest")
-        if existing:
-            manifest = read_json(Path(existing))
+    sync = run.data["command"] == "sync"
+    artifacts = run.data["artifacts"]
+    checkpoints = run.data.get("checkpoints", {})
+    if artifacts.get("manifest"):
+        manifest = read_checkpoint(run, "corpus", "manifest")
+        if sync and "corpus" not in checkpoints:
+            seal_corpus(book, store, run)
+        if not sync:
             for document in manifest["documents"]:
-                if (
-                    Path(document["path"]).read_bytes()
-                    != Path(document["input_copy"]).read_bytes()
-                ):
+                if file_digest(Path(document["path"])) != document["input_copy_sha256"]:
                     raise ValueError(
                         "published plan input changed; generate a new plan"
                     )
-            return {
-                "exit_code": 2 if run.data["failures"] else 0,
-                "paused": False,
-                "manifest": existing,
-            }
+        return pause(run, "corpus", stop_after, manifest=artifacts["manifest"]) or {
+            "exit_code": 2 if run.data["failures"] else 0,
+            "paused": False,
+            "manifest": artifacts["manifest"],
+        }
+    if artifacts.get("plan"):
+        plan = read_checkpoint(run, "plan", "plan")
+        if plan.get("run_id") != run.id:
+            raise ValueError("plan ownership mismatch")
     else:
-        if isinstance(differences, (str, Path)):
-            differences = read_json(Path(differences))
-        rows = prepare_inputs(
-            settings, book, store, run, differences, concurrency=concurrency
-        )
+        if "collect" in checkpoints:
+            read_checkpoint(run, "collect", "differences")
+            rows = list(read_checkpoint(run, "collect", "prepared_inputs").values())
+        else:
+            if resume:
+                if not artifacts.get("differences"):
+                    raise ValueError(
+                        "run has no frozen difference scope; start a new discovery"
+                    )
+                differences = read_json(Path(artifacts["differences"]))
+            if isinstance(differences, (str, Path)):
+                differences = read_json(Path(differences))
+            rows = prepare_inputs(
+                settings, book, store, run, differences, concurrency=concurrency
+            )
+            if sync:
+                # Export progress uses this same file; only this final version
+                # is the handoff, with exactly the verified acquired inputs.
+                path = run.directory / "prepared-inputs.json"
+                atomic_json(path, {row["document_id"]: row for row in rows})
+                artifacts["prepared_inputs"] = str(path)
+                seal_phase(run, "collect", "differences", "prepared_inputs")
+        if result := pause(run, "collect", stop_after):
+            return result
+        if sync:
+            rows = current_rows(book, store, run, rows, "plan")
+        validate_inputs(rows, check_baseline=True)
         knowledge, comparison, semantic = compare_inputs(
             settings, book, store, run, rows
         )
         run.stage("plan", total=len(rows))
         plan = make_plan(book, run, rows, knowledge, comparison, semantic)
+        if sync:
+            seal_phase(run, "plan", "plan")
     if stop_after == "plan":
-        run.finish("paused")
-        return {"exit_code": 0, "paused": True, "manifest": None}
-    checkpoint = run.data.get("artifacts", {}).get("publication")
-    if checkpoint:
-        publication = read_json(Path(checkpoint))
+        validate_inputs(plan["documents"])
+        return pause(run, "plan", stop_after)
+
+    has_publication = bool(artifacts.get("publication"))
+    if has_publication:
+        publication = read_checkpoint(run, "ocr", "publication")
     else:
-        validate_plan(plan, book, store, check_baseline=True)
-        results = ocr_inputs(settings, book, store, run, plan["documents"])
-        validate_plan(plan, book, store, check_baseline=True)
+        rows = plan["documents"]
+        stale = set()
+        if sync:
+            current = current_rows(book, store, run, rows, "ocr")
+            stale = {row["document_id"] for row in rows} - {
+                row["document_id"] for row in current
+            }
+            # An already-created native batch cannot be edited or replayed.
+            # Reconcile its verified children without admitting stale work.
+            if not (store.path.parent / "ocr" / run.id / "request.json").exists():
+                rows = current
+        validate_plan(
+            {
+                **plan,
+                "documents": [row for row in rows if row["document_id"] not in stale],
+            },
+            book,
+            store,
+            check_baseline=True,
+        )
+        results = ocr_inputs(settings, book, store, run, rows, stale=stale)
+        rows = [row for row in rows if row["document_id"] not in stale]
+        validate_plan({**plan, "documents": rows}, book, store, check_baseline=True)
         from dogpdkb.inputs import retain_inputs
 
-        retain_inputs(store, run, plan["documents"], results)
-        publication = prepare_publication(book, store, run, plan["documents"], results)
-    manifest = publish_corpus(book, store, run, plan, publication)
+        retain_inputs(store, run, rows, results)
+        publication = prepare_publication(book, store, run, rows, results)
+    if sync and "ocr" not in checkpoints:
+        seal_phase(run, "ocr", "publication")
+    if result := pause(run, "ocr", stop_after):
+        return result
+    manifest = publish_corpus(
+        book, store, run, plan, publication, verify_ocr=has_publication
+    )
+    if sync:
+        seal_corpus(book, store, run)
+        if result := pause(run, "corpus", stop_after, manifest=str(manifest)):
+            return result
     partial = bool(run.data["failures"])
-    if run.data["command"] != "sync":
+    if not sync:
         run.finish("partial" if partial else "completed", 2 if partial else 0)
     return {
         "exit_code": 2 if partial else 0,
@@ -1164,7 +1343,9 @@ def parser_for(command="apply"):
     if command == "apply":
         selection.add_argument("--input", type=Path)
     selection.add_argument("--resume")
-    parser.add_argument("--stop-after", choices=["plan"])
+    parser.add_argument(
+        "--stop-after", choices=SYNC_PHASES if command == "sync" else ["plan"]
+    )
     if command == "sync":
         inputs = parser.add_mutually_exclusive_group()
         inputs.add_argument("--source", action="append", metavar="KEY")
@@ -1189,11 +1370,13 @@ def main(argv=None):
         book = select_book(settings, args.book)
         store = Store(settings, book)
         with store.lock():
-            run = (
-                Run.load(store, args.resume)
-                if args.resume
-                else Run.create(store, "apply")
-            )
+            if args.resume:
+                previous = Run.load(store, args.resume)
+                if previous.data.get("command") != "apply":
+                    raise ValueError("apply resume requires an apply run")
+                run = previous
+            else:
+                run = Run.create(store, "apply")
             run.data.update(
                 status="running",
                 pid=os.getpid(),

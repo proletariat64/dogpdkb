@@ -139,6 +139,39 @@ failures. Status is observationally interrupted when `running` has no live owner
 freezes only selected sources and checks them against durable bindings. Loading
 a run for execution rejects changed targets before any tool call or publication;
 use a newly generated plan for a different source or target.
+
+### Sync phase handoffs
+
+`sync --stop-after {collect,plan,ocr,corpus,graph}` runs through the named
+boundary. The first four stop with `paused`/exit 0 and retain their wash;
+`graph` uses the ordinary final result and cleanup. `sync --resume RUN`
+continues the same run and cannot take a new source or directory. A repeated
+stop at the same phase does not re-enter the phase. The download concurrency
+option remains a scheduler limit rather than part of the frozen plan.
+
+`run.json` records `completed_phase`, SHA-256 `checkpoints` keyed by phase and
+artifact, and `sync_policy`. The policy captures the selected tools, OCR and
+score limits, explicit body-recovery inputs, and Graphify input mode before
+collection. It does not include provider credentials. The handoffs are:
+
+| Phase | Frozen output |
+| --- | --- |
+| collect | Complete `differences` scope and `prepared_inputs` (only verified acquired inputs), with separate export failures |
+| plan | `plan` and frozen per-document routing; no OCR or public writes |
+| ocr | Native OCR request/plan/result/journal and a `publication` handoff of verified OCR or readable fallback bytes; no corpus replacement |
+| corpus | Final `manifest`, containing only published documents, and the pre-extraction public graph generation |
+| graph | Settled graph exit; native result proof and atomic publication remain the Graphify adapter's responsibility |
+
+Compare, OCR and corpus publication exclude documents whose frozen state has
+been superseded (`STALE_DOCUMENT`), while nonconflicting peers continue. A
+paused corpus handoff whose published inputs or previous graph generation have
+changed reports `STALE_GRAPH_HANDOFF` without dispatching a new directory
+extraction. If graph state already records this batch's exact successful inputs,
+reconciliation does not re-extract. Ordinary resume does not change the scope of
+an already admitted native OCR batch; if its scope went stale, settled children
+can be verified, but the batch cannot admit further work as a whole.
+Explicit graph-only retry still uses the existing Graphify recovery contract.
+
 Corpus publication saves `publication.json` (`dogpdkb-publication-1`) before
 replacing any corpus file. It freezes the complete compile rows, retained output
 witnesses and optional `before_copy` snapshots; book/run identity and plan
@@ -149,7 +182,13 @@ listing, download, comparison or OCR. Short same-directory temporary names avoid
 lengthening valid final filenames; corpus facts are saved once per batch (also
 on a caught partial publication error). A replacement that precedes the state
 save is reconciled from the handoff. The final `dogpdkb-compile-1` manifest is
-written only after complete publication and excludes `before_copy`.
+written only after publication settles and excludes `before_copy` and its hash.
+
+A later run may select a same-version document whose OCR was provably not sent.
+It does not resubmit verified or failed/unknown peers. If no OCR enrichment was
+added, it keeps the previous readable corpus bytes and witness. New verified
+OCR bytes override authored-body reuse for that row (`OCR_ENRICHMENT_ADDED`),
+so the regular graph stage picks them up in one directory batch.
 
 A saved final compile manifest is reused without renewing its bounded OCR budget.
 OCR is advisory: new manifests emit no required pending OCR steps. Historical

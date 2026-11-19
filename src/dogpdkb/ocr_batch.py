@@ -328,6 +328,24 @@ def _saved_ocr(previous, row):
     return result
 
 
+def verify_completed_ocr(store, row, evidence):
+    """Verify the original successful tool output at a paused publication boundary."""
+    try:
+        step = store.step(row["document_id"], "ocr")
+        if (
+            not step
+            or step["status"] != "completed"
+            or not same_version(step["version"], row["version"])
+        ):
+            raise ValueError("missing matching completed OCR attempt")
+        if _saved_ocr(step, row)["ocr"] != evidence:
+            raise ValueError("OCR publication evidence changed")
+    except _INVALID as error:
+        raise ValueError(
+            f"OCR evidence changed for {row['document_id']}; generate a new plan"
+        ) from error
+
+
 def _start_args(root, request):
     policy = request["policy"]
     docs = request["documents"]
@@ -397,7 +415,7 @@ def _verify_running_journal(state, budget, mirror=None):
             raise ValueError("OCR journal lost observed admissions or outcomes")
 
 
-def _execute(root, request, store, run, call_tool):
+def _execute(root, request, store, run, call_tool, *, allow_dispatch=True):
     """Seal final evidence; resume only through mdocr's original journal."""
     req_path, plan_path = root / "request.json", root / "plan.json"
     start_path, seal_path = root / "started.json", root / "settled.json"
@@ -408,7 +426,9 @@ def _execute(root, request, store, run, call_tool):
     dispatched = start_path.exists()
     report, code, reason = None, None, None
     docs = {}
-    if not dispatched and not plan_path.exists():
+    if not dispatched and not allow_dispatch:
+        reason = "OCR_BATCH_SCOPE_STALE"
+    if reason is None and not dispatched and not plan_path.exists():
         code = call_tool("mdocr", _start_args(root, request))
         if code != 0:
             reason = "OCR_PLAN_REJECTED"
@@ -460,6 +480,8 @@ def _execute(root, request, store, run, call_tool):
                 if dispatched
                 else "OCR_PLAN_BINDING_INVALID"
             )
+    if reason is None and report is None and not allow_dispatch:
+        reason = "OCR_BATCH_SCOPE_STALE"
     if reason is None and report is None:
         atomic_json(start_path, initial, durable=True)
         store.complete_batch(
@@ -509,7 +531,7 @@ def _execute(root, request, store, run, call_tool):
     return seal
 
 
-def ocr_inputs(settings, book, store, run, rows):
+def ocr_inputs(settings, book, store, run, rows, *, stale=()):
     from dogpdkb.apply import call_tool, failure
 
     plan_path = run.data["artifacts"]["plan"]
@@ -557,6 +579,8 @@ def ocr_inputs(settings, book, store, run, rows):
 
     for row in candidates:
         identifier, version = row["document_id"], row["version"]
+        if identifier in stale:
+            continue
         if identifier in enrolled:
             if enrolled[identifier]["version"] != version:
                 raise ValueError(
@@ -634,14 +658,22 @@ def ocr_inputs(settings, book, store, run, rows):
         ):
             raise ValueError("Saved OCR batch does not match the frozen run policy")
         run.data["artifacts"]["ocr_request"] = str(request_path)
-    validate_inputs(rows)
+    current = [row for row in rows if row["document_id"] not in stale]
+    validate_inputs(current)
     if enrolled and existing is not None:
 
         def invoke(name, args):
             return call_tool(settings, run, name, args, command=policy["command"])
 
-        seal = _execute(root, existing, store, run, invoke)
-        validate_inputs(rows)
+        seal = _execute(
+            root,
+            existing,
+            store,
+            run,
+            invoke,
+            allow_dispatch=not any(key in stale for key in enrolled),
+        )
+        validate_inputs(current)
         report, plan, docs, records = None, {}, {}, {}
         batch_reason = seal["reason"]
         try:
@@ -663,7 +695,7 @@ def ocr_inputs(settings, book, store, run, rows):
                 artifacts.setdefault(key, str(path))
         for row in candidates:
             identifier = row["document_id"]
-            if identifier not in enrolled:
+            if identifier not in enrolled or identifier in stale:
                 continue
             entry = enrolled[identifier]
             result = None

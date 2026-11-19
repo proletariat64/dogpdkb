@@ -5,17 +5,93 @@ from __future__ import annotations
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
-from dogpdkb.apply import apply_run, parser_for, record_interruption
+from dogpdkb.apply import apply_run, corpus_fact, parser_for, record_interruption
 from dogpdkb.discover import DiscoverError
+from dogpdkb.ocr_batch import file_digest
+from dogpdkb.phases import SYNC_PHASES, graph_generation, read_checkpoint, seal_phase
 from dogpdkb.records import Run, Store
+from dogpdkb.semantic import freeze_recovery
 from dogpdkb.settings import (
     DEFAULT_DOWNLOAD_CONCURRENCY,
     load_config,
     select_book,
     select_inputs,
 )
+
+
+def freeze_policy(settings, store, run, graphify_inputs):
+    """Persist the selected runtime choices, not provider credentials."""
+    policy = run.data.get("sync_policy")
+    if policy is None:
+        source = freeze_recovery(
+            settings.body_recovery, run.directory / "source-recovery"
+        )
+        policy = {
+            "settings": {
+                key: getattr(settings, key)
+                for key in (
+                    "semantic_score_request_budget",
+                    "semantic_score_model",
+                    "ocr_mode",
+                    "ocr_request_budget",
+                    "ocr_budget_seconds",
+                    "timeout_seconds",
+                    "mcp_url",
+                    "proxy_bin",
+                )
+            },
+            "tools": {
+                name: settings.command(name)
+                for name in ("mdcompare", "mdocr", "graphify", "skylark")
+            },
+            "ocr_cache": str(settings.ocr_cache),
+            "body_recovery": str(source) if source else None,
+            "graphify_inputs": graphify_inputs,
+        }
+        run.data["sync_policy"] = policy
+        run.save(durable=True)
+    frozen = replace(
+        settings,
+        **policy["settings"],
+        tools=policy["tools"],
+        ocr_cache=Path(policy["ocr_cache"]),
+        body_recovery=Path(policy["body_recovery"])
+        if policy["body_recovery"]
+        else None,
+    )
+    store.settings = frozen
+    return frozen, policy["graphify_inputs"]
+
+
+def graph_handoff_current(book, store, run):
+    manifest = read_checkpoint(run, "corpus", "manifest")
+    pending = False
+    for row in manifest["documents"]:
+        identifier = row["document_id"]
+        path = Path(row["path"])
+        if (
+            store.document(identifier).get("corpus", {}) != corpus_fact(row)
+            or path.is_symlink()
+            or not path.is_file()
+            or file_digest(path) != row["input_copy_sha256"]
+        ):
+            return False
+        if row["action"] == "compile":
+            previous = store.step(identifier, "graph") or {}
+            witness = Path(previous.get("input_copy", ""))
+            if not (
+                previous.get("status") == "completed"
+                and previous.get("run_id") == run.id
+                and previous.get("version") == row["version"]
+                and previous.get("metadata") == row["metadata"]
+                and witness.is_file()
+                and file_digest(witness) == row["input_copy_sha256"]
+            ):
+                pending = True
+    return not pending or run.data["graph_generation"] == graph_generation(store, book)
 
 
 def sync_run(
@@ -50,6 +126,14 @@ def sync_run(
             raise ValueError("graph recovery requires a saved final compile manifest")
         result = {"exit_code": 0, "paused": False, "manifest": manifest}
     else:
+        completed = run.data.get("completed_phase")
+        if (
+            stop_after
+            and completed
+            and SYNC_PHASES.index(stop_after) < SYNC_PHASES.index(completed)
+        ):
+            raise ValueError("cannot stop before the last completed phase")
+        settings, graphify_inputs = freeze_policy(settings, store, run, graphify_inputs)
         differences = (
             None if resume else discover(settings, book, store, run, sources=sources)
         )
@@ -69,19 +153,32 @@ def sync_run(
 
     run.data.update(status="running", ended_at=None, exit_code=None, reason=None)
     run.save()
-    graph_code = run_graph(
-        settings,
-        book,
-        store,
-        run,
-        manifest=Path(result["manifest"]),
-        retry_graph=retry_graph,
-        graphify_inputs=graphify_inputs,
-    )
+    if not retry_graph and "graph_exit_code" in run.data:
+        graph_code = run.data["graph_exit_code"]
+    elif (
+        not retry_graph
+        and "graph_generation" in run.data
+        and not graph_handoff_current(book, store, run)
+    ):
+        run.failure(step="graph", reason="STALE_GRAPH_HANDOFF")
+        graph_code = 2
+    else:
+        graph_code = run_graph(
+            settings,
+            book,
+            store,
+            run,
+            manifest=Path(result["manifest"]),
+            retry_graph=retry_graph,
+            graphify_inputs=graphify_inputs,
+        )
     if graph_code in {130, 143}:
         record_interruption(store, run, graph_code)
         return {**result, "exit_code": graph_code}
     code = 1 if graph_code == 1 else 2 if 2 in {graph_code, result["exit_code"]} else 0
+    if not retry_graph and code != 1:
+        run.data["graph_exit_code"] = graph_code
+        seal_phase(run, "graph")
     run.finish("failed" if code == 1 else "partial" if code == 2 else "completed", code)
     from dogpdkb.cleanup import clean_run
 
@@ -116,6 +213,8 @@ def main(argv=None):
         with store.lock():
             if args.resume:
                 previous = Run.load(store, args.resume)
+                if not args.retry_graph and previous.data.get("command") != "sync":
+                    raise ValueError("ordinary resume requires a sync run")
                 if previous.data.get("cleanup") and not args.retry_graph:
                     raise ValueError("run has been cleaned; start a new run")
                 run = previous
