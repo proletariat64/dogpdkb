@@ -114,6 +114,74 @@ raise SystemExit(143)
     assert {f["reason"] for f in manifest["failures"]} >= {"OCR_EXECUTION_UNVERIFIABLE"}
 
 
+def test_enrolled_ocr_resume_does_not_send_newer_unknown_but_sends_peer(tmp_path):
+    config, differences = batch_instance(
+        tmp_path,
+        """ids = [Path(row['path']).name for row in plan['documents']]
+with (root / 'accepted').open('a') as stream:
+    stream.write(json.dumps(ids) + '\\n')
+if (root / 'unknown').exists():
+    raise SystemExit(143)
+result.write_text(json.dumps(payload([completed(d) for d in plan['documents']], 'completed')))
+""",
+    )
+    tool = tmp_path / "batch_ocr.py"
+    tool.write_text(
+        tool.read_text().replace(
+            "if args[0] == 'plan':",
+            "if args[0] == 'plan':\n    if (root / 'pre_dispatch_loss').exists(): raise SystemExit(143)",
+        )
+    )
+    args = ("apply", "--config", config)
+    crash = tmp_path / "pre_dispatch_loss"
+    crash.touch()
+    assert cli(*args, "--input", differences).returncode == 143
+    [old] = (tmp_path / "runs/funds").glob("run-*/run.json")
+    crash.unlink()
+    selection = json.loads(differences.read_bytes())
+    selection["documents"].pop()
+    differences.write_text(json.dumps(selection))
+    unknown = tmp_path / "unknown"
+    unknown.touch()
+    assert cli(*args, "--input", differences).returncode == 143
+    unknown.unlink()
+
+    resumed = cli(*args, "--resume", old)
+    assert resumed.returncode == 2, resumed.stderr
+    first, second = map(json.loads, (tmp_path / "accepted").read_text().splitlines())
+    assert len(first) == len(second) == 1 and first != second
+    manifest = json.loads(Path(json.loads(resumed.stdout)["manifest"]).read_bytes())
+    assert len(manifest["documents"]) == 2
+    state = json.loads((tmp_path / "state/funds/state.json").read_bytes())
+    docs = state["documents"]
+    assert docs[team_id("42")]["steps"]["ocr"]["status"] == "unknown"
+    assert docs[team_id("43")]["steps"]["ocr"]["status"] == "completed"
+
+
+def test_ocr_does_not_dispatch_when_durable_book_admission_fails(tmp_path, monkeypatch):
+    from dogpdkb import records
+    from dogpdkb.apply import main
+
+    config, differences = batch_instance(
+        tmp_path, "raise AssertionError('unexpected run')\n"
+    )
+    save = records.Store.save
+
+    def fail_durable_admission(store, *, durable=False):
+        if durable and any(
+            doc["steps"].get("ocr", {}).get("status") == "running"
+            for doc in store.data["documents"].values()
+        ):
+            raise OSError("simulated lost durable book admission")
+        save(store, durable=durable)
+
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1] / "src"))
+    monkeypatch.setattr(records.Store, "save", fail_durable_admission)
+    assert main(["--config", str(config), "--input", str(differences)]) == 1
+    calls = (tmp_path / "ocr-argv").read_text().splitlines()
+    assert [json.loads(call)[0] for call in calls] == ["plan"]
+
+
 def _native_instance(tmp_path, *, crash=False):
     config, differences = instance(tmp_path)
     two_sources(tmp_path, differences)

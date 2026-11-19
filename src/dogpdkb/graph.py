@@ -164,7 +164,9 @@ def _prove_native_result(log, graph_path):
     """Require the pinned CLI's terminal output and complete chunk accounting."""
     done = set()
     totals = set()
-    dispatched = written = unchanged = False
+    dispatched = 0
+    cache = None
+    written = unchanged = False
     with log.open(encoding="utf-8") as lines:
         for line in lines:
             chunk = re.fullmatch(
@@ -176,10 +178,20 @@ def _prove_native_result(log, graph_path):
                     raise IncompleteExtraction("unexpected native chunk completion")
                 done.add(index)
                 totals.add(total)
-            elif line.startswith("[graphify extract] semantic extraction on "):
+            elif match := re.fullmatch(
+                r"\[graphify extract\] semantic cache: ([1-9]\d*) hit / (\d+) miss\s*",
+                line,
+            ):
+                if cache is not None or dispatched or written or unchanged:
+                    raise IncompleteExtraction("unexpected native cache accounting")
+                cache = tuple(map(int, match.groups()))
+            elif match := re.fullmatch(
+                r"\[graphify extract\] semantic extraction on ([1-9]\d*) files via .+",
+                line.rstrip(),
+            ):
                 if dispatched or written or unchanged:
                     raise IncompleteExtraction("unexpected native semantic dispatch")
-                dispatched = True
+                dispatched = int(match[1])
             elif line.startswith(f"[graphify extract] wrote {graph_path} — "):
                 if written or unchanged:
                     raise IncompleteExtraction("multiple native terminal outputs")
@@ -210,6 +222,9 @@ def _prove_native_result(log, graph_path):
         not done or totals != {len(done)} or min(done) != 1 or max(done) != len(done)
     ):
         raise IncompleteExtraction("native chunk completion is missing or inconsistent")
+    if cache is not None and cache[1] != dispatched:
+        raise IncompleteExtraction("native cache misses were not all dispatched")
+    return dispatched + (cache[0] if cache else 0)
 
 
 class IncompleteExtraction(ValueError):
@@ -269,15 +284,33 @@ def _snapshot(root):
 
 
 def _semantic_owners(graph):
+    nodes = [
+        n for n in graph.get("nodes", []) if isinstance(n.get("id"), str) and n["id"]
+    ]
+    ids = {node["id"] for node in nodes}
+    hyperedges = [
+        edge
+        for edge in graph.get("hyperedges", [])
+        if isinstance(edge.get("nodes"), list)
+        and edge["nodes"]
+        and all(isinstance(member, str) and member in ids for member in edge["nodes"])
+    ]
     return {
         unicodedata.normalize("NFC", record["source_file"])
-        for kind in ("nodes", "hyperedges")
-        for record in graph.get(kind, [])
+        for record in (*nodes, *hyperedges)
         if isinstance(record.get("source_file"), str)
     }
 
 
-def _prove_coverage(corpus, witnesses, tool_manifest, graph):
+def _prove_coverage(
+    corpus,
+    witnesses,
+    tool_manifest,
+    graph,
+    baseline_manifest,
+    baseline_graph,
+    native_work,
+):
     required = {
         unicodedata.normalize("NFC", target.relative_to(corpus).as_posix())
         for target, _ in witnesses
@@ -288,6 +321,8 @@ def _prove_coverage(corpus, witnesses, tool_manifest, graph):
         raise IncompleteExtraction(
             "Graphify manifest or graph omitted frozen Markdown or a selected source"
         )
+    baseline_owners = _semantic_owners(baseline_graph)
+    changed = 0
     for name, entry in tool_manifest.items():
         if name not in files or not isinstance(entry, dict):
             raise IncompleteExtraction(
@@ -300,6 +335,18 @@ def _prove_coverage(corpus, witnesses, tool_manifest, graph):
             raise IncompleteExtraction(
                 f"Graphify manifest lacks current byte coverage: {name}"
             )
+        if name in required:
+            prior = baseline_manifest.get(name)
+            if (
+                name not in baseline_owners
+                or not isinstance(prior, dict)
+                or prior.get("semantic_hash") != expected
+            ):
+                changed += 1
+    if changed > native_work:
+        raise IncompleteExtraction(
+            "native extraction or cache evidence omitted changed sources"
+        )
 
 
 def _check_historical_inputs(corpus, book, pending, manifest, graph):
@@ -787,7 +834,7 @@ def run_graph(
     else:
         try:
             graph = _graph(candidate / "graph.json")
-            _prove_native_result(log, candidate / "graph.json")
+            native_work = _prove_native_result(log, candidate / "graph.json")
             tool_manifest = _portable_manifest(candidate / "manifest.json")
             # Extraction may take hours. Do not publish if an input changed.
             _manifest(settings, book, store, run, data)
@@ -796,7 +843,15 @@ def run_graph(
                 for target, witness in witnesses
             ):
                 raise ValueError("graph corpus mirror changed during extraction")
-            _prove_coverage(corpus, witnesses, tool_manifest, graph)
+            _prove_coverage(
+                corpus,
+                witnesses,
+                tool_manifest,
+                graph,
+                baseline_manifest,
+                baseline_graph,
+                native_work,
+            )
             _tree_files(candidate)
             if _snapshot(graph_dir) != public_snapshot:
                 raise ValueError("public Graphify generation changed during extraction")

@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from scripts.smoke_install import REMOTE_CLI
 from tests.test_orchestrator_ocr_batch_cli import _native_instance
 from tests.test_sync_source_selection_cli import YUQUE, cli, instance, run_data
@@ -122,6 +124,48 @@ def test_corpus_handoff_refuses_new_graph_generation(tmp_path):
     assert (
         json.loads(old.read_bytes())["failures"][-1]["reason"] == "STALE_GRAPH_HANDOFF"
     )
+
+
+@pytest.mark.parametrize("newer_graph", [False, True])
+def test_resume_after_unsealed_corpus_reuses_frozen_graph_baseline(
+    tmp_path, monkeypatch, newer_graph
+):
+    from dogpdkb import apply, sync
+
+    config, source = setup_local(tmp_path)
+    (source / "a.md").write_text("# Published A\n")
+    args = ("--config", str(config))
+    with monkeypatch.context() as patch:
+
+        def power_loss(*_):
+            raise RuntimeError("lost power before corpus checkpoint")
+
+        patch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1] / "src"))
+        patch.setattr(apply, "seal_corpus", power_loss)
+        with pytest.raises(RuntimeError, match="lost power"):
+            sync.main([*args, "--dir", str(source)])
+    [run] = (tmp_path / "runs/funds").glob("run-*/run.json")
+    interrupted = json.loads(run.read_bytes())
+    assert "manifest" in interrupted["artifacts"]
+    assert "corpus" not in interrupted["checkpoints"]
+
+    public = tmp_path / "corpus/funds/graphify-out"
+    newer = b'{"nodes":[{"id":"lib","source_file":"lib.py"}],"links":[]}'
+    if newer_graph:
+        (public / "graph.json").write_bytes(newer)
+        (public / "manifest.json").write_text("{}")
+    resumed = cli(tmp_path, "sync", *args, "--resume", run)
+    assert resumed.returncode == (2 if newer_graph else 0), resumed.stderr
+    calls = (tmp_path / "commands.jsonl").read_text()
+    assert calls.count('"graphify", "extract"') == (0 if newer_graph else 1)
+    if newer_graph:
+        assert (public / "graph.json").read_bytes() == newer
+        assert (
+            json.loads(run.read_bytes())["failures"][-1]["reason"]
+            == "STALE_GRAPH_HANDOFF"
+        )
+    else:
+        assert (public / "graph.json").is_file()
 
 
 def test_catchup_only_sends_unattempted_document_and_recompiles_enrichment(tmp_path):

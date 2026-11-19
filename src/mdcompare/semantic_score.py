@@ -388,6 +388,18 @@ def publish_semantic_scores(args):
                 "evidence": bindings[key][0],
                 "evidence_sha256": bindings[key][1],
             }
+    if args.document_id is not None:
+        selected = set(args.document_id)
+        candidates = {
+            key: binding for key, binding in candidates.items() if key[1] in selected
+        }
+        if (
+            len(selected) != len(args.document_id)
+            or len(candidates) != len(selected)
+            or {key[1] for key in candidates} != selected
+        ):
+            raise InputError("SCORE_DOCUMENT_SCOPE_INVALID")
+        config["document_ids"] = sorted(selected)
     with lock_path.open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if journal.exists():

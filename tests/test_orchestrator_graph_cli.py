@@ -654,9 +654,8 @@ def test_missing_chunk_completion_is_not_proof_even_with_current_stamps(tmp_path
     tool = tmp_path / "graphify.py"
     tool.write_text(
         tool.read_text().replace(
-            "print(f'[graphify extract] wrote",
-            "print('[graphify extract] semantic extraction on 1 files via openai-oauth...')\n"
-            "print(f'[graphify extract] wrote",
+            "    print('[graphify extract] chunk 1/1 done')\n",
+            "",
         )
     )
 
@@ -665,6 +664,57 @@ def test_missing_chunk_completion_is_not_proof_even_with_current_stamps(tmp_path
     assert not (source.parent / "graphify-out/graph.json").exists()
     assert cli(config, manifest).returncode == 2
     assert len((tmp_path / "calls.jsonl").read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize("with_chunks", [False, True])
+def test_candidate_needs_native_work_and_real_source_ownership(tmp_path, with_chunks):
+    config, manifest, source = fixture(tmp_path)
+    graph = source.parent / "graphify-out/graph.json"
+    write(graph, {"nodes": [{"id": "old"}], "links": []})
+    write(graph.with_name("manifest.json"), {})
+    before = graph.read_bytes()
+    tool = tmp_path / "graphify.py"
+    proof = GRAPHIFY_PROOF
+    if not with_chunks:
+        # Good source ownership does not prove the new stamp came from extraction.
+        proof = proof[: proof.index("if manifest:")] + (
+            "print(f'[graphify extract] wrote {out / \"graph.json\"} — complete')\n"
+        )
+    else:
+        # Complete chunks do not turn an empty hyperedge into source ownership.
+        proof = proof.replace(
+            "graph['nodes'].append({'id':name,'source_file':name})",
+            "graph.setdefault('hyperedges',[]).append({'source_file':name,'nodes':[]})",
+        )
+    tool.write_text(tool.read_text().removesuffix(GRAPHIFY_PROOF) + proof)
+
+    assert cli(config, manifest).returncode == 2
+    assert graph.read_bytes() == before
+    assert cli(config, manifest).returncode == 2
+    assert len((tmp_path / "calls.jsonl").read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize("native_cache", [False, True])
+def test_no_dispatch_accepts_proven_baseline_or_cache_coverage(tmp_path, native_cache):
+    config, manifest, source = fixture(tmp_path)
+    tool = tmp_path / "graphify.py"
+    proof = GRAPHIFY_PROOF[: GRAPHIFY_PROOF.index("if manifest:")]
+    if native_cache:
+        proof += "print('[graphify extract] semantic cache: 1 hit / 0 miss')\n"
+    else:
+        graph = source.parent / "graphify-out/graph.json"
+        # Graphify's native change stamp is MD5, not a security digest.
+        stamp = hashlib.new(
+            "md5", source.read_bytes(), usedforsecurity=False
+        ).hexdigest()
+        write(graph.with_name("manifest.json"), {source.name: {"semantic_hash": stamp}})
+        write(
+            graph, {"nodes": [{"id": "old", "source_file": source.name}], "links": []}
+        )
+    proof += "print(f'[graphify extract] wrote {out / \"graph.json\"} — complete')\n"
+    tool.write_text(tool.read_text().removesuffix(GRAPHIFY_PROOF) + proof)
+    result = cli(config, manifest)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_existing_baseline_cannot_authorize_unstamped_historical_backfill(tmp_path):

@@ -109,8 +109,15 @@ Keep the score output with its private `.execution.json` journal and `.lock`
 file. Exit 2 from the scorer is a published partial result, not a reason to
 skip unscored changes. Neither scorer nor router rewrites the input
 comparison. The plan binds the report, index, scores and route by SHA-256.
-A resume with a frozen plan does not make more scoring calls. An interruption
-before the plan suppresses a second scoring pass in that same dogpdkb run.
+A resume with a frozen plan does not make more scoring calls. Before invoking
+the scorer, dogpdkb durably reserves each candidate version in book state and
+limits admission to those IDs with repeatable `--document-id` options. A bound
+score result distinguishes admitted rows (with a status) from proven unsent
+ones (without one). Completed, failed or uncertain admissions do not get a new
+score request on a later run for that version; unscored evidence leaves the
+deterministic route intact. An interruption before the plan suppresses a second
+scoring pass in that same run. Without a verified result, reserved versions
+remain suppressed rather than assuming work was unsent.
 See `mdcompare semantic-score --help --full` for admission limits and privacy.
 
 
