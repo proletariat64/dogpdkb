@@ -242,3 +242,32 @@ def test_only_authored_image_outside_multiline_and_nested_code_is_selected(tmp_p
     ]
     text = (tmp_path / "source.md").read_text()
     assert text[image["start"] : image["end"]] == "![real](same.png)"
+
+
+def test_code_delimiters_do_not_cross_heading_or_list_item_boundaries(tmp_path):
+    (tmp_path / "source.md").write_bytes(
+        b"# Heading `\n![heading image](same.png)\n# Another heading `\n\n"
+        b"- First `\n- ![list image](same.png)\n- Third `\n\n"
+        b"- One item with `code\n  ![example](same.png)` followed by ![real](same.png).\n"
+    )
+    (tmp_path / "same.png").write_bytes(b"fixture")
+    result = cli(
+        tmp_path,
+        "plan",
+        "--mode",
+        "paddle",
+        "--input",
+        "source.md",
+        "--output",
+        "out.md",
+        "--plan",
+        "plan.json",
+    )
+    assert result.returncode == 0, result.stderr
+    images = json.loads((tmp_path / "plan.json").read_text())["documents"][0]["images"]
+    text = (tmp_path / "source.md").read_text()
+    assert [text[im["start"] : im["end"]] for im in images] == [
+        "![heading image](same.png)",
+        "![list image](same.png)",
+        "![real](same.png)",
+    ]

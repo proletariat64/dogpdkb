@@ -41,6 +41,32 @@ def _atomic_json(path: Path, value: dict) -> None:
             os.unlink(name)
 
 
+_ATX = re.compile(r" {0,3}#{1,6}(?:[ \t]|$)")
+_LIST_ITEM = re.compile(r"[ \t]*(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]|$)")
+_BLOCK_SEPARATOR = re.compile(
+    r" {0,3}(?:=+|-+|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})[ \t]*$"
+)
+
+
+def _inline_blocks(segment: str):
+    """Yield offset and text of each run eligible for inline-code matching."""
+    beginning = offset = 0
+    for full_line in segment.splitlines(keepends=True):
+        line = full_line.rstrip("\r\n")
+        end = offset + len(full_line)
+        heading = _ATX.match(line)
+        separator = not line.strip() or _BLOCK_SEPARATOR.fullmatch(line)
+        if heading or separator or _LIST_ITEM.match(line):
+            if beginning < offset:
+                yield beginning, segment[beginning:offset]
+            if heading:
+                yield offset, full_line
+            beginning = end if heading or separator else offset
+        offset = end
+    if beginning < offset:
+        yield beginning, segment[beginning:offset]
+
+
 def _masked_ranges(markdown: str) -> list[tuple[int, int]]:
     """Ranges within which image syntax is literal or already generated."""
     ranges = []
@@ -71,8 +97,7 @@ def _masked_ranges(markdown: str) -> list[tuple[int, int]]:
     # Inline code may span lines but cannot cross a block boundary. Delimiters
     # are whole runs: a literal shorter run cannot close a longer opener.
     def inline(segment, offset):
-        for paragraph in re.finditer(r"(?:[^\n]|\n(?![ \t\r]*\n))+", segment):
-            text = paragraph.group()
+        for block_start, text in _inline_blocks(segment):
             runs = list(re.finditer(r"`+", text))
             next_run, closing = {}, {}
             for i in reversed(range(len(runs))):
@@ -87,7 +112,7 @@ def _masked_ranges(markdown: str) -> list[tuple[int, int]]:
                 escaped = (len(prefix) - len(prefix.rstrip("\\"))) % 2
                 if i in closing and not escaped:
                     j = closing[i]
-                    beginning = offset + paragraph.start()
+                    beginning = offset + block_start
                     yield beginning + start, beginning + runs[j].end()
                     i = j + 1
                 else:
