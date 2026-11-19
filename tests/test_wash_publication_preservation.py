@@ -9,7 +9,6 @@ from urllib.parse import unquote, urlsplit
 
 import pytest
 
-from tests.ocr_fixture import write_ocr_fixture
 from tests.source_fixture import team_id
 from tests.test_orchestrator_apply_cli import cli
 from tests.test_wash_durable_inputs import enriched_instance
@@ -62,7 +61,8 @@ def test_local_fragments_survive_ocr_input_publication_and_purge(
     assert result.returncode == (0 if has_ocr_output else 2), result.stderr
     output = json.loads(result.stdout)
     run = Path(output["run"]).parent
-    request = json.loads((run / "ocr-0-request.json").read_text())["documents"][0]
+    artifacts = json.loads(Path(output["run"]).read_text())["artifacts"]
+    request = json.loads(Path(artifacts["ocr_request"]).read_text())["documents"][0]
     observed = (tmp_path / "observed-ocr.md").read_text()
     targets = re.findall(r'(?:xlink:)?href="([^"]+)"', observed)
     assert [urlsplit(target).fragment for target in targets] == [
@@ -96,22 +96,15 @@ def test_local_fragments_survive_ocr_input_publication_and_purge(
 
 def image_instance(tmp_path):
     config, differences = enriched_instance(tmp_path)
-    write_ocr_fixture(
-        (tmp_path / "enrich.py"),
-        """import json,sys
-from pathlib import Path
-from urllib.parse import quote
-args=sys.argv[1:]
-def option(name): return Path(args[args.index(name)+1])
-doc=json.loads(fixture_request.read_text())['documents'][0]
-output=fixture_output;output.parent.mkdir(parents=True,exist_ok=True)
-body=Path(doc['path']).read_text()
-image=output.parent/'prepared image.png';image.write_bytes(body.encode())
-output.write_text(body+'\\n![prepared]('+quote(str(image),safe='/')+')\\n')
-resource={'resource_id':'image','status':'success','source_path':str(image),'prepared_image':str(image)}
-fixture_result({'schema_version':'mdocr-result-2','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[resource],'ocr':{'images':[resource]}}]})
-""",
-    )
+    remote_path = tmp_path / "remote.json"
+    remote = json.loads(remote_path.read_text())
+    remote["42"]["body"] += "\n![diagram](image.png)\n"
+    remote_path.write_text(json.dumps(remote))
+    tool = tmp_path / "skylark.py"
+    tool.write_text(tool.read_text().replace(
+        "path.write_text(doc['body'])",
+        "path.write_text(doc['body']); (path.parent/'image.png').write_bytes(doc['version'].encode())",
+    ))
     return config, differences
 
 
@@ -158,13 +151,13 @@ def test_failed_asset_retention_keeps_previous_published_image(tmp_path):
     document = manifest["documents"][0]
     corpus = Path(document["path"])
     before = corpus.read_bytes()
-    image = Path(document["ocr"]["images"][0]["prepared_image"])
+    image = Path(document["ocr"]["images"][0]["source_path"])
     old_image = image.read_bytes()
     next_version(tmp_path, differences)
     failed = fault_cli(
         ["apply", "--config", config, "--input", differences],
         """def deny_retention(event,args):
- if event=='shutil.copyfile' and '/ocr-files/' in str(args[1]):
+ if event=='shutil.copyfile' and '/.raw-' in str(args[1]) and str(args[1]).endswith('.png'):
   raise OSError('INJECTED_ASSET_COPY_FAILURE')
 sys.addaudithook(deny_retention)
 """,
@@ -204,7 +197,7 @@ output.mkdir(parents=True,exist_ok=True)
     document = json.loads(manifest_path.read_text())["documents"][0]
     corpus, witness = Path(document["path"]), Path(document["input_copy"])
     old_bytes = witness.read_bytes()
-    image = Path(document["ocr"]["images"][0]["prepared_image"])
+    image = Path(document["ocr"]["images"][0]["source_path"])
     old_image = image.read_bytes()
     next_version(tmp_path, differences)
     arguments = ["apply", "--config", config, "--input", differences]
@@ -248,8 +241,8 @@ def test_ocr_request_survives_cleanup_after_earlier_export_failure(tmp_path):
     )
     script = script.replace(
         "if tool in ('mdcompare', 'mdocr'):",
-        "if tool == 'mdocr':\n"
-        "    pathlib.Path(args[args.index('--report')+1]).write_text('invalid')\n"
+        "if tool == 'mdocr' and args[0] == 'run':\n"
+        "    pathlib.Path(args[args.index('--result')+1]).write_text('invalid')\n"
         "    raise SystemExit(2)\n"
         "if tool in ('mdcompare', 'mdocr'):",
     )
@@ -260,7 +253,7 @@ def test_ocr_request_survives_cleanup_after_earlier_export_failure(tmp_path):
     record = json.loads(run_path.read_text())
     assert record["cleanup"]["status"] == "completed"
     assert {failure["step"] for failure in record["failures"]} >= {"export", "ocr"}
-    request = run_path.parent / "ocr-0-request.json"
+    request = Path(record["artifacts"]["ocr_request"])
     assert request.is_file(), "cleanup lost the actual failed OCR invocation"
     assert json.loads(request.read_text())["documents"][0]["document_id"] == team_id(
         "2"
@@ -270,25 +263,9 @@ def test_ocr_request_survives_cleanup_after_earlier_export_failure(tmp_path):
 
 
 def test_later_run_uses_new_publication_generation(tmp_path):
-    from tests.test_orchestrator_apply_cli import two_sources
+    from tests.test_orchestrator_ocr_batch_cli import _native_instance
 
-    config, differences = image_instance(tmp_path)
-    two_sources(tmp_path, differences)
-    tool = tmp_path / "enrich.py"
-    script = tool.read_text().replace(
-        "'schema_version':'mdocr-result-2','documents'",
-        "'schema_version':'mdocr-result-2','causes':"
-        "(['OCR_AUTH_UNAVAILABLE'] if not Path(__file__).with_name('allow').exists() else []),"
-        "'documents'",
-    )
-    script = script.replace(
-        "'status':'completed'",
-        "'status':('completed' if Path(__file__).with_name('allow').exists() else 'partial')",
-    )
-    tool.write_text(
-        script
-        + "\nraise SystemExit(0 if Path(__file__).with_name('allow').exists() else 2)\n"
-    )
+    config, differences = _native_instance(tmp_path)
     first = cli("apply", "--config", config, "--input", differences)
     assert first.returncode == 2, first.stderr
     first_result = json.loads(first.stdout)
@@ -302,9 +279,8 @@ def test_later_run_uses_new_publication_generation(tmp_path):
     assert any(failure["step"] == "ocr" for failure in before["failures"])
     old_witness = Path(old_document["input_copy"])
     old_bytes = old_witness.read_bytes()
-    (tmp_path / "allow").touch()
     resumed = cli("apply", "--config", config, "--input", differences)
-    assert resumed.returncode == 2, resumed.stderr
+    assert resumed.returncode == 0, resumed.stderr
     resumed_result = json.loads(resumed.stdout)
     assert resumed_result["run"] != first_result["run"]
     after = json.loads(Path(resumed_result["manifest"]).read_text())

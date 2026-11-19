@@ -81,4 +81,5 @@ def ref_of(markdown: str):
 def isolated_env(monkeypatch, tmp_path):
     monkeypatch.delenv("PADDLEOCR_TOKEN", raising=False)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "user-state"))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "absent-pi-auth"))
     monkeypatch.delenv("DOGPDKB_UPDATE_LOCK_FD", raising=False)

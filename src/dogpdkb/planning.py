@@ -143,10 +143,17 @@ def make_plan(book, run, documents, knowledge, comparison, semantic, *, workspac
             "SCORE_ABOVE_THRESHOLD",
         }:
             reasons.append(body["routing_reason"])
+        previous = row.get("previous_corpus", {})
+        retry_ocr = (
+            status == "EQUIVALENT"
+            and previous.get("ocr_status") == "unattempted"
+            and same_version(previous["version"], row["version"])
+        )
         rows.append(
             {
                 **row,
                 "action": action,
+                "retry_ocr": retry_ocr,
                 "reason_codes": reasons,
                 "ocr_resources": None,
                 "semantic_status": status,
@@ -156,6 +163,7 @@ def make_plan(book, run, documents, knowledge, comparison, semantic, *, workspac
         )
     plan = {
         "schema": "dogpdkb-plan-1",
+        "ocr_policy": run.store.settings.ocr_policy(),
         "book": book.key,
         "run_id": run.id,
         "sources": run.data.get("sources", []),

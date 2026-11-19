@@ -1,0 +1,700 @@
+"""Orchestrate one public mdocr execution; keep its originals outside wash."""
+
+import hashlib
+import re
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
+from dogpdkb.inputs import _local_destination, relocate_targets
+from dogpdkb.planning import same_version, validate_inputs
+from dogpdkb.records import atomic_json, read_json
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def file_digest(path):
+    return digest(Path(path).read_bytes())
+
+
+def _path(root, value):
+    path = Path(value)
+    if not path.is_relative_to(root) or path.resolve() != path:
+        raise ValueError("OCR path outside its durable directory or through a symlink")
+    return path
+
+
+def _targets(resource):
+    key = resource["resource_id"]
+    url = urlsplit(key)
+    return {key, key.partition("#")[0], unquote(url.path)}
+
+
+def _prepare(root, row):
+    """Stage exact raw/image bytes and a separate, path-safe CLI input."""
+    name = f"{row['slot']}.md"
+    raw = _path(root, root / "raw" / name)
+    source = _path(root, root / "input" / name)
+    output = _path(root, root / "output" / name)
+    body = Path(row["raw_path"]).read_bytes()
+    text = body.decode("utf-8")
+    mappings, assets = {}, {}
+    for index, item in enumerate(row.get("resources") or []):
+        if not item.get("path"):
+            continue
+        suffix = Path(item["path"]).suffix
+        if not re.fullmatch(r"\.[A-Za-z0-9]+", suffix):
+            suffix = ""
+        relative = f"assets/{row['slot']}/{index}{suffix}"
+        target = _path(root, source.parent / relative)
+        data = Path(item["path"]).read_bytes()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        for key in _targets(item):
+            previous = mappings.setdefault(key, relative)
+            if previous != relative and assets[previous]["sha256"] != digest(data):
+                raise ValueError(f"ambiguous local OCR resource: {key}")
+        assets[relative] = {
+            "resource_id": item["resource_id"],
+            "path": str(target),
+            "sha256": digest(data),
+        }
+    replacements = {
+        key: _local_destination(relative, key) for key, relative in mappings.items()
+    }
+    prepared = relocate_targets(text, replacements).encode("utf-8")
+    for path, data in [(raw, body), (source, prepared)]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    selection = row.get("ocr_resources")
+    if selection is not None:
+        selection = [mappings.get(key, key) for key in selection]
+    return {
+        "document_id": row["document_id"],
+        "source_key": row["source_key"],
+        "version": row["version"],
+        "path": str(source),
+        "output": str(output),
+        "sha256": digest(prepared),
+        "raw_copy": str(raw),
+        "source_sha256": digest(body),
+        "assets": assets,
+        "selection": selection,
+    }
+
+
+def _index(rows, field="document_id"):
+    indexed = {row[field]: row for row in rows}
+    if len(indexed) != len(rows):
+        raise ValueError("duplicate OCR identity")
+    return indexed
+
+
+def _load_plan(root, request):
+    plan = read_json(root / "plan.json")
+    docs = _index(plan["documents"])
+    expected = _index(request["documents"], "path")
+    if plan["schema_version"] != "mdocr-plan-2" or docs.keys() != expected.keys():
+        raise ValueError("OCR plan set differs from requested documents")
+    policy = request["policy"]
+    for key in (
+        "mode",
+        "model",
+        "effort",
+        "concurrency",
+        "request_budget",
+        "max_seconds",
+        "cache_dir",
+    ):
+        if plan["settings"][key] != policy[key]:
+            raise ValueError(f"OCR plan did not preserve {key}")
+    for key, entry in expected.items():
+        doc = docs[key]
+        if any(doc[field] != entry[field] for field in ("path", "output", "sha256")):
+            raise ValueError("OCR plan doc does not bind its input and destination")
+    return plan, docs
+
+
+def _verify_input(root, entry, doc):
+    for key, sha in [("path", "sha256"), ("raw_copy", "source_sha256")]:
+        if file_digest(_path(root, entry[key])) != entry[sha]:
+            raise ValueError("OCR frozen input bytes changed")
+    for asset in entry["assets"].values():
+        if file_digest(_path(root, asset["path"])) != asset["sha256"]:
+            raise ValueError("OCR frozen resource bytes changed")
+    for im in doc["images"]:
+        if not im["selected"] or im["error"]:
+            continue
+        asset = entry["assets"].get(im["resource_id"])
+        if asset:
+            if (im["source_path"], im["sha256"]) != (asset["path"], asset["sha256"]):
+                raise ValueError("OCR plan changed local resource binding")
+        else:
+            if urlsplit(im["resource_id"]).scheme not in {"http", "https"}:
+                raise ValueError(
+                    "OCR plan references a local image not frozen by collect"
+                )
+            copied = _path(root / "plan.json.images", im["source_path"])
+            if file_digest(copied) != im["sha256"]:
+                raise ValueError("OCR staged remote image bytes changed")
+
+
+def _tool_result(root, path, plan_sha):
+    report = read_json(_path(root, path))
+    if (
+        report["schema_version"] != "mdocr-result-2"
+        or report["plan_sha256"] != plan_sha
+        or report.get("result_path") != str(root / "result.json")
+    ):
+        raise ValueError(
+            "OCR result/journal is not bound to the original plan and result path"
+        )
+    return report
+
+
+def _verified_result(root, plan, doc, entry, row):
+    _verify_input(root, entry, doc)
+    if row["path"] != doc["path"]:
+        raise ValueError("OCR row source path is not its planned source")
+    occurrences = _index(doc["images"], "id")
+    resources = _index(row["resources"], "id")
+    if resources.keys() != occurrences.keys() or any(
+        item["resource_id"] != occurrences[key]["resource_id"]
+        for key, item in resources.items()
+    ):
+        raise ValueError("OCR row resource occurrences do not match plan")
+    if row.get("status") != "completed":
+        if row.get("output") is not None or row.get("ocr") is not None:
+            raise ValueError("Incomplete OCR row claims a usable output or evidence")
+        selected = [
+            (item, occurrences[key])
+            for key, item in resources.items()
+            if occurrences[key]["selected"]
+        ]
+        states = {item["status"] for item, _ in selected}
+        reasons = sorted({item["reason"] for item, _ in selected if item.get("reason")})
+        reason = reasons[0] if reasons else "OCR_PARTIAL_OR_UNKNOWN"
+        if (
+            row.get("status") != "partial"
+            or not selected
+            or states & {"admitted", "unknown"}
+        ):
+            return None, "unknown", "unknown", reason
+        allowed = {"failed", "held", "reused", "success", "unattempted"}
+        if not states <= allowed:
+            raise ValueError("Unrecognized OCR occurrence state")
+        if states == {"unattempted"}:
+            return None, "skipped", "not_sent", reason
+        sent = any(
+            item["status"] in {"failed", "held", "success"} and not im["error"]
+            for item, im in selected
+        )
+        return None, "failed", "settled" if sent else "not_sent", reason
+
+    if row["output"] != doc["output"]:
+        raise ValueError("OCR output does not identify its planned destination")
+    output = _path(root, row["output"]).read_bytes()
+    output.decode("utf-8")
+    if digest(output) != row["output_sha256"]:
+        raise ValueError("OCR output bytes changed")
+    evidence = row["ocr"]
+    config = evidence["configuration"]
+    settings = plan["settings"]
+    if evidence["contract"] != "mdocr-ocr-2" or config["mode"] != settings["mode"]:
+        raise ValueError("OCR evidence contract or mode changed")
+    if config["mode"] == "llm" and (
+        config["model"] != settings["model"]
+        or config["effort"] != settings["effort"]
+        or config["prompt_sha256"] != digest(settings["prompt"].encode())
+        or config["schema"] != "mdocr-image-patches-1"
+    ):
+        raise ValueError("OCR evidence configuration differs from plan")
+    selected = {}
+    admitted = False
+    for key, im in occurrences.items():
+        state = resources[key]["status"]
+        if im["selected"]:
+            if im["error"] or state not in {"success", "reused"}:
+                raise ValueError("OCR completed row has an unfinished image")
+            selected.setdefault(im["resource_id"], im)
+            admitted |= state == "success"
+            prefix = (
+                f"<!-- mdocr:ocr-begin v=2 id={im['id']} -->\n"
+                f"<!-- mdocr:meta mode={config['mode']} sha256={im['sha256']} -->\n"
+            ).encode()
+            if prefix not in output:
+                raise ValueError("OCR completed output does not contain its planned block")
+        elif state != "unselected":
+            raise ValueError("OCR completed row changed planned image selection")
+    images = _index(evidence["images"], "resource_id")
+    if images.keys() != selected.keys():
+        raise ValueError("OCR evidence does not cover the selected images")
+    if (
+        selected
+        and config["mode"] == "llm"
+        and not re.fullmatch(r"[a-f0-9]{64}", evidence.get("context_sha256", ""))
+    ):
+        raise ValueError("OCR evidence is missing the LLM context digest")
+    for key, image in images.items():
+        im = selected[key]
+        if image["status"] != "success" or (
+            image["source_path"],
+            image["source_sha256"],
+        ) != (im["source_path"], im["sha256"]):
+            raise ValueError("OCR original image differs from the planned image")
+        artifact = _path(root, image["artifact"]).read_bytes()
+        marker = f"<!-- mdocr:ocr-begin v=2 id={im['id']} -->\n".encode()
+        if (
+            not artifact.startswith(marker)
+            or not artifact.endswith(b"\n<!-- mdocr:ocr-end -->")
+            or digest(artifact) != image["artifact_sha256"]
+            or artifact not in output
+        ):
+            raise ValueError("OCR block witness differs from output or its digest")
+    # This is a caller-owned projection. Never rewrite the original mdocr row.
+    projected = {
+        **evidence,
+        "images": [
+            {
+                **image,
+                "resource_id": entry["assets"].get(key, {}).get("resource_id", key),
+            }
+            for key, image in images.items()
+        ],
+    }
+    return (
+        {
+            "output": row["output"],
+            "output_sha256": row["output_sha256"],
+            "status": "completed",
+            "ocr": projected,
+            "assets": entry["assets"],
+        },
+        "completed",
+        "settled" if admitted else "not_sent",
+        None,
+    )
+
+
+_INVALID = (OSError, ValueError, KeyError, TypeError, AttributeError)
+
+
+def _settled_report(root, seal):
+    for name, expected in seal["witnesses"].items():
+        path = _path(root, root / name)
+        if file_digest(path) != expected:
+            raise ValueError(f"OCR witness changed: {name}")
+    if seal["report"]:
+        return _tool_result(root, root / seal["report"], seal["witnesses"]["plan.json"])
+    return None
+
+
+def _saved_ocr(previous, row):
+    root = Path(previous["input"]).parent
+    seal_path = root / "settled.json"
+    if file_digest(seal_path) != previous["seal_sha256"]:
+        raise ValueError("OCR checkpoint changed")
+    seal = read_json(seal_path)
+    payload = _settled_report(root, seal)
+    if payload is None:
+        raise ValueError("Previous OCR report unavailable")
+    request = read_json(root / "request.json")
+    entry = _index(request["documents"])[row["document_id"]]
+    if file_digest(row["raw_path"]) != entry["source_sha256"]:
+        raise ValueError("Raw bytes changed at the same version")
+    resources = _index(row.get("resources") or [], "resource_id")
+    for asset in entry["assets"].values():
+        if file_digest(resources[asset["resource_id"]]["path"]) != asset["sha256"]:
+            raise ValueError("Raw resource changed at the same version")
+    plan, docs = _load_plan(root, request)
+    result, *_ = _verified_result(
+        root,
+        plan,
+        docs[entry["path"]],
+        entry,
+        _index(payload["documents"])[entry["path"]],
+    )
+    if not result:
+        raise ValueError("Previous OCR success no longer verifies")
+    return result
+
+
+def _start_args(root, request):
+    policy = request["policy"]
+    docs = request["documents"]
+    atomic_json(root / "inputs.json", [doc["path"] for doc in docs])
+    args = [
+        "plan",
+        "--mode",
+        policy["mode"],
+        "--list",
+        root / "inputs.json",
+        "--output-dir",
+        root / "output",
+        "--plan",
+        root / "plan.json",
+        "--cache-dir",
+        policy["cache_dir"],
+        "--concurrency",
+        policy["concurrency"],
+        "--max-seconds",
+        policy["max_seconds"],
+    ]
+    if policy["mode"] == "llm":
+        args += ["--model", policy["model"], "--effort", policy["effort"]]
+        if policy["request_budget"] is not None:
+            args += ["--request-budget", policy["request_budget"]]
+    if any(entry["selection"] is not None for entry in docs):
+        # A missing selection means all occurrences, not an empty list. The
+        # mdocr CLI only accepts a whole-batch selection when all rows specify it.
+        if any(entry["selection"] is None for entry in docs):
+            raise ValueError("OCR batch mixes explicit and implicit selections")
+        atomic_json(
+            root / "selection.json", {doc["path"]: doc["selection"] for doc in docs}
+        )
+        args += ["--selection", root / "selection.json"]
+    if request["download"]:
+        args.append("--download")
+    return args
+
+
+def _execute(root, request, store, run, call_tool):
+    """Seal final evidence; resume only through mdocr's original journal."""
+    req_path, plan_path = root / "request.json", root / "plan.json"
+    start_path, seal_path = root / "started.json", root / "settled.json"
+    report_path, journal = root / "result.json", root / "plan.json.execution.json"
+    if seal_path.exists():
+        return read_json(seal_path)
+    initial = {"request.json": file_digest(req_path)}
+    dispatched = start_path.exists()
+    report, code, reason = None, None, None
+    docs = {}
+    if not dispatched and not plan_path.exists():
+        code = call_tool("mdocr", _start_args(root, request))
+        if code != 0:
+            reason = "OCR_PLAN_REJECTED"
+    if reason is None:
+        try:
+            _, docs = _load_plan(root, request)
+            initial["plan.json"] = plan_sha = file_digest(plan_path)
+            if dispatched and read_json(start_path) != initial:
+                raise ValueError("OCR immutable plan or request changed")
+            for entry in request["documents"]:
+                _verify_input(root, entry, docs[entry["path"]])
+            if dispatched:
+                if journal.exists():
+                    state = _tool_result(root, journal, plan_sha)
+                    if state["status"] in {"completed", "partial"}:
+                        if report_path.exists():
+                            _tool_result(root, report_path, plan_sha)
+                            if report_path.read_bytes() != journal.read_bytes():
+                                # Native journal is written first. Never replace
+                                # or pass off an older mirror as a final report.
+                                report = journal
+                            else:
+                                report = report_path
+                        else:
+                            report = journal
+                    elif (
+                        state["status"] != "running"
+                        or not isinstance(state["requests"], list)
+                        or not isinstance(state["budget"], dict)
+                    ):
+                        raise ValueError("OCR journal cannot prove prior admissions")
+                    elif report_path.exists():
+                        mirror = _tool_result(root, report_path, plan_sha)
+                        prior = [attempt["key"] for attempt in mirror["requests"]]
+                        if prior != [
+                            attempt["key"]
+                            for attempt in state["requests"][: len(prior)]
+                        ]:
+                            raise ValueError("OCR journal lost observed admissions")
+                elif report_path.exists():
+                    # A terminal result is sufficient to inspect completed rows,
+                    # but an absent journal never authorizes execution again.
+                    report = report_path
+                else:
+                    raise ValueError("OCR execution journal is missing")
+            elif report_path.exists() or journal.exists():
+                raise ValueError("unowned OCR execution artifacts")
+        except _INVALID:
+            reason = (
+                "OCR_EXECUTION_UNVERIFIABLE"
+                if dispatched
+                else "OCR_PLAN_BINDING_INVALID"
+            )
+    if reason is None and report is None:
+        atomic_json(start_path, initial, durable=True)
+        store.complete_batch(
+            {
+                "doc_id": entry["document_id"],
+                "name": "ocr",
+                "version": entry["version"],
+                "status": "running",
+                "run_id": run.id,
+                "input": str(req_path),
+                "report": str(report_path),
+                "send_state": "unknown",
+            }
+            for entry in request["documents"]
+        )
+        dispatched = True
+        code = call_tool("mdocr", ["run", "--plan", plan_path, "--result", report_path])
+        if code in {0, 2} and report_path.exists():
+            report = report_path
+        elif journal.exists():
+            report = journal
+        else:
+            reason = "OCR_RESULT_UNAVAILABLE"
+    if report is not None:
+        try:
+            payload = _tool_result(root, report, initial["plan.json"])
+            if (
+                payload["status"] not in {"completed", "partial"}
+                or _index(payload["documents"]).keys() != docs.keys()
+            ):
+                raise ValueError("OCR terminal result has the wrong identity set")
+        except _INVALID:
+            report, reason = None, "OCR_RESULT_BINDING_INVALID"
+    seal = {
+        "dispatched": dispatched,
+        "exit_code": code,
+        "reason": reason,
+        "report": report.name if report else None,
+        "witnesses": initial
+        | {
+            path.name: file_digest(path)
+            for path in [report_path, journal]
+            if path.is_file()
+        },
+    }
+    atomic_json(seal_path, seal, durable=True)
+    return seal
+
+
+def ocr_inputs(settings, book, store, run, rows):
+    from dogpdkb.apply import call_tool, failure
+
+    plan_path = run.data["artifacts"]["plan"]
+    policy = read_json(Path(plan_path)).get("ocr_policy") or settings.ocr_policy()
+    root = store.path.parent / "ocr" / run.id
+    _path(store.path.parent, root)
+    request_path, seal_path = root / "request.json", root / "settled.json"
+    candidates = [
+        row for row in rows if row["action"] == "compile" or row.get("retry_ocr")
+    ]
+    run.stage("ocr", total=len(candidates))
+    if not candidates:
+        return {}
+    results, pending, observed = {}, [], {}
+    existing = read_json(request_path) if request_path.exists() else None
+    enrolled = _index(existing["documents"]) if existing else {}
+    rejected = existing["rejected"] if existing else {}
+
+    def note(row, status, send, reason, **details):
+        identifier = row["document_id"]
+        results.setdefault(
+            identifier, {"status": "unattempted" if status == "skipped" else status}
+        )
+        if reason is None:
+            return
+        if not any(
+            item.get("step") == "ocr"
+            and item.get("document_id") == identifier
+            and item.get("reason") == reason
+            for item in run.data["failures"]
+        ):
+            failure(
+                run,
+                row,
+                "ocr",
+                reason,
+                persist=False,
+                status=results[identifier]["status"],
+                source_key=row["source_key"],
+                send_state=send,
+                input_sha256=file_digest(row["raw_path"]),
+                retry_scope="document" if send == "not_sent" else "none",
+                **details,
+            )
+
+    for row in candidates:
+        identifier, version = row["document_id"], row["version"]
+        if identifier in enrolled:
+            if enrolled[identifier]["version"] != version:
+                raise ValueError(
+                    "OCR request version does not match the saved business plan"
+                )
+            continue
+        if identifier in rejected:
+            note(
+                row,
+                "skipped",
+                "not_sent",
+                "OCR_INPUT_PREPARATION_FAILED",
+                report=str(request_path),
+            )
+            continue
+        previous = store.step(identifier, "ocr")
+        if (
+            previous
+            and previous["status"] == "completed"
+            and same_version(previous["version"], version)
+        ):
+            try:
+                results[identifier] = _saved_ocr(previous, row)
+            except _INVALID:
+                note(
+                    row,
+                    "unknown",
+                    "unknown",
+                    "OCR_PREVIOUS_EVIDENCE_INVALID",
+                    report=previous.get("report"),
+                )
+            continue
+        if store.suppressed(identifier, "ocr", version):
+            note(
+                row,
+                "unknown",
+                "unknown",
+                "VERSION_ATTEMPT_SUPPRESSED",
+                report=(previous or {}).get("report"),
+            )
+            continue
+        if existing:
+            raise ValueError("Saved OCR batch does not cover the frozen candidates")
+        pending.append(row)
+    if existing is None and pending:
+        original_ids = [row["document_id"] for row in pending]
+        prepared = []
+        for row in pending:
+            try:
+                prepared.append(_prepare(root, row))
+            except (OSError, ValueError) as error:
+                rejected[row["document_id"]] = str(error)
+                note(
+                    row,
+                    "skipped",
+                    "not_sent",
+                    "OCR_INPUT_PREPARATION_FAILED",
+                    report=str(request_path),
+                )
+        existing = {
+            "schema": "dogpdkb-ocr-request-3",
+            "run_id": run.id,
+            "policy": policy,
+            "initial_ids": original_ids,
+            "documents": prepared,
+            "rejected": rejected,
+            # Directory-source snapshots must not introduce live resource reads.
+            "download": any("directory_snapshot" not in row for row in pending),
+        }
+        atomic_json(request_path, existing, durable=True)
+        enrolled = _index(prepared)
+    if existing is not None:
+        if (
+            existing["schema"] != "dogpdkb-ocr-request-3"
+            or existing["run_id"] != run.id
+            or existing["policy"] != policy
+        ):
+            raise ValueError("Saved OCR batch does not match the frozen run policy")
+        run.data["artifacts"]["ocr_request"] = str(request_path)
+    validate_inputs(rows)
+    if enrolled and existing is not None:
+
+        def invoke(name, args):
+            return call_tool(settings, run, name, args, command=policy["command"])
+
+        seal = _execute(root, existing, store, run, invoke)
+        validate_inputs(rows)
+        report, plan, docs, records = None, {}, {}, {}
+        batch_reason = seal["reason"]
+        try:
+            report = _settled_report(root, seal)
+            if report is not None:
+                plan, docs = _load_plan(root, existing)
+                records = _index(report["documents"])
+                reports = run.data["artifacts"]
+                reports["ocr_report"] = str(root / seal["report"])
+        except _INVALID:
+            report, batch_reason = None, "OCR_RESULT_BINDING_INVALID"
+        artifacts = run.data["artifacts"]
+        for key, path in [
+            ("ocr_plan", root / "plan.json"),
+            ("ocr_journal", root / "plan.json.execution.json"),
+            ("ocr_report", root / "result.json"),
+        ]:
+            if path.is_file():
+                artifacts.setdefault(key, str(path))
+        for row in candidates:
+            identifier = row["document_id"]
+            if identifier not in enrolled:
+                continue
+            entry = enrolled[identifier]
+            result = None
+            if report is None:
+                status, send = (
+                    ("unknown", "unknown")
+                    if seal["dispatched"]
+                    else ("skipped", "not_sent")
+                )
+                reason = batch_reason or "OCR_RESULT_UNAVAILABLE"
+            else:
+                try:
+                    result, status, send, reason = _verified_result(
+                        root, plan, docs[entry["path"]], entry, records[entry["path"]]
+                    )
+                except _INVALID:
+                    status, send, reason = (
+                        "unknown",
+                        "unknown",
+                        "OCR_ROW_BINDING_INVALID",
+                    )
+            if result:
+                results[identifier] = result
+            # Held/unattempted rows of a terminal batch never run again on
+            # that plan, but a new batch can admit demonstrably unsent work.
+            observed[identifier] = {
+                "doc_id": identifier,
+                "name": "ocr",
+                "version": row["version"],
+                "run_id": run.id,
+                "status": status,
+                "send_state": send,
+                "exit_code": seal["exit_code"],
+                "input": str(request_path),
+                "report": artifacts.get("ocr_report"),
+                "seal_sha256": file_digest(seal_path),
+                "reason": reason,
+                "input_sha256": entry["source_sha256"],
+            }
+            note(
+                row,
+                status,
+                send,
+                reason,
+                report=artifacts.get("ocr_report"),
+                reports=[
+                    artifacts[key]
+                    for key in ("ocr_request", "ocr_plan", "ocr_journal")
+                    if key in artifacts
+                ],
+                exit_code=seal["exit_code"],
+            )
+        store.complete_batch(observed.values())
+        run.data["failures"] = [
+            item for item in run.data["failures"]
+            if not (
+                item.get("step") == "ocr"
+                and item.get("reason") == "CALL_INTERRUPTED"
+                and item.get("document_id") in observed
+            )
+        ]
+    run.stage(
+        "ocr",
+        total=len(candidates),
+        completed=sum(r["status"] == "completed" for r in results.values()),
+        failed=sum(r["status"] != "completed" for r in results.values()),
+    )
+    return results

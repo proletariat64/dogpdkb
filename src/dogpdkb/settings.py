@@ -100,6 +100,21 @@ class Settings:
     body_recovery: Path | None = None
     semantic_score_request_budget: int = 0
     semantic_score_model: str | None = None
+    ocr_mode: str = "llm"
+    ocr_request_budget: int | None = None
+
+    def ocr_policy(self) -> dict:
+        llm = self.ocr_mode == "llm"
+        return {
+            "mode": self.ocr_mode,
+            "model": "openai/gpt-6.1-terra" if llm else None,
+            "effort": "medium" if llm else None,
+            "concurrency": 3,
+            "request_budget": self.ocr_request_budget,
+            "max_seconds": self.ocr_budget_seconds,
+            "cache_dir": str(self.ocr_cache),
+            "command": self.command("mdocr"),
+        }
 
     def graph_for(self, book: Book) -> Path:
         return self.graph_dir or book.corpus / "graphify-out"
@@ -227,6 +242,14 @@ def load_config(path: Path | str | None = None) -> Settings:
         )
     if model is not None and (not isinstance(model, str) or not model.strip()):
         raise ConfigError("semantic_score.model: expected provider/model")
+    ocr = data.get("ocr", {})
+    ocr_mode, ocr_requests = ocr.get("mode", "llm"), ocr.get("request_budget")
+    if ocr_mode not in ("llm", "paddle"):
+        raise ConfigError("ocr.mode: expected llm or paddle")
+    if ocr_requests is not None and (type(ocr_requests) is not int or ocr_requests < 0):
+        raise ConfigError("ocr.request_budget: expected a nonnegative integer")
+    if ocr_mode == "paddle" and ocr_requests is not None:
+        raise ConfigError("ocr.request_budget: only supported in llm mode")
     return Settings(
         file=selected,
         books_file=(selected.parent / Path(books).expanduser()).resolve(),
@@ -245,6 +268,8 @@ def load_config(path: Path | str | None = None) -> Settings:
         proxy_bin=proxy,
         timeout_seconds=number("skylark", "timeout_seconds", 60),
         ocr_budget_seconds=number("ocr", "budget_seconds", 1800),
+        ocr_mode=ocr_mode,
+        ocr_request_budget=ocr_requests,
         body_recovery=configured_path("body_recovery"),
         semantic_score_request_budget=score_requests,
         semantic_score_model=model,

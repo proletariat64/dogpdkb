@@ -337,8 +337,6 @@ raise SystemExit(subprocess.call([sys.executable,'-m',module,*args]))
         "mdcompare compare",
         "mdocr plan",
         "mdocr run",
-        "mdocr plan",
-        "mdocr run",
     ]
 
 
@@ -400,7 +398,7 @@ def test_interrupted_export_does_not_suppress_later_unstarted_source(tmp_path):
     assert (tmp_path / "events").read_text().splitlines() == ["export"]
 
 
-def test_shared_ocr_stop_preserves_unattempted_sources_for_later_run(tmp_path):
+def test_invalid_ocr_row_does_not_erase_a_verified_peer(tmp_path):
     config, differences = instance(tmp_path)
     two_sources(tmp_path, differences)
     original = config.read_text()
@@ -428,19 +426,11 @@ raise SystemExit(2)
     assert result.returncode == 2, result.stderr
     manifest = json.loads(Path(json.loads(result.stdout)["manifest"]).read_text())
     assert manifest["documents"][1]["pending_steps"] == []
-    assert any(
-        f["step"] == "ocr" and f["document_id"] == team_id("43")
-        for f in manifest["failures"]
-    )
+    assert {f["document_id"] for f in manifest["failures"] if f["step"] == "ocr"} == {
+        team_id("42")
+    }
     state = json.loads((tmp_path / "state" / "funds" / "state.json").read_text())
-    assert state["documents"][team_id("42")]["steps"]["ocr"]["status"] == "failed"
-    assert "ocr" not in state["documents"][team_id("43")]["steps"]
-    config.write_text(original)
-    next_run = cli("apply", "--config", config, "--input", differences)
-    assert next_run.returncode == 2, next_run.stderr
-    manifest = json.loads(Path(json.loads(next_run.stdout)["manifest"]).read_text())
-    assert manifest["documents"][1]["pending_steps"] == []
-    state = json.loads((tmp_path / "state" / "funds" / "state.json").read_text())
+    assert state["documents"][team_id("42")]["steps"]["ocr"]["status"] == "unknown"
     assert state["documents"][team_id("43")]["steps"]["ocr"]["status"] == "completed"
 
 
@@ -631,6 +621,7 @@ def test_image_selection_is_owned_by_mdocr(tmp_path, monkeypatch, suffix):
 
     monkeypatch.delenv("PADDLEOCR_TOKEN", raising=False)
     config, differences = instance(tmp_path)
+    config.write_text(config.read_text() + '\n[ocr]\nmode="paddle"\n')
     image = tmp_path / "image space.png"
     Image.new("RGB", (8, 8), "red").save(image)
     remote = json.loads((tmp_path / "remote.json").read_text())
