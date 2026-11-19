@@ -1,8 +1,8 @@
 # graph-proof
 
-Status: ready-for-integration
+Status: integrated
 
-Progress: implemented in `work/sync-redesign-03`; not integrated.
+Progress: integrated in Draft PR #36 at `91d1bfd`; integrated UAT pending.
 
 Blocked by: none
 
