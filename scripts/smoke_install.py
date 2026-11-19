@@ -111,7 +111,7 @@ def inspect_artifacts(wheel: Path, sdist: Path) -> None:
         "mdcompare/semantic_score_prompt.txt",
         "mdocr/cli.py",
         "mdocr/doctor.py",
-        "mdocr/batch.py",
+        "mdocr/runner.py",
         "mdocr/help.py",
         "mdcompare/help.py",
         "dogpdkb/help.py",

@@ -1,5 +1,9 @@
 # mdocr original requirements
 
+> Historical reference only. The OCR commands described here were retired.
+> Current workflow: `mdocr plan` → `mdocr run`; see `mdocr plan --help --full`.
+
+
 i have scripts/paddleocr_convert.py use paddle ocr api to convert pictures inside a markdown.
 
 now i want to upgrade it into a cli 'mdocr'

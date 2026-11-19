@@ -1,5 +1,9 @@
 # `mdocr` CLI specification
 
+> Historical reference only. The OCR commands described here were retired.
+> Current workflow: `mdocr plan` → `mdocr run`; see `mdocr plan --help --full`.
+
+
 Status: approved design, awaiting implementation.
 
 ## Purpose

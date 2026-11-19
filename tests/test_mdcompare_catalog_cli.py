@@ -4,8 +4,6 @@ import json
 import subprocess
 import sys
 
-from PIL import Image
-
 
 def catalog(tmp_path, body, *, resources=None, provenance=None, historical=False):
     raw = tmp_path / "raw.md"
@@ -63,53 +61,28 @@ def test_catalog_does_not_use_local_bytes_for_protocol_relative_remote(tmp_path)
     assert "path" not in row["resources"][0]
 
 
-def test_catalog_preserves_verified_historical_source_inventory_and_paths(tmp_path):
-    Image.new("RGB", (8, 8), "red").save(tmp_path / "a.png")
-    Image.new("RGB", (8, 8), "red").save(tmp_path / "prepared.jpg")
-    (tmp_path / "source.md").write_text("Before\n![image](a.png)\nAfter\n")
-    (tmp_path / "artifact.md").write_text("Recognized text")
-    enriched = (
-        'Before\n<!-- mdocr:ocr-begin source="prepared.jpg" -->\n\n'
-        "Recognized text\n\n> Original image: [prepared.jpg](prepared.jpg)\n\n"
-        "<!-- mdocr:ocr-end -->\nAfter\n"
-    )
-    provenance = {
-        "contract": "mdocr-raw-snapshot-v1",
-        "raw_path": "source.md",
-        "blocks": [
-            {
-                "resource_id": "original",
-                "raw_start_byte": 7,
-                "raw_end_byte": 22,
-                "prepared_image": "prepared.jpg",
-                "artifact_path": "artifact.md",
-                "source_reference": "prepared.jpg",
-            }
-        ],
-    }
+def test_catalog_does_not_open_legacy_raw_snapshot(tmp_path):
     result, row = catalog(
         tmp_path,
-        enriched,
+        "Before\nAfter\n",
         historical=True,
-        provenance=provenance,
+        provenance={
+            "contract": "mdocr-raw-snapshot-v1",
+            "raw_path": "absent.md",
+            "blocks": [],
+        },
         resources=[
             {
                 "resource_id": "original",
                 "kind": "image",
                 "url": "a.png",
                 "path": "a.png",
-            },
+            }
         ],
     )
     assert result.returncode == 0, result.stderr
-    assert [(r["resource_id"], r["url"]) for r in row["resources"]] == [
-        ("original", "a.png")
-    ]
-    assert row["provenance"]["raw_path"] == str(tmp_path / "source.md")
-    block = row["provenance"]["blocks"][0]
-    assert block["prepared_image"] == str(tmp_path / "prepared.jpg")
-    assert block["artifact_path"] == str(tmp_path / "artifact.md")
-    assert block["source_reference"] == "prepared.jpg"
+    assert row["resources"][0]["path"] == str(tmp_path / "a.png")
+    assert row["resources"][0]["resource_id"] == "original"
 
 
 def test_catalog_builds_manifest_without_fetching_remote_resources(tmp_path):
@@ -194,12 +167,11 @@ def test_catalog_preserves_declared_evidence_when_output_moves(tmp_path):
                             }
                         ],
                         "ocr": {
-                            "contract": "prepared-jpeg-ocr-v1",
+                            "contract": "mdocr-ocr-2",
                             "images": [
                                 {
                                     "resource_id": "stable-id",
                                     "source_path": "original.png",
-                                    "prepared_image": "prepared.jpg",
                                     "artifact": "ocr.md",
                                 }
                             ],
@@ -232,7 +204,6 @@ def test_catalog_preserves_declared_evidence_when_output_moves(tmp_path):
     image = row["ocr"]["images"][0]
     for key, filename in [
         ("source_path", "original.png"),
-        ("prepared_image", "prepared.jpg"),
         ("artifact", "ocr.md"),
     ]:
         assert image[key] == str(tmp_path / filename)

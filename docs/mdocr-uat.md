@@ -1,5 +1,9 @@
 # mdocr UAT 报告
 
+> Historical reference only. The OCR commands described here were retired.
+> Current workflow: `mdocr plan` → `mdocr run`; see `mdocr plan --help --full`.
+
+
 Status: 通过 · Date: 2026-08-30 · Commit: `f319c59 feat(mdocr): control supported image formats`
 
 ## 测试对象

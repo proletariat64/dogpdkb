@@ -302,3 +302,73 @@ def test_distinct_plans_cannot_share_a_live_result(tmp_path):
             thread.join()
         assert result[0].returncode == 0, result[0].stderr
         assert calls == [1]
+
+
+def test_paddle_and_llm_publish_same_v2_block_shape(tmp_path, monkeypatch):
+    from mdocr import runner
+    from mdocr.cli import main
+
+    class LocalLlm:
+        def __init__(self, *_args):
+            pass
+
+        def preflight(self):
+            return {"ok": True}
+
+        def convert(self, _body, images, _prompt):
+            return {
+                "patches": [
+                    {
+                        "id": image["id"],
+                        "kind": "text",
+                        "markdown": "Recognized.",
+                        "uncertainty": "",
+                    }
+                    for image in images
+                ],
+                "usage_tokens": None,
+            }
+
+    monkeypatch.setattr(runner, "LlmClient", LocalLlm)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PADDLEOCR_TOKEN", "synthetic-only")
+    corpus(tmp_path, 1)
+    blocks = {}
+    with service() as (endpoint, calls):
+        for mode in ("paddle", "llm"):
+            plan = f"{mode}-plan.json"
+            result = f"{mode}-result.json"
+            output = f"{mode}.md"
+            extra = ["--endpoint", endpoint] if mode == "paddle" else []
+            assert (
+                main(
+                    [
+                        "plan",
+                        "--mode",
+                        mode,
+                        "--input",
+                        "source/0.md",
+                        "--output",
+                        output,
+                        "--plan",
+                        plan,
+                        *extra,
+                    ]
+                )
+                == 0
+            )
+            assert main(["run", "--plan", plan, "--result", result]) == 0
+            evidence = json.loads(Path(result).read_bytes())["documents"][0]["ocr"]
+            assert evidence["contract"] == "mdocr-ocr-2"
+            (image,) = evidence["images"]
+            block = Path(image["artifact"]).read_bytes()
+            assert image["artifact_sha256"] == hashlib.sha256(block).hexdigest()
+            assert block in Path(output).read_bytes()
+            assert block.startswith(b"<!-- mdocr:ocr-begin v=2 id=")
+            assert (
+                f"> Original image: [source](<{tmp_path / 'source/0.png'}>)".encode()
+                in block
+            )
+            blocks[mode] = block.replace(f"mode={mode}".encode(), b"mode=engine", 1)
+    assert blocks["paddle"] == blocks["llm"]
+    assert calls == [1]

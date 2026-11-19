@@ -17,17 +17,13 @@ remote content was downloaded or inspected. Resources keep stable IDs where
 matching declared evidence exists. A colliding declared ID for a different URL
 fails with RESOURCE_ID_COLLISION.
 
-OCR source_path, prepared_image and artifact fields, and supported provenance
-raw_path, prepared_image and artifact_path fields are resolved against the
-manifest directory. Local Markdown targets resolve against the Markdown parent.
-No URLs are fetched. Original Markdown, resources and all declared evidence
-remain read-only. Output parents are created. The output cannot alias any of
-these inputs; it is staged privately and atomically replaced on success.
+OCR source_path and artifact fields are resolved against the input manifest.
+Local Markdown targets resolve against the Markdown parent. No URLs are fetched.
+Output parents are created; output cannot alias an input file.
 
-A historical_enriched document with mdocr-raw-snapshot-v1 provenance is inventoried
-from its verified raw source view. Other historical declarations are preserved
-as evidence, not treated as a reconstructed raw source. Unsupported resource
-syntax is retained in resource_warnings and cannot establish completeness.
+Historical-enriched declarations are retained; catalog inventories the
+supplied Markdown without reconstructing a raw source view.
+Unsupported resource syntax is retained in resource_warnings and cannot establish completeness.
 
 Limits: 16 MiB per manifest/document/evidence file; at most 10,000 resource
 declarations or occurrences and cumulative resource syntax work estimate

@@ -71,12 +71,10 @@ synthesized. The emitted document object contains:
   string), url (target string), kind (image, attachment or media), optional
   absolute path when local bytes exist, and any declared evidence fields. For matching OCR
   evidence, path points to retained original bytes rather than disposable wash.
-- ocr: optional prepared-jpeg-ocr-v1 evidence object from mdocr batch, omitted
-  when no evidence object is available. Its contract is prepared-jpeg-ocr-v1;
-  preprocessing contains name/version, configuration contains engine/model/
-  jpeg_quality, and images is an array of successful records with resource_id,
-  status success, and absolute source_path/prepared_image/artifact strings.
-  An empty images array does not itself mean all OCR was attempted or completed.
+- ocr: optional mdocr-ocr-2 evidence from mdocr run, omitted when unavailable.
+  Includes effective configuration and successful resource records bound to
+  original image and OCR-block files by SHA-256. An empty images array does
+  not prove all OCR work was attempted or completed.
 - baseline_version: normalized version object or null when the comparison
   baseline has no known version. previous_graph: prior graph-facts object, empty
   when no graph facts exist. Both fields are emitted even without prior success.

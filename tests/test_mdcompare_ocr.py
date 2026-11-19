@@ -1,5 +1,6 @@
 """OCR reuse is verified through independently invoked offline CLI."""
 
+import hashlib
 from copy import deepcopy
 
 import pytest
@@ -14,25 +15,25 @@ def captured_pair(tmp_path):
     markdown.write_text("![limit](limit.png)")
     original = tmp_path / "original.png"
     Image.new("RGB", (20, 20), "white").save(original)
-    prepared = tmp_path / "prepared.jpg"
-    Image.new("RGB", (20, 20), "white").save(prepared)
+    source_hash = hashlib.sha256(original.read_bytes()).hexdigest()
     artifact = tmp_path / "ocr.md"
     artifact.write_text(
-        '<!-- mdocr:ocr-begin source="prepared.jpg" -->\n\n'
-        "Limit 100k\n\n> Original image: [prepared.jpg](prepared.jpg)\n\n"
-        "<!-- mdocr:ocr-end -->"
+        "<!-- mdocr:ocr-begin v=2 id=img-1 -->\n"
+        f"<!-- mdocr:meta mode=paddle sha256={source_hash} -->\n"
+        "> Original image: [source](<limit.png>)\n\n"
+        "Limit 100k\n<!-- mdocr:ocr-end -->"
     )
     record = {
         "resource_id": "limit",
         "source_path": str(original),
-        "prepared_image": str(prepared),
+        "source_sha256": source_hash,
         "status": "success",
         "artifact": str(artifact),
+        "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
     }
     evidence = {
-        "contract": "prepared-jpeg-ocr-v1",
-        "preprocessing": {"name": "mdocr", "version": "1"},
-        "configuration": {"engine": "offline-fixture", "model": "v1"},
+        "contract": "mdocr-ocr-2",
+        "configuration": {"mode": "paddle"},
         "images": [record],
     }
     baseline = document(
@@ -41,8 +42,6 @@ def captured_pair(tmp_path):
         ocr=evidence,
     )
     incoming = deepcopy(baseline)
-    incoming["ocr"]["images"][0].pop("status")
-    incoming["ocr"]["images"][0].pop("artifact")
     return baseline, incoming
 
 
@@ -142,30 +141,16 @@ def test_verified_ocr_keeps_independent_changes(tmp_path, change, action):
 @pytest.mark.parametrize(
     "mutation,reason",
     [
-        ("prepared", "OCR_PREPARED_IMAGE_CHANGED"),
-        ("invalid-jpeg", "OCR_PREPARED_IMAGE_INVALID"),
-        ("preprocessing", "OCR_CONFIGURATION_INCOMPATIBLE"),
         ("configuration", "OCR_CONFIGURATION_INCOMPATIBLE"),
-        ("missing-artifact", "OCR_ARTIFACT_UNAVAILABLE"),
-        ("empty-artifact", "OCR_ARTIFACT_EMPTY"),
+        ("changed-artifact", "OCR_ARTIFACT_CHANGED"),
         ("failed", "OCR_SUCCESS_RECORD_UNSUCCESSFUL"),
     ],
 )
 def test_known_unusable_ocr_requires_processing(tmp_path, mutation, reason):
     baseline, incoming = captured_pair(tmp_path)
-    if mutation == "prepared":
-        prepared = tmp_path / "other.jpg"
-        Image.new("RGB", (20, 20), "black").save(prepared)
-        incoming["ocr"]["images"][0]["prepared_image"] = str(prepared)
-    elif mutation == "invalid-jpeg":
-        prepared = tmp_path / "fake.jpg"
-        Image.new("RGB", (20, 20), "white").save(prepared, format="PNG")
-        incoming["ocr"]["images"][0]["prepared_image"] = str(prepared)
-    elif mutation in ("preprocessing", "configuration"):
-        incoming["ocr"][mutation]["version"] = "incompatible"
-    elif mutation == "missing-artifact":
-        (tmp_path / "ocr.md").unlink()
-    elif mutation == "empty-artifact":
+    if mutation == "configuration":
+        incoming["ocr"]["configuration"]["version"] = "incompatible"
+    elif mutation == "changed-artifact":
         p = tmp_path / "ocr.md"
         p.write_text(p.read_text().replace("Limit 100k", ""))
     else:
@@ -194,11 +179,11 @@ def test_configuration_types_cannot_authorize_reuse(tmp_path, before, after):
     [
         ("missing-source", "OCR_SOURCE_MAPPING_INCOMPLETE"),
         ("wrong-source", "OCR_SOURCE_MAPPING_MISMATCH"),
-        ("wrong-block-source", "OCR_ARTIFACT_MAPPING_MISMATCH"),
+        ("wrong-image-sha", "OCR_ARTIFACT_MAPPING_INVALID"),
         ("unmarked-artifact", "OCR_ARTIFACT_MAPPING_INVALID"),
         ("missing-config", "OCR_CONFIGURATION_UNVERIFIED"),
         ("duplicate-record", "OCR_PROVENANCE_INCOMPLETE"),
-        ("missing-prepared-file", "INPUT_READ_FAILED"),
+        ("missing-artifact-file", "INPUT_READ_FAILED"),
     ],
 )
 def test_unverifiable_ocr_stays_unknown(tmp_path, mutation, reason):
@@ -210,17 +195,20 @@ def test_unverifiable_ocr_stays_unknown(tmp_path, mutation, reason):
         other = tmp_path / "other.png"
         other.write_bytes(b"not the captured original")
         record["source_path"] = str(other)
-    elif mutation == "wrong-block-source":
+    elif mutation in {"wrong-image-sha", "unmarked-artifact"}:
         p = tmp_path / "ocr.md"
-        p.write_text(p.read_text().replace("prepared.jpg", "unrelated.jpg"))
-    elif mutation == "unmarked-artifact":
-        (tmp_path / "ocr.md").write_text("Limit 100k")
+        p.write_text(
+            p.read_text().replace(record["source_sha256"], "0" * 64)
+            if mutation == "wrong-image-sha"
+            else "Limit 100k"
+        )
+        record["artifact_sha256"] = hashlib.sha256(p.read_bytes()).hexdigest()
     elif mutation == "missing-config":
         incoming["ocr"].pop("configuration")
     elif mutation == "duplicate-record":
         baseline["ocr"]["images"].append(deepcopy(record))
     else:
-        (tmp_path / "prepared.jpg").unlink()
+        (tmp_path / "ocr.md").unlink()
     result, report = invoke(tmp_path, [baseline], [incoming])
     assert report is not None
     row = report["results"][0]
@@ -253,22 +241,6 @@ def test_known_attachment_does_not_need_image_ocr(tmp_path):
     assert result.returncode == 0
     assert report["results"][0]["action"] == "SKIP_VERIFIED"
     assert report["results"][0]["ocr"]["status"] == "NOT_APPLICABLE"
-
-
-def test_prepared_image_validation_budget_stays_unknown(tmp_path):
-    baseline, incoming = captured_pair(tmp_path)
-    path = tmp_path / "large.jpg"
-    data = bytearray((tmp_path / "prepared.jpg").read_bytes())
-    frame = data.index(b"\xff\xc0")
-    data[frame + 5 : frame + 9] = b"\x17\x70\x17\x70"  # 6000 x 6000 header
-    path.write_bytes(data)
-    incoming["ocr"]["images"][0]["prepared_image"] = str(path)
-    result, report = invoke(tmp_path, [baseline], [incoming])
-    assert report is not None
-    row = report["results"][0]
-    assert result.returncode == 2
-    assert row["action"] == "UNKNOWN"
-    assert "OCR_PREPARED_IMAGE_BUDGET_EXCEEDED" in row["reason_codes"]
 
 
 def test_mixed_unknown_keeps_verified_per_image_reuse(tmp_path):
@@ -305,20 +277,6 @@ def test_new_image_is_processing_work_not_a_duplicate(tmp_path):
     assert row["ocr"]["processing_required"] == ["limit"]
 
 
-def test_cyclic_artifact_image_reference_is_private_unknown(tmp_path):
-    baseline, incoming = captured_pair(tmp_path)
-    (tmp_path / "loop-a").symlink_to("loop-b")
-    (tmp_path / "loop-b").symlink_to("loop-a")
-    artifact = tmp_path / "ocr.md"
-    artifact.write_text(artifact.read_text().replace("prepared.jpg", "loop-a"))
-    result, report = invoke(tmp_path, [baseline], [incoming])
-    assert report is not None
-    assert result.returncode == 2
-    assert report["results"][0]["action"] == "UNKNOWN"
-    assert "OCR_ARTIFACT_MAPPING_UNVERIFIED" in report["results"][0]["reason_codes"]
-    assert result.stdout == result.stderr == ""
-
-
 @pytest.mark.parametrize("obsolete_records", ["malformed", "oversized"])
 def test_changed_image_does_not_validate_obsolete_ocr_inventory(
     tmp_path, obsolete_records
@@ -338,3 +296,13 @@ def test_changed_image_does_not_validate_obsolete_ocr_inventory(
     assert row["action"] == "PROCESS_CHANGED_RESOURCES"
     assert row["ocr"]["processing_required"] == ["limit"]
     assert row["ocr"]["reusable"] == []
+
+
+def test_v1_ocr_evidence_cannot_authorize_reuse(tmp_path):
+    baseline, incoming = captured_pair(tmp_path)
+    baseline["ocr"]["contract"] = "prepared-jpeg-ocr-v1"
+    baseline["ocr"]["images"][0]["artifact"] = str(tmp_path / "not-opened.md")
+    result, report = invoke(tmp_path, [baseline], [incoming])
+    assert result.returncode == 2
+    assert report["results"][0]["ocr"]["reusable"] == []
+    assert "OCR_PROVENANCE_INCOMPLETE" in report["results"][0]["reason_codes"]

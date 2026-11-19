@@ -44,8 +44,7 @@ def test_atomic_write_long_name(tmp_path, monkeypatch, long_name):
     assert list(destination.parent.iterdir()) == [destination]
 
 
-def test_ocr_cli_long_name(tmp_path, long_name, patch_client, ocr_env):
-    patch_client()
+def test_prepare_cli_long_name(tmp_path, long_name):
     source = tmp_path / long_name
     content = "# Whale Configuration MCP\n测试内容\n"
     source.write_text(content, encoding="utf-8")
@@ -54,7 +53,9 @@ def test_ocr_cli_long_name(tmp_path, long_name, patch_client, ocr_env):
     (output / long_name).write_text("old", encoding="utf-8")
 
     assert (
-        cli.main(["ocr", "-o", str(output), "--download", "--force", "-f", str(source)])
+        cli.main(
+            ["prepare", "-o", str(output), "--download", "--force", "-f", str(source)]
+        )
         == 0
     )
     assert (output / long_name).read_text(encoding="utf-8") == content

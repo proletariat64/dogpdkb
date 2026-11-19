@@ -33,7 +33,7 @@ TOML 路径相对配置，来源 corpus 相对 books.json，凭证保持工具�
 
 需要具备的公开工具合同：
 
-- [mdcompare catalog/knowledge/compare 与 mdocr batch](orchestrator-tool-contracts.md)。
+- [mdcompare catalog/knowledge/compare 与 mdocr plan/run](orchestrator-tool-contracts.md)。
 - [Graphify 原版 extract](orchestrator-graphify-contract.md)，使用目录级原生增量及隔离输出。
 - [Skylark listing/export](orchestrator-skylark-contract.md)，使用已恢复的独立 CLI。
 

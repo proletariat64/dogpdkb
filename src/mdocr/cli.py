@@ -112,112 +112,49 @@ def build_parser(*, full: bool = False) -> argparse.ArgumentParser:
     run.add_argument("--result", required=True)
     run.add_argument("--retry-failed", action="store_true")
 
-    for name, help_text in (
-        ("prepare", "copy Markdown with local Prepared image JPEGs; no model calls"),
-        ("ocr", "replace eligible image embeds with marked PaddleOCR results"),
-    ):
-        contract = contracts.PREPARE if name == "prepare" else contracts.OCR
-        full_contract = (
-            contracts.PREPARE_FULL if name == "prepare" else contracts.OCR_FULL
-        )
-        command = sub.add_parser(
-            name,
-            help=help_text,
-            description=help_text,
-            epilog=contract + ("\n" + full_contract if full else ""),
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-        )
-        command.add_argument(
-            "--full",
-            action="store_true",
-            help="with -h/--help, show the full local contract",
-        )
-        command.add_argument(
-            "-f",
-            "--file",
-            required=True,
-            nargs="+",
-            metavar="FILE",
-            help="required Markdown file(s); paths relative to cwd; basenames must be unique",
-        )
-        command.add_argument(
-            "-o",
-            "--output-dir",
-            required=True,
-            type=Path,
-            metavar="DIR",
-            help="required directory for output Markdown and Prepared image JPEGs; relative to cwd",
-        )
-        command.add_argument(
-            "--download",
-            action="store_true",
-            help="download eligible HTTP(S) images; default: retain remote links with warnings",
-        )
-        command.add_argument(
-            "--format",
-            action="append",
-            default=[],
-            metavar="EXT[,EXT...]",
-            help="add Pillow-readable extensions to PNG/WebP/GIF/JPEG/TIFF defaults; repeatable",
-        )
-        command.add_argument(
-            "--force",
-            action="store_true",
-            help=(
-                "overwrite existing output Markdown; never submits OCR jobs"
-                if name == "prepare"
-                else "overwrite output Markdown and re-OCR existing blocks from their local JPEGs"
-            ),
-        )
-    batch = sub.add_parser(
-        "batch",
-        help="process a JSON OCR manifest with cached successes and structured outcomes",
-        description="Process a JSON OCR manifest and report per-resource outcomes.",
-        epilog=contracts.BATCH + ("\n" + contracts.BATCH_FULL if full else ""),
+    command = sub.add_parser(
+        "prepare",
+        help="copy Markdown with local Prepared image JPEGs; no model calls",
+        epilog=contracts.PREPARE + ("\n" + contracts.PREPARE_FULL if full else ""),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    batch.add_argument(
+    command.add_argument(
         "--full",
         action="store_true",
         help="with -h/--help, show the full local contract",
     )
-    batch.add_argument(
-        "--manifest",
-        type=Path,
+    command.add_argument(
+        "-f",
+        "--file",
         required=True,
-        help="required mdocr-batch-input-1.0 JSON manifest; path relative to cwd",
+        nargs="+",
+        metavar="FILE",
+        help="required Markdown file(s); paths relative to cwd; basenames must be unique",
     )
-    batch.add_argument(
+    command.add_argument(
+        "-o",
         "--output-dir",
-        type=Path,
         required=True,
-        help="required directory for enriched Markdown and Prepared image JPEGs; outputs replaced",
-    )
-    batch.add_argument(
-        "--report",
         type=Path,
-        required=True,
-        help="required mdocr-batch-1.0 JSON report path; atomically replaced",
+        metavar="DIR",
+        help="required directory for output Markdown and Prepared image JPEGs; relative to cwd",
     )
-    batch.add_argument(
-        "--cache-dir",
-        type=Path,
-        help="persistent successful OCR cache; default: OUTPUT_DIR/.cache; paths relative to cwd",
-    )
-    batch.add_argument(
+    command.add_argument(
         "--download",
         action="store_true",
-        help="download eligible HTTP(S) images, including cache checks; default: disabled",
+        help="download eligible HTTP(S) images; default: retain remote links with warnings",
     )
-    batch.add_argument(
-        "--endpoint",
-        help="compatible PaddleOCR jobs URL; default: official PaddleOCR endpoint",
+    command.add_argument(
+        "--format",
+        action="append",
+        default=[],
+        metavar="EXT[,EXT...]",
+        help="add Pillow-readable extensions to PNG/WebP/GIF/JPEG/TIFF defaults; repeatable",
     )
-    batch.add_argument(
-        "--max-seconds",
-        type=float,
-        default=900,
-        help="finite nonnegative batch wall-time budget in seconds; default: 900; 0 stops selected work",
+    command.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite existing output Markdown; never submits OCR jobs",
     )
     return parser
 
@@ -233,8 +170,6 @@ def _validate(args: argparse.Namespace) -> list[Path]:
         raise CliError(
             "duplicate input basenames would collide: " + ", ".join(duplicates)
         )
-    if args.command == "ocr" and not os.environ.get("PADDLEOCR_TOKEN"):
-        raise CliError("missing PADDLEOCR_TOKEN environment variable")
     return files
 
 
@@ -288,19 +223,12 @@ def _check_output_collisions(files: list[Path], args: argparse.Namespace) -> Non
 def run_command(args: argparse.Namespace) -> int:
     import requests
 
-    from .ocr import ocr_document
-    from .paddle import PaddleClient
     from .prepare import prepare_document
 
     files = _validate(args)
     enabled_extensions = _enabled_extensions(args.format)
     _check_output_collisions(files, args)
     session = requests.Session()
-    client = (
-        PaddleClient(os.environ["PADDLEOCR_TOKEN"], session=session)
-        if args.command == "ocr"
-        else None
-    )
 
     failed = False
     for md_file in files:
@@ -311,28 +239,14 @@ def run_command(args: argparse.Namespace) -> int:
             failed = True
             continue
         try:
-            if args.command == "ocr":
-                if client is None:  # PADDLEOCR_TOKEN validated in _validate
-                    raise CliError("missing PADDLEOCR_TOKEN environment variable")
-                result = ocr_document(
-                    text,
-                    md_file,
-                    args.output_dir,
-                    client,
-                    download=args.download,
-                    force=args.force,
-                    enabled_extensions=enabled_extensions,
-                    session=session,
-                )
-            else:
-                result = prepare_document(
-                    text,
-                    md_file,
-                    args.output_dir,
-                    download=args.download,
-                    enabled_extensions=enabled_extensions,
-                    session=session,
-                )
+            result = prepare_document(
+                text,
+                md_file,
+                args.output_dir,
+                download=args.download,
+                enabled_extensions=enabled_extensions,
+                session=session,
+            )
             output = args.output_dir / md_file.name
             # Re-check at write time: a file created after the upfront collision
             # check must not be silently overwritten without --force.
@@ -396,14 +310,6 @@ def main(argv: list[str] | None = None) -> int:
             return execute_plan(args)
         except (OSError, ValueError, TypeError) as exc:
             print(f"mdocr: run: {exc}", file=sys.stderr)
-            return 1
-    if args.command == "batch":
-        from .batch import run_batch
-
-        try:
-            return run_batch(args)
-        except (OSError, ValueError, TypeError) as exc:
-            print(f"mdocr: batch: {exc}", file=sys.stderr)
             return 1
     try:
         return run_command(args)
