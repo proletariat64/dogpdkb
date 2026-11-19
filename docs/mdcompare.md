@@ -111,19 +111,13 @@ explicit immutable-version contract; a URL alone cannot prove unchanged bytes.
 Resource order, count, titles, alt text and link meaning remain visible. See
 [resource schema and limits](mdcompare-resources.md).
 
-Optional `ocr` supplies captured successful baseline artifacts and desired incoming
-prepared JPEG/configuration evidence. Original resource equality cannot establish
-OCR reuse: source correspondence, usable artifacts, JPEG bytes, preprocessing and
-OCR configuration must independently agree. Missing success/usable output and
-unverifiable provenance have different outcomes. See [OCR schema and action
-priority](mdcompare-ocr.md).
+Optional `ocr` supplies v2 evidence. Original resource equality alone cannot
+establish OCR reuse: verify original-image and OCR-block digests, engine
+configuration and, for LLM output, the context digest. See the [OCR contract](mdcompare-ocr.md).
 
-Declare old OCR-enriched files as `historical_enriched`, never raw. Without retained
-raw and complete verifiable provenance, historical comparisons remain UNKNOWN,
-including equal or contained text. Observed differences are still explained as
-asymmetric input-stage differences. [Historical input schema](mdcompare-history.md)
-describes the narrowly supported exact reconstruction proof; it does not recover
-missing original text or certify publication.
+Declare enriched files as `historical_enriched`, never raw. Strict comparisons
+involving enriched Markdown report observed differences, not verified changes
+between original files. See the [historical input contract](mdcompare-history.md).
 
 ## Output schema 1.0
 
@@ -199,7 +193,6 @@ not just the final action. Common groups are:
   OCR_ARTIFACT_UNAVAILABLE, OCR_ARTIFACT_EMPTY and OCR_*_MAPPING_* or
   OCR_PROVENANCE_INCOMPLETE for unverified correspondence.
 - History: HISTORICAL_RAW_UNAVAILABLE, HISTORICAL_UNMARKED_CONTENT,
-  HISTORICAL_BLOCK_PROVENANCE_INCOMPLETE, HISTORICAL_RECONSTRUCTION_MISMATCH,
   HISTORICAL_PROVENANCE_VERIFIED.
 
 Missing/unreadable dependencies, unsupported syntax and legacy source gaps are

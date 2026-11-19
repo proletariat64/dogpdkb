@@ -22,6 +22,12 @@ mdocr run -h --full
 skylark export -h --full
 ```
 
+`mdocr plan` + `mdocr run` is the only OCR workflow. It supports one file,
+a file list, or a directory, with the same v2 OCR block and evidence format
+for Paddle and LLM. `mdocr prepare` is optional image preprocessing only.
+The legacy OCR commands and v1 evidence are not supported; start a fresh
+build from original Markdown instead of reusing old OCR output.
+
 Check the running environment before processing files:
 
 ```bash

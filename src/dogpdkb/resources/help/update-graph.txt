@@ -6,7 +6,7 @@ version, path to complete published Markdown, input_copy (durable byte witness),
 metadata (name/logical_path/source_ref), action (compile/metadata/reuse), and
 reason_codes. Optional baseline_version/previous_graph freeze prior facts.
 The emitted manifest also carries resources (resource-object array, empty when
-none), optional prepared-jpeg-ocr-v1 ocr evidence, pending_metadata (source
+none), optional mdocr-ocr-2 ocr evidence, pending_metadata (source
 metadata object), and pending_steps ([] or ["ocr"] for a never-started OCR call).
 These preserve source evidence and pending-observation acknowledgement, not a
 request for Graphify to perform OCR. On graph success, nonempty pending_steps

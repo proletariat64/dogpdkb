@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import json
 from collections.abc import Callable
-from pathlib import Path
 
 import pytest
 from PIL import Image
@@ -69,33 +68,6 @@ def paddle_handler(result_markdown: str = "OCR output line", job_id: str = "job-
     return handler
 
 
-class StubClient:
-    """PaddleClient stand-in: records convert calls, returns canned Markdown."""
-
-    def __init__(self, token, session=None, *, fail=None):
-        self.token = token
-        self.calls: list[Path] = []
-        self.fail = fail
-
-    def convert(self, image_path: Path) -> str:
-        self.calls.append(Path(image_path))
-        if self.fail and any(part in Path(image_path).name for part in self.fail):
-            raise RuntimeError("stubbed OCR failure")
-        return f"OCR of {Path(image_path).name}"
-
-
-@pytest.fixture
-def patch_client(monkeypatch):
-    def apply(*, fail=None):
-        from mdocr import paddle
-
-        stub = StubClient("test-token", fail=fail)
-        monkeypatch.setattr(paddle, "PaddleClient", lambda token, session=None: stub)
-        return stub
-
-    return apply
-
-
 def ref_of(markdown: str):
     """Parse the first inline image in a Markdown snippet."""
     from mdocr.markdown import IMAGE_RE, parse_image_match
@@ -110,8 +82,3 @@ def isolated_env(monkeypatch, tmp_path):
     monkeypatch.delenv("PADDLEOCR_TOKEN", raising=False)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "user-state"))
     monkeypatch.delenv("DOGPDKB_UPDATE_LOCK_FD", raising=False)
-
-
-@pytest.fixture
-def ocr_env(monkeypatch):
-    monkeypatch.setenv("PADDLEOCR_TOKEN", "test-token")

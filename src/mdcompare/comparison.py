@@ -90,9 +90,7 @@ def compare_documents(
             _record_error(errors, new, exc, text)
         else:
             try:
-                history = compare_history(
-                    old, new, old_bytes, new_bytes, reader, options
-                )
+                history = compare_history(old, new, old_bytes, new_bytes, options)
                 text = (
                     compare_text(old_bytes, new_bytes, options)
                     if history is None
