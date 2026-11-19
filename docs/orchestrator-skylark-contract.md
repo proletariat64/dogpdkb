@@ -37,7 +37,7 @@ token, so concurrent same-count edits remain a tool limitation.
 ```
 
 The orchestrator's `sync` and `apply --concurrency N` schedule up to N independent
-single-document export calls at once: default 2, allowed values 1, 2 and 3 only.
+single-document export calls at once: default 3, allowed values 1, 2 and 3 only.
 This is a dogpdkb runtime option, not a Skylark flag or TOML setting. Each call has
 its own request/report/raw destination. The main coordinator alone records
 attempts and settled outcomes, validates source identity/version and checkpoints

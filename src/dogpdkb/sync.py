@@ -10,7 +10,12 @@ from pathlib import Path
 from dogpdkb.apply import apply_run, parser_for, record_interruption
 from dogpdkb.discover import DiscoverError
 from dogpdkb.records import Run, Store
-from dogpdkb.settings import load_config, select_book
+from dogpdkb.settings import (
+    DEFAULT_DOWNLOAD_CONCURRENCY,
+    load_config,
+    select_book,
+    select_inputs,
+)
 
 
 def sync_run(
@@ -23,7 +28,7 @@ def sync_run(
     resume=False,
     retry_graph=False,
     replan=False,
-    concurrency=2,
+    concurrency=DEFAULT_DOWNLOAD_CONCURRENCY,
     graphify_inputs="text",
     sources=None,
 ):
@@ -88,8 +93,8 @@ def main(argv=None):
     parser = parser_for("sync")
     try:
         args = parser.parse_args(argv)
-        if args.resume and args.source is not None:
-            parser.error("--source cannot be used with --resume")
+        if args.resume and (args.source is not None or args.dir is not None):
+            parser.error("--source and --dir cannot be used with --resume")
         if args.replan and (not args.resume or not args.retry_graph or args.stop_after):
             parser.error(
                 "--replan requires --resume and --retry-graph without --stop-after"
@@ -102,7 +107,11 @@ def main(argv=None):
     try:
         settings = load_config(args.config)
         book = select_book(settings, args.book)
-        sources = None if args.resume else book.select_sources(args.source)
+        sources = (
+            None
+            if args.resume
+            else select_inputs(settings, book, args.source, args.dir)
+        )
         store = Store(settings, book)
         with store.lock():
             if args.resume:
@@ -111,7 +120,7 @@ def main(argv=None):
                     raise ValueError("run has been cleaned; start a new run")
                 run = previous
             else:
-                run = Run.create(store, "sync")
+                run = Run.create(store, "sync", sources=sources)
             run.data.update(
                 status="running",
                 pid=os.getpid(),

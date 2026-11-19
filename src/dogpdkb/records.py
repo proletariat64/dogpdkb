@@ -13,7 +13,14 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from dogpdkb.settings import Book, Settings, YuqueSource, document_identity
+from dogpdkb.settings import (
+    Book,
+    Settings,
+    Source,
+    YuqueSource,
+    document_identity,
+    source_binding,
+)
 
 STATE_SCHEMA = "dogpdkb-state-2"
 RUN_SCHEMA = "dogpdkb-run-2"
@@ -337,7 +344,25 @@ class Run:
         self.id = data["run_id"]
 
     @classmethod
-    def create(cls, store: Store, command: str):
+    def create(
+        cls, store: Store, command: str, *, sources: tuple[Source, ...] | None = None
+    ):
+        targets = store.run_targets()
+        if sources is not None:
+            bindings = {source.key: source_binding(source) for source in sources}
+            registered = store.data["book"]["sources"]
+            if any(
+                registered[key] != bindings[key]
+                for key in bindings.keys() & registered.keys()
+            ):
+                raise ValueError("selected source binding changed")
+            new_keys = bindings.keys() - registered.keys()
+            registered.update(bindings)
+            if new_keys:
+                # Keep an ad hoc run identifiable even if its first scan fails.
+                # Registration is not an observation or a successful acquisition.
+                store.save()
+            targets["sources"] = bindings
         run_id = f"run-{datetime.now(UTC8):%Y%m%d-%H%M%S}-{uuid4().hex[:8]}"
         directory = store.runs / run_id
         directory.mkdir(parents=True)
@@ -346,7 +371,7 @@ class Run:
             "run_id": run_id,
             "command": command,
             "book": store.data["book"],
-            "targets": store.run_targets(),
+            "targets": targets,
             "pid": os.getpid(),
             "lock": str(store.lock_path),
             "status": "running",
@@ -360,6 +385,8 @@ class Run:
             "artifacts": {},
             "failures": [],
         }
+        if sources is not None:
+            data["sources"] = list(targets["sources"])
         run = cls(store, directory, data)
         run.save()
         return run
@@ -378,7 +405,21 @@ class Run:
             or data.get("book", {}).get("key") != store.book.key
         ):
             raise ValueError("run does not belong to the selected book or schema")
-        if data.get("targets") != store.run_targets():
+        targets = data.get("targets")
+        expected = store.run_targets()
+        if data.get("command") == "sync" and isinstance(targets, dict):
+            frozen = targets.get("sources")
+            known = store.data["book"]["sources"]
+            if (
+                isinstance(frozen, dict)
+                and frozen
+                and all(
+                    key in known and known[key] == binding
+                    for key, binding in frozen.items()
+                )
+            ):
+                expected["sources"] = frozen
+        if targets != expected:
             raise ValueError("run source or write targets changed; generate a new plan")
         return cls(store, path.resolve(), data)
 

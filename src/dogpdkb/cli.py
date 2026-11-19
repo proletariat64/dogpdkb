@@ -34,6 +34,13 @@ def init_config(directory: Path) -> None:
 
 
 def _main(argv: list[str] | None = None) -> int:
+    code = _dispatch(argv)
+    if not isinstance(code, int):
+        raise TypeError("dogpdkb command returned a non-integer exit status")
+    return code
+
+
+def _dispatch(argv: list[str] | None = None):
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] == "discover":
         from dogpdkb.discover import main as discover_main
@@ -82,7 +89,10 @@ def _main(argv: list[str] | None = None) -> int:
     doctor = commands.add_parser("doctor", help="read-only, offline preflight checks")
     doctor.add_argument("--config", type=Path)
     doctor.add_argument("--book")
-    doctor.add_argument(
+    doctor_inputs = doctor.add_mutually_exclusive_group()
+    doctor_inputs.add_argument("--source", action="append", metavar="KEY")
+    doctor_inputs.add_argument("--dir", type=Path, metavar="PATH")
+    doctor_inputs.add_argument(
         "--package", action="store_true", help="check installed package only"
     )
     doctor.add_argument("--json", action="store_true", help="machine-readable report")
@@ -137,7 +147,9 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         from dogpdkb.preflight import diagnose, print_report
 
-        report = diagnose(args.config, args.book, args.package)
+        report = diagnose(
+            args.config, args.book, args.package, keys=args.source, directory=args.dir
+        )
         print_report(report, json_output=args.json)
         for row in report:
             if row.get("exit_code") in {130, 143}:
