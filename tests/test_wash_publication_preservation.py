@@ -293,7 +293,10 @@ def test_later_run_uses_new_publication_generation(tmp_path):
     old_document = next(
         row for row in before["documents"] if row["document_id"] == "43"
     )
-    assert old_document["pending_steps"] == ["ocr"]
+    assert (
+        old_document["pending_steps"] == []
+    )  # Enrichment is advisory, not required graph work.
+    assert any(failure["step"] == "ocr" for failure in before["failures"])
     old_witness = Path(old_document["input_copy"])
     old_bytes = old_witness.read_bytes()
     (tmp_path / "allow").touch()
@@ -360,7 +363,9 @@ def test_catalogued_noninline_resource_survives_wash_purge(tmp_path, markup):
     if 'srcset="1x 1x,' in markup:
         import re
 
-        srcset = re.search(r'srcset="([^"]+)"', published).group(1)
+        match = re.search(r'srcset="([^"]+)"', published)
+        assert match is not None
+        srcset = match.group(1)
         assert [candidate.split()[1] for candidate in srcset.split(",")] == ["1x", "2x"]
     removed = cli("purge", "--config", config, "--run", run)
     assert removed.returncode == 0, removed.stderr

@@ -32,7 +32,7 @@ def read_json(path: Path) -> Any:
         raise ValueError(f"cannot read {path}: {error}") from error
 
 
-def atomic_json(path: Path, payload: Any) -> None:
+def atomic_json(path: Path, payload: Any, *, durable: bool = False) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_symlink():
@@ -46,6 +46,14 @@ def atomic_json(path: Path, payload: Any) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         temporary.replace(path)
+        if durable:
+            # The run directory itself may have been created for this run.
+            for directory in (path.parent, path.parent.parent):
+                fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -352,9 +360,9 @@ class Run:
             raise ValueError("run source or write targets changed; generate a new plan")
         return cls(store, path.resolve(), data)
 
-    def save(self) -> None:
+    def save(self, *, durable: bool = False) -> None:
         self.data["updated_at"] = now_iso()
-        atomic_json(self.path, self.data)
+        atomic_json(self.path, self.data, durable=durable)
 
     def stage(self, name: str, *, phase: str | None = None, **counts) -> None:
         self.data.update(stage=name, counts=counts)

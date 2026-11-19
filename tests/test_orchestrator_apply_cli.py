@@ -196,7 +196,9 @@ def test_same_raw_is_reused_and_old_plan_cannot_replace_newer_corpus(tmp_path):
     second = cli("apply", "--config", config, "--input", differences)
     assert second.returncode == 0, second.stderr
     manifest = json.loads(Path(json.loads(second.stdout)["manifest"]).read_text())
-    assert manifest["documents"][0]["action"] == "reuse"
+    assert manifest["documents"][0]["action"] == "compile"
+    # Reusing captured raw bytes does not invent a successful graph baseline.
+    assert manifest["documents"][0]["reason_codes"] == ["NEW_DOCUMENT"]
     assert (tmp_path / "events").read_text().splitlines() == ["export"]
     paused = cli(
         "apply", "--config", config, "--input", differences, "--stop-after", "plan"
@@ -226,13 +228,14 @@ def test_same_raw_is_reused_and_old_plan_cannot_replace_newer_corpus(tmp_path):
     )
 
 
-def test_changed_images_require_compile_even_with_reusable_body(tmp_path):
+def test_changed_images_are_advisory_for_equivalent_authored_body(tmp_path):
     config, differences = instance(tmp_path)
     remote = json.loads((tmp_path / "remote.json").read_text())
     remote["42"]["body"] += "\n![image](https://example.invalid/old.svg)\n"
     (tmp_path / "remote.json").write_text(json.dumps(remote))
+    seed_body_baseline(tmp_path, config, remote["42"]["body"])
     first = cli("apply", "--config", config, "--input", differences)
-    assert first.returncode == 2, first.stderr
+    assert first.returncode == 0, first.stderr
     remote["42"]["body"] = remote["42"]["body"].replace("old.svg", "new.svg")
     remote["42"]["version"] = "2026-11-13T10:00:00Z"
     (tmp_path / "remote.json").write_text(json.dumps(remote))
@@ -244,9 +247,9 @@ def test_changed_images_require_compile_even_with_reusable_body(tmp_path):
     }
     differences.write_text(json.dumps(changed))
     second = cli("apply", "--config", config, "--input", differences)
-    assert second.returncode == 2, second.stderr
+    assert second.returncode == 0, second.stderr
     manifest = json.loads(Path(json.loads(second.stdout)["manifest"]).read_text())
-    assert manifest["documents"][0]["action"] == "compile"
+    assert manifest["documents"][0]["action"] == "reuse"
 
 
 def test_sync_uses_discover_and_apply_in_one_run_and_stops_before_ocr(tmp_path):
@@ -316,6 +319,7 @@ raise SystemExit(subprocess.call([sys.executable,'-m',module,*args]))
         "export",
         "mdcompare catalog",
         "mdcompare catalog",
+        "mdcompare semantic",
         "mdcompare knowledge",
         "mdcompare compare",
         "mdocr plan",
@@ -410,7 +414,10 @@ raise SystemExit(2)
     result = cli("apply", "--config", config, "--input", differences)
     assert result.returncode == 2, result.stderr
     manifest = json.loads(Path(json.loads(result.stdout)["manifest"]).read_text())
-    assert manifest["documents"][1]["pending_steps"] == ["ocr"]
+    assert manifest["documents"][1]["pending_steps"] == []
+    assert any(
+        f["step"] == "ocr" and f["document_id"] == "43" for f in manifest["failures"]
+    )
     state = json.loads((tmp_path / "state" / "funds" / "state.json").read_text())
     assert state["documents"]["42"]["steps"]["ocr"]["status"] == "failed"
     assert "ocr" not in state["documents"]["43"]["steps"]
@@ -737,12 +744,8 @@ def test_compare_contract_failure_and_valid_unknown_defer_without_compile(tmp_pa
         )
     )
     failed = cli("apply", "--config", config, "--input", differences)
-    assert failed.returncode == 2, failed.stderr
-    manifest = json.loads(Path(json.loads(failed.stdout)["manifest"]).read_text())
-    assert manifest["documents"][0]["action"] == "defer"
-    assert any(
-        row["reason"] == "COMPARISON_REPORT_UNAVAILABLE" for row in manifest["failures"]
-    )
+    assert failed.returncode == 1
+    assert "authoritative semantic comparison unavailable" in failed.stderr
     # A separate source version with actual public UNKNOWN reports remains usable.
     remote = json.loads((tmp_path / "remote.json").read_text())
     remote["42"].update(
@@ -772,7 +775,7 @@ def test_compare_contract_failure_and_valid_unknown_defer_without_compile(tmp_pa
     manifest = json.loads(Path(json.loads(unknown.stdout)["manifest"]).read_text())
     assert manifest["documents"][0]["action"] == "defer"
     assert any(
-        row["reason"] == "BODY_COMPARISON_DEFERRED" for row in manifest["failures"]
+        row["reason"] == "AUTHORED_BODY_UNAVAILABLE" for row in manifest["failures"]
     )
 
 
@@ -959,11 +962,11 @@ def test_complete_hold_retains_graph_without_manual_gate(tmp_path):
     assert result.returncode == 0, result.stderr
     manifest = json.loads(Path(json.loads(result.stdout)["manifest"]).read_text())
     row = manifest["documents"][0]
-    assert row["action"] == "retain"
-    assert "BODY_RETAINED" in row["reason_codes"]
+    assert row["action"] == "compile"
+    assert "AUTHORED_BODY_CHANGED" in row["reason_codes"]
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
     assert "version" not in state["documents"]["42"]["graph"]
-    assert "ocr" not in state["documents"]["42"]["steps"]
+    assert state["documents"]["42"]["steps"]["ocr"]["status"] == "completed"
 
 
 def test_unavailable_body_defers_without_ocr_and_keeps_old_comparison_basis(tmp_path):
@@ -1077,7 +1080,7 @@ def test_graph_replan_requires_explicit_owned_recovery_flags(args):
     assert "--replan requires" in result.stderr
 
 
-def test_retained_body_is_not_selected_again_by_next_daily_discovery(tmp_path):
+def test_changed_body_stays_pending_until_actual_graph_compilation(tmp_path):
     config, _ = instance(tmp_path)
     seed_body_baseline(
         tmp_path,
@@ -1117,18 +1120,22 @@ def test_retained_body_is_not_selected_again_by_next_daily_discovery(tmp_path):
     applied = cli("apply", "--config", config, "--input", selection)
     assert applied.returncode == 0, applied.stderr
     manifest = json.loads(Path(json.loads(applied.stdout)["manifest"]).read_text())
-    assert manifest["documents"][0]["action"] == "retain"
+    assert manifest["documents"][0]["action"] == "compile"
     next_day = cli("discover", "--config", config, "--listing", listing)
     assert next_day.returncode == 0, next_day.stderr
-    assert (
-        json.loads(Path(json.loads(next_day.stdout)["differences"]).read_text())[
-            "documents"
-        ]
-        == []
-    )
+    # Corpus publication is not successful graph compilation. A now-compiled
+    # authored deletion must keep its pending graph work instead of being
+    # acknowledged as the former HOLD/retain decision.
+    selected = json.loads(Path(json.loads(next_day.stdout)["differences"]).read_text())[
+        "documents"
+    ]
+    assert [row["document_id"] for row in selected] == ["42"]
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    assert "pending" in state["documents"]["42"]
+    assert "version" not in state["documents"]["42"]["graph"]
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
     document = state["documents"]["42"]
-    assert "pending" not in document
+    assert "pending" in document
     assert "version" not in document["graph"]
     assert (
         "Historical old-only paragraph."

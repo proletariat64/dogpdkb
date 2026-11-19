@@ -37,11 +37,28 @@ failures. Minimal shape (paths and witnesses must actually be produced by apply)
 {"schema":"dogpdkb-compile-1","book":"funds","run_id":"run-example","documents":[{"document_id":"42","version":{"value":"2026-11-13T00:00:00Z","precision":"instant","utc":"2026-11-13T00:00:00+00:00"},"path":"/absolute/corpus/source.md","input_copy":"/absolute/state/funds/inputs/42/source.md","metadata":{"name":"Example","logical_path":"folder","source_ref":"https://example.invalid/source"},"action":"compile","reason_codes":["BODY_CHANGED"]}],"failures":[]}
 ```
 
-Document actions: compile (complete current source), metadata (source metadata
-maintenance only), reuse (no graph content work), retain (complete no-candidate
-body comparison; keep previous graph knowledge without certifying equality),
-and defer (comparison unavailable/incomplete; retain graph and record an
-exception). Paths identify full published
+New plans use mdcompare semantic as the authored-body authority:
+NEW/CHANGED/UNCERTAIN -> compile (whole current source); EQUIVALENT -> reuse or
+metadata; UNAVAILABLE -> defer and retain prior graph truth. Usable uncertain
+alignment is not unavailable extraction. Authored deletions compile. Image/OCR
+changes and enrichment results are advisory and never promote equality to compile;
+equivalent documents start no fresh OCR. Legacy retain actions remain readable
+in saved manifests but new plans do not produce HOLD/retain advice.
+
+Semantic report/index/full per-document evidence are durable under
+state/<book>/semantic/<run>, outside wash. Complete old/new unit text, context,
+original source locations, versions and operation references are never clipped.
+Preserve the index with its referenced evidence directory. Captured raw/published
+corpus never become a compiled baseline for a new document: only actual graph
+success advances that fact (explicit init-state is the existing-corpus bootstrap).
+
+Optional [paths].body_recovery points to mdcompare-body-recovery-1 JSON relative
+to config: established marker-only repairs with identity/side, source_copy and
+insertions[{byte_offset,text}]. The run freezes the manifest/source byte witnesses
+and validates them on resume. Live config edits do not replace a frozen plan;
+changed frozen evidence requires a new plan. No automatic repair/model calls.
+
+Paths identify full published
 Markdown; input_copy is its exact durable witness. Version is observed, never
 synthesized. The emitted document object contains:
 
@@ -67,15 +84,15 @@ synthesized. The emitted document object contains:
   observation, defaulting to {} when the selected row has no metadata. This is
   separate from normalized published metadata. The graph stage falls back to
   metadata if pending_metadata is absent in an input manifest.
-- pending_steps: always an array, currently ["ocr"] when that document's entire
-  OCR invocation was unattempted because of a shared stop or exhausted budget;
-  otherwise []. This is not a list of individual failed images or a retry queue.
-  An absent field is treated as no pending steps by the graph stage.
+- pending_steps: always an array, [] in new manifests because OCR enrichment is
+  advisory, not required graph work. Historical ["ocr"] fields remain readable;
+  an absent field is treated as no pending steps. Failures remain reported and
+  suppressed separately; this field never authorizes retries.
 
 After graph success, pending observation facts are cleared only when no pending
 steps remain and observed version/metadata match the manifest's acknowledgement.
-Thus successful graph publication can retain pending never-started OCR work;
-[] alone does not erase recorded OCR failures or same-version suppression.
+Historical manifests can retain their pending fields. New optional OCR failures
+do not prevent graph acknowledgement; [] does not erase failure/suppression facts.
 Keep these fields and the original evidence when diagnosing recovery. Do not
 edit a manifest to fabricate completion, remove suppression, or enable resume.
 Failures carry step/document/version/reason and evidence when available; they

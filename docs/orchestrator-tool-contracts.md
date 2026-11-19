@@ -99,6 +99,72 @@ evidence is preserved by target. Remote resources are never fetched. A document'
 claimed complete. Output must not replace an input document or the input manifest.
 Exit 0: catalog written; exit 1: invalid/unreadable input or publication failure.
 
+## mdcompare semantic
+
+```text
+mdcompare semantic --baseline OLD.json --incoming NEW.json \
+  --output semantic-report.json --diff-output semantic-diff.json \
+  [--recovery body-recovery.json]
+```
+
+Inputs are the existing descriptor schema1.0, paired by knowledge_base/document_id.
+Optional descriptor provenance.version records the actual source version; it does
+not establish equality. Filtering is offline: no model, login, image/OCR request
+or compilation. New documents do not depend on unrelated baseline failures.
+
+The semantic-1.0 report has scope authored_body and results with identity,
+semantic_status, action, reason_codes, extraction.available and
+comparison_complete. Legal routes are NEW/CHANGED/UNCERTAIN→COMPILE,
+EQUIVALENT→SKIP, UNAVAILABLE→DEFER. Only paired contextual normalized sequence
+equality proves EQUIVALENT. Changes include authored deletions, context/order,
+conditions, numbers, tables and code. Ambiguous/incomplete alignment with usable
+bodies compiles. Missing/unreadable/unscoped bodies defer individually. A reliable
+empty body is explicit NO_TEXT evidence, not successful graph extraction.
+Baseline-only identities are advisory and never remote document deletion.
+
+Images/alt text and explicitly scoped generated OCR are excluded. Resource/OCR
+unknowns are advisory and never veto body routing. Existing knowledge and strict
+compare reports remain diagnostics, not substitutes for this routing contract.
+
+mdcompare-semantic-diff-1 indexes all expected documents through relative evidence
+paths under its private evidence_directory. Preserve the directory with the index.
+Each sidecar contains full old_units/new_units, input paths/metadata/versions,
+context/original line coordinates and changes. Operations add/delete/modify/move/
+equal/uncertain use zero-based old_ref/new_ref, null for an absent side. Full
+machine evidence is never clipped by a human excerpt limit. Per-document streaming
+and canonical references avoid corpus-sized JSON memory materialization. Unique
+evidence generations keep previous indexes valid; obsolete standalone generations
+require explicit cleanup, not silent history deletion.
+
+Optional mdcompare-body-recovery-1 has documents with knowledge_base, document_id,
+side (baseline/incoming), source_copy and ordered insertions[{byte_offset,text}].
+source_copy resolves from the recovery JSON and must equal original source bytes.
+Offsets address original UTF-8 bytes. Only marker/newline insertions are accepted;
+no arbitrary content replacement/removal or automatic heuristic repair. Projection
+is in memory. Provenance retains original offsets/source_line; units retain
+original start_line/end_line and repaired projected_start_line/projected_end_line.
+A repair can establish availability but never automatically establishes equality.
+Invalid whole schema is error1; invalid per-document replay/witness defers that
+document. Runtime snapshot drift refuses stale equality/publication.
+
+Exit0: complete routing including uncertain compilation; exit2: complete report
+with DEFER; exit1: invalid inputs/arguments or global publication failure. Outputs
+cannot alias inputs, manifests or declared repair witnesses. Requested private
+reports are staged together; caught ordinary failures roll back replacements.
+A failed invocation must not make an old report appear newly complete. Full
+schema/example is installed in `mdcompare semantic --help --full`.
+
+With a positive `[semantic_score].request_budget`, `apply`/`sync` calls public
+`mdcompare semantic-score --report … --diff-index … --output … --request-budget N`
+(default `openai/gpt-6.1-terra`, Pi OAuth only), then public `mdcompare
+semantic-route`. Exit 2 from the scorer is a published partial result, not a
+reason to skip unscored changes. Neither scorer nor router rewrites the input
+comparison. The plan binds the report, index, scores and route by SHA-256.
+A resume with a frozen plan does not make more scoring calls. An interruption
+before the plan suppresses a second scoring pass in that same dogpdkb run.
+See `mdcompare semantic-score --help --full` for admission limits and privacy.
+
+
 ## Existing mdcompare reports
 
 `mdcompare knowledge --baseline OLD --incoming NEW --output REPORT` compares body

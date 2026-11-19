@@ -33,7 +33,7 @@ namespaces = false
 
 [tool.setuptools.package-data]
 dogpdkb = ["resources/*.toml", "resources/*.json", "resources/help/*.txt"]
-mdcompare = ["help/*.txt"]
+mdcompare = ["help/*.txt", "*.mjs", "semantic_score_format.json", "semantic_score_prompt.txt"]
 mdocr = ["*.mjs", "*.txt"]
 
 [[tool.uv.index]]

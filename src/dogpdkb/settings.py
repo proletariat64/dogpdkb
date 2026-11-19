@@ -9,7 +9,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 from urllib.parse import urlsplit
 
 if sys.version_info >= (3, 11):
@@ -48,6 +48,9 @@ class Settings:
     ocr_budget_seconds: float
     tools: dict[str, tuple[str, ...]] = field(default_factory=dict)
     web_options: dict[str, Any] = field(default_factory=dict)
+    body_recovery: Path | None = None
+    semantic_score_request_budget: int = 0
+    semantic_score_model: str | None = None
 
     def graph_for(self, book: Book) -> Path:
         return self.graph_dir or book.corpus / "graphify-out"
@@ -115,7 +118,17 @@ def load_config(path: Path | str | None = None) -> Settings:
     if any(not isinstance(v, dict) for v in data.values()):
         raise ConfigError("configuration sections must be tables")
 
-    def configured_path(name: str, default=None, env=None):
+    @overload
+    def configured_path(name: str, default: str, env: str | None = None) -> Path: ...
+
+    @overload
+    def configured_path(
+        name: str, default: None = None, env: str | None = None
+    ) -> Path | None: ...
+
+    def configured_path(
+        name: str, default: str | None = None, env: str | None = None
+    ) -> Path | None:
         value = os.environ.get(env) if env else None
         base = Path.cwd() if value is not None else selected.parent
         value = value if value is not None else data.get("paths", {}).get(name, default)
@@ -155,6 +168,16 @@ def load_config(path: Path | str | None = None) -> Settings:
         raise ConfigError("skylark.proxy_bin: expected executable")
     if "/" in proxy or proxy.startswith("~"):
         proxy = str((selected.parent / Path(proxy).expanduser()).absolute())
+    score = data.get("semantic_score", {})
+    if not isinstance(score, dict):
+        raise ConfigError("semantic_score: expected a TOML table")
+    score_requests, model = score.get("request_budget", 0), score.get("model")
+    if type(score_requests) is not int or score_requests < 0:
+        raise ConfigError(
+            "semantic_score.request_budget: expected a nonnegative integer"
+        )
+    if model is not None and (not isinstance(model, str) or not model.strip()):
+        raise ConfigError("semantic_score.model: expected provider/model")
     return Settings(
         file=selected,
         books_file=(selected.parent / Path(books).expanduser()).resolve(),
@@ -173,6 +196,9 @@ def load_config(path: Path | str | None = None) -> Settings:
         proxy_bin=proxy,
         timeout_seconds=number("skylark", "timeout_seconds", 60),
         ocr_budget_seconds=number("ocr", "budget_seconds", 1800),
+        body_recovery=configured_path("body_recovery"),
+        semantic_score_request_budget=score_requests,
+        semantic_score_model=model,
         tools=tools,
         web_options=data.get("web", {}),
     )

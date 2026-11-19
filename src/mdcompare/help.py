@@ -24,7 +24,7 @@ Example:
   mdcompare semantic --baseline old.json --incoming new.json --output report.json --diff-output diff.json
 
 Prerequisites and effects:
-  No configuration, login, token, network or model is required. Inputs are
+  With the exception of explicit semantic-score, no login, network or model is required. Inputs are
   read-only; only explicitly requested manifests/reports are published.
   Command-line paths are relative to cwd. Manifest paths are relative to
   their containing JSON manifest. Reports may replace existing output files.
@@ -78,6 +78,17 @@ Exit codes and next steps:
   fetch missing evidence, run models, process resources or authorize publication.
 
 Full schema: mdcompare compare --help --full
+"""
+
+SEMANTIC_SCORE = """Example:
+  mdcompare semantic-score --report semantic.json --diff-index diff.json --output scores.json --request-budget 20
+
+Requires installed Pi and Node, and Pi OAuth. Default: openai/gpt-6.1-terra, medium.
+Sends changed authored evidence only, with at most two nearby units per side.
+Oversized evidence is not clipped or sent. Output is consumed by semantic-route.
+Reuse the same bindings and output on resume; admitted requests are not replayed.
+Exit 0: complete; 2: some eligible documents unscored; 1: invalid input or failure.
+Use mdcompare semantic-score --help --full for the full contract.
 """
 
 SEMANTIC_ROUTE = """Offline score routing after mdcompare semantic and external scoring.
@@ -176,6 +187,7 @@ NORMAL = {
     "knowledge": KNOWLEDGE,
     "semantic": SEMANTIC,
     "semantic-route": SEMANTIC_ROUTE,
+    "semantic-score": SEMANTIC_SCORE,
     "catalog": CATALOG,
 }
 
@@ -189,6 +201,8 @@ def full_contract(command: str) -> str:
         names += ["knowledge.txt"]
     elif command == "semantic":
         names += ["semantic.txt"]
+    elif command == "semantic-score":
+        names += ["semantic-score.txt"]
     elif command == "semantic-route":
         names += ["semantic-route.txt"]
     elif command == "catalog":

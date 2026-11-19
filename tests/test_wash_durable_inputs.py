@@ -36,7 +36,9 @@ with Path(__file__).with_name('ocr-calls').open('a') as log: log.write('call\\n'
     return config, differences
 
 
-def test_new_version_compares_raw_baseline_after_old_wash_is_deleted(tmp_path):
+def test_new_version_without_graph_success_stays_new_after_old_wash_is_deleted(
+    tmp_path,
+):
     config, differences = enriched_instance(tmp_path)
     first = cli("apply", "--config", config, "--input", differences)
     assert first.returncode == 0, first.stderr
@@ -54,7 +56,14 @@ def test_new_version_compares_raw_baseline_after_old_wash_is_deleted(tmp_path):
     second = cli("apply", "--config", config, "--input", differences)
     assert second.returncode == 0, second.stderr
     manifest = json.loads(Path(json.loads(second.stdout)["manifest"]).read_text())
-    assert manifest["documents"][0]["action"] == "reuse"
+    # Neither raw capture nor publication establishes a successful graph baseline.
+    assert manifest["documents"][0]["action"] == "compile"
+    semantic = json.loads(Path(json.loads(second.stdout)["run"]).read_text())[
+        "artifacts"
+    ]["semantic"]
+    assert (
+        json.loads(Path(semantic).read_text())["results"][0]["semantic_status"] == "NEW"
+    )
 
 
 def test_same_version_ocr_reuse_and_corpus_witness_survive_old_wash_deletion(tmp_path):
@@ -105,9 +114,22 @@ def test_raw_relative_images_remain_readable_after_wash_deletion(tmp_path):
     assert second.returncode == 0, second.stderr
     run = Path(json.loads(second.stdout)["run"]).parent
     comparison = json.loads((run / "compare-report.json").read_text())
-    assert comparison["results"][0]["resources"]["status"] == "UNCHANGED"
+    # The retained image is readable, but there is no compiled baseline yet.
+    assert comparison["results"][0]["resources"]["status"] == "NEW"
     knowledge = json.loads((run / "knowledge-report.json").read_text())
-    assert knowledge["results"][0]["status"] == "REUSE"
+    assert knowledge["results"][0]["status"] == "DELTA"
+    semantic_path = json.loads((run / "run.json").read_text())["artifacts"]["semantic"]
+    assert (
+        json.loads(Path(semantic_path).read_text())["results"][0]["semantic_status"]
+        == "NEW"
+    )
+    next_raw = json.loads((tmp_path / "state/funds/state.json").read_text())[
+        "documents"
+    ]["42"]["raw"]
+    assert (
+        Path(next_raw["resources"][0]["path"]).read_bytes()
+        == Path(raw["resources"][0]["path"]).read_bytes()
+    )
 
 
 def test_unknown_ocr_report_remains_partial_and_retains_raw_baseline(tmp_path):
@@ -220,7 +242,7 @@ fixture_result({'schema_version':'mdocr-result-2','documents':[{'document_id':do
     next_run = Path(json.loads(second.stdout)["run"]).parent
     comparison = json.loads((next_run / "compare-report.json").read_text())
     item = next(row for row in comparison["results"] if row["document_id"] == "43")
-    assert item["resources"]["status"] == "UNCHANGED"
+    assert item["resources"]["status"] == "NEW"  # Still no successful graph baseline.
     assert item["resources"]["items"][0]["resource_id"] == identifier
 
 

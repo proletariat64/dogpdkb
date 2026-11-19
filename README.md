@@ -15,6 +15,7 @@ invocation, and `--help --full` for the complete local contract:
 dogpdkb --help
 dogpdkb sync --help
 dogpdkb sync --help --full
+mdcompare semantic -h --full
 mdcompare knowledge -h --full
 mdocr plan -h --full
 mdocr run -h --full
@@ -108,19 +109,58 @@ dogpdkb purge --config ./instance/dogpdkb.toml --book funds --run RUN --force
 purge 只删除所选 book 的 wash，包括失败材料和运行记录；正式语料、图谱、持久
 版本事实、必要比较输入和工具缓存保留。它不解除失败抑制、不触发重试或历史回填。
 
+## Authored-text routing and durable diffs
+
+`apply`/`sync` consume the independent offline `mdcompare semantic` CLI as the
+body-routing authority: **NEW / CHANGED / UNCERTAIN → compile; demonstrated
+EQUIVALENT → reuse/metadata; UNAVAILABLE → defer**. Authored deletions compile.
+Image changes and OCR failures/results are advisory and never promote equivalent
+body text to compilation. Equivalent documents do not start fresh OCR. Usable
+uncertainty compiles without a model, manual approval or hidden network call.
+Missing or malformed authoritative reports stop explicitly rather than falling
+back to legacy knowledge advice. Baseline-only IDs never imply remote deletion.
+
+Complete `mdcompare-semantic-diff-1` evidence is streamed per document and indexed
+outside wash under `state/<book>/semantic/<run>/`. Preserve the index and its
+referenced evidence directory together. Full text, source versions, heading
+context, original coordinates and add/delete/modify/move evidence are not clipped
+by human-report limits. Skips and failed compilation never advance the actual
+successful graph baseline; capturing raw or publishing a new document alone is
+not a compiled baseline. Explicit `init-state` facts remain the bootstrap for an
+existing corpus, without inventing successful graph steps.
+
+For previously established marker repairs, optionally configure
+`[paths] body_recovery = "body-recovery.json"` relative to the instance TOML.
+The public `mdcompare-body-recovery-1` artifact binds identity/side to immutable
+source-copy bytes and ordered UTF-8 byte-offset marker insertions. dogpdkb freezes
+this artifact and witnesses once per run and validates them on resume. Changing
+live configuration does not rewrite an existing plan; changed frozen evidence
+requires a new plan. Invalid/unresolved body scope defers its document; recovery
+never itself proves semantic equality. No automatic rescue or model call occurs.
+See [tool contracts](docs/orchestrator-tool-contracts.md) and
+[core routing contract](docs/orchestrator-core-contracts.md).
+
+This routing does **not** change Graphify's text-input projection described below:
+whole published Markdown, including existing inline images/OCR, remains its input.
+
 ## Optional offline semantic score routing
 
-After `mdcompare semantic`, an external operator/scorer may create a
-`mdcompare-semantic-scores-1` manifest, then call
+After `mdcompare semantic`, use `mdcompare semantic-score` with an explicit
+`--request-budget` (Pi OAuth, default `openai/gpt-6.1-terra`, medium), or supply
+an external `mdcompare-semantic-scores-1` manifest, then call
 `mdcompare semantic-route --report semantic.json --diff-index diff.json --scores scores.json --output route.json`.
 This is a separate policy stage: it never calls a model, network, Graphify or
-compiler and does not alter the deterministic `semantic-1.0` report or dogpdkb
-consumer. Scores bind exact sidecar bytes using SHA-256 and must match the index
+compiler and does not alter the deterministic `semantic-1.0` report. Scores bind exact sidecar bytes using SHA-256 and must match the index
 report digest; invalid/duplicate/stale bindings fail without publishing. Default
 threshold 3 means strictly greater scores compile, lower/equal scores skip;
 `--skip-ambiguity-intercept yes` only converts ambiguous lower/equal skips to
 compile. Missing scores never enable skips. See
 `mdcompare semantic-route --help --full` for the complete schema and path rules.
+
+Enable bounded scoring in `dogpdkb apply/sync` with `[semantic_score]` and
+`request_budget = N` (default `0`, offline). Optional `model = "provider/model"`
+overrides the scorer default. Plans freeze the exact score and route artifacts;
+a resume does not call the scorer again. Ambiguity is advisory.
 
 ## 小订阅
 

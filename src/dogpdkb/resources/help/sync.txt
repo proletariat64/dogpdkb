@@ -8,6 +8,18 @@ source, subscription, corpus and graph targets must still match. --stop-after
 plan pauses after complete raw inputs/comparisons and the fixed plan, before
 OCR, corpus and graph writes. Remove that option on resume to continue.
 
+Authored-body routing uses the offline public mdcompare semantic CLI:
+NEW/CHANGED/UNCERTAIN -> COMPILE; demonstrated EQUIVALENT -> reuse/metadata;
+UNAVAILABLE -> DEFER. Authored deletions compile. Image/OCR changes, errors and
+results are advisory, never body vetoes or reasons to promote equality. Uncertain
+usable body evidence compiles without a model or manual review. Full durable
+semantic diff/index sidecars live outside wash under state/<book>/semantic/<run>.
+Optional [paths].body_recovery names explicit mdcompare-body-recovery-1 repairs,
+resolved from config and frozen with byte witnesses per run. Resume validates
+saved repair inputs; it never silently replaces them with live config changes.
+See apply --help --full for schemas, source versions and successful-baseline rules.
+This routing does not change Graphify's text-input projection below.
+
 --concurrency N applies only to document exports. It accepts 1, 2 or 3, defaults
 to 2 and never permits more than 3 in-flight exports; 1 selects serial downloads.
 Invalid values fail before run creation or tool calls. Exports remain independent

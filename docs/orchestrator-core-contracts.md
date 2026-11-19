@@ -14,7 +14,9 @@ then `DOGPDKB_CONFIG`, then checkout `default.toml` / caller `dogpdkb.toml`.
 - `Book`: `key`, `name`, `url`, `corpus`.
 - `Settings`: `file`, `books_file`, `corpus`, `staging`, `state`, `web`,
   `graph_dir` (optional), `mcp_url`, `proxy_bin`, `timeout_seconds`,
-  `ocr_budget_seconds`, `ocr_cache`, `results`.
+  `ocr_budget_seconds`, `ocr_cache`, `results`, optional `body_recovery`.
+  `[paths].body_recovery` resolves relative to the selected config and names an
+  explicit public `mdcompare-body-recovery-1` manifest; it defaults to absent.
 - `settings.graph_for(book)` returns configured graph directory or the book's
   `graphify-out`; `settings.command(name)` returns an argv list from `[tools]`
   (`mdcompare`, `mdocr`, `graphify`, `skylark`; strings mean an executable,
@@ -133,9 +135,9 @@ on a caught partial publication error). A replacement that precedes the state
 save is reconciled from the handoff. The final `dogpdkb-compile-1` manifest is
 written only after complete publication and excludes `before_copy`.
 
-A saved final compile manifest is reused even with pending optional OCR work;
-resuming a run does not renew its bounded OCR budget. Existing failures/pending
-reasons remain observable and usable bodies can proceed to incremental Graphify.
+A saved final compile manifest is reused without renewing its bounded OCR budget.
+OCR is advisory: new manifests emit no required pending OCR steps. Historical
+pending fields/failures remain readable; usable bodies proceed to Graphify.
 Explicit recovery of older failed runs belongs to the external agent; there is
 no automatic historical migration or retry layer.
 
@@ -180,16 +182,43 @@ liveness and elapsed seconds. Watch emits JSONL when combined with JSON.
 
 ## Automatic body routing and explicit reselection
 
-Complete `HOLD_EXISTING` body advice produces `retain`; unavailable/incomplete
-body comparison (including incomplete baseline evidence) produces `defer` and a
-durable unknown comparison result. Neither invokes new OCR or promotes resource
-uncertainty into full-source extraction. Strict KEEP remains reuse/metadata,
-while concrete body candidates compile. Retained/deferred documents can publish
-a usable corpus version without advancing graph extraction facts. A durable
-`graph_baseline` descriptor preserves the previous full body outside wash, with
-`path` to its witness and `source_file` relative to corpus; future comparisons
-prefer the latest actual successful graph witness, then that preserved basis.
-This prevents a newer raw export from silently becoming its own graph baseline.
+The public `mdcompare semantic` report is authoritative: NEW/CHANGED/UNCERTAIN
+produce compile; proven EQUIVALENT produces reuse/metadata; UNAVAILABLE produces
+defer and an unknown comparison record. Incomplete/ambiguous alignment of usable
+bodies is UNCERTAIN, not failed extraction. Authored deletions compile. Missing or
+malformed semantic reports/diff evidence stop explicitly; diagnostic catalog,
+knowledge and strict compare uncertainty cannot override a valid body route.
+Image/OCR changes and enrichment results never promote equality to compilation;
+equivalent documents start no new OCR. Enrichment failures remain reported and
+suppressed, not required pending work. Legacy retain actions remain readable in
+saved artifacts; newly generated plans do not produce HOLD/retain advice.
+An opt-in positive semantic-score request budget permits a separate validated
+score route to override only complete `CHANGED → COMPILE` rows: 1–3 uses
+retained corpus or metadata-only publication; 4–5 and unscored changes compile.
+Ambiguity is advisory. Default scoring budget is zero.
+
+
+A durable `graph_baseline` descriptor preserves the actual successful full body
+outside wash, with path/source_file/version; future comparisons prefer the latest
+successful graph witness, then that preserved basis. Only explicit init-state
+corpus facts bootstrap an existing baseline. A never-compiled new document stays
+NEW/compile despite captured raw or published corpus. Skip/failure/defer never
+advance successful graph-baseline truth or clear required pending graph work.
+
+Semantic reports, diff indexes and complete per-document sidecars live under
+`state/<book>/semantic/<run>/comparison-*`, outside wash. Plan and compare-step
+records reference these artifacts; source descriptor provenance.version records
+the old and incoming versions. All expected identities, legal status/action/body
+availability, source bindings and sidecar/reference completeness are validated.
+A launched comparison batch with unusable authoritative evidence becomes unknown,
+not permanently running and not silently retried.
+
+Optional explicit repair manifests/source copies are frozen under that run's
+semantic/recovery directory with byte witnesses. A plan references the frozen
+manifest; resume validates it and its dependencies, never live config changes.
+Missing repair sources defer their affected document through mdcompare. Changed
+frozen inputs require a new plan. These are operator-established insertion-only
+scope repairs, not inferred equivalence or an automatic historical migration.
 
 `sync --resume RUN --retry-graph --replan` explicitly recomputes a saved published
 batch's selection using its original plan and retained input/baseline snapshots.

@@ -87,6 +87,9 @@ def descriptor(book, row, path, *, historical=False, evidence=None):
         },
         "resources": [],
     }
+    version = row.get("version")
+    if version is not None:
+        result["provenance"] = {"version": version}
     if evidence:
         result.update(resources=evidence.get("resources", []))
         if evidence.get("ocr"):
@@ -94,66 +97,60 @@ def descriptor(book, row, path, *, historical=False, evidence=None):
     return result
 
 
-def make_plan(book, run, documents, knowledge, comparison, *, workspace=None):
-    bodies = {str(r["document_id"]): r for r in knowledge.get("results", [])}
-    full = {str(r["document_id"]): r for r in comparison.get("results", [])}
+def make_plan(book, run, documents, knowledge, comparison, semantic, *, workspace=None):
+    bodies = {str(item["document_id"]): item for item in semantic.get("results", [])}
+    full = {str(item["document_id"]): item for item in comparison.get("results", [])}
     rows = []
     for row in documents:
         identifier = row["document_id"]
-        body, detail = bodies.get(identifier, {}), full.get(identifier, {})
-        advice = body.get("graphify_plan", {})
-        hold_reasons = advice.get("hold_reason_codes", [])
-        unavailable = (
-            body.get("status") == "UNKNOWN"
-            or not body.get("comparison_complete", False)
-            or "BASELINE_BODY_INCOMPLETE" in hold_reasons
-            or "BASELINE_BODY_INCOMPLETE" in body.get("reason_codes", [])
-            or advice.get("action")
-            not in {"KEEP_EXISTING", "HOLD_EXISTING", "BODY_DELTA_CANDIDATE"}
-        )
-        if unavailable:
-            action, reasons = "defer", ["BODY_COMPARISON_DEFERRED"]
+        body = bodies.get(identifier, {})
+        status = body.get("semantic_status")
+        if (
+            status in {"NEW", "CHANGED", "UNCERTAIN"}
+            and body.get("action") == "COMPILE"
+        ):
+            action, reasons = "compile", list(body["reason_codes"])
+        elif body.get("action") == "SKIP" and (
+            status == "EQUIVALENT"
+            or status == "CHANGED"
+            and body.get("routing_reason") == "SCORE_AT_OR_BELOW_THRESHOLD"
+        ):
+            action = (
+                "metadata"
+                if full.get(identifier, {}).get("metadata", {}).get("status")
+                == "CHANGED"
+                else "reuse"
+            )
+            reasons = list(body["reason_codes"])
+        else:
+            action, reasons = (
+                "defer",
+                list(body.get("reason_codes", [])) or ["SEMANTIC_RESULT_UNAVAILABLE"],
+            )
             run.failure(
                 persist=False,
                 document_id=identifier,
                 version=row.get("version"),
                 step="compare",
-                reason="BODY_COMPARISON_DEFERRED",
+                reason="AUTHORED_BODY_UNAVAILABLE",
                 input=row.get("raw_path"),
-                reason_codes=body.get("reason_codes", []),
-                reports=[
-                    value
-                    for key, value in run.data["artifacts"].items()
-                    if key in {"knowledge", "compare"}
-                ],
+                reason_codes=reasons,
+                reports=[run.data["artifacts"].get("semantic")],
             )
-        elif advice["action"] == "HOLD_EXISTING":
-            action, reasons = "retain", ["BODY_RETAINED", *hold_reasons]
-        elif advice["action"] == "KEEP_EXISTING":
-            action = (
-                "metadata"
-                if detail.get("metadata", {}).get("status") == "CHANGED"
-                else "reuse"
-            )
-            reasons = ["BODY_REUSABLE"]
-        else:
-            action, reasons = "compile", ["FULL_SOURCE_REQUIRED"]
-        resources = detail.get("resources", {}).get("status")
-        ocr = detail.get("ocr", {}).get("status")
-        if action not in {"defer", "retain"} and (
-            resources in {"CHANGED", "NEW"}
-            or detail.get("resources", {}).get("references_changed")
-            or ocr in {"CHANGED", "NEW", "REMOVED"}
-            or detail.get("ocr", {}).get("removed_contributions")
-        ):
-            action = "compile"
-            reasons.append("RESOURCE_OR_OCR_CHANGED")
+        if body.get("routing_reason") in {
+            "SCORE_AT_OR_BELOW_THRESHOLD",
+            "SCORE_ABOVE_THRESHOLD",
+        }:
+            reasons.append(body["routing_reason"])
         rows.append(
             {
                 **row,
                 "action": action,
                 "reason_codes": reasons,
                 "ocr_resources": None,
+                "semantic_status": status,
+                "semantic_score": body.get("score"),
+                "semantic_ambiguity_advisory": body.get("ambiguous"),
             }
         )
     plan = {
@@ -161,6 +158,10 @@ def make_plan(book, run, documents, knowledge, comparison, *, workspace=None):
         "book": book.key,
         "run_id": run.id,
         "documents": rows,
+        "semantic_report": run.data["artifacts"].get("semantic"),
+        "semantic_diff": run.data["artifacts"].get("semantic_diff"),
+        "body_recovery": run.data["artifacts"].get("body_recovery"),
+        "semantic_scoring": run.data["artifacts"].get("semantic_scoring"),
     }
     path = (workspace or run.directory) / "plan.json"
     atomic_json(path, plan)
@@ -172,6 +173,14 @@ def make_plan(book, run, documents, knowledge, comparison, *, workspace=None):
 def validate_plan(plan, book, store, *, check_baseline=False):
     if plan.get("schema") != "dogpdkb-plan-1" or plan.get("book") != book.key:
         raise ValueError("plan schema or book mismatch")
+    if plan.get("body_recovery"):
+        from dogpdkb.semantic import validate_recovery
+
+        validate_recovery(plan["body_recovery"])
+    if plan.get("semantic_scoring"):
+        from dogpdkb.semantic import verify_score_artifacts
+
+        verify_score_artifacts(plan["semantic_scoring"])
     reject_rollback(store, plan["documents"])
     validate_inputs(plan["documents"], check_baseline=check_baseline)
 

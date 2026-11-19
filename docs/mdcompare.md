@@ -1,6 +1,26 @@
-# mdcompare: body knowledge and offline content comparison
+# mdcompare: authored-text routing and offline content comparison
 
-For knowledge-base deduplication, use `mdcompare knowledge`. It reports reusable
+For unattended whole-document compilation routing, use `mdcompare semantic`:
+
+```bash
+mdcompare semantic --baseline baseline.json --incoming incoming.json \
+  --output semantic-report.json --diff-output semantic-diff.json
+mdcompare semantic --help --full
+```
+
+It uses the same descriptor manifests. NEW/CHANGED/UNCERTAIN compile; only proven
+paired contextual equivalence skips; unavailable authored-body extraction defers.
+Images/OCR are advisory, not vetoes. Baseline-only IDs are never deletion requests.
+The diff index references full per-document evidence files written with bounded
+memory; preserve the index and its `evidence_directory` together. Unit arrays are
+complete, operations use zero-based old_ref/new_ref, source coordinates refer to
+original captured inputs, and optional provenance.version carries source versions.
+`--recovery` consumes explicit `mdcompare-body-recovery-1` marker-only repair
+witnesses without changing sources. No model, network, OCR or compilation runs.
+Exit0 permits compile/skip/uncertain routes; exit2 includes DEFER; exit1 is invalid
+input/publication. Complete schema and repair example ship in normal/full help.
+
+For separate knowledge-unit reuse/revision diagnostics, use `mdcompare knowledge`. It reports reusable
 body units and actual additions or possible revisions, with source locations.
 Images and OCR are completely excluded from that command and cannot block body
 results. See the [body knowledge guide](mdcompare-knowledge.md).

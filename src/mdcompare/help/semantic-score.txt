@@ -1,0 +1,24 @@
+Semantic scoring (mdcompare-semantic-scores-1)
+=============================================
+
+The input report and diff index must be a matched semantic generation and
+all sidecars must match their indexed hashes. Only complete CHANGED/COMPILE
+rows are candidates. Sends full changed units and up to two neighbors per
+side plus explicitly linked retained-text candidates. Exact operation coverage
+and materiality claims are validated before a numeric score can be routed.
+Does not send source
+paths, image payloads or OCR. Scores bind the exact sidecar bytes.
+
+--request-budget is required; 0 does not start a model. The limit counts
+admissions across resumes, including uncertain outcomes. A separate maximum
+byte size applies per prepared evidence packet; oversized packets are held
+whole, not clipped. This byte limit is not a hard token or invoice limit.
+
+Run with installed Pi and Node. Pi owns OAuth login/refresh; no API-key
+fallback. Default model openai/gpt-6.1-terra, medium. Keep the .execution.json
+journal beside the output; it contains provider replies and is private. Resume with the same immutable report, index,
+output, model, effort and budget; previously admitted jobs are never resent.
+401/403, rate limits and unknown submissions stop further admission. Valid
+scores from earlier requests remain; unscored entries never authorize a skip.
+
+semantic-route consumes this output independently and applies the threshold.
