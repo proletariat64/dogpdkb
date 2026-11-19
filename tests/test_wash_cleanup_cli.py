@@ -159,6 +159,10 @@ def test_failed_graph_keeps_input_and_report_without_candidate_graph(tmp_path):
             "--out",
             str(Path(failure["report"]).parent),
             "--no-cluster",
+            "--backend",
+            "openai-oauth",
+            "--max-concurrency",
+            "3",
         ]
         assert failure["argv"] == expected
         assert report["graphify_inputs"] == "text"

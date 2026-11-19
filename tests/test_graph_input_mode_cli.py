@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.smoke_install import GRAPHIFY_PREFLIGHT
 from tests.test_graph_body_scope_cli import held_source
 from tests.test_orchestrator_graph_cli import ROOT, cli, fixture
 
@@ -39,7 +40,7 @@ def test_graphify_input_mode_at_public_subprocess_boundary(tmp_path, command, mo
     (native / "manifest.json").write_text("{}")
     tool = tmp_path / "graphify.py"
     tool.write_text(
-        "import json,sys\nfrom pathlib import Path\n"
+        GRAPHIFY_PREFLIGHT + "import json,sys\nfrom pathlib import Path\n"
         "scan=Path(sys.argv[3])\n"
         "files=sorted(str(p.relative_to(scan)) for p in scan.rglob('*') if p.is_file())\n"
         "(Path(sys.argv[1])/'scanned.json').write_text(json.dumps(files))\n"

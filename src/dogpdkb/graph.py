@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import ctypes
+import hashlib
 import os
+import re
 import shutil
 import sys
+import tempfile
 import unicodedata
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from dogpdkb.help import HelpParser
 from dogpdkb.planning import reject_rollback
@@ -83,6 +87,194 @@ def _graph(path):
     ):
         raise TypeError("Graphify did not produce a graph artifact")
     return data
+
+
+_NATIVE_VERSION = "graphify 0.9.111"
+_NATIVE_ENV = {
+    "GRAPHIFY_OUT": "graphify-out",
+    "GRAPHIFY_FORCE": "0",
+    "GRAPHIFY_OPENAI_OAUTH_PARALLEL": "1",
+}
+
+
+def _native_extract(command, corpus, workspace):
+    return [
+        *command,
+        "extract",
+        str(corpus),
+        "--out",
+        str(workspace),
+        "--no-cluster",
+        "--backend",
+        "openai-oauth",
+        "--max-concurrency",
+        "3",
+    ]
+
+
+def _native_preflight(command, workspace):
+    """Check the attested CLI protocol without reading live credentials or documents."""
+    log = workspace / "version.log"
+    code = run_command([*command, "--version"], log=log, cwd=workspace, timeout=15)
+    if (
+        code in {130, 143}
+        or code != 0
+        or _NATIVE_VERSION not in log.read_text().splitlines()
+    ):
+        return code if code in {130, 143} else 2, log
+    probe = workspace / "capability"
+    probe.mkdir()
+    (probe / "probe.md").write_text(
+        "# Graphify capability probe\n\nSynthetic test input.\n"
+    )
+    log = workspace / "capability.log"
+    code = run_command(
+        _native_extract(command, probe, workspace / "capability-output"),
+        log=log,
+        cwd=workspace,
+        timeout=15,
+        env={
+            **_NATIVE_ENV,
+            "GRAPHIFY_OPENAI_OAUTH_AUTH_FILE": str(workspace / "no-oauth.json"),
+            "GRAPHIFY_CODEX_BASE_URL": "http://127.0.0.1:1",
+        },
+    )
+    if code in {130, 143}:
+        return code, log
+    expected = (
+        "error: backend 'openai-oauth' requires a ChatGPT subscription OAuth login."
+    )
+    return (0 if code == 1 and expected in log.read_text() else 2), log
+
+
+def _native_incomplete(log):
+    """Recognize the pinned CLI's public partial-extraction diagnostics."""
+    done = set()
+    totals = set()
+    with log.open(encoding="utf-8") as lines:
+        for line in lines:
+            chunk = re.fullmatch(
+                r"\[graphify extract\] chunk (\d+)/(\d+) done\s*", line
+            )
+            if chunk:
+                index, total = map(int, chunk.groups())
+                done.add(index)
+                totals.add(total)
+            elif line.startswith(
+                (
+                    "[graphify extract] semantic extraction is incomplete:",
+                    "[graphify extract] semantic extraction failed:",
+                    "[graphify extract] AST extraction incomplete for ",
+                    "[graphify extract] warning: could not write manifest:",
+                )
+            ) or re.match(
+                r"\[graphify\] WARNING: \d+/\d+ semantic chunk\(s\) failed", line
+            ):
+                return True
+    return bool(
+        totals
+        and (
+            len(totals) != 1
+            or min(done) != 1
+            or max(done) != len(done)
+            or len(done) != max(totals)
+        )
+    )
+
+
+class IncompleteExtraction(ValueError):
+    """The candidate cannot prove complete extraction of the frozen inputs."""
+
+
+def _portable_manifest(path):
+    data = read_json(path)
+    if not isinstance(data, dict):
+        raise TypeError("Graphify manifest must be an object")
+    for name in data:
+        relative = Path(name)
+        if (
+            relative == Path(".")
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or PureWindowsPath(name).drive
+            or "\\" in name
+        ):
+            raise ValueError(
+                "GRAPHIFY_PORTABLE_BASELINE_REQUIRED: nonportable manifest key"
+            )
+    return data
+
+
+def _snapshot(root):
+    """Bind the whole actual directory input, not just compile rows."""
+    files = {}
+    for path in root.rglob("*"):
+        if path.is_symlink() or not (path.is_file() or path.is_dir()):
+            raise ValueError("Graphify requires an ordinary file tree")
+        if path.is_file():
+            name = unicodedata.normalize("NFC", path.relative_to(root).as_posix())
+            if name in files:
+                raise ValueError(
+                    "Graphify input names collide after Unicode normalization"
+                )
+            with path.open("rb") as stream:
+                files[name] = hashlib.file_digest(stream, "sha256").hexdigest()
+    return files
+
+
+def _prove_coverage(corpus, snapshot, witnesses, tool_manifest, graph):
+    required = {
+        unicodedata.normalize("NFC", target.relative_to(corpus).as_posix())
+        for target, _ in witnesses
+    }
+    represented = set()
+    for kind in ("nodes", "hyperedges"):
+        for item in graph.get(kind, []):
+            owner = item.get("source_file")
+            if isinstance(owner, str):
+                represented.add(unicodedata.normalize("NFC", owner))
+    if not required <= represented or not required <= tool_manifest.keys():
+        raise IncompleteExtraction(
+            "Graphify manifest or graph omitted a selected/retained source"
+        )
+    for name, entry in tool_manifest.items():
+        if name not in snapshot or not isinstance(entry, dict):
+            raise IncompleteExtraction(
+                f"Graphify manifest has an unbound source: {name}"
+            )
+        path = corpus / name
+        if not path.is_file():
+            # Graphify normalizes keys to NFC; the actual filesystem entry need not be NFC.
+            path = next(
+                p
+                for p in corpus.rglob("*")
+                if unicodedata.normalize("NFC", p.relative_to(corpus).as_posix())
+                == name
+            )
+        with path.open("rb") as stream:
+            # Native manifest uses MD5 as a change stamp, not a trust digest.
+            expected = hashlib.file_digest(
+                stream, lambda: hashlib.new("md5", usedforsecurity=False)
+            ).hexdigest()
+        field = "semantic_hash" if name in required else "ast_hash"
+        if entry.get(field) != expected:
+            raise IncompleteExtraction(
+                f"Graphify manifest lacks current byte coverage: {name}"
+            )
+
+
+def _publish_generation(candidate, public, exchange):
+    """Switch graph, manifest and native cache in one filesystem operation."""
+    with tempfile.TemporaryDirectory(
+        prefix=".dogpdkb-graph-", dir=public.parent
+    ) as temporary:
+        staged = Path(temporary) / "generation"
+        shutil.copytree(candidate, staged)
+        # Store.lock guards this inode. Keep it stable across the switch.
+        os.link(public / ".dogpdkb.lock", staged / ".dogpdkb.lock")
+        if exchange(-100, os.fsencode(staged), -100, os.fsencode(public), 2):
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), public)
 
 
 def _previous_graph_input(store, doc_id, document):
@@ -195,9 +387,6 @@ def _retained_corpus(
         if graphify_inputs == "text" and relative.suffix.lower() != ".md":
             raise ValueError("text Graphify inputs require Markdown retained sources")
         retained.append((current.relative_to(book.corpus), relative, Path(witness)))
-    if graphify_inputs == "all" and not retained and not omitted_paths:
-        return book.corpus, []
-
     native_manifest_path = settings.graph_for(book) / "manifest.json"
     native_manifest = (
         read_json(native_manifest_path) if native_manifest_path.is_file() else {}
@@ -216,6 +405,7 @@ def _retained_corpus(
             name
             for name in names
             if name == ".dogpdkb.lock"
+            or name.startswith(".dogpdkb-graph-")
             or (
                 graphify_inputs == "text"
                 and not (Path(folder) / name).is_dir()
@@ -350,30 +540,61 @@ def run_graph(
             return 2
     graph_dir = settings.graph_for(book)
     graph_path = graph_dir / "graph.json"
-    if graph_path.exists() and not (graph_dir / "manifest.json").is_file():
+    native_manifest = graph_dir / "manifest.json"
+    if graph_path.exists() != native_manifest.is_file():
         run.failure(step="graph", reason="GRAPHIFY_BASELINE_MANIFEST_REQUIRED")
         return 1
+    if graph_path.exists():
+        _graph(graph_path)
+        _portable_manifest(native_manifest)
     if not graph_path.exists():
         selected = {Path(row["path"]).resolve() for row in pending}
         if any(
             path.resolve() not in selected
-            for path in book.corpus.rglob("*.md")
-            if not path.resolve().is_relative_to(graph_dir.resolve())
+            for path in book.corpus.rglob("*")
+            if path.is_file()
+            and not path.is_symlink()
+            and path.suffix.lower() == ".md"
+            and not path.is_relative_to(graph_dir)
+            and not path.is_relative_to(settings.staging)
+            and not any(
+                part.startswith(".dogpdkb-graph-")
+                for part in path.relative_to(book.corpus).parts
+            )
         ):
             run.failure(step="graph", reason="GRAPHIFY_BASELINE_REQUIRED")
             return 1
-    import tempfile
+    exchange = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    if exchange is None:
+        run.failure(step="graph", reason="GRAPHIFY_ATOMIC_PUBLICATION_UNAVAILABLE")
+        return 2
 
     run.stage("graphify", total=len(pending), completed=0, failed=0, phase="prepare")
     workspace = Path(tempfile.mkdtemp(prefix="graphify-", dir=run.directory))
+    command = settings.command("graphify")
+    preflight, preflight_log = _native_preflight(command, workspace)
+    if preflight:
+        run.failure(
+            step="graph",
+            reason=(
+                "GRAPHIFY_PREFLIGHT_INTERRUPTED"
+                if preflight in {130, 143}
+                else "GRAPHIFY_NATIVE_PROOF_UNSUPPORTED"
+            ),
+            report=str(preflight_log),
+        )
+        return preflight
     candidate = workspace / "graphify-out"
-    if graph_dir.exists():
-        shutil.copytree(graph_dir, candidate)
+    _snapshot(graph_dir)
+    shutil.copytree(
+        graph_dir, candidate, ignore=shutil.ignore_patterns(".dogpdkb.lock")
+    )
     corpus, witnesses = _retained_corpus(
         settings, book, store, run, data, pending, workspace, omitted, graphify_inputs
     )
     if corpus is None:
         return 2
+    snapshot = _snapshot(corpus)
     report = workspace / "result.json"
     run.data["artifacts"].update(
         graph_report=str(report), graph_candidate=str(candidate)
@@ -391,52 +612,37 @@ def run_graph(
         for row in pending
     )
     run.stage("graphify", total=len(pending), completed=0, failed=0, phase="tools")
-    argv = [
-        *settings.command("graphify"),
-        "extract",
-        str(corpus),
-        "--out",
-        str(workspace),
-        "--no-cluster",
-    ]
+    argv = _native_extract(command, corpus, workspace)
+    log = workspace / "extract.log"
     code = run_command(
         argv,
-        log=run.directory / "graphify.log",
-        env={"GRAPHIFY_OUT": "graphify-out", "GRAPHIFY_FORCE": "0"},
+        log=log,
+        env=_NATIVE_ENV,
     )
     status, reason = "failed", None
     if code in {124, 130, 143}:
         status, reason = "unknown", "Graphify interrupted before a known result"
     elif code:
         reason = f"Graphify directory extraction exited {code}"
+    elif _native_incomplete(log):
+        reason = "GRAPHIFY_INCOMPLETE_EXTRACTION: see native extract log"
     else:
         try:
             graph = _graph(candidate / "graph.json")
-            tool_manifest = read_json(candidate / "manifest.json")
-            if not isinstance(tool_manifest, dict):
-                raise TypeError("Graphify did not produce its manifest")
+            tool_manifest = _portable_manifest(candidate / "manifest.json")
             # Extraction may take hours. Do not publish if an input changed.
             _manifest(settings, book, store, run, data)
-            if any(
-                not target.is_file() or target.read_bytes() != witness.read_bytes()
+            if _snapshot(corpus) != snapshot or any(
+                target.read_bytes() != witness.read_bytes()
                 for target, witness in witnesses
             ):
                 raise ValueError("graph corpus mirror changed during extraction")
-            graph_dir.mkdir(parents=True, exist_ok=True)
-            for artifact in candidate.iterdir():
-                if artifact.name in {"graph.json", "manifest.json", ".dogpdkb.lock"}:
-                    continue
-                target = graph_dir / artifact.name
-                if artifact.is_dir():
-                    shutil.copytree(artifact, target, dirs_exist_ok=True)
-                else:
-                    shutil.copyfile(artifact, target)
-            # Native graph contents pass through without node/edge rewriting.
-            # Publish graph before manifest: an interrupted publication must
-            # never make a later scan skip work absent from the public graph.
-            atomic_json(graph_path, graph)
-            atomic_json(graph_dir / "manifest.json", tool_manifest)
+            _prove_coverage(corpus, snapshot, witnesses, tool_manifest, graph)
+            _snapshot(candidate)
+            _publish_generation(candidate, graph_dir, exchange)
             status = "completed"
+        except IncompleteExtraction as error:
+            reason = f"GRAPHIFY_INCOMPLETE_EXTRACTION: {error}"
         except (OSError, TypeError, ValueError) as error:
             status, reason = "unknown", str(error)
     atomic_json(
@@ -448,6 +654,9 @@ def run_graph(
             "argv": diagnostic_argv(argv),
             "graph": str(graph_path),
             "candidate": str(candidate),
+            "native_version": _NATIVE_VERSION,
+            "native_log": str(log),
+            "input_sha256": snapshot,
             "corpus": str(corpus),
             "graphify_inputs": graphify_inputs,
             "omitted_deferred_sources": sorted(omitted),
@@ -461,6 +670,7 @@ def run_graph(
     for row in pending:
         doc_id = row["document_id"]
         acknowledgement = {}
+        retained_report = report
         if status == "completed":
             retained_report = store.input_directory(doc_id) / "graph-report.json"
             atomic_json(retained_report, {**read_json(report), "candidate": None})
@@ -504,7 +714,7 @@ def run_graph(
                 "version": row["version"],
                 "status": status,
                 "run_id": run.id,
-                "report": str(retained_report if status == "completed" else report),
+                "report": str(retained_report),
                 "reason": reason,
                 **acknowledgement,
             }
@@ -520,6 +730,7 @@ def run_graph(
                 else "GRAPHIFY_RESULT_UNKNOWN",
                 message=reason,
                 report=str(report),
+                log=str(log),
                 exit_code=code,
                 argv=diagnostic_argv(argv),
             )
@@ -558,7 +769,7 @@ def main(argv=None) -> int:
     try:
         args = parser.parse_args(argv)
     except SystemExit as error:
-        return 64 if error.code == 2 else error.code
+        return 64 if error.code == 2 else int(error.code or 0)
     run = None
     try:
         settings = load_config(args.config)

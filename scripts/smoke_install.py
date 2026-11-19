@@ -10,6 +10,7 @@ import shutil
 import sys
 import tarfile
 import tempfile
+import textwrap
 import zipfile
 from pathlib import Path
 from subprocess import PIPE
@@ -49,9 +50,40 @@ def observe(event, args):
 sys.addaudithook(observe)
 """
 
+# This prefix exits before synthetic capability checks can reach a fake's extraction body.
+GRAPHIFY_PREFLIGHT = """import os,sys
+from pathlib import Path
+if '--version' in sys.argv and sys.argv[1:2] != ['skylark']:
+    print('graphify 0.9.110' if Path(__file__).with_name('mode').is_file() and Path(__file__).with_name('mode').read_text() == 'unsupported' else 'graphify 0.9.111')
+    raise SystemExit(0)
+if os.environ.get('GRAPHIFY_OPENAI_OAUTH_AUTH_FILE','').endswith('/no-oauth.json'):
+    assert 'openai-oauth' in sys.argv
+    print("error: backend 'openai-oauth' requires a ChatGPT subscription OAuth login.")
+    raise SystemExit(1)
+"""
+
+GRAPHIFY_PROOF = """
+import hashlib,json,sys,unicodedata
+from pathlib import Path
+scan=Path(sys.argv[sys.argv.index('extract')+1])
+out=Path(sys.argv[sys.argv.index('--out')+1])/'graphify-out'
+manifest={}
+graph=json.loads((out/'graph.json').read_text())
+for path in scan.rglob('*'):
+    if path.is_file() and not path.name.startswith('.'):
+        name=unicodedata.normalize('NFC', path.relative_to(scan).as_posix())
+        stamp=hashlib.new('md5',path.read_bytes(),usedforsecurity=False).hexdigest()
+        manifest[name]={'ast_hash':stamp,'semantic_hash':stamp}
+        graph.setdefault('hyperedges',[]).append({'source_file':name,'nodes':[]})
+(out/'manifest.json').write_text(json.dumps(manifest))
+(out/'graph.json').write_text(json.dumps(graph))
+"""
+
 # Fake only external remote/graph processes. Comparison and image-less OCR use
 # the installed public CLIs, with no replacement packages or tool runtime imports.
-REMOTE_CLI = r"""
+REMOTE_CLI = (
+    GRAPHIFY_PREFLIGHT
+    + r"""
 import json, pathlib, subprocess, sys
 tool, *args = sys.argv[1:]
 root = pathlib.Path(__file__).parent
@@ -88,6 +120,9 @@ elif tool == 'graphify' and args[0] == 'extract':
 else:
     raise SystemExit('unexpected public command')
 """
+    + "\nif tool == 'graphify':\n"
+    + textwrap.indent(GRAPHIFY_PROOF, "    ")
+)
 
 
 def inspect_artifacts(wheel: Path, sdist: Path) -> None:

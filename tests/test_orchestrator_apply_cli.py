@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.smoke_install import GRAPHIFY_PREFLIGHT, GRAPHIFY_PROOF
 from tests.ocr_fixture import write_ocr_fixture
 from tests.source_fixture import team_id, team_row, yuque_binding
 
@@ -1020,7 +1021,8 @@ def test_explicit_graph_replan_preserves_original_reports_and_published_bytes(tm
     seed_body_baseline(tmp_path, config, "# Title\n\nPrevious different knowledge.\n")
     graph = tmp_path / "graphify.py"
     graph.write_text(
-        "from pathlib import Path\nPath(__file__).with_suffix('.called').touch()\nraise SystemExit(2)\n"
+        GRAPHIFY_PREFLIGHT
+        + "from pathlib import Path\nPath(__file__).with_suffix('.called').touch()\nraise SystemExit(2)\n"
     )
     config.write_text(
         config.read_text()
@@ -1162,13 +1164,13 @@ def test_retry_after_interrupted_replan_preserves_active_selection_and_inputs(tm
     seed_body_baseline(tmp_path, config, "# Title\n\nPrevious different knowledge.\n")
     graph = tmp_path / "graphify.py"
     graph.write_text(
-        "import json,sys\nfrom pathlib import Path\n"
+        GRAPHIFY_PREFLIGHT + "import json,sys\nfrom pathlib import Path\n"
         "flag=Path(__file__).with_suffix('.called')\n"
         "if not flag.exists():\n    flag.touch()\n    raise SystemExit(130)\n"
         "out=Path(sys.argv[sys.argv.index('--out')+1])/'graphify-out'\n"
         "out.mkdir(parents=True,exist_ok=True)\n"
         "(out/'graph.json').write_text(json.dumps({'nodes':[], 'links':[]}))\n"
-        "(out/'manifest.json').write_text('{}')\n"
+        "(out/'manifest.json').write_text('{}')\n" + GRAPHIFY_PROOF
     )
     config.write_text(
         config.read_text()
