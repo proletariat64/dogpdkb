@@ -62,7 +62,10 @@ def build_parser(*, full: bool = False) -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=False)
 
     plan = sub.add_parser(
-        "plan", help="create an immutable, inference-free conversion plan"
+        "plan",
+        help="create an immutable, inference-free conversion plan",
+        epilog=contracts.PLAN + ("\n" + contracts.PLAN_FULL if full else ""),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     plan.add_argument("--mode", choices=("paddle", "llm"), required=True)
     shape = plan.add_mutually_exclusive_group(required=True)
@@ -84,7 +87,12 @@ def build_parser(*, full: bool = False) -> argparse.ArgumentParser:
     plan.add_argument("--selection")
     plan.add_argument("--cache-dir")
 
-    run = sub.add_parser("run", help="run or resume a frozen plan")
+    run = sub.add_parser(
+        "run",
+        help="run or resume a frozen plan",
+        epilog=contracts.RUN + ("\n" + contracts.RUN_FULL if full else ""),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     run.add_argument("--plan", required=True)
     run.add_argument("--result", required=True)
     run.add_argument("--retry-failed", action="store_true")
