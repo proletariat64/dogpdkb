@@ -136,8 +136,9 @@ def test_raw_relative_images_remain_readable_after_wash_deletion(tmp_path):
 def test_unknown_ocr_report_remains_partial_and_retains_raw_baseline(tmp_path):
     config, differences = enriched_instance(tmp_path)
     tool = tmp_path / "enrich.py"
-    tool.write_text(
-        "import sys\nfrom pathlib import Path\na=sys.argv[1:]\nPath(a[a.index('--report')+1]).write_text('invalid')\nraise SystemExit(2)\n"
+    write_ocr_fixture(
+        tool,
+        "_argument('--result').write_text('invalid')\nraise SystemExit(2)\n",
     )
     result = cli("apply", "--config", config, "--input", differences)
     assert result.returncode == 2, result.stderr
@@ -163,37 +164,36 @@ def test_successful_graph_witness_and_report_survive_wash_deletion(tmp_path):
     assert report["candidate"] is None
 
 
-def test_declared_ocr_images_are_relocated_before_corpus_publication(tmp_path):
+def test_declared_v2_ocr_images_are_retained_before_corpus_publication(tmp_path):
     config, differences = enriched_instance(tmp_path)
-    tool = tmp_path / "enrich.py"
-    write_ocr_fixture(
-        tool,
-        """import json,sys
-from pathlib import Path
-from urllib.parse import quote
-args=sys.argv[1:]
-def option(name):return Path(args[args.index(name)+1])
-doc=json.loads(fixture_request.read_text())['documents'][0]
-output=fixture_output;output.parent.mkdir(parents=True,exist_ok=True)
-image=output.parent/'prepared image.png';image.write_bytes(b'original image bytes')
-output.write_text(Path(doc['path']).read_text()+'\\n![prepared]('+quote(str(image),safe='/')+')\\n')
-resource={'resource_id':'image','status':'success','source_path':str(image),'prepared_image':str(image)}
-fixture_result({'schema_version':'mdocr-result-2','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[resource],'ocr':{'images':[resource]}}]})
-""",
+    remote_path = tmp_path / "remote.json"
+    remote = json.loads(remote_path.read_bytes())
+    remote["42"]["body"] += "\n![diagram](../images/diagram.png)\n"
+    remote_path.write_text(json.dumps(remote))
+    tool = tmp_path / "skylark.py"
+    tool.write_text(
+        tool.read_text().replace(
+            "path.write_text(doc['body'])",
+            "path.write_text(doc['body']); image=path.parent.parent/'images'/'diagram.png'; image.parent.mkdir(parents=True,exist_ok=True); __import__('PIL.Image',fromlist=['Image']).new('RGB',(2,2),'red').save(image)",
+        )
     )
     first = cli("apply", "--config", config, "--input", differences)
     assert first.returncode == 0, first.stderr
-    manifest = json.loads(Path(json.loads(first.stdout)["manifest"]).read_text())
+    manifest = json.loads(Path(json.loads(first.stdout)["manifest"]).read_bytes())
     document = manifest["documents"][0]
     shutil.rmtree(Path(json.loads(first.stdout)["run"]).parent)
-    image = Path(document["ocr"]["images"][0]["prepared_image"])
-    assert image.read_bytes() == b"original image bytes"
-    from urllib.parse import quote
+    image = document["ocr"]["images"][0]
+    import hashlib
 
-    assert quote(str(image), safe="/") in Path(document["path"]).read_text()
     assert (
-        Path(document["input_copy"]).read_bytes() == Path(document["path"]).read_bytes()
+        hashlib.sha256(Path(image["source_path"]).read_bytes()).hexdigest()
+        == image["source_sha256"]
     )
+    block = Path(image["artifact"]).read_bytes()
+    assert hashlib.sha256(block).hexdigest() == image["artifact_sha256"]
+    publication = Path(document["path"]).read_bytes()
+    assert block in publication
+    assert Path(document["input_copy"]).read_bytes() == publication
 
 
 def test_unattempted_ocr_reads_retained_absolute_image_after_old_wash_deleted(tmp_path):
@@ -221,8 +221,9 @@ def option(name):return Path(args[args.index(name)+1])
 doc=json.loads(fixture_request.read_text())['documents'][0]
 body=Path(doc['path']).read_text()
 if not Path(__file__).with_name('allow').exists():
- fixture_result({'schema_version':'mdocr-result-2','causes':['OCR_AUTH_UNAVAILABLE'],'documents':[{'document_id':doc['document_id'],'status':'partial','output':None,'resources':[]}]});raise SystemExit(2)
-if doc['document_id']=='SCOPED_PEER':
+ fixture_result({'schema_version':'mdocr-result-2','causes':['OCR_AUTH_UNAVAILABLE'],'documents':[{'status':'partial','output':None,'resources':[]} for doc in fixture_plan['documents']]});raise SystemExit(2)
+entry = next(item for item in json.loads(fixture_request.read_bytes())['documents'] if item['path'] == doc['path'])
+if entry['document_id']=='SCOPED_PEER':
  target=body.split('](')[1].split(')')[0]
  assert (Path(doc['path']).parent/target).is_file(),target
  with Path(__file__).with_name('valid-images').open('a') as log:log.write('43\\n')
@@ -421,17 +422,19 @@ def test_real_mdocr_retained_mixed_image_targets_remain_supported(
         assert second.returncode == 2, second.stderr
     else:
         second = first
-    directory = Path(json.loads(second.stdout)["run"]).parent
-    report = next(
-        json.loads(p.read_text())
-        for p in directory.glob("ocr-*-report.json")
-        if json.loads(
-            p.with_name(p.name.replace("-report.json", "-request.json")).read_text()
-        )["documents"][0]["document_id"]
-        == team_id("43")
+    run = json.loads(Path(json.loads(second.stdout)["run"]).read_bytes())
+    artifacts = run["artifacts"]
+    request = json.loads(Path(artifacts["ocr_request"]).read_bytes())
+    entry = next(
+        row for row in request["documents"] if row["document_id"] == team_id("43")
     )
+    report = json.loads(Path(artifacts["ocr_report"]).read_bytes())
     assert report.get("causes"), report
-    resources = report["documents"][0]["resources"]
+    resources = next(
+        row["resources"]
+        for row in report["documents"]
+        if row["document_id"] == entry["path"]
+    )
     assert resources and not any(
         "UNSUPPORTED" in r.get("reason", "") for r in resources
     ), resources

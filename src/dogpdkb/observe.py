@@ -298,6 +298,8 @@ def report(data: dict) -> str:
         f"publication: corpus={publication['corpus']} graph={publication['graph']}; corpus/graph byte differences={different}",
         f"next: {data['next_action']['message']}",
     ]
+    if (detail := data.get("phase")) and detail != progress["phase"]:
+        lines.insert(1, f"tool phase={detail}")
     if data.get("reason"):
         lines.append(f"reason: {data['reason']}")
     if handoff := data.get("handoff"):

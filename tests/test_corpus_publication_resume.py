@@ -42,14 +42,14 @@ def test_resume_after_replacement_without_repeating_tools(
             raise OSError("injected interruption after first replacement")
         return replace(path, target)
 
-    def fail_save(store):
+    def fail_save(store, *, durable=False):
         if (
             not save_facts
             and store.document(team_id("42")).get("corpus", {}).get("version")
             == VERSION
         ):
             raise OSError("injected state save interruption")
-        return save(store)
+        return save(store, durable=durable)
 
     with monkeypatch.context() as patch:
         patch.setattr(Path, "replace", fail_second)
