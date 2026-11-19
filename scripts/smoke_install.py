@@ -274,9 +274,9 @@ def smoke(dist: Path) -> None:
         before_help = {path.relative_to(work) for path in work.rglob("*")}
         for tool in ("dogpdkb", "mdcompare", "mdocr"):
             executable = environment / "bin" / tool
-            root_help = run([executable, "--help"], extra_env=help_env)
-            # Commands are discovered from the public root help, so a new leaf
-            # cannot silently remain outside the installed acceptance matrix.
+            root_help = run([executable, "--help", "--full"], extra_env=help_env)
+            # The full public help lists all commands even when quick help is
+            # intentionally terse. Still exercise both help forms below.
             commands = re.findall(
                 r"^    ([a-z][a-z0-9-]*)\s{2,}",
                 root_help.split("options:", 1)[0],
