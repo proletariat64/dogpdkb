@@ -3,7 +3,27 @@
 These are generic tool interfaces. Book/version selection, plan decisions, agent
 handoff, scheduling, and publication belong to the caller.
 
-## mdocr batch
+## mdocr plan and run
+
+The active interface is `mdocr plan --mode paddle|llm --input FILE --output FILE --plan PLAN`,
+then `mdocr run --plan PLAN --result RESULT`. For batch inputs, use `--list` (JSON array
+of Markdown paths resolved from the list) or `--directory` (recursive Markdown paths)
+with `--output-dir`. See `mdocr plan --help --full` and [OCR runtime prerequisites](mdocr-runtime.md).
+The orchestrator explicitly chooses Paddle and uses a single input plan per document. It binds the
+result to the plan SHA-256, the planned source and destination, and the SHA-256 of output/evidence.
+It does not import the OCR implementation. `--selection` is a separate optional map keyed by
+absolute input path; selected image hashes are bound to each occurrence. Planning may download
+selected remote images only with `--download`; it performs no OCR.
+
+`mdocr-result-2` contains `plan_sha256`, `status`, request/reservation state,
+concurrency transitions and ordered document rows. Complete rows have `output`,
+`output_sha256`, and `mdocr-ocr-2` evidence containing effective mode configuration,
+resource IDs, and original image and OCR-block paths/byte digests. LLM evidence also
+has a context digest. Failed/held/unknown rows cannot claim a completed Markdown
+output. The internal plan-side journal prevents resubmission if result mirroring was
+interrupted. Exit 0 means complete, 2 incomplete, and 1 fatal invocation or artifact error.
+
+## Independent legacy mdocr batch command
 
 ```
 mdocr batch --manifest input.json --output-dir output --report report.json \

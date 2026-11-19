@@ -49,7 +49,7 @@ def atomic_write(path: Path, text: str) -> None:
 def build_parser(*, full: bool = False) -> argparse.ArgumentParser:
     parser = _HelpfulParser(
         prog="mdocr",
-        description="Prepare images referenced by Markdown and optionally OCR them.",
+        description="Plan and safely process Markdown image OCR.",
         epilog=contracts.ROOT + ("\n" + contracts.ROOT_FULL if full else ""),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -60,6 +60,42 @@ def build_parser(*, full: bool = False) -> argparse.ArgumentParser:
         help="with -h/--help, show the full local contract",
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=False)
+
+    plan = sub.add_parser(
+        "plan",
+        help="create an immutable, inference-free conversion plan",
+        epilog=contracts.PLAN + ("\n" + contracts.PLAN_FULL if full else ""),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    plan.add_argument("--mode", choices=("paddle", "llm"), required=True)
+    shape = plan.add_mutually_exclusive_group(required=True)
+    shape.add_argument("--input", help="one Markdown file")
+    shape.add_argument("--list", help="JSON array of Markdown paths")
+    shape.add_argument("--directory", help="recursive Markdown directory")
+    plan.add_argument("--output", help="output Markdown file for --input")
+    plan.add_argument("--output-dir", help="output directory for --list/--directory")
+    plan.add_argument("--plan", required=True, help="immutable plan JSON destination")
+    plan.add_argument("--model")
+    plan.add_argument("--effort")
+    plan.add_argument("--prompt-file")
+    plan.add_argument("--token-budget", type=int)
+    plan.add_argument("--request-budget", type=int)
+    plan.add_argument("--concurrency", type=int, choices=(1, 2, 3), default=3)
+    plan.add_argument("--max-seconds", type=float, default=900)
+    plan.add_argument("--endpoint")
+    plan.add_argument("--download", action="store_true")
+    plan.add_argument("--selection")
+    plan.add_argument("--cache-dir")
+
+    run = sub.add_parser(
+        "run",
+        help="run or resume a frozen plan",
+        epilog=contracts.RUN + ("\n" + contracts.RUN_FULL if full else ""),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    run.add_argument("--plan", required=True)
+    run.add_argument("--result", required=True)
+    run.add_argument("--retry-failed", action="store_true")
 
     for name, help_text in (
         ("prepare", "copy Markdown with local Prepared image JPEGs; no model calls"),
@@ -321,6 +357,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 0
+    if args.command == "plan":
+        from .plan import plan_command
+
+        try:
+            return plan_command(args)
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"mdocr: plan: {exc}", file=sys.stderr)
+            return 1
+    if args.command == "run":
+        from .runner import run_command as execute_plan
+
+        try:
+            return execute_plan(args)
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"mdocr: run: {exc}", file=sys.stderr)
+            return 1
     if args.command == "batch":
         from .batch import run_batch
 

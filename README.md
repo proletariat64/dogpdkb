@@ -16,7 +16,8 @@ dogpdkb --help
 dogpdkb sync --help
 dogpdkb sync --help --full
 mdcompare knowledge -h --full
-mdocr batch -h --full
+mdocr plan -h --full
+mdocr run -h --full
 skylark export -h --full
 ```
 
@@ -150,7 +151,7 @@ skylark = ["node", "/opt/pi-skylark/dist/cli.mjs"]
 编排器对工具只调用公开 CLI、读取公开产物，不导入工具包或复刻其内部算法。
 本轮新增能力必须先提供给所选工具入口：
 
-- [mdcompare catalog、mdocr batch](docs/orchestrator-tool-contracts.md)，随本仓库 wheel 提供。
+- [mdcompare catalog、mdocr plan/run](docs/orchestrator-tool-contracts.md)，随本仓库 wheel 提供。
 - [Graphify 原版 CLI](docs/orchestrator-graphify-contract.md)：目录级增量、原生 manifest/cache 和整批发布。
 - [Skylark listing/export](docs/orchestrator-skylark-contract.md)：已恢复的独立 CLI 与构建方法。
 

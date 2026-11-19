@@ -1,0 +1,660 @@
+"""Durably admit jobs, settle exact evidence, and publish complete OCR Markdown."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import tempfile
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import quote
+
+import requests
+
+from . import __version__
+from .llm import LlmClient, LlmError
+from .markdown import IMAGE_RE, parse_image_match
+from .paddle import _MODEL, OcrRequestOutcome, PaddleClient
+from .plan import read_plan
+from .prepare import JPEG_QUALITY, ImageError, normalize_image
+
+
+class NotCompleted(RuntimeError):
+    """A classified provider or image outcome; never includes provider text."""
+
+    def __init__(self, reason, status=None, unknown=False):
+        super().__init__(reason)
+        self.reason = reason
+        self.status = status
+        self.unknown = unknown
+
+
+@dataclass(frozen=True)
+class Job:
+    key: str
+    images: tuple[dict, ...]
+    body: str | None = None
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _json(value) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode()
+
+
+def _atomic(path, data, *, exclusive=False):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".mdocr-run-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if exclusive:
+            os.link(name, path)
+        else:
+            os.replace(name, path)
+        parent = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def _block(image, mode, patch):
+    original = quote(image["original_link"], safe="/:%?&=+@#;,.~!$'*-_")
+    uncertainty = patch.get("uncertainty", "").strip()
+    body = patch["markdown"].strip()
+    if uncertainty:
+        body += "\n\n" + "\n".join(f"> {line}" for line in uncertainty.splitlines())
+    return (
+        f"<!-- mdocr:ocr-begin v=2 id={image['id']} -->\n"
+        f"<!-- mdocr:meta mode={mode} sha256={image['sha256']} -->\n"
+        f"> Original image: [source](<{original}>)\n\n"
+        f"{body}\n<!-- mdocr:ocr-end -->"
+    )
+
+
+def _patches(value, count):
+    if not isinstance(value, list) or len(value) != count:
+        raise NotCompleted("OCR_RESPONSE_INVALID")
+    for patch in value:
+        if not isinstance(patch, dict):
+            raise NotCompleted("OCR_RESPONSE_INVALID")
+        keys = ("markdown", "uncertainty")
+        if any(not isinstance(patch.get(k), str) for k in keys):
+            raise NotCompleted("OCR_RESPONSE_INVALID")
+        if any(re.search(r"<!--\s*mdocr:", patch[k], re.IGNORECASE) for k in keys):
+            raise NotCompleted("OCR_DELIMITER_RESERVED")
+        if patch.get("kind") == "hold":
+            if patch["markdown"] or not patch["uncertainty"].strip():
+                raise NotCompleted("OCR_RESPONSE_INVALID")
+        elif not patch["markdown"].strip():
+            raise NotCompleted("OCR_EMPTY")
+    return value
+
+
+def _text(path, digest, reason):
+    data = Path(path).read_bytes()
+    if _sha(data) != digest:
+        raise ValueError(reason)
+    return data
+
+
+def _validate(plan, plan_path, result_path, ledger, artifacts, lock_paths):
+    settings, docs = plan["settings"], plan["documents"]
+    if settings["mode"] not in {"paddle", "llm"} or settings["concurrency"] not in {
+        1,
+        2,
+        3,
+    }:
+        raise ValueError("invalid plan settings")
+    for budget in (settings["token_budget"], settings["request_budget"]):
+        if budget is not None and (type(budget) is not int or budget < 0):
+            raise ValueError("invalid plan budget")
+    if not 0 <= settings["max_seconds"] < float("inf"):
+        raise ValueError("invalid plan deadline")
+    controls = {
+        path.resolve()
+        for path in (
+            plan_path,
+            result_path,
+            ledger,
+            *lock_paths,
+        )
+    }
+    if len(controls) != 5:
+        raise ValueError("overlapping execution artifacts")
+    sources, outputs, images = set(), set(), set()
+    texts = []
+    for doc in docs:
+        source, output = (
+            Path(doc["path"]).resolve(strict=True),
+            Path(doc["output"]).resolve(),
+        )
+        if source in sources or output in outputs or doc["document_id"] != str(source):
+            raise ValueError("duplicate or invalid planned input/output identity")
+        sources.add(source)
+        outputs.add(output)
+        text = _text(source, doc["sha256"], "SOURCE_DRIFT").decode()
+        texts.append(text)
+        end, seen = 0, set()
+        for image in doc["images"]:
+            start, stop, key = image["start"], image["end"], image["id"]
+            if (
+                not isinstance(key, str)
+                or not re.fullmatch(r"[a-zA-Z0-9-]+", key)
+                or key in seen
+                or not end <= start < stop <= len(text)
+            ):
+                raise ValueError("invalid planned image coordinates")
+            seen.add(key)
+            end = stop
+            match = IMAGE_RE.fullmatch(text[start:stop])
+            if match is None or parse_image_match(match).target != image["resource_id"]:
+                raise ValueError("image occurrence no longer agrees with plan")
+            original = image["original_link"]
+            if (
+                (
+                    not isinstance(original, str)
+                    or not original
+                    or not original.startswith(("/", "http://", "https://"))
+                )
+                and image["selected"]
+                and not image["error"]
+            ):
+                raise ValueError("invalid original image destination")
+            if image["source_path"] is not None:
+                path = Path(image["source_path"]).resolve()
+                images.add(path)
+                if image["selected"] and not image["error"]:
+                    _text(path, image["sha256"], "IMAGE_DRIFT")
+    protected = (
+        sources | images | {Path(x).resolve() for x in plan.get("protected_inputs", [])}
+    )
+    if controls & (protected | outputs) or outputs & protected:
+        raise ValueError(
+            "output, result, plan, or lock overlaps another input/destination"
+        )
+    if any(
+        x == artifacts or artifacts in x.parents for x in protected | outputs | controls
+    ):
+        raise ValueError("planned path overlaps the execution artifact directory")
+    if settings["cache_dir"]:
+        cache = Path(settings["cache_dir"]).resolve()
+        if any(
+            x == cache or cache in x.parents for x in protected | outputs | controls
+        ):
+            raise ValueError("planned path overlaps the OCR cache")
+    return texts
+
+
+class Execution:
+    def __init__(self, plan, digest, ledger, result, artifacts, retry):
+        self.docs = plan["documents"]
+        self.settings = plan["settings"]
+        self.mode = self.settings["mode"]
+        self.result, self.ledger, self.artifacts = result, ledger, artifacts
+        self.retry = retry
+        self.deadline = time.monotonic() + self.settings["max_seconds"]
+        self.limit = self.settings["concurrency"]
+        self.config = {"mode": self.mode, "version": __version__}
+        if self.mode == "llm":
+            self.config |= {
+                "model": self.settings["model"],
+                "effort": self.settings["effort"],
+                "prompt_sha256": _sha(self.settings["prompt"].encode()),
+                "schema": "mdocr-image-patches-1",
+            }
+        else:
+            self.config |= {
+                "model": _MODEL,
+                "jpeg_quality": JPEG_QUALITY,
+                "endpoint": self.settings["endpoint"],
+            }
+        self.client = None
+        self.causes = []
+        self.stop = None
+        self.cache = (
+            Path(self.settings["cache_dir"]) if self.settings["cache_dir"] else None
+        )
+        if (
+            result.exists()
+            and json.loads(result.read_bytes()).get("plan_sha256") != digest
+        ):
+            raise ValueError("result is owned by another plan")
+        if ledger.exists():
+            self.state = json.loads(ledger.read_bytes())
+            if (self.state.get("plan_sha256"), self.state.get("result_path")) != (
+                digest,
+                str(result),
+            ):
+                raise ValueError(
+                    "execution is bound to a different plan or result path"
+                )
+        else:
+            if result.exists() or any(Path(d["output"]).exists() for d in self.docs):
+                raise ValueError(
+                    "preexisting unowned execution result or document output"
+                )
+            self.state = {
+                "schema_version": "mdocr-result-2",
+                "plan_sha256": digest,
+                "result_path": str(result),
+                "status": "running",
+                "causes": [],
+                "concurrency": {
+                    "initial": self.limit,
+                    "final": self.limit,
+                    "transitions": [],
+                },
+                "budget": {"requests": 0, "tokens": 0, "reserved_tokens": 0},
+                "requests": [],
+                "documents": [],
+            }
+        self.limit = self.state["concurrency"]["final"]
+        self.latest = {}
+        for previous in self.state["requests"]:
+            if previous["status"] == "admitted":
+                previous.update(status="unknown", reason="OCR_OUTCOME_UNKNOWN")
+            self.latest[previous["key"]] = previous
+        self.reused = self.state.setdefault("reused", {})
+        self.latest.update(self.reused)
+        self.budget = self.state["budget"]
+        self.state["status"] = "running"
+        self.save()
+
+    def save(self):
+        data = _json(self.state)
+        _atomic(self.ledger, data)
+        _atomic(self.result, data)
+
+    def plan_jobs(self, texts):
+        jobs, layout = {}, []
+        for doc, text in zip(self.docs, texts):
+            selected = [im for im in doc["images"] if im["selected"]]
+            bindings = {}
+            context = None
+            if (
+                self.mode == "llm"
+                and selected
+                and not any(im["error"] for im in selected)
+            ):
+                context = _sha(
+                    _json(
+                        [doc["sha256"], [(im["id"], im["sha256"]) for im in selected]]
+                    )
+                )
+                key = _sha(_json([self.config, context]))
+                body = text
+                for image in reversed(doc["images"]):
+                    body = (
+                        body[: image["start"]]
+                        + f"![Image occurrence]({image['id']})"
+                        + body[image["end"] :]
+                    )
+                jobs.setdefault(key, Job(key, tuple(selected), body))
+                bindings = {
+                    image["id"]: (key, offset) for offset, image in enumerate(selected)
+                }
+            elif self.mode == "paddle":
+                for image in selected:
+                    if image["error"]:
+                        continue
+                    key = _sha(_json([self.config, image["sha256"]]))
+                    jobs.setdefault(key, Job(key, (image,)))
+                    bindings[image["id"]] = (key, 0)
+            layout.append((bindings, context))
+        return jobs.values(), layout
+
+    def cached(self, job):
+        if self.cache is None:
+            return None
+        path = self.cache / f"{job.key}.json"
+        if not path.exists():
+            return None
+        try:
+            record = json.loads(path.read_bytes())
+            patches = record["patches"]
+            if record["key"] != job.key or record["sha256"] != _sha(_json(patches)):
+                return None
+            return _patches(patches, len(job.images))
+        except (KeyError, TypeError, ValueError, NotCompleted):
+            return None
+
+    def reserve(self, job):
+        if self.stop:
+            return None
+        if time.monotonic() >= self.deadline:
+            self.stop = "BATCH_DEADLINE_EXCEEDED"
+            return None
+        requests_limit = self.settings["request_budget"]
+        if requests_limit is not None and self.budget["requests"] >= requests_limit:
+            self.stop = "OCR_REQUEST_BUDGET_EXHAUSTED"
+            return None
+        token_limit = self.settings["token_budget"]
+        if token_limit is None:
+            return 0
+        bound = self.client.token_upper_bound(
+            job.body, job.images, self.settings["prompt"]
+        )
+        if type(bound) is not int or bound <= 0:
+            self.stop = "OCR_TOKEN_BOUND_UNAVAILABLE"
+        elif (
+            self.budget["tokens"] + self.budget["reserved_tokens"] + bound > token_limit
+        ):
+            self.stop = "OCR_TOKEN_BUDGET_EXHAUSTED"
+        else:
+            return bound
+        return None
+
+    def convert(self, job):
+        image = job.images[0]
+        if self.mode == "llm":
+            images = [{"id": im["id"], "path": im["source_path"]} for im in job.images]
+            for im in job.images:
+                _text(im["source_path"], im["sha256"], "IMAGE_DRIFT")
+            result = self.client.convert(job.body, images, self.settings["prompt"])
+            patches = _patches(result["patches"], len(images))
+            if [p.get("id") for p in patches] != [im["id"] for im in images]:
+                raise NotCompleted("OCR_RESPONSE_INVALID")
+            return patches, result["usage_tokens"]
+        data = _text(image["source_path"], image["sha256"], "IMAGE_DRIFT")
+        try:
+            jpeg = normalize_image(data)
+        except ImageError as exc:
+            raise NotCompleted("IMAGE_PROCESSING_FAILED") from exc
+        with (
+            tempfile.TemporaryDirectory(prefix="mdocr-image-") as tmp,
+            requests.Session() as session,
+        ):
+            path = Path(tmp) / "prepared.jpg"
+            path.write_bytes(jpeg)
+            client = PaddleClient(
+                self.client,
+                session=session,
+                endpoint=self.settings["endpoint"],
+                adaptive=True,
+            )
+            try:
+                text = client.convert(path)
+            except OcrRequestOutcome as exc:
+                reason = {
+                    401: "OCR_AUTH_UNAVAILABLE",
+                    403: "OCR_QUOTA_EXHAUSTED",
+                    429: "OCR_RATE_LIMITED",
+                }.get(exc.status, "OCR_PROVIDER_FAILED")
+                raise NotCompleted(
+                    reason, status=exc.status, unknown=exc.unknown
+                ) from exc
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise NotCompleted("OCR_OUTCOME_UNKNOWN", unknown=True) from exc
+        return _patches([{"markdown": text, "uncertainty": ""}], 1), None
+
+    def settle(self, active):
+        done, _ = wait(active, return_when=FIRST_COMPLETED)
+        for future in tuple(active):
+            if future not in done:
+                continue
+            job, attempt, admitted = active.pop(future)
+            reservation = attempt["reserved_tokens"]
+            status, unknown, usage = None, False, None
+            try:
+                patches, usage = future.result()
+            except (LlmError, NotCompleted) as exc:
+                status = exc.status
+                unknown = (
+                    getattr(exc, "unknown", False) or exc.reason == "unknown_outcome"
+                )
+                usage = getattr(exc, "usage_tokens", None)
+                attempt.update(
+                    status="unknown" if unknown else "failed", reason=exc.reason
+                )
+            else:
+                attempt.update(status="success", patches=patches)
+                if self.cache is not None and not any(
+                    p.get("kind") == "hold" for p in patches
+                ):
+                    _atomic(
+                        self.cache / f"{job.key}.json",
+                        _json(
+                            {
+                                "key": job.key,
+                                "patches": patches,
+                                "sha256": _sha(_json(patches)),
+                            }
+                        ),
+                    )
+            if usage is not None:
+                if type(usage) is not int or usage < 0:
+                    raise ValueError("invalid provider token usage")
+                self.budget["tokens"] += usage
+                self.budget["reserved_tokens"] -= reservation
+                attempt["usage_tokens"] = usage
+                if self.settings["token_budget"] is not None and usage > reservation:
+                    self.stop = "OCR_TOKEN_BOUND_BREACH"
+            elif status in {401, 403, 429} and not unknown:
+                self.budget["reserved_tokens"] -= reservation
+            if status in {401, 403} and not self.stop:
+                self.stop = (
+                    "OCR_AUTH_UNAVAILABLE" if status == 401 else "OCR_QUOTA_EXHAUSTED"
+                )
+            if status == 429 and admitted == self.limit and not self.stop:
+                if self.limit == 1:
+                    self.stop = "OCR_RATE_LIMITED"
+                else:
+                    self.limit -= 1
+                    self.state["concurrency"]["final"] = self.limit
+                    self.state["concurrency"]["transitions"].append(
+                        {"from": admitted, "to": self.limit}
+                    )
+            self.save()
+
+    def dispatch(self, jobs):
+        with ThreadPoolExecutor(max_workers=self.limit) as pool:
+            active = {}
+            for job in jobs:
+                previous = self.latest.get(job.key)
+                if previous and (previous["status"] != "failed" or not self.retry):
+                    continue
+                cached = self.cached(job)
+                if cached is not None:
+                    self.reused[job.key] = self.latest[job.key] = {
+                        "key": job.key,
+                        "status": "reused",
+                        "patches": cached,
+                    }
+                    self.save()
+                    continue
+                while active and (
+                    len(active) >= self.limit
+                    or any(w > self.limit for _, _, w in active.values())
+                ):
+                    self.settle(active)
+                if self.stop:
+                    continue
+                if self.client is None:
+                    if self.mode == "paddle":
+                        self.client = os.environ.get("PADDLEOCR_TOKEN")
+                        if not self.client:
+                            self.stop = "OCR_AUTH_UNAVAILABLE"
+                            continue
+                    else:
+                        # Cheap terminal caps need no credentials or model runtime.
+                        if (
+                            self.settings["request_budget"] == 0
+                            or self.settings["token_budget"] == 0
+                        ):
+                            self.stop = (
+                                "OCR_REQUEST_BUDGET_EXHAUSTED"
+                                if self.settings["request_budget"] == 0
+                                else "OCR_TOKEN_BUDGET_EXHAUSTED"
+                            )
+                            continue
+                        self.client = LlmClient(
+                            self.settings["model"], self.settings["effort"]
+                        )
+                        try:
+                            self.client.preflight()
+                        except LlmError as exc:
+                            self.stop = exc.reason
+                            continue
+                reservation = self.reserve(job)
+                if reservation is None:
+                    continue
+                attempt = {
+                    "key": job.key,
+                    "status": "admitted",
+                    "reserved_tokens": reservation,
+                }
+                self.state["requests"].append(attempt)
+                self.latest[job.key] = attempt
+                self.budget["requests"] += 1
+                self.budget["reserved_tokens"] += reservation
+                self.save()
+                active[pool.submit(self.convert, job)] = (job, attempt, self.limit)
+            while active:
+                self.settle(active)
+
+    def publish(self, texts, layout):
+        rows = []
+        for position, (doc, text, (bindings, context)) in enumerate(
+            zip(self.docs, texts, layout)
+        ):
+            records, replacements, evidence = [], [], {}
+            for image in doc["images"]:
+                identifier = image["id"]
+                record = {
+                    "id": identifier,
+                    "resource_id": image["resource_id"],
+                    "status": "unselected",
+                }
+                records.append(record)
+                if not image["selected"]:
+                    continue
+                key, offset = bindings.get(identifier, (None, None))
+                attempt = self.latest.get(key)
+                if (
+                    image["error"]
+                    or not attempt
+                    or attempt["status"] not in {"success", "reused"}
+                ):
+                    status = (
+                        "failed"
+                        if image["error"]
+                        else attempt["status"]
+                        if attempt
+                        else "unattempted"
+                    )
+                    reason = image["error"] or (
+                        attempt.get("reason")
+                        if attempt
+                        else self.stop or "OCR_GROUP_INPUT_HELD"
+                    )
+                    record.update(status=status, reason=reason)
+                    continue
+                patch = attempt["patches"][offset]
+                if patch.get("kind") == "hold":
+                    record.update(
+                        status="held",
+                        reason="IMAGE_CONVERSION_HELD",
+                        uncertainty=patch["uncertainty"],
+                    )
+                    continue
+                record["status"] = attempt["status"]
+                block = _block(image, self.mode, patch)
+                replacements.append((image["start"], image["end"], f"\n\n{block}\n\n"))
+                resource = image["resource_id"]
+                if resource not in evidence:
+                    artifact = self.artifacts / str(position) / f"{identifier}.md"
+                    block_bytes = block.encode()
+                    evidence[resource] = {
+                        "resource_id": resource,
+                        "status": "success",
+                        "source_path": image["source_path"],
+                        "source_sha256": image["sha256"],
+                        "artifact": str(artifact),
+                        "artifact_sha256": _sha(block_bytes),
+                    }
+                    if not artifact.exists():
+                        _atomic(artifact, block_bytes, exclusive=True)
+                    elif artifact.read_bytes() != block_bytes:
+                        raise ValueError("OCR evidence has drifted")
+            row = {
+                "document_id": doc["document_id"],
+                "path": doc["path"],
+                "status": "partial",
+                "output": None,
+                "resources": records,
+            }
+            if all(r["status"] in {"success", "reused", "unselected"} for r in records):
+                for start, end, replacement in reversed(replacements):
+                    text = text[:start] + replacement + text[end:]
+                output = Path(doc["output"])
+                content = text.encode()
+                if output.exists():
+                    if output.read_bytes() != content:
+                        raise ValueError("OCR destination has drifted")
+                else:
+                    _atomic(output, content, exclusive=True)
+                ocr = {
+                    "contract": "mdocr-ocr-2",
+                    "configuration": self.config,
+                    "images": list(evidence.values()),
+                }
+                if context is not None:
+                    ocr["context_sha256"] = context
+                row.update(
+                    status="completed",
+                    output=str(output),
+                    output_sha256=_sha(content),
+                    ocr=ocr,
+                )
+            rows.append(row)
+        self.state["documents"] = rows
+        if self.stop and self.stop not in self.state["causes"]:
+            self.state["causes"].append(self.stop)
+        complete = all(r["status"] == "completed" for r in rows)
+        self.state["status"] = "completed" if complete else "partial"
+        self.save()
+        return 0 if complete else 2
+
+
+def run_command(args) -> int:
+    plan_path = Path(args.plan).resolve(strict=True)
+    result = Path(args.result).resolve()
+    plan = read_plan(plan_path)
+    digest = _sha(plan_path.read_bytes())
+    ledger = plan_path.with_name(plan_path.name + ".execution.json")
+    artifacts = plan_path.with_name(plan_path.name + ".evidence").resolve()
+    lock_paths = tuple(
+        path.with_name(path.name + ".lock") for path in (plan_path, result)
+    )
+    texts = _validate(plan, plan_path, result, ledger, artifacts, lock_paths)
+    result.parent.mkdir(parents=True, exist_ok=True)
+    with (
+        lock_paths[0].open("a+b") as plan_lock,
+        lock_paths[1].open("a+b") as result_lock,
+    ):
+        for name, lock in (("plan", plan_lock), ("result", result_lock)):
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ValueError(f"{name} is already being executed") from exc
+        execution = Execution(
+            plan, digest, ledger, result, artifacts, args.retry_failed
+        )
+        jobs, layout = execution.plan_jobs(texts)
+        execution.dispatch(jobs)
+        return execution.publish(texts, layout)

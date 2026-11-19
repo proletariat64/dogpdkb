@@ -246,8 +246,8 @@ def smoke(dist: Path) -> None:
                 assert full == run(
                     [executable, *scope, "-h", "--full"], extra_env=help_env
                 )
-                assert len(full) > len(ordinary)
-                assert "--full" in ordinary
+                assert len(full) > len(ordinary), (tool, scope)
+                assert "--full" in ordinary, (tool, scope)
                 help_checks += 4
             run([executable, "--version"], extra_env=help_env)
             help_checks += 1

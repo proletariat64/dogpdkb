@@ -1,34 +1,69 @@
 """Installed, offline command contracts for mdocr."""
 
 ROOT = """Start here:
-  mdocr prepare -f doc.md -o prepared
-  mdocr ocr --help
-  mdocr batch --help
+  mdocr plan --mode paddle --input doc.md --output enriched.md --plan plan.json
+  mdocr run --plan plan.json --result result.json
 
-Choose prepare for local image preparation without model calls, ocr for direct
-Markdown-to-OCR conversion, or batch for JSON manifests and structured outcomes.
-Downloads are opt-in. New OCR work needs PADDLEOCR_TOKEN; do not put credentials
-in command arguments or manifests.
-
-Local documentation:
-  mdocr COMMAND --help        first invocation, effects, exits, and next steps
-  mdocr COMMAND --help --full complete schema and boundary behavior, offline
-  mdocr --version             installed distribution version
-
-Help/version require no configuration or token and create no operational files.
+Choose paddle for PaddleOCR (PADDLEOCR_TOKEN) or llm for multimodal conversion
+through installed Pi and Node. Use Pi's /login; mdocr does not own credentials.
+Use --help --full on the first command to inspect inputs, outputs and behavior.
+Help/version perform no network access and create no files.
 """
 
 ROOT_FULL = """Full contract:
-  Prepared image: validated local JPEG retained for traceable OCR and re-OCR.
-  OCR block: marked Markdown containing OCR text and its Prepared image link.
-  prepare and ocr accept Markdown files, not JSON manifests. batch accepts a
-  versioned JSON manifest. Paths passed as CLI arguments resolve from cwd;
-  references inside Markdown resolve from that Markdown file's directory.
-  There is no scheduler, corpus policy, or automatic retry/resume layer here.
-  Commands retain usable output after isolated failures; inspect diagnostics
-  or the batch report before selecting another invocation.
-  Use mdocr prepare --help --full, mdocr ocr --help --full, or
-  mdocr batch --help --full for the complete operation-specific contract.
+  OCR block: marked generated Markdown linked to its original image.
+  Prepared image: validated JPEG submitted by the Paddle backend.
+  Use mdocr plan --help --full for input shapes and controls, and
+  mdocr run --help --full for execution and recovery. Independent earlier
+  commands retain their own contracts, including mdocr batch --help --full.
+"""
+
+PLAN = """Examples:
+  mdocr plan --mode paddle --input doc.md --output enriched.md --plan plan.json
+  mdocr plan --mode llm --list paths.json --output-dir enriched --plan plan.json
+  mdocr plan --mode llm --directory raw --output-dir enriched --plan plan.json
+
+Paths in a JSON list are relative to that list. Directory mode is recursive.
+A plan writes new JSON and optionally downloads explicitly selected remote
+images with --download. It does not call an OCR provider or publish Markdown.
+Run the plan with mdocr run --plan plan.json --result result.json.
+Use mdocr plan --help --full for the complete contract.
+"""
+
+PLAN_FULL = """Plan controls:
+  mdocr-plan-2 binds source bytes, image occurrences and witnesses, settings,
+  and destinations. --selection is a JSON object mapping absolute input
+  paths to lists of selected image targets; an empty list selects none.
+  --mode llm defaults to openai/gpt-6.1-terra with medium effort. Use
+  --model provider/model, --effort, and --prompt-file to override. The response
+  schema stays code-owned. --token-budget and --request-budget are run-wide
+  nonnegative ceilings; omit them for unlimited. A hard token budget refuses
+  admission if a trustworthy upper bound is unavailable. Both modes start at
+  concurrency 3 by default. --max-seconds is an admission deadline (default 900).
+"""
+
+RUN = """Example:
+  mdocr run --plan plan.json --result result.json
+
+Tool credentials: set PADDLEOCR_TOKEN for a new Paddle job, or log into the
+chosen OpenAI OAuth route in Pi for LLM. Existing local successful cache results
+need no credentials. Completed documents are atomically published; failed or
+unknown work is written to the result and never passed off as completed.
+
+Exit codes: 0 completed; 2 incomplete or unsupported arguments; 1 invalid plan,
+invalid result binding, or other preflight/write failure.
+Use mdocr run --help --full for the complete contract.
+"""
+
+RUN_FULL = """Execution and recovery:
+  Reuse the same plan and result paths when resuming. The private plan-side
+  journal is authoritative for prior submissions, even if the result mirror was
+  not written. Do not delete or move it to restart an incomplete plan.
+  HTTP 429 reduces later admission 3 → 2 → 1, then stops. Known failed requests
+  require --retry-failed; unknown outcomes are never automatically replayed.
+  Total token accounting includes vision and provider-reported output. Each
+  mdocr-result-2 document row records output digest and mdocr-ocr-2 evidence
+  only if complete. Local original image paths in OCR blocks stay traceable.
 """
 
 FILE_CONTRACT = """Inputs and paths:
