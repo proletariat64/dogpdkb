@@ -1,6 +1,6 @@
 # phase-resume
 
-Status: implemented
+Status: integrated
 
 Blocked by: none
 

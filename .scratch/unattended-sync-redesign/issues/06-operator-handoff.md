@@ -1,6 +1,6 @@
 # operator-handoff
 
-Status: ready-for-agent
+Status: in-progress
 
 Blocked by: 03,05
 
