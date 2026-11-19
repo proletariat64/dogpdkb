@@ -4,7 +4,9 @@ import json
 import os
 import subprocess
 import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = sys.executable
@@ -109,3 +111,108 @@ def test_plan_cannot_overwrite_its_list_input(tmp_path):
     assert result.returncode == 1
     assert "overlaps" in result.stderr
     assert listing.read_text() == '["raw.md"]'
+
+
+def test_plan_downloads_remote_reference_once_only_when_selected(tmp_path):
+    import hashlib
+
+    payload = b"remote image bytes"
+    seen = []
+
+    class Server(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            seen.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.end_headers()
+            self.wfile.write(payload)
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Server) as server:
+        port = server.server_port
+        source = tmp_path / "source.md"
+        source.write_text(
+            f"![a](http://127.0.0.1:{port}/a.png)\n"
+            f"![b](http://127.0.0.1:{port}/a.png)\n"
+            f"![c](http://127.0.0.1:{port}/not-selected.png)\n"
+        )
+        (tmp_path / "selection.json").write_text(
+            json.dumps({str(source): [f"http://127.0.0.1:{port}/a.png"]})
+        )
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = cli(
+                tmp_path,
+                "plan",
+                "--mode",
+                "paddle",
+                "--input",
+                "source.md",
+                "--output",
+                "out.md",
+                "--plan",
+                "plan.json",
+                "--download",
+                "--selection",
+                "selection.json",
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+    assert result.returncode == 0, result.stderr
+    assert seen == ["/a.png"]
+    plan = json.loads((tmp_path / "plan.json").read_bytes())
+    a, b, c = plan["documents"][0]["images"]
+    assert a["id"] != b["id"]
+    assert a["sha256"] == b["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert Path(a["source_path"]).read_bytes() == payload
+    assert not c["selected"] and c["source_path"] is None
+    assert not (tmp_path / "out.md").exists()
+
+
+def test_plan_preserves_directory_tree_and_explicit_list_order(tmp_path):
+    for relative in ("a/First.MD", "b/second.md", "b/notes.txt"):
+        path = tmp_path / "source" / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Body\n")
+    result = cli(
+        tmp_path,
+        "plan",
+        "--mode",
+        "paddle",
+        "--directory",
+        "source",
+        "--output-dir",
+        "out",
+        "--plan",
+        "directory-plan.json",
+    )
+    assert result.returncode == 0, result.stderr
+    directory = json.loads((tmp_path / "directory-plan.json").read_bytes())
+    assert [
+        Path(doc["output"]).relative_to(tmp_path / "out").as_posix()
+        for doc in directory["documents"]
+    ] == ["a/First.MD", "b/second.md"]
+    (tmp_path / "paths.json").write_text('["source/b/second.md", "source/a/First.MD"]')
+    result = cli(
+        tmp_path,
+        "plan",
+        "--mode",
+        "llm",
+        "--list",
+        "paths.json",
+        "--output-dir",
+        "out",
+        "--plan",
+        "list-plan.json",
+    )
+    assert result.returncode == 0, result.stderr
+    listing = json.loads((tmp_path / "list-plan.json").read_bytes())
+    assert [Path(doc["output"]).name for doc in listing["documents"]] == [
+        "second.md",
+        "First.MD",
+    ]
+    assert not (tmp_path / "out").exists()
