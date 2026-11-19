@@ -77,6 +77,7 @@ for path in scan.rglob('*'):
         graph.setdefault('hyperedges',[]).append({'source_file':name,'nodes':[]})
 (out/'manifest.json').write_text(json.dumps(manifest))
 (out/'graph.json').write_text(json.dumps(graph))
+print(f'[graphify extract] wrote {out / "graph.json"} — {len(graph["nodes"])} nodes (no clustering)')
 """
 
 # Fake only external remote/graph processes. Comparison and image-less OCR use

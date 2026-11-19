@@ -1,5 +1,6 @@
 """Retained full source inputs at the installed orchestration CLI seam."""
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -43,12 +44,20 @@ def held_source(tmp_path, manifest, action="retain", *, witness=True, renamed=Fa
             "metadata": {"name": "Held"},
         },
     }
+    # Match Graphify's native manifest change stamp; this is not a trust digest.
+    stamp = hashlib.new("md5", old.read_bytes(), usedforsecurity=False).hexdigest()
     if not witness:
         old.unlink()
     write(state_path, state)
     native = tmp_path / "corpus/graphify-out"
-    write(native / "graph.json", {"nodes": [{"id": "held"}], "links": []})
-    write(native / "manifest.json", {"native": "unchanged"})
+    write(
+        native / "graph.json",
+        {"nodes": [{"id": "held", "source_file": "Held.md"}], "links": []},
+    )
+    write(
+        native / "manifest.json",
+        {"Held.md": {"ast_hash": stamp, "semantic_hash": stamp}},
+    )
     return source, old_graph
 
 
@@ -74,7 +83,7 @@ def test_native_scan_uses_prior_held_body_and_keeps_held_graph_truth(
         "assert not (root/'Renamed.md').exists()\n"
         f"assert (root/'assets/image.png').exists()=={graphify_inputs == 'all'}\n"
         f"assert (root/{selected.name!r}).read_text().startswith('# Complete current')\n"
-        "assert json.loads((out/'manifest.json').read_text())=={'native':'unchanged'}\n"
+        "assert list(json.loads((out/'manifest.json').read_text()))==['Held.md']\n"
         "graph=json.loads((out/'graph.json').read_text())\n"
         "graph['nodes'].append({'id':'fresh'})\n"
         "(out/'graph.json').write_text(json.dumps(graph))\n"

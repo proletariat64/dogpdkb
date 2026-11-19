@@ -1,5 +1,6 @@
 """Graphify receives only Markdown by default through both public entry points."""
 
+import hashlib
 import json
 import os
 import subprocess
@@ -36,8 +37,14 @@ def test_graphify_input_mode_at_public_subprocess_boundary(tmp_path, command, mo
     # selection for a new full extraction.
     native = corpus / "graphify-out"
     native.mkdir()
-    (native / "graph.json").write_text('{"nodes":[],"links":[]}')
-    (native / "manifest.json").write_text("{}")
+    historical = "ocr/result.MD"
+    stamp = hashlib.new("md5", files[historical], usedforsecurity=False).hexdigest()
+    (native / "graph.json").write_text(
+        json.dumps({"nodes": [{"id": "ocr", "source_file": historical}], "links": []})
+    )
+    (native / "manifest.json").write_text(
+        json.dumps({historical: {"ast_hash": stamp, "semantic_hash": stamp}})
+    )
     tool = tmp_path / "graphify.py"
     tool.write_text(
         GRAPHIFY_PREFLIGHT + "import json,sys\nfrom pathlib import Path\n"

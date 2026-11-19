@@ -150,12 +150,13 @@ if mode=='grow-incomplete':
  (output/'graph.json').write_text(json.dumps({'nodes':[{'id':'old'}, {'id':'new'}], 'links':[]}))
  (output/'cache').mkdir(exist_ok=True)
  (output/'cache/entry').write_text('unpublishable')
- (output/'manifest.json').write_text('{}')
+ print('[graphify extract] semantic extraction on 1 files via openai-oauth...')
  print('[graphify extract] chunk 1/2 done')
  print('[graphify] WARNING: 1/2 semantic chunk(s) failed — see errors above. Partial results returned.')
- sys.exit(0)
-(output/'graph.json').write_text(json.dumps({'nodes':[], 'links':[], 'graph':{}, 'hyperedges':[]}))
-(output/'manifest.json').write_text('{}')
+else:
+ (output/'graph.json').write_text(json.dumps({'nodes':[], 'links':[], 'graph':{}, 'hyperedges':[]}))
+ (output/'cache').mkdir(exist_ok=True)
+ (output/'cache/entry').write_text('trusted replacement')
 """
         + GRAPHIFY_PROOF
     )
@@ -615,6 +616,12 @@ def test_growing_partial_candidate_keeps_entire_generation_and_suppresses(tmp_pa
     assert cli(config, manifest).returncode == 2
     assert len((tmp_path / "calls.jsonl").read_text().splitlines()) == 1
 
+    (tmp_path / "mode").write_text("success")
+    result = cli(config, manifest, retry_graph=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert all(path.read_bytes() != old for path, old in zip(generation, before))
+    assert cache.read_bytes() == b"trusted replacement"
+
 
 def test_successful_exit_without_native_current_byte_coverage_is_partial(tmp_path):
     config, manifest, source = fixture(tmp_path)
@@ -627,6 +634,36 @@ def test_successful_exit_without_native_current_byte_coverage_is_partial(tmp_pat
     result = cli(config, manifest)
     assert result.returncode == 2, result.stdout + result.stderr
     assert not (source.parent / "graphify-out/graph.json").exists()
+
+
+def test_missing_chunk_completion_is_not_proof_even_with_current_stamps(tmp_path):
+    config, manifest, source = fixture(tmp_path)
+    tool = tmp_path / "graphify.py"
+    tool.write_text(
+        tool.read_text().replace(
+            "print(f'[graphify extract] wrote",
+            "print('[graphify extract] semantic extraction on 1 files via openai-oauth...')\n"
+            "print(f'[graphify extract] wrote",
+        )
+    )
+
+    first = cli(config, manifest)
+    assert first.returncode == 2, first.stdout + first.stderr
+    assert not (source.parent / "graphify-out/graph.json").exists()
+    assert cli(config, manifest).returncode == 2
+    assert len((tmp_path / "calls.jsonl").read_text().splitlines()) == 1
+
+
+def test_existing_baseline_cannot_authorize_unstamped_historical_backfill(tmp_path):
+    config, manifest, source = fixture(tmp_path)
+    native = source.parent / "graphify-out"
+    write(native / "graph.json", {"nodes": [], "links": []})
+    write(native / "manifest.json", {})
+    (source.parent / "historical.md").write_text("# Historical corpus\n")
+
+    result = cli(config, manifest)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert not (tmp_path / "calls.jsonl").exists()
 
 
 def test_changed_input_during_extraction_does_not_publish(tmp_path):
@@ -734,6 +771,92 @@ def test_original_graphify_incremental_directory_preserves_other_sources(tmp_pat
         count = len(calls)
         assert cli(config, manifest, environment).returncode == 0
         assert len(calls) == count
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_installed_graphify_oauth_parallelism_caps_inflight_chunks_at_three(tmp_path):
+    import shutil
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    executable = shutil.which("graphify")
+    if not executable:
+        pytest.skip("patched Graphify CLI is not installed")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    names = {f"source-{i}.md" for i in range(5)}
+    for name in names:
+        (corpus / name).write_text(f"# {name}\n\n" + "knowledge topic sentence. " * 120)
+    condition = threading.Condition()
+    dispatched = []
+    peak = active = 0
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+        def do_POST(self):
+            nonlocal peak, active
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            body = request["input"][0]["content"][0]["text"]
+            found = {name for name in names if name in body}
+            with condition:
+                dispatched.append(found)
+                active += 1
+                peak = max(peak, active)
+                condition.notify_all()
+                if condition.wait_for(lambda: peak >= 3, timeout=1):
+                    condition.wait_for(lambda: peak > 3, timeout=0.2)
+                active -= 1
+            result = graphify_sse(
+                [
+                    {
+                        "id": name,
+                        "label": name,
+                        "source_file": name,
+                        "file_type": "concept",
+                    }
+                    for name in found
+                ]
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(result)))
+            self.end_headers()
+            self.wfile.write(result)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        result = subprocess.run(
+            [
+                executable,
+                "extract",
+                str(corpus),
+                "--no-cluster",
+                "--backend",
+                "openai-oauth",
+                "--max-concurrency",
+                "3",
+                "--token-budget",
+                "512",
+            ],
+            env={
+                **graphify_offline_env(tmp_path, server.server_port),
+                "GRAPHIFY_OPENAI_OAUTH_PARALLEL": "1",
+            },
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert len(dispatched) == len(names)
+        assert set.union(*dispatched) == names
+        assert peak == 3
+        assert "chunk 5/5 done" in result.stdout
     finally:
         server.shutdown()
         server.server_close()
