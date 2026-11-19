@@ -1,8 +1,8 @@
 # ocr-batch
 
-Status: in-progress
+Status: integrated
 
-Progress: Batch OCR is being finished in the independent ticket 02 worktree; not integrated.
+Progress: Implemented by `14cd9d8`; 118 focused offline tests passed and 18 affected checks passed after final fixes. Integrated in Draft PR #36; full-scale and integrated UAT pending.
 
 Blocked by: none
 
