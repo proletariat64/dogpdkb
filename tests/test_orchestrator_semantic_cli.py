@@ -71,7 +71,9 @@ def test_usable_uncertainty_compiles_and_complete_diff_survives_wash_purge(tmp_p
     assert plan["documents"][0]["action"] == "compile"
     assert plan["documents"][0]["semantic_status"] == "UNCERTAIN"
     state = load(tmp_path / "state/funds/state.json")
-    assert state["documents"][team_id("42")]["steps"]["compare"]["status"] == "completed"
+    assert (
+        state["documents"][team_id("42")]["steps"]["compare"]["status"] == "completed"
+    )
     index_path = Path(run["artifacts"]["semantic_diff"])
     index = load(index_path)
     detail = index_path.parent / index["documents"][0]["evidence"]
