@@ -181,8 +181,20 @@ Full schema: mdcompare catalog --help --full
 """
 
 
+DOCTOR = """Examples:
+  mdcompare doctor
+  mdcompare doctor --mode llm --model openai/gpt-6.1-terra --json
+
+Default mode checks the local comparison runtime (no Node or login). LLM mode
+checks the installed Pi SDK, model/effort, proxy setup, and stored OAuth. An
+expired credential is a warning, not a check of refresh capability.
+Local only: no requests, token refresh, credential output or report files.
+Exit 0: no failing check; 2: environment check failed; 1: invalid invocation.
+"""
+
 NORMAL = {
     "mdcompare": ROOT,
+    "doctor": DOCTOR,
     "compare": COMPARE,
     "knowledge": KNOWLEDGE,
     "semantic": SEMANTIC,
@@ -194,6 +206,8 @@ NORMAL = {
 
 def full_contract(command: str) -> str:
     """Read only bundled documentation, never a checkout or remote resource."""
+    if command == "doctor":
+        return "\n--json emits mdcompare-doctor-1 with checks and network_checked: false.\n"
     names = ["manifest.txt", "input-safety.txt"]
     if command == "compare":
         names += ["compare.txt", "resources.txt", "ocr.txt", "history.txt"]

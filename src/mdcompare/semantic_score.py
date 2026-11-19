@@ -174,50 +174,63 @@ def _validate_reply(raw, count):
     return {"ok": True, "score": score, "ambiguous": ambiguous}
 
 
-def _assess(model, effort, evidence, prompt):
+def _bridge_request(request, *, timeout):
+    diagnostic = request.get("op") == "doctor"
     try:
         proc = subprocess.run(
             ["node", str(_BRIDGE)],
-            input=_json(
-                {
-                    "model": model,
-                    "effort": effort,
-                    "prompt": prompt,
-                    "evidence": evidence,
-                }
-            ),
+            input=_json(request),
             text=True,
             capture_output=True,
             check=False,
-            timeout=180,
+            timeout=timeout,
             env={
                 k: v
                 for k, v in os.environ.items()
                 if k not in {"OPENAI_API_KEY", "CODEX_API_KEY"}
             },
         )
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "reason": "node_unavailable" if diagnostic else "sdk_unavailable",
+        }
     except OSError:
         return {"ok": False, "reason": "sdk_unavailable"}
     except subprocess.TimeoutExpired:
-        return {"ok": False, "reason": "unknown_outcome"}
+        return {
+            "ok": False,
+            "reason": "bridge_timeout" if diagnostic else "unknown_outcome",
+        }
     try:
         result = json.loads(proc.stdout)
         if not isinstance(result, dict) or proc.returncode:
             raise ValueError
-        if result.get("ok") is True:
-            try:
-                result.update(
-                    _validate_reply(
-                        result["reply"], len(json.loads(evidence)["operations"])
-                    )
-                )
-            except (ValueError, KeyError, TypeError):
-                result.update(ok=False, reason="invalid_response")
-        elif not isinstance(result.get("reason"), str):
+        if result.get("ok") is not True and not isinstance(result.get("reason"), str):
             raise ValueError
         return result
     except ValueError:
-        return {"ok": False, "reason": "unknown_outcome"}
+        return {
+            "ok": False,
+            "reason": "invalid_response" if diagnostic else "unknown_outcome",
+        }
+
+
+def _assess(model, effort, evidence, prompt):
+    result = _bridge_request(
+        {"model": model, "effort": effort, "prompt": prompt, "evidence": evidence},
+        timeout=180,
+    )
+    if result.get("ok") is True:
+        try:
+            result.update(
+                _validate_reply(
+                    result["reply"], len(json.loads(evidence)["operations"])
+                )
+            )
+        except (ValueError, KeyError, TypeError):
+            result.update(ok=False, reason="invalid_response")
+    return result
 
 
 def _save(path, value):

@@ -56,24 +56,38 @@ const main = async () => {
   const request = JSON.parse(readFileSync(0, 'utf8'));
   const [provider, modelId, ...extra] = request.model.split('/');
   if (extra.length || !['openai', 'openai-codex'].includes(provider) || !modelId) fail('unsupported_model');
+  if (!['low', 'medium', 'high', 'xhigh'].includes(request.effort)) fail('unsupported_effort');
   const expected = provider === 'openai' ? 'https://api.openai.com/v1/responses' : 'https://chatgpt.com/backend-api/codex/responses';
   const api = provider === 'openai' ? 'openai-responses' : 'openai-codex-responses';
   const { entry } = findSdk();
-  const { ModelRuntime } = await import(pathToFileURL(entry).href);
+  const { ModelRuntime, readStoredCredential } = await import(pathToFileURL(entry).href);
   const agentDir = resolve(process.env.PI_CODING_AGENT_DIR || join(homedir(), '.pi', 'agent'));
   delete process.env.OPENAI_API_KEY;
   delete process.env.CODEX_API_KEY;
+  const doctor = request.op === 'doctor';
+  const authPath = join(agentDir, 'auth.json');
   const transport = connection(entry);
   const nativeFetch = globalThis.fetch;
-  if (transport.close) globalThis.fetch = (input, init) => {
+  if (doctor) globalThis.fetch = () => fail('unsupported_transport');
+  else if (transport.close) globalThis.fetch = (input, init) => {
     if (!authUrls.has(requestUrl(input).href)) fail('unsupported_transport');
     return transport.fetch(input, init);
   };
   let runtime, attempted = false, status = null, usage = null;
   try {
-    runtime = await ModelRuntime.create({authPath: join(agentDir, 'auth.json'), modelsPath: join(agentDir, 'models.json'), allowModelNetwork: false});
+    if (doctor && typeof readStoredCredential !== 'function') fail('sdk_unavailable', null);
+    // Avoid creating or locking live auth storage, and never check/refresh a live credential.
+    const options = doctor
+      ? { refreshOnCreate: false, credentials: { read: async () => undefined, list: async () => [], modify: async () => { throw new Error('read only'); }, delete: async () => { throw new Error('read only'); } } }
+      : { authPath };
+    runtime = await ModelRuntime.create({ ...options, modelsPath: join(agentDir, 'models.json'), allowModelNetwork: false });
     const model = runtime.getPhysicalModel(provider, modelId);
     if (!model || model.id !== modelId || model.provider !== provider || model.api !== api || !model.reasoning || (model.thinkingLevelMap && !model.thinkingLevelMap[request.effort])) fail('unsupported_model');
+    if (doctor) {
+      const credential = readStoredCredential(provider, authPath);
+      if (credential?.type !== 'oauth' || !credential.access || !credential.refresh || !Number.isFinite(credential.expires)) fail('oauth_required');
+      return { ok: true, node: process.versions.node, oauth: credential.expires <= Date.now() ? 'expired' : 'stored' };
+    }
     if (!runtime.isUsingOAuth(provider) || (await runtime.checkAuth(provider, {env: {}}))?.type !== 'oauth') fail('oauth_required');
     const reply = await runtime.completeSimple(model, {systemPrompt: request.prompt, messages: [{role: 'user', content: [{type: 'text', text: request.evidence}], timestamp: Date.now()}]}, {
       maxTokens: 4096, reasoning: request.effort, maxRetries: 0, timeoutMs: 170000, transport: 'sse', cacheRetention: 'none', env: {},
@@ -98,7 +112,7 @@ const main = async () => {
   } catch (error) {
     return {ok: false, reason: !error.reason && attempted ? 'unknown_outcome' : error.reason || 'bridge_error', http_status: error.status || status, usage_tokens: usage};
   } finally {
-    try { if (runtime) await runtime.settleCredentialWrites(); }
+    try { if (runtime && !doctor) await runtime.settleCredentialWrites(); }
     finally { globalThis.fetch = nativeFetch; if (transport.close) await transport.close(); }
   }
 };

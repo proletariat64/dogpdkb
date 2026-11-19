@@ -142,14 +142,17 @@ const main = async () => {
   if (extra.length || !['openai', 'openai-codex'].includes(provider) || !modelId) fail('unsupported_model', 'Model must use an allowlisted provider/model route');
   if (!['low', 'medium', 'high', 'xhigh'].includes(request.effort)) fail('unsupported_effort', 'Unsupported reasoning effort');
   const { entry } = findSdk();
-  const { ModelRuntime } = await import(pathToFileURL(entry).href);
+  const { ModelRuntime, readStoredCredential } = await import(pathToFileURL(entry).href);
   const agentDir = resolve(process.env.PI_CODING_AGENT_DIR || join(homedir(), '.pi', 'agent'));
   // Prevent ambient keys from taking precedence on the request path; Pi owns the stored OAuth bearer and refresh.
   delete process.env.OPENAI_API_KEY;
   delete process.env.CODEX_API_KEY;
+  const doctor = request.op === 'doctor';
+  const authPath = join(agentDir, 'auth.json');
   const transport = connection(entry);
   const nativeFetch = globalThis.fetch;
-  if (transport.close) {
+  if (doctor) globalThis.fetch = () => fail('unsupported_transport', 'Doctor never sends network requests');
+  else if (transport.close) {
     globalThis.fetch = (input, init) => {
       if (!authUrls.has(requestUrl(input).href)) fail('unsupported_transport', 'Unexpected Pi authentication route');
       return transport.fetch(input, init);
@@ -157,17 +160,28 @@ const main = async () => {
   }
   let runtime;
   try {
-    runtime = await ModelRuntime.create({ authPath: join(agentDir, 'auth.json'), modelsPath: join(agentDir, 'models.json'), allowModelNetwork: false });
+    if (doctor && typeof readStoredCredential !== 'function') fail('sdk_unavailable', 'Pi SDK does not expose offline credential inspection');
+    // Avoid creating or locking live auth storage, and never check/refresh a live credential.
+    const options = doctor
+      ? { refreshOnCreate: false, credentials: { read: async () => undefined, list: async () => [], modify: async () => { throw new Error('read only'); }, delete: async () => { throw new Error('read only'); } } }
+      : { authPath };
+    runtime = await ModelRuntime.create({ ...options, modelsPath: join(agentDir, 'models.json'), allowModelNetwork: false });
     const model = runtime.getPhysicalModel(provider, modelId);
     if (!model || model.provider !== provider || model.id !== modelId) fail('unsupported_model', `Unknown physical Pi model ${request.model}`);
     if (!model.input?.includes('image')) fail('unsupported_model', 'Selected Pi model does not advertise image input');
     if (!model.reasoning || (model.thinkingLevelMap && !model.thinkingLevelMap[request.effort])) fail('unsupported_effort', `Model ${request.model} does not support ${request.effort} effort`);
-    if (!runtime.isUsingOAuth(provider)) fail('oauth_required', `Pi OAuth credentials are required for ${provider}`);
-    const authStatus = await runtime.checkAuth(provider, { env: {} });
-    if (!authStatus || authStatus.type !== 'oauth') fail('oauth_required', `Pi OAuth credentials are required for ${provider}`);
     const expected = provider === 'openai' ? 'https://api.openai.com/v1/responses' : 'https://chatgpt.com/backend-api/codex/responses';
     const expectedApi = provider === 'openai' ? 'openai-responses' : 'openai-codex-responses';
     if (model.api !== expectedApi) fail('unsupported_model', 'Pi route does not use the supported Responses transport');
+    if (doctor) {
+      const credential = readStoredCredential(provider, authPath);
+      if (credential?.type !== 'oauth' || !credential.access || !credential.refresh || !Number.isFinite(credential.expires)) fail('oauth_required', 'No stored Pi OAuth credential for the selected route');
+      await validateMermaid([{ kind: 'mermaid', markdown: '```mermaid\nflowchart LR\n  A --> B\n```' }]);
+      return { ok: true, node: process.versions.node, oauth: credential.expires <= Date.now() ? 'expired' : 'stored' };
+    }
+    if (!runtime.isUsingOAuth(provider)) fail('oauth_required', `Pi OAuth credentials are required for ${provider}`);
+    const authStatus = await runtime.checkAuth(provider, { env: {} });
+    if (!authStatus || authStatus.type !== 'oauth') fail('oauth_required', `Pi OAuth credentials are required for ${provider}`);
     if (request.op === 'preflight') return { ok: true, model: request.model, effort: request.effort };
     if (request.op !== 'convert') fail('bridge_error', 'Unknown bridge operation');
     const content = [{ type: 'text', text: `${request.markdown}\n\nStable image occurrences are named in the source.` }];
@@ -220,7 +234,7 @@ const main = async () => {
       throw error;
     }
   } finally {
-    try { if (runtime) await runtime.settleCredentialWrites(); }
+    try { if (runtime && !doctor) await runtime.settleCredentialWrites(); }
     finally {
       globalThis.fetch = nativeFetch;
       if (transport.close) await transport.close();

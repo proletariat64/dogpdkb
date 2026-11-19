@@ -10,8 +10,6 @@ _N = TypeVar("_N", bound=argparse.Namespace)
 from pathlib import Path
 
 from . import __version__
-from .catalog import catalog_manifest
-from .comparison import compare_documents
 from .help import NORMAL, full_contract
 from .io import (
     InputError,
@@ -235,6 +233,18 @@ def main(argv=None) -> int:
     )
     from .semantic_score import DEFAULT_EFFORT, DEFAULT_MODEL
 
+    doctor = sub.add_parser(
+        "doctor",
+        help="check the local comparison or scoring environment",
+        epilog=NORMAL["doctor"],
+    )
+    doctor.add_argument("--mode", choices=("offline", "llm"), default="offline")
+    doctor.add_argument("--model")
+    doctor.add_argument("--effort", choices=("low", "medium", "high", "xhigh"))
+    doctor.add_argument(
+        "--json", action="store_true", help="emit a machine-readable report"
+    )
+
     scorer = sub.add_parser(
         "semantic-score",
         help="Score authored changes through Pi OAuth",
@@ -283,7 +293,17 @@ def main(argv=None) -> int:
         help="catalog JSON manifest path; missing parents are created",
     )
     args = parser.parse_args(argv)
+    if args.command == "doctor":
+        from .doctor import check
+
+        if args.mode != "llm" and (args.model is not None or args.effort is not None):
+            doctor.error("--model and --effort require --mode llm")
+        args.model = DEFAULT_MODEL if args.model is None else args.model
+        args.effort = args.effort or DEFAULT_EFFORT
+        return check(args)
     if args.command == "catalog":
+        from .catalog import catalog_manifest
+
         try:
             catalog_manifest(args.input, args.output)
         except (InputError, ManifestError, OSError, ValueError) as exc:
@@ -339,6 +359,8 @@ def main(argv=None) -> int:
             incoming = load_manifest(args.incoming, reader, body_only=True)
             report = compare_knowledge_documents(baseline, incoming, options, reader)
         else:
+            from .comparison import compare_documents
+
             baseline = load_manifest(args.baseline, reader)
             incoming = load_manifest(args.incoming, reader)
             report = compare_documents(baseline, incoming, options, reader)
