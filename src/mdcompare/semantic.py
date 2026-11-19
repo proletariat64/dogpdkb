@@ -2,7 +2,7 @@
 
 import json
 from bisect import bisect_right
-from collections import Counter
+from collections import Counter, defaultdict, deque
 from dataclasses import asdict
 from pathlib import Path
 
@@ -166,8 +166,16 @@ def _changes(before, after, aligned, indexes):
         for item in aligned["items"][: len(after)]
         if item["old"] is not None
     }
+    exact = defaultdict(deque)
+    movable = defaultdict(dict)
+    positions = {id(unit): position for position, unit in enumerate(before)}
+    for unit in before:
+        exact[unit.kind, unit.context, unit.key].append(unit)
+        if id(unit) not in reserved:
+            movable[unit.kind, unit.key][id(unit)] = unit
     operations = []
     for position, item in enumerate(aligned["items"][: len(after)]):
+        incoming = after[position]
         previous = item["old"]
         operation = {
             "reuse": "equal",
@@ -176,36 +184,21 @@ def _changes(before, after, aligned, indexes):
             "unresolved": "uncertain",
         }[item["kind"]]
         if operation == "equal":
-            previous = next(
-                (
-                    unit
-                    for unit in before
-                    if id(unit) not in used
-                    and (unit.kind, unit.context, unit.key)
-                    == (
-                        after[position].kind,
-                        after[position].context,
-                        after[position].key,
-                    )
-                ),
-                None,
-            )
+            matches = exact[incoming.kind, incoming.context, incoming.key]
+            while matches and id(matches[0]) in used:
+                matches.popleft()
+            previous = matches.popleft() if matches else None
             if previous is None:
                 operation = "add"
-            elif before.index(previous) != position:
+            elif positions[id(previous)] != position:
                 operation = "move"
         elif previous is None:
-            matches = [
-                unit
-                for unit in before
-                if id(unit) not in used
-                and id(unit) not in reserved
-                and (unit.kind, unit.key) == (after[position].kind, after[position].key)
-            ]
-            if len(matches) == 1:
-                previous, operation = matches[0], "move"
+            candidates = movable[incoming.kind, incoming.key]
+            if len(candidates) == 1:
+                previous, operation = next(iter(candidates.values())), "move"
         if previous is not None:
             used.add(id(previous))
+            movable[previous.kind, previous.key].pop(id(previous), None)
         operations.append(
             {
                 "operation": operation,
@@ -233,7 +226,7 @@ def _source(doc):
     if doc is None:
         return None
     return {
-        "path": str(doc.path),
+        "path": str(doc.path.absolute()),
         "content_kind": doc.content_kind,
         "metadata": doc.metadata,
         "version": doc.provenance.get("version"),

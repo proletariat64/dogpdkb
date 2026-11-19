@@ -17,7 +17,8 @@ dogpdkb sync --help
 dogpdkb sync --help --full
 mdcompare semantic -h --full
 mdcompare knowledge -h --full
-mdocr batch -h --full
+mdocr plan -h --full
+mdocr run -h --full
 skylark export -h --full
 ```
 
@@ -142,6 +143,20 @@ See [tool contracts](docs/orchestrator-tool-contracts.md) and
 This routing does **not** change Graphify's text-input projection described below:
 whole published Markdown, including existing inline images/OCR, remains its input.
 
+## Optional offline semantic score routing
+
+After `mdcompare semantic`, an external operator/scorer may create a
+`mdcompare-semantic-scores-1` manifest, then call
+`mdcompare semantic-route --report semantic.json --diff-index diff.json --scores scores.json --output route.json`.
+This is a separate policy stage: it never calls a model, network, Graphify or
+compiler and does not alter the deterministic `semantic-1.0` report or dogpdkb
+consumer. Scores bind exact sidecar bytes using SHA-256 and must match the index
+report digest; invalid/duplicate/stale bindings fail without publishing. Default
+threshold 3 means strictly greater scores compile, lower/equal scores skip;
+`--skip-ambiguity-intercept yes` only converts ambiguous lower/equal skips to
+compile. Missing scores never enable skips. See
+`mdcompare semantic-route --help --full` for the complete schema and path rules.
+
 ## 小订阅
 
 在独立 `books.json` 来源中设置 `document_ids`，并使用独立 key 和目标目录：
@@ -171,7 +186,7 @@ skylark = ["node", "/opt/pi-skylark/dist/cli.mjs"]
 编排器对工具只调用公开 CLI、读取公开产物，不导入工具包或复刻其内部算法。
 本轮新增能力必须先提供给所选工具入口：
 
-- [mdcompare semantic/catalog、mdocr batch](docs/orchestrator-tool-contracts.md)，随本仓库 wheel 提供。
+- [mdcompare catalog、mdocr plan/run](docs/orchestrator-tool-contracts.md)，随本仓库 wheel 提供。
 - [Graphify 原版 CLI](docs/orchestrator-graphify-contract.md)：目录级增量、原生 manifest/cache 和整批发布。
 - [Skylark listing/export](docs/orchestrator-skylark-contract.md)：已恢复的独立 CLI 与构建方法。
 

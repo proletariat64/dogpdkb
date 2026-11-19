@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.ocr_fixture import write_ocr_fixture
+
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = {
     "value": "2026-11-12T10:00:00Z",
@@ -296,10 +298,10 @@ with (root/'events').open('a') as stream:
 if name == 'mdcompare' and args[0] == 'catalog' and 'incoming' in args[args.index('--input')+1]:
     documents = json.loads(Path(args[args.index('--input')+1]).read_text())['documents']
     assert len(documents) == 2 and all(Path(d['path']).is_file() for d in documents)
-if name == 'mdocr':
-    request = Path(args[args.index('--manifest')+1])
-    assert (request.parent/'plan.json').is_file()
-    assert len(json.loads(request.read_text())['documents']) == 1
+if name == 'mdocr' and args[0] == 'run':
+    planned = Path(args[args.index('--plan')+1])
+    assert (planned.parent/'plan.json').is_file()
+    assert len(json.loads(planned.read_text())['documents']) == 1
 module = 'mdcompare' if name == 'mdcompare' else 'mdocr.cli'
 raise SystemExit(subprocess.call([sys.executable,'-m',module,*args]))
 """)
@@ -320,8 +322,10 @@ raise SystemExit(subprocess.call([sys.executable,'-m',module,*args]))
         "mdcompare semantic",
         "mdcompare knowledge",
         "mdcompare compare",
-        "mdocr batch",
-        "mdocr batch",
+        "mdocr plan",
+        "mdocr run",
+        "mdocr plan",
+        "mdocr run",
     ]
 
 
@@ -388,16 +392,19 @@ def test_shared_ocr_stop_preserves_unattempted_sources_for_later_run(tmp_path):
     two_sources(tmp_path, differences)
     original = config.read_text()
     tool = tmp_path / "ocr_shared.py"
-    tool.write_text("""import json,sys
+    write_ocr_fixture(
+        tool,
+        """import json,sys
 from pathlib import Path
 args=sys.argv[1:]
 def option(name): return Path(args[args.index(name)+1])
-doc=json.loads(option('--manifest').read_text())['documents'][0]
-output=option('--output-dir')/'document.md'; output.parent.mkdir(parents=True,exist_ok=True)
+doc=json.loads(fixture_request.read_text())['documents'][0]
+output=fixture_output; output.parent.mkdir(parents=True,exist_ok=True)
 output.write_text(Path(doc['path']).read_text())
-option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','status':'partial','causes':['OCR_AUTH_UNAVAILABLE'],'documents':[{'document_id':doc['document_id'],'status':'partial','output':str(output),'resources':[]}]}))
+fixture_result({'schema_version':'mdocr-result-2','status':'partial','causes':['OCR_AUTH_UNAVAILABLE'],'documents':[{'document_id':doc['document_id'],'status':'partial','output':str(output),'resources':[]}]})
 raise SystemExit(2)
-""")
+""",
+    )
     config.write_text(
         original.replace(
             "mdocr=" + json.dumps([sys.executable, "-m", "mdocr.cli"]),
@@ -430,21 +437,24 @@ def test_input_changed_during_ocr_is_refused_before_publication(
     config, differences = instance(tmp_path)
     two_sources(tmp_path, differences)
     tool = tmp_path / "ocr_wait.py"
-    tool.write_text("""import json,sys,time
+    write_ocr_fixture(
+        tool,
+        """import json,sys,time
 from pathlib import Path
 root=Path(__file__).parent; args=sys.argv[1:]
 def option(name): return Path(args[args.index(name)+1])
-doc=json.loads(option('--manifest').read_text())['documents'][0]
+doc=json.loads(fixture_request.read_text())['documents'][0]
 with (root/'ocr-calls').open('a') as log: log.write(doc['document_id']+'\\n')
 (root/'ocr-started').touch()
 deadline=time.monotonic()+5
 while not (root/'ocr-release').exists():
  if time.monotonic()>deadline: raise SystemExit(1)
  time.sleep(.01)
-output=option('--output-dir')/'document.md'; output.parent.mkdir(parents=True,exist_ok=True)
+output=fixture_output; output.parent.mkdir(parents=True,exist_ok=True)
 output.write_bytes(Path(doc['path']).read_bytes())
-option('--report').write_text(json.dumps({'schema_version':'mdocr-batch-1.0','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[]}]}))
-""")
+fixture_result({'schema_version':'mdocr-result-2','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[]}]})
+""",
+    )
     config.write_text(
         config.read_text().replace(
             "mdocr=" + json.dumps([sys.executable, "-m", "mdocr.cli"]),
@@ -562,19 +572,20 @@ def test_registered_day_baseline_allows_same_local_day_timestamp(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("schema", "code"), [("unsupported", 0), ("mdocr-batch-1.0", 1)]
+    ("schema", "code"), [("unsupported", 0), ("mdocr-result-2", 1)]
 )
 def test_unreliable_ocr_report_is_never_reused_as_success(tmp_path, schema, code):
     config, differences = instance(tmp_path)
     tool = tmp_path / "ocr_unreliable.py"
-    tool.write_text(
+    write_ocr_fixture(
+        tool,
         "import json,sys\nfrom pathlib import Path\na=sys.argv[1:]\n"
         "def option(k): return Path(a[a.index(k)+1])\n"
-        "doc=json.loads(option('--manifest').read_text())['documents'][0]\n"
-        "out=option('--output-dir')/'output.md';out.parent.mkdir(parents=True,exist_ok=True)\n"
+        "doc=json.loads(fixture_request.read_text())['documents'][0]\n"
+        "out=fixture_output;out.parent.mkdir(parents=True,exist_ok=True)\n"
         "out.write_text('UNRELIABLE OCR OUTPUT')\n"
-        f"option('--report').write_text(json.dumps({{'schema_version':{schema!r},'documents':[{{'document_id':doc['document_id'],'status':'completed','output':str(out)}}]}}))\n"
-        f"raise SystemExit({code})\n"
+        f"fixture_result({{'schema_version':{schema!r},'documents':[{{'document_id':doc['document_id'],'status':'completed','output':str(out)}}]}})\n"
+        f"raise SystemExit({code})\n",
     )
     config.write_text(
         config.read_text().replace(

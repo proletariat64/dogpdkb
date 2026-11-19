@@ -57,6 +57,15 @@ class OcrQuotaError(OcrSharedError):
     code = "OCR_QUOTA_EXHAUSTED"
 
 
+class OcrRequestOutcome(RuntimeError):
+    """An adaptive batch request failure with known admission facts."""
+
+    def __init__(self, status: int | None, *, unknown: bool):
+        super().__init__("Paddle request did not complete")
+        self.status = status
+        self.unknown = unknown
+
+
 def _ocr_error(status: int | None, message: str) -> RuntimeError:
     """Classify a terminal request failure into a shared or generic error."""
     if status == 401:
@@ -135,7 +144,9 @@ class PaddleClient:
         *,
         session: HttpClient | None = None,
         endpoint: str | None = None,
+        adaptive: bool = False,
     ):
+        self.adaptive = adaptive
         self.endpoint = (endpoint or _JOB_URL).rstrip("/")
         self.headers = {"Authorization": f"bearer {token}"}
         self.session = session or requests.Session()
@@ -161,7 +172,13 @@ class PaddleClient:
                 resp = getattr(exc, "response", None)
                 if resp is not None:
                     status = getattr(resp, "status_code", status)
+            if self.adaptive and (method == "POST" or status in {401, 403, 429}):
+                raise OcrRequestOutcome(
+                    status, unknown=status is None or status >= 500 or method != "POST"
+                )
             if attempt >= retries:
+                if self.adaptive:
+                    raise OcrRequestOutcome(status, unknown=True)
                 raise _ocr_error(status, error)
             time.sleep(delay * (2**attempt))
         raise AssertionError("unreachable")

@@ -1,6 +1,8 @@
 """Verify captured original-to-prepared-to-OCR evidence without executing OCR."""
 
+import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,6 +12,7 @@ from .model import Document
 from .prepared_image import is_prepared_jpeg
 
 CONTRACT = "prepared-jpeg-ocr-v1"
+V2_CONTRACT = "mdocr-ocr-2"
 
 
 def _outcome(status: str, reason: str) -> dict[str, Any]:
@@ -27,7 +30,7 @@ def _settings(value: Any) -> str | None:
 
 def _records(document: Document) -> dict[str, dict[str, Any]] | None:
     evidence = document.ocr
-    if not evidence or evidence.get("contract") != CONTRACT:
+    if not evidence or evidence.get("contract") not in {CONTRACT, V2_CONTRACT}:
         return None
     images = evidence.get("images")
     if not isinstance(images, list):
@@ -132,6 +135,74 @@ def _artifact(
     return None
 
 
+def _v2_record(document, record, resource, reader):
+    source = _path(document, record, "source_path")
+    original = _path(document, resource, "path")
+    artifact = _path(document, record, "artifact")
+    if not source or not original or not artifact:
+        return None, _outcome("UNKNOWN", "OCR_SOURCE_MAPPING_INCOMPLETE")
+    data = reader.read_bytes(source)
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != record.get("source_sha256") or data != reader.read_bytes(original):
+        return None, _outcome("UNKNOWN", "OCR_SOURCE_MAPPING_MISMATCH")
+    block = reader.read_bytes(artifact)
+    if hashlib.sha256(block).hexdigest() != record.get("artifact_sha256"):
+        return None, _outcome("CHANGED", "OCR_ARTIFACT_CHANGED")
+    mode = document.ocr["configuration"].get("mode")
+    header = re.compile(
+        rb"<!-- mdocr:ocr-begin v=2 id=[a-zA-Z0-9-]+ -->\n"
+        rb"<!-- mdocr:meta mode=(paddle|llm) sha256=([a-f0-9]{64}) -->\n"
+        rb"> Original image: \[source\]\(<[^<>\r\n]+>\)\n\n"
+    ).match(block)
+    end = b"\n<!-- mdocr:ocr-end -->"
+    if (
+        header is None
+        or header[1].decode() != mode
+        or header[2].decode() != digest
+        or not block.endswith(end)
+        or not block[header.end() : -len(end)].strip()
+        or re.search(rb"<!--\s*mdocr:", block[header.end() : -len(end)], re.IGNORECASE)
+    ):
+        return None, _outcome("UNKNOWN", "OCR_ARTIFACT_MAPPING_INVALID")
+    return digest, None
+
+
+def _verify_v2(old, new, identifier, previous, desired, reader, inputs):
+    before = old.ocr.get("configuration")
+    after = new.ocr.get("configuration")
+    if _settings(before) is None or _settings(after) is None:
+        return _outcome("UNKNOWN", "OCR_CONFIGURATION_UNVERIFIED")
+    if _settings(before) != _settings(after):
+        return _outcome("CHANGED", "OCR_CONFIGURATION_INCOMPATIBLE")
+    if before.get("mode") not in {"paddle", "llm"}:
+        return _outcome("UNKNOWN", "OCR_CONFIGURATION_UNVERIFIED")
+    if before["mode"] == "llm":
+        old_context, new_context = (
+            old.ocr.get("context_sha256"),
+            new.ocr.get("context_sha256"),
+        )
+        if not all(
+            isinstance(v, str) and re.fullmatch(r"[a-f0-9]{64}", v)
+            for v in (old_context, new_context)
+        ):
+            return _outcome("UNKNOWN", "OCR_CONTEXT_UNVERIFIED")
+        if old_context != new_context:
+            return _outcome("CHANGED", "OCR_CONTEXT_CHANGED")
+    left, issue = _v2_record(
+        old, previous, inputs.old_resources.get(identifier, {}), reader
+    )
+    if issue:
+        return issue
+    right, issue = _v2_record(
+        new, desired, inputs.new_resources.get(identifier, {}), reader
+    )
+    if issue:
+        return issue
+    if left != right:
+        return _outcome("CHANGED", "OCR_SOURCE_MAPPING_MISMATCH")
+    return _outcome("UNCHANGED", "OCR_REUSE_VERIFIED")
+
+
 def _verify(
     old: Document,
     new: Document,
@@ -150,6 +221,10 @@ def _verify(
     if previous.get("status") != "success" or desired is None:
         return _outcome("UNKNOWN", "OCR_PROVENANCE_INCOMPLETE")
     assert old.ocr is not None and new.ocr is not None
+    if old.ocr.get("contract") != new.ocr.get("contract"):
+        return _outcome("CHANGED", "OCR_CONFIGURATION_INCOMPATIBLE")
+    if old.ocr.get("contract") == V2_CONTRACT:
+        return _verify_v2(old, new, identifier, previous, desired, reader, inputs)
     for key in ("preprocessing", "configuration"):
         before, after = _settings(old.ocr.get(key)), _settings(new.ocr.get(key))
         if before is None or after is None:

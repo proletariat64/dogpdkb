@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dogpdkb"
-version = "0.2.8"
+version = "0.2.9"
 description = "Yuque knowledge synchronization, graph updates and Web publication"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.28",
     "Pillow>=9",
+    "markdown-it-py>=3,<5",
     "tomli>=2; python_version < '3.11'",
 ]
 
@@ -33,6 +34,7 @@ namespaces = false
 [tool.setuptools.package-data]
 dogpdkb = ["resources/*.toml", "resources/*.json", "resources/help/*.txt"]
 mdcompare = ["help/*.txt"]
+mdocr = ["*.mjs", "*.txt"]
 
 [[tool.uv.index]]
 name = "pypi"
