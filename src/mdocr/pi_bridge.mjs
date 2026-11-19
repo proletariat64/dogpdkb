@@ -66,6 +66,31 @@ const findSdk = () => {
   }
   fail('sdk_unavailable', 'Could not locate the installed Pi coding-agent SDK; set PI_PACKAGE_DIR to the Pi package root');
 };
+const authUrls = new Set([
+  'https://auth.openai.com/api/accounts/oauth/token',
+  'https://auth.openai.com/oauth/token',
+]);
+const requestUrl = input => new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
+const connection = entry => {
+  const proxy = process.env.HTTPS_PROXY || process.env.https_proxy;
+  if (!proxy) return { fetch: (input, init) => globalThis.fetch(input, { ...init, redirect: 'error' }) };
+  try {
+    const { fetch, ProxyAgent } = createRequire(entry)('undici');
+    const dispatcher = new ProxyAgent(proxy);
+    return {
+      fetch: async (input, init) => {
+        const prior = typeof input === 'object' && !(input instanceof URL)
+          ? { method: input.method, headers: input.headers, signal: input.signal,
+              body: init?.body === undefined && input.body ? await input.clone().arrayBuffer() : undefined }
+          : {};
+        return fetch(requestUrl(input), { ...prior, ...init, redirect: 'error', dispatcher });
+      },
+      close: () => dispatcher.destroy(),
+    };
+  } catch {
+    fail('proxy_unavailable', 'Could not configure the installed Pi HTTPS proxy transport');
+  }
+};
 const main = async () => {
   const request = JSON.parse(await new Promise((resolve, reject) => {
     let data = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', x => data += x);
@@ -80,8 +105,17 @@ const main = async () => {
   // Prevent ambient keys from taking precedence on the request path; Pi owns the stored OAuth bearer and refresh.
   delete process.env.OPENAI_API_KEY;
   delete process.env.CODEX_API_KEY;
-  const runtime = await ModelRuntime.create({ authPath: join(agentDir, 'auth.json'), modelsPath: join(agentDir, 'models.json'), allowModelNetwork: false });
+  const transport = connection(entry);
+  const nativeFetch = globalThis.fetch;
+  if (transport.close) {
+    globalThis.fetch = (input, init) => {
+      if (!authUrls.has(requestUrl(input).href)) fail('unsupported_transport', 'Unexpected Pi authentication route');
+      return transport.fetch(input, init);
+    };
+  }
+  let runtime;
   try {
+    runtime = await ModelRuntime.create({ authPath: join(agentDir, 'auth.json'), modelsPath: join(agentDir, 'models.json'), allowModelNetwork: false });
     const model = runtime.getPhysicalModel(provider, modelId);
     if (!model || model.provider !== provider || model.id !== modelId) fail('unsupported_model', `Unknown physical Pi model ${request.model}`);
     if (!model.input?.includes('image')) fail('unsupported_model', 'Selected Pi model does not advertise image input');
@@ -108,10 +142,10 @@ const main = async () => {
       maxTokens: 8192, samplingParams: { max_output_tokens: 8192 }, reasoning: request.effort,
       maxRetries: 0, timeoutMs: 230000, transport: 'sse', cacheRetention: 'none', env: {},
       fetch: async (input, init) => {
-        const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
+        const url = requestUrl(input);
         if (url.href !== expected || attempted) fail('unsupported_transport', 'Pi attempted an unauthorized route or duplicate submission');
         attempted = true;
-        const response = await globalThis.fetch(input, { ...init, redirect: 'error' });
+        const response = await transport.fetch(input, init);
         status = response.status;
         return response;
       },
@@ -137,12 +171,18 @@ const main = async () => {
       ? usage.input + usage.output + usage.cacheRead + usage.cacheWrite : null;
     try { await validateMermaid(parsed.images); } catch (error) { error.usageTokens = usageTokens; throw error; }
     return { ok: true, patches: parsed.images, usage_tokens: usageTokens };
-  } finally { await runtime.settleCredentialWrites(); }
+  } finally {
+    try { if (runtime) await runtime.settleCredentialWrites(); }
+    finally {
+      globalThis.fetch = nativeFetch;
+      if (transport.close) await transport.close();
+    }
+  }
 };
 try { process.stdout.write(JSON.stringify(await main())); }
 catch (error) {
 const status = Number.isInteger(error.status) ? error.status : null;
 const reason = error.reason || (status === 429 ? 'rate_limited' : status === 401 || status === 403 ? 'auth_error' : 'provider_error');
-const message = status === 429 ? 'Provider rate limited the request' : status === 401 || status === 403 ? 'Provider rejected authentication' : reason === 'unknown_outcome' ? 'Provider request failed after possible submission; outcome is unknown' : reason === 'invalid_response' || reason.startsWith('unsupported_') || reason === 'oauth_required' || reason === 'sdk_unavailable' || reason === 'mermaid_parser_unavailable' || reason === 'invalid_image' ? error.message : 'Pi provider request failed; details withheld';
+const message = status === 429 ? 'Provider rate limited the request' : status === 401 || status === 403 ? 'Provider rejected authentication' : reason === 'unknown_outcome' ? 'Provider request failed after possible submission; outcome is unknown' : reason === 'invalid_response' || reason.startsWith('unsupported_') || reason === 'oauth_required' || reason === 'sdk_unavailable' || reason === 'mermaid_parser_unavailable' || reason === 'invalid_image' || reason === 'proxy_unavailable' ? error.message : 'Pi provider request failed; details withheld';
 process.stdout.write(JSON.stringify({ ok: false, error: { reason, message, status, usage_tokens: error.usageTokens ?? null } })); process.exitCode = 1;
 }

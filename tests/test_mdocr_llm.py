@@ -57,6 +57,8 @@ export class ModelRuntime {
  async settleCredentialWrites() {}
 }
 """)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("https_proxy", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-forwarded")
     monkeypatch.setenv("MDOCR_PI_SDK_DIR", str(sdk))
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
@@ -137,3 +139,27 @@ def test_real_mermaid_parser_accepts_and_rejects_diagrams(model, tmp_path, monke
     )
     with pytest.raises(LlmError, match="syntactically invalid Mermaid"):
         convert(model, tmp_path)
+
+
+def test_bridge_honors_https_proxy_without_direct_fallback(
+    model, tmp_path, monkeypatch
+):
+    package = tmp_path / "sdk" / "node_modules" / "undici"
+    package.mkdir(parents=True)
+    (package / "index.js").write_text("""
+const assert = require('node:assert/strict');
+exports.ProxyAgent = class {
+ constructor(proxy) { assert.equal(proxy, 'http://proxy.invalid:8080'); }
+ async destroy() {}
+};
+exports.fetch = async (url, options) => {
+ assert.equal(url.href, 'https://api.openai.com/v1/responses');
+ assert.ok(options.dispatcher instanceof exports.ProxyAgent);
+ assert.equal(options.redirect, 'error');
+ return new Response('{}', {status: 429});
+};
+""")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8080")
+    with pytest.raises(LlmError) as exc:
+        convert(model, tmp_path)
+    assert exc.value.status == 429
