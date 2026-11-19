@@ -1,5 +1,6 @@
 """Graphify receives only Markdown by default through both public entry points."""
 
+import hashlib
 import json
 import os
 import subprocess
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.smoke_install import GRAPHIFY_PREFLIGHT
 from tests.test_graph_body_scope_cli import held_source
 from tests.test_orchestrator_graph_cli import ROOT, cli, fixture
 
@@ -35,11 +37,17 @@ def test_graphify_input_mode_at_public_subprocess_boundary(tmp_path, command, mo
     # selection for a new full extraction.
     native = corpus / "graphify-out"
     native.mkdir()
-    (native / "graph.json").write_text('{"nodes":[],"links":[]}')
-    (native / "manifest.json").write_text("{}")
+    historical = "ocr/result.MD"
+    stamp = hashlib.new("md5", files[historical], usedforsecurity=False).hexdigest()
+    (native / "graph.json").write_text(
+        json.dumps({"nodes": [{"id": "ocr", "source_file": historical}], "links": []})
+    )
+    (native / "manifest.json").write_text(
+        json.dumps({historical: {"ast_hash": stamp, "semantic_hash": stamp}})
+    )
     tool = tmp_path / "graphify.py"
     tool.write_text(
-        "import json,sys\nfrom pathlib import Path\n"
+        GRAPHIFY_PREFLIGHT + "import json,sys\nfrom pathlib import Path\n"
         "scan=Path(sys.argv[3])\n"
         "files=sorted(str(p.relative_to(scan)) for p in scan.rglob('*') if p.is_file())\n"
         "(Path(sys.argv[1])/'scanned.json').write_text(json.dumps(files))\n"

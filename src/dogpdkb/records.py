@@ -156,8 +156,8 @@ class Store:
             raise ValueError("source ID cannot be represented as a local filename")
         return self.path.parent / "inputs" / doc_id
 
-    def save(self) -> None:
-        atomic_json(self.path, self.data)
+    def save(self, *, durable: bool = False) -> None:
+        atomic_json(self.path, self.data, durable=durable)
 
     def document(self, doc_id: str | int) -> dict:
         return self.data["documents"].setdefault(str(doc_id), {"steps": {}})
@@ -186,7 +186,7 @@ class Store:
         self.save()
         return record
 
-    def complete_batch(self, records) -> None:
+    def complete_batch(self, records, *, durable: bool = False) -> None:
         """Persist one external batch at its call/result boundary."""
         records = list(records)
         for item in records:
@@ -194,7 +194,7 @@ class Store:
         for item in records:
             self._record(**item)
         if records:
-            self.save()
+            self.save(durable=durable)
 
     @staticmethod
     def _validate_step(version, status):

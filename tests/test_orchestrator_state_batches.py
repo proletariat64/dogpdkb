@@ -15,6 +15,7 @@ from dogpdkb.graph import run_graph
 from dogpdkb.observe import report, snapshot
 from dogpdkb.records import Run, Store
 from dogpdkb.settings import load_config, select_book
+from scripts.smoke_install import GRAPHIFY_PREFLIGHT
 from tests.test_orchestrator_apply_cli import VERSION, instance, two_sources
 from tests.test_orchestrator_graph_cli import fixture as graph_fixture
 
@@ -262,7 +263,7 @@ def test_graph_batch_writes_state_twice_for_actual_tool_result(
     (tmp_path / "mode").write_text(mode)
     wrapper = tmp_path / "graphify.py"
     wrapper.write_text(
-        "import json\nfrom pathlib import Path\n"
+        GRAPHIFY_PREFLIGHT + "import json\nfrom pathlib import Path\n"
         f"state=json.loads(Path({str(store.path)!r}).read_text())\n"
         "assert all(d['steps']['graph']['status']=='running' for d in state['documents'].values())\n"
         + wrapper.read_text()

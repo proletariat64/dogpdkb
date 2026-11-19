@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.smoke_install import GRAPHIFY_PREFLIGHT, GRAPHIFY_PROOF
 from tests.source_fixture import team_id
 from tests.test_orchestrator_apply_cli import (
     VERSION,
@@ -247,7 +248,9 @@ def test_successful_graph_baseline_does_not_advance_on_equivalent_revision(tmp_p
     config, differences = instance(tmp_path)
     graph = tmp_path / "graphify.py"
     graph.write_text(
-        "import json,sys\nfrom pathlib import Path\nout=Path(sys.argv[sys.argv.index('--out')+1])/'graphify-out'\nout.mkdir(parents=True,exist_ok=True)\n(out/'graph.json').write_text(json.dumps({'nodes':[],'links':[]}))\n(out/'manifest.json').write_text('{}')\n"
+        GRAPHIFY_PREFLIGHT
+        + "import json,sys\nfrom pathlib import Path\nout=Path(sys.argv[sys.argv.index('--out')+1])/'graphify-out'\nout.mkdir(parents=True,exist_ok=True)\n(out/'graph.json').write_text(json.dumps({'nodes':[],'links':[]}))\n(out/'manifest.json').write_text('{}')\n"
+        + GRAPHIFY_PROOF
     )
     config.write_text(
         config.read_text()

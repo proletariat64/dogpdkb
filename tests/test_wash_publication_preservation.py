@@ -9,6 +9,7 @@ from urllib.parse import unquote, urlsplit
 
 import pytest
 
+from scripts.smoke_install import GRAPHIFY_PREFLIGHT, GRAPHIFY_PROOF
 from tests.source_fixture import team_id
 from tests.test_orchestrator_apply_cli import cli
 from tests.test_wash_durable_inputs import enriched_instance
@@ -182,7 +183,8 @@ def test_old_corpus_witness_remains_immutable_across_publication(
     config, differences = image_instance(tmp_path)
     graphify = tmp_path / "graphify.py"
     graphify.write_text(
-        """import json,sys
+        GRAPHIFY_PREFLIGHT
+        + """import json,sys
 from pathlib import Path
 Path(__file__).with_name('graph-called').touch()
 args=sys.argv[1:]; output=Path(args[args.index('--out')+1])/'graphify-out'
@@ -190,6 +192,7 @@ output.mkdir(parents=True,exist_ok=True)
 (output/'graph.json').write_text(json.dumps({'nodes':[],'links':[]}))
 (output/'manifest.json').write_text('{}')
 """
+        + GRAPHIFY_PROOF
     )
     config.write_text(
         config.read_text()

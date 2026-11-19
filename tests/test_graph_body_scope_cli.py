@@ -1,10 +1,13 @@
 """Retained full source inputs at the installed orchestration CLI seam."""
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
+from scripts.smoke_install import GRAPHIFY_PREFLIGHT, GRAPHIFY_PROOF
+from tests.source_fixture import graphify_offline_env, graphify_sse
 from tests.test_orchestrator_graph_cli import VERSION, cli, fixture, write
 
 
@@ -41,12 +44,20 @@ def held_source(tmp_path, manifest, action="retain", *, witness=True, renamed=Fa
             "metadata": {"name": "Held"},
         },
     }
+    # Match Graphify's native manifest change stamp; this is not a trust digest.
+    stamp = hashlib.new("md5", old.read_bytes(), usedforsecurity=False).hexdigest()
     if not witness:
         old.unlink()
     write(state_path, state)
     native = tmp_path / "corpus/graphify-out"
-    write(native / "graph.json", {"nodes": [{"id": "held"}], "links": []})
-    write(native / "manifest.json", {"native": "unchanged"})
+    write(
+        native / "graph.json",
+        {"nodes": [{"id": "held", "source_file": "Held.md"}], "links": []},
+    )
+    write(
+        native / "manifest.json",
+        {"Held.md": {"ast_hash": stamp, "semantic_hash": stamp}},
+    )
     return source, old_graph
 
 
@@ -63,7 +74,7 @@ def test_native_scan_uses_prior_held_body_and_keeps_held_graph_truth(
     image.write_bytes(b"retained resource")
     tool = tmp_path / "graphify.py"
     tool.write_text(
-        "import json,sys\nfrom pathlib import Path\n"
+        GRAPHIFY_PREFLIGHT + "import json,sys\nfrom pathlib import Path\n"
         "base=Path(sys.argv[1]); args=sys.argv[3:]; root=Path(args[0])\n"
         "out=Path(args[args.index('--out')+1])/'graphify-out'\n"
         "assert root!=base/'corpus'\n"
@@ -72,11 +83,11 @@ def test_native_scan_uses_prior_held_body_and_keeps_held_graph_truth(
         "assert not (root/'Renamed.md').exists()\n"
         f"assert (root/'assets/image.png').exists()=={graphify_inputs == 'all'}\n"
         f"assert (root/{selected.name!r}).read_text().startswith('# Complete current')\n"
-        "assert json.loads((out/'manifest.json').read_text())=={'native':'unchanged'}\n"
+        "assert list(json.loads((out/'manifest.json').read_text()))==['Held.md']\n"
         "graph=json.loads((out/'graph.json').read_text())\n"
         "graph['nodes'].append({'id':'fresh'})\n"
         "(out/'graph.json').write_text(json.dumps(graph))\n"
-        "(base/'scope-checked').touch()\n"
+        "(base/'scope-checked').touch()\n" + GRAPHIFY_PROOF
     )
 
     result = cli(config, manifest, graphify_inputs=graphify_inputs)
@@ -235,13 +246,13 @@ def test_new_deferred_source_requires_native_absence_and_retry_ownership(
         write(native / "graph.json", graph)
     tool = tmp_path / "graphify.py"
     tool.write_text(
-        "import json,sys\nfrom pathlib import Path\n"
+        GRAPHIFY_PREFLIGHT + "import json,sys\nfrom pathlib import Path\n"
         "base=Path(sys.argv[1]); args=sys.argv[3:]; root=Path(args[0])\n"
         "assert not (root/'Held.md').exists(), 'unverified deferred body submitted'\n"
         f"assert (root/{selected.name!r}).is_file()\n"
         "output=Path(args[args.index('--out')+1])/'graphify-out'\n"
         "(output/'graph.json').write_text(json.dumps({'nodes':[{'id':'healthy'}], 'links':[]}))\n"
-        "(base/'scope-checked').touch()\n"
+        "(base/'scope-checked').touch()\n" + GRAPHIFY_PROOF
     )
 
     result = cli(config, manifest, retry_graph=retry)
@@ -273,7 +284,6 @@ def test_only_retained_sources_do_not_call_graphify(tmp_path, action, code):
 
 
 def test_original_graphify_mirror_preserves_held_source_without_dispatch(tmp_path):
-    import os
     import shutil
     import subprocess
     import threading
@@ -291,16 +301,14 @@ def test_original_graphify_mirror_preserves_held_source_without_dispatch(tmp_pat
     calls = []
 
     class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *_):
+        def log_message(self, format, *args):
             pass
 
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            body = "\n".join(
-                message["content"]
-                for message in request["messages"]
-                if message["role"] == "user"
-            )
+            assert self.path == "/codex/responses"
+            assert self.headers["chatgpt-account-id"] == "offline-fixture"
+            body = request["input"][0]["content"][0]["text"]
             calls.append(body)
             nodes = []
             for name in (selected.name, held.name):
@@ -320,48 +328,16 @@ def test_original_graphify_mirror_preserves_held_source_without_dispatch(tmp_pat
                             "source_file": name,
                         }
                     )
-            result = json.dumps(
-                {
-                    "id": "mock",
-                    "object": "chat.completion",
-                    "created": 0,
-                    "model": "mock",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "finish_reason": "stop",
-                            "message": {
-                                "role": "assistant",
-                                "content": json.dumps({"nodes": nodes, "edges": []}),
-                            },
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": 1,
-                        "completion_tokens": 1,
-                        "total_tokens": 2,
-                    },
-                }
-            ).encode()
+            result = graphify_sse(nodes)
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "text/event-stream")
             self.send_header("Content-Length", str(len(result)))
             self.end_headers()
             self.wfile.write(result)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    environment = {
-        "PATH": os.environ["PATH"],
-        "HOME": str(tmp_path / "home"),
-        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
-        "OPENAI_API_KEY": "offline-fixture",
-        "OPENAI_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
-        "OPENAI_MODEL": "mock",
-        "NO_PROXY": "127.0.0.1,localhost",
-        "GRAPHIFY_API_TIMEOUT": "5",
-        "GRAPHIFY_MAX_RETRIES": "0",
-    }
+    environment = graphify_offline_env(tmp_path, server.server_port)
     try:
         baseline = subprocess.run(
             [
@@ -370,9 +346,7 @@ def test_original_graphify_mirror_preserves_held_source_without_dispatch(tmp_pat
                 str(selected.parent),
                 "--no-cluster",
                 "--backend",
-                "openai",
-                "--model",
-                "mock",
+                "openai-oauth",
             ],
             env=environment,
             check=False,

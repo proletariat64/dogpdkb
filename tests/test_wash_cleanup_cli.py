@@ -66,6 +66,29 @@ def test_completed_sync_cleans_bulk_and_keeps_status_and_next_sync(tmp_path):
     ]
 
 
+def test_unsupported_native_graphify_does_not_prevent_corpus_publication(tmp_path):
+    config, _ = instance(tmp_path)
+    (tmp_path / "mode").write_text("unsupported")
+
+    result = cli("sync", "--config", config)
+    assert result.returncode == 2, result.stderr
+    run = json.loads(Path(json.loads(result.stdout)["run"]).read_text())
+    assert run["status"] == "partial"
+    assert any(
+        row["reason"] == "GRAPHIFY_NATIVE_PROOF_UNSUPPORTED" for row in run["failures"]
+    )
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    docs = state["documents"].values()
+    assert len(docs) == 2
+    assert all(
+        Path(doc["corpus"]["path"]).is_file() and "graph" not in doc for doc in docs
+    )
+    assert not any(
+        json.loads(line)[:2] == ["graphify", "extract"]
+        for line in (tmp_path / "commands.jsonl").read_text().splitlines()
+    )
+
+
 def test_partial_ocr_keeps_failed_markdown_image_report_but_cleans_success(tmp_path):
     from PIL import Image
 
@@ -159,11 +182,30 @@ def test_failed_graph_keeps_input_and_report_without_candidate_graph(tmp_path):
             "--out",
             str(Path(failure["report"]).parent),
             "--no-cluster",
+            "--backend",
+            "openai-oauth",
+            "--max-concurrency",
+            "3",
         ]
         assert failure["argv"] == expected
         assert report["graphify_inputs"] == "text"
         assert report["argv"] == expected
+        assert Path(report["native_log"]).is_file()
     assert not list(run.parent.glob("graphify-*/graphify-out"))
+
+    second = cli("sync", "--config", config)
+    assert second.returncode == 2, second.stderr
+    next_run = Path(json.loads(second.stdout)["run"])
+    assert next_run != run
+    assert any(
+        row["reason"] == "SAME_VERSION_NOT_RETRIED"
+        for row in json.loads(next_run.read_text())["failures"]
+    )
+    calls = [
+        json.loads(line)
+        for line in (tmp_path / "commands.jsonl").read_text().splitlines()
+    ]
+    assert sum(row[:2] == ["graphify", "extract"] for row in calls) == 1
 
 
 @pytest.mark.parametrize("tool_exit,expected", [(1, 2), (130, 130)])
