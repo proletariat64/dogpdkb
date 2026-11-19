@@ -27,6 +27,7 @@ Paths in a JSON list are relative to that list. Directory mode is recursive.
 A plan writes new JSON and optionally downloads explicitly selected remote
 images with --download. It does not call an OCR provider or publish Markdown.
 Run the plan with mdocr run --plan plan.json --result result.json.
+Use mdocr plan --help --full for the complete contract.
 """
 
 PLAN_FULL = """Plan controls:
@@ -51,6 +52,7 @@ unknown work is written to the result and never passed off as completed.
 
 Exit codes: 0 completed; 2 incomplete or unsupported arguments; 1 invalid plan,
 invalid result binding, or other preflight/write failure.
+Use mdocr run --help --full for the complete contract.
 """
 
 RUN_FULL = """Execution and recovery:
