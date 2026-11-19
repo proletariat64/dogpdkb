@@ -47,8 +47,8 @@ def count_state_writes(monkeypatch, store):
     writes = []
     original = records.atomic_json
 
-    def write(path, payload):
-        original(path, payload)
+    def write(path, payload, *, durable=False):
+        original(path, payload, durable=durable)
         if Path(path) == store.path:
             writes.append(Path(path).stat().st_size)
 
