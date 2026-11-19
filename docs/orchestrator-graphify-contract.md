@@ -125,9 +125,12 @@ proof of a particular installation's provenance.
 Exit zero and valid JSON are necessary but insufficient. Require the native
 write/no-change diagnostic. If native semantic work was dispatched, require
 all numbered chunks to complete with one consistent total, and reject native
-incomplete-extraction, manifest or cache errors. Require native semantic byte
-stamps and graph node/hyperedge ownership for the frozen Markdown; validate
-other present manifest stamps against their frozen bytes. The native manifest
+incomplete-extraction, manifest or cache errors. Every frozen Markdown source
+requires a current native semantic stamp and graph ownership by a node or a
+nonempty hyperedge with existing members. Sources without that evidence in the
+previous public generation must be accounted for by native dispatch or cache
+hit counts; a terminal write alone cannot prove new work. Validate other present
+manifest stamps against their frozen bytes. The native manifest
 uses MD5 as a change stamp; dogpdkb records SHA-256 input witnesses separately.
 No size growth or shrink threshold substitutes for these checks.
 

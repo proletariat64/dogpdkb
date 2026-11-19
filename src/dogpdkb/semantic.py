@@ -279,6 +279,67 @@ def read_semantic_artifacts(code, report_path, diff_path, rows, knowledge_base):
     return report
 
 
+def score_eligible(row):
+    return (
+        row["semantic_status"] == "CHANGED"
+        and row["action"] == "COMPILE"
+        and row["comparison_complete"]
+        and row["extraction"]["available"]
+    )
+
+
+def read_score_outcomes(path, report, diff_index, expected):
+    """A bound, complete score report can prove which reserved rows were unsent."""
+    report_data = read_json(path)
+    bindings = {
+        (row["knowledge_base"], row["document_id"]): (row["evidence"], row["sha256"])
+        for row in read_json(diff_index)["documents"]
+    }
+    if not isinstance(report_data, dict):
+        raise SemanticArtifactError("invalid score result")
+    scored, unscored = report_data.get("scores"), report_data.get("unscored")
+    execution = report_data.get("execution")
+    if (
+        report_data.get("schema_version") != "mdcompare-semantic-scores-1"
+        or not isinstance(scored, list)
+        or not isinstance(unscored, list)
+        or not isinstance(execution, dict)
+    ):
+        raise SemanticArtifactError("invalid score result scope")
+    scored_ids, unscored_ids = _identities(scored), _identities(unscored)
+    if scored_ids & unscored_ids or scored_ids | unscored_ids != expected:
+        raise SemanticArtifactError("invalid score result scope")
+    configuration = execution.get("configuration")
+    if not isinstance(configuration, dict) or any(
+        configuration.get(key) != hashlib.sha256(source.read_bytes()).hexdigest()
+        for key, source in (("report_sha256", report), ("index_sha256", diff_index))
+    ):
+        raise SemanticArtifactError("score result belongs to another generation")
+    outcomes = {}
+    for row in scored + unscored:
+        identity = row["knowledge_base"], row["document_id"]
+        if bindings[identity] != (row.get("evidence"), row.get("evidence_sha256")):
+            raise SemanticArtifactError("score result evidence mismatch")
+        status = row.get("status")
+        if identity in scored_ids:
+            if status != "scored":
+                raise SemanticArtifactError("invalid scored admission outcome")
+            outcome = "completed"
+        elif status == "unscored" and isinstance(row.get("reason"), str):
+            outcome = "unknown" if row["reason"] == "unknown_outcome" else "failed"
+        elif "status" not in row and "packet_sha256" not in row:
+            outcome = "skipped"
+        else:
+            raise SemanticArtifactError("invalid score admission outcome")
+        outcomes[identity[1]] = outcome, row.get("reason")
+    requests = execution.get("requests")
+    if type(requests) is not int or requests != sum(
+        status != "skipped" for status, _ in outcomes.values()
+    ):
+        raise SemanticArtifactError("score result admission count mismatch")
+    return outcomes
+
+
 def read_score_route(code, path, semantic):
     if code != 0 or not path.is_file():
         raise SemanticArtifactError("semantic score route unavailable")
@@ -302,12 +363,7 @@ def read_score_route(code, path, semantic):
             or type(row.get("ambiguous")) is not bool
         ):
             raise SemanticArtifactError("invalid semantic score")
-        eligible = (
-            source["semantic_status"] == "CHANGED"
-            and source["action"] == "COMPILE"
-            and source["comparison_complete"]
-            and source["extraction"]["available"]
-        )
+        eligible = score_eligible(source)
         action = (
             "SKIP"
             if eligible and score is not None and score <= 3

@@ -258,6 +258,12 @@ def main(argv=None) -> int:
     )
     scorer.add_argument("--request-budget", type=nonnegative_int, required=True)
     scorer.add_argument(
+        "--document-id",
+        action="append",
+        metavar="ID",
+        help="limit admission to this eligible document ID (repeatable)",
+    )
+    scorer.add_argument(
         "--concurrency",
         type=int,
         choices=(1, 2, 3),

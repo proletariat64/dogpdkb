@@ -74,9 +74,12 @@ for path in scan.rglob('*'):
         name=unicodedata.normalize('NFC', path.relative_to(scan).as_posix())
         stamp=hashlib.new('md5',path.read_bytes(),usedforsecurity=False).hexdigest()
         manifest[name]={'ast_hash':stamp,'semantic_hash':stamp}
-        graph.setdefault('hyperedges',[]).append({'source_file':name,'nodes':[]})
+        graph['nodes'].append({'id':name,'source_file':name})
 (out/'manifest.json').write_text(json.dumps(manifest))
 (out/'graph.json').write_text(json.dumps(graph))
+if manifest:
+    print(f'[graphify extract] semantic extraction on {len(manifest)} files via openai-oauth...')
+    print('[graphify extract] chunk 1/1 done')
 print(f'[graphify extract] wrote {out / "graph.json"} — {len(graph["nodes"])} nodes (no clustering)')
 """
 

@@ -382,6 +382,59 @@ def test_budgeted_semantic_scoring_routes_changed_and_resume_verifies_frozen_art
     assert score_runtime.read_text().splitlines() == ["submitted"]
 
 
+def test_unknown_score_is_not_replayed_but_proven_unsent_peer_can_score_next_run(
+    tmp_path, score_runtime, monkeypatch
+):
+    config, differences = instance(tmp_path)
+    two_sources(tmp_path, differences)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for identifier in ("42", "43"):
+        (corpus / f"Title-2026-11-11-[{identifier}].md").write_text(
+            f"# Title\n\nPrevious rules for document {identifier}.\n"
+        )
+    initialized = cli("init-state", "--config", config)
+    assert initialized.returncode == 0, initialized.stderr
+    config.write_text(config.read_text() + "\n[semantic_score]\nrequest_budget=1\n")
+    monkeypatch.setenv("SCORE_TEST_REPLY", "unknown")
+    _, first, first_plan = pause(config, differences)
+    assert [row["action"] for row in first_plan["documents"]] == ["compile", "compile"]
+    scores = Path(first["artifacts"]["semantic_scoring"]["scores"]["path"])
+    assert {row["reason"] for row in json.loads(scores.read_bytes())["unscored"]} == {
+        "unknown_outcome"
+    }
+
+    monkeypatch.delenv("SCORE_TEST_REPLY")
+    _, _, second_plan = pause(config, differences)
+    assert [row.get("semantic_score") for row in second_plan["documents"]] == [None, 3]
+    assert [row["action"] for row in second_plan["documents"]] == ["compile", "reuse"]
+    assert score_runtime.read_text().splitlines() == ["submitted", "submitted"]
+
+    _, _, third_plan = pause(config, differences)
+    assert [row.get("semantic_score") for row in third_plan["documents"]] == [
+        None,
+        None,
+    ]
+    assert score_runtime.read_text().splitlines() == ["submitted", "submitted"]
+
+
+def test_score_process_loss_keeps_compile_without_cross_run_replay(
+    tmp_path, score_runtime, monkeypatch
+):
+    config, differences = instance(tmp_path)
+    seed_body_baseline(tmp_path, config, "# Title\n\nPrevious rule.\n")
+    config.write_text(config.read_text() + "\n[semantic_score]\nrequest_budget=1\n")
+    monkeypatch.setenv("SCORE_TEST_REPLY", "crash")
+    _, first, plan = pause(config, differences)
+    assert plan["documents"][0]["action"] == "compile"
+    assert first["failures"][-1]["reason"] == "SEMANTIC_SCORE_UNVERIFIABLE"
+
+    monkeypatch.delenv("SCORE_TEST_REPLY")
+    _, _, plan = pause(config, differences)
+    assert plan["documents"][0]["action"] == "compile"
+    assert score_runtime.read_text().splitlines() == ["submitted"]
+
+
 @pytest.mark.parametrize("duplicate_score", [False, True])
 def test_score_rejects_ambiguous_wire_encoding_or_incomplete_coverage(
     tmp_path, score_runtime, monkeypatch, duplicate_score

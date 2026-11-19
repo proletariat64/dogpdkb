@@ -165,18 +165,26 @@ class Store:
     def step(self, doc_id: str | int, name: str) -> dict | None:
         return self.data["documents"].get(str(doc_id), {}).get("steps", {}).get(name)
 
-    def suppressed(self, doc_id: str | int, name: str, version: Any) -> bool:
+    def blocked_attempt(
+        self, doc_id: str | int, name: str, version: Any
+    ) -> dict | None:
+        key = version_key(version)
         blocked = (
             self.data["documents"].get(str(doc_id), {}).get("blocked_versions", {})
         )
-        if version_key(version) in blocked.get(name, {}):
-            return True
+        if key in blocked.get(name, {}):
+            return blocked[name][key]
         record = self.step(doc_id, name)
-        return bool(
+        if (
             record
-            and version_key(record["version"]) == version_key(version)
+            and version_key(record["version"]) == key
             and record["status"] in {"running", "failed", "unknown"}
-        )
+        ):
+            return record
+        return None
+
+    def suppressed(self, doc_id: str | int, name: str, version: Any) -> bool:
+        return self.blocked_attempt(doc_id, name, version) is not None
 
     def attempt(self, doc_id, name, version, run_id, **details) -> dict:
         return self.complete(doc_id, name, version, "running", run_id, **details)
@@ -218,7 +226,7 @@ class Store:
         if status in {"running", "failed", "unknown"}:
             blocked[key] = {"status": status, "run_id": run_id}
         elif status == "completed" or (
-            name == "ocr"
+            name in {"ocr", "semantic_score"}
             and status == "skipped"
             and details.get("send_state") == "not_sent"
             and blocked.get(key, {}).get("run_id") == run_id

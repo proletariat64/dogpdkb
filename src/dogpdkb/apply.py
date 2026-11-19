@@ -37,8 +37,10 @@ from dogpdkb.records import Run, Store, atomic_json, read_json, version_key
 from dogpdkb.semantic import (
     bind_score_artifacts,
     freeze_recovery,
+    read_score_outcomes,
     read_score_route,
     read_semantic_artifacts,
+    score_eligible,
 )
 from dogpdkb.settings import (
     DEFAULT_DOWNLOAD_CONCURRENCY,
@@ -651,38 +653,15 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
         and not replan
         and not run.data.get("semantic_score_started")
     ):
-        score_path = semantic_dir / "scores.json"
-        route_path = semantic_dir / "score-route.json"
-        run.data["semantic_score_started"] = str(score_path)
-        run.save(durable=True)
-        common = ["--report", semantic_report_path, "--diff-index", semantic_diff_path]
-        score_args = [
-            "semantic-score",
-            *common,
-            "--output",
-            score_path,
-            "--request-budget",
-            str(settings.semantic_score_request_budget),
-        ]
-        if settings.semantic_score_model:
-            score_args += ["--model", settings.semantic_score_model]
-        score_code = call_tool(settings, run, "mdcompare", score_args)
-        if score_code not in {0, 2} or not score_path.is_file():
-            raise ValueError("semantic score execution did not publish its result")
-        route_code = call_tool(
+        semantic = _score_inputs(
             settings,
+            book,
+            store,
             run,
-            "mdcompare",
-            ["semantic-route", *common, "--scores", score_path, "--output", route_path],
-        )
-        semantic = read_score_route(route_code, route_path, semantic)
-        run.data["artifacts"]["semantic_scoring"] = bind_score_artifacts(
-            {
-                "semantic": semantic_report_path,
-                "semantic_diff": semantic_diff_path,
-                "scores": score_path,
-                "route": route_path,
-            }
+            active,
+            semantic,
+            semantic_report_path,
+            semantic_diff_path,
         )
     reports = []
     for mode in ("knowledge", "compare"):
@@ -761,6 +740,121 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
     store.complete_batch(outcomes)
     run.save()
     return (*reports, semantic)
+
+
+def _score_inputs(settings, book, store, run, rows, semantic, report, diff_index):
+    eligible = {
+        row["document_id"] for row in semantic["results"] if score_eligible(row)
+    }
+    score_path = report.with_name("scores.json")
+    route_path = report.with_name("score-route.json")
+    records = {}
+    for row in rows:
+        identifier, version = row["document_id"], row["version"]
+        previous = store.step(identifier, "semantic_score")
+        if (
+            identifier not in eligible
+            or store.suppressed(identifier, "semantic_score", version)
+            or (
+                previous
+                and previous["status"] == "completed"
+                and same_version(previous["version"], version)
+            )
+        ):
+            continue
+        records[identifier] = {
+            "doc_id": identifier,
+            "name": "semantic_score",
+            "version": version,
+            "run_id": run.id,
+            "report": str(score_path),
+            "input_sha256": row.get("raw_sha256"),
+        }
+    if not records:
+        return semantic
+    run.data["semantic_score_started"] = str(score_path)
+    run.save(durable=True)
+    store.complete_batch(
+        (
+            dict(record, status="running", send_state="unknown")
+            for record in records.values()
+        ),
+        durable=True,
+    )
+    common = ["--report", report, "--diff-index", diff_index]
+    score_args = [
+        "semantic-score",
+        *common,
+        "--output",
+        score_path,
+        "--request-budget",
+        str(settings.semantic_score_request_budget),
+    ]
+    for identifier in records:
+        score_args += ["--document-id", identifier]
+    if settings.semantic_score_model:
+        score_args += ["--model", settings.semantic_score_model]
+    code = call_tool(settings, run, "mdcompare", score_args)
+    try:
+        if code not in {0, 2} or not score_path.is_file():
+            raise ValueError("semantic score execution did not publish its result")
+        outcomes = read_score_outcomes(
+            score_path, report, diff_index, {(book.key, key) for key in records}
+        )
+    except (OSError, ValueError) as error:
+        run.failure(
+            step="compare",
+            reason="SEMANTIC_SCORE_UNVERIFIABLE",
+            message=str(error),
+            exit_code=code,
+            report=str(score_path),
+        )
+        outcomes = {key: ("unknown", "unverified_result") for key in records}
+        verified = False
+    else:
+        verified = True
+    store.complete_batch(
+        (
+            dict(
+                records[key],
+                status=status,
+                reason=reason,
+                send_state={"skipped": "not_sent", "completed": "sent"}.get(
+                    status, "unknown"
+                ),
+            )
+            for key, (status, reason) in outcomes.items()
+        ),
+        durable=True,
+    )
+    if not verified:
+        return semantic
+    route_code = call_tool(
+        settings,
+        run,
+        "mdcompare",
+        ["semantic-route", *common, "--scores", score_path, "--output", route_path],
+    )
+    try:
+        routed = read_score_route(route_code, route_path, semantic)
+    except (OSError, ValueError) as error:
+        run.failure(
+            step="compare",
+            reason="SEMANTIC_SCORE_ROUTE_UNVERIFIABLE",
+            message=str(error),
+            exit_code=route_code,
+            report=str(route_path),
+        )
+        return semantic
+    run.data["artifacts"]["semantic_scoring"] = bind_score_artifacts(
+        {
+            "semantic": report,
+            "semantic_diff": diff_index,
+            "scores": score_path,
+            "route": route_path,
+        }
+    )
+    return routed
 
 
 def keep_catchup_body(row, result):
@@ -1068,8 +1162,9 @@ def publish_corpus(book, store, run, plan, publication, *, verify_ocr=False):
     return path
 
 
-def seal_corpus(book, store, run):
-    run.data["graph_generation"] = graph_generation(store, book)
+def seal_corpus(run):
+    # An older unsealed handoff without a saved baseline cannot adopt live graph.
+    run.data.setdefault("graph_generation", None)
     manifest = Path(run.data["artifacts"]["manifest"])
     bind_graph_manifest(
         run, manifest, read_json(manifest), run.data["sync_policy"]["graphify_inputs"]
@@ -1094,7 +1189,7 @@ def apply_run(
     if artifacts.get("manifest"):
         manifest = read_checkpoint(run, "corpus", "manifest")
         if sync and "corpus" not in checkpoints:
-            seal_corpus(book, store, run)
+            seal_corpus(run)
         if not sync:
             for document in manifest["documents"]:
                 if file_digest(Path(document["path"])) != document["input_copy_sha256"]:
@@ -1171,7 +1266,12 @@ def apply_run(
             }
             # An already-created native batch cannot be edited or replayed.
             # Reconcile its verified children without admitting stale work.
-            if not (store.path.parent / "ocr" / run.id / "request.json").exists():
+            ocr_request = Path(
+                artifacts.get(
+                    "ocr_request", store.path.parent / "ocr" / run.id / "request.json"
+                )
+            )
+            if not ocr_request.exists():
                 rows = current
         validate_plan(
             {
@@ -1193,11 +1293,14 @@ def apply_run(
         seal_phase(run, "ocr", "publication")
     if result := pause(run, "ocr", stop_after):
         return result
+    if sync and "graph_generation" not in run.data:
+        run.data["graph_generation"] = graph_generation(store, book)
+        run.save(durable=True)
     manifest = publish_corpus(
         book, store, run, plan, publication, verify_ocr=has_publication
     )
     if sync:
-        seal_corpus(book, store, run)
+        seal_corpus(run)
         if result := pause(run, "corpus", stop_after, manifest=str(manifest)):
             return result
     partial = bool(run.data["failures"])

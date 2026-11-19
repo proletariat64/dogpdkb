@@ -3,6 +3,7 @@
 import hashlib
 import json
 import re
+import tempfile
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -493,18 +494,21 @@ def _execute(root, request, store, run, call_tool, *, allow_dispatch=True):
     if reason is None and report is None:
         atomic_json(start_path, initial, durable=True)
         store.complete_batch(
-            {
-                "doc_id": entry["document_id"],
-                "name": "ocr",
-                "version": entry["version"],
-                "status": "running",
-                "run_id": run.id,
-                "input": str(req_path),
-                "report": str(report_path),
-                "send_state": "unknown",
-                "input_sha256": entry["source_sha256"],
-            }
-            for entry in request["documents"]
+            (
+                {
+                    "doc_id": entry["document_id"],
+                    "name": "ocr",
+                    "version": entry["version"],
+                    "status": "running",
+                    "run_id": run.id,
+                    "input": str(req_path),
+                    "report": str(report_path),
+                    "send_state": "unknown",
+                    "input_sha256": entry["source_sha256"],
+                }
+                for entry in request["documents"]
+            ),
+            durable=True,
         )
         dispatched = True
         code = call_tool("mdocr", ["run", "--plan", plan_path, "--result", report_path])
@@ -545,9 +549,13 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
 
     plan_path = run.data["artifacts"]["plan"]
     policy = read_json(Path(plan_path)).get("ocr_policy") or settings.ocr_policy()
-    root = store.path.parent / "ocr" / run.id
-    _path(store.path.parent, root)
-    request_path, seal_path = root / "request.json", root / "settled.json"
+    batches = store.path.parent / "ocr"
+    request_path = _path(
+        batches,
+        run.data["artifacts"].get("ocr_request", batches / run.id / "request.json"),
+    )
+    root = request_path.parent
+    seal_path = root / "settled.json"
     candidates = [
         row for row in rows if row["action"] == "compile" or row.get("retry_ocr")
     ]
@@ -559,6 +567,13 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
     existing = read_json(request_path) if request_path.exists() else None
     enrolled = _index(existing["documents"]) if existing else {}
     rejected = existing["rejected"] if existing else {}
+    if existing is not None and (
+        existing["schema"] != "dogpdkb-ocr-request-3"
+        or existing["run_id"] != run.id
+        or existing["policy"] != policy
+    ):
+        raise ValueError("Saved OCR batch does not match the frozen run policy")
+    superseded = set()
 
     def note(row, status, send, reason, **details):
         identifier = row["document_id"]
@@ -591,12 +606,11 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
         identifier, version = row["document_id"], row["version"]
         if identifier in stale:
             continue
-        if identifier in enrolled:
-            if enrolled[identifier]["version"] != version:
-                raise ValueError(
-                    "OCR request version does not match the saved business plan"
-                )
-            continue
+        was_enrolled = identifier in enrolled
+        if was_enrolled and enrolled[identifier]["version"] != version:
+            raise ValueError(
+                "OCR request version does not match the saved business plan"
+            )
         if identifier in rejected:
             note(
                 row,
@@ -611,7 +625,10 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
             previous
             and previous["status"] == "completed"
             and same_version(previous["version"], version)
+            and (not was_enrolled or previous.get("run_id") != run.id)
         ):
+            if was_enrolled:
+                superseded.add(identifier)
             try:
                 results[identifier] = _saved_ocr(previous, row)
             except _INVALID:
@@ -623,7 +640,10 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
                     report=previous.get("report"),
                 )
             continue
-        if store.suppressed(identifier, "ocr", version):
+        blocked = store.blocked_attempt(identifier, "ocr", version)
+        if blocked and (not was_enrolled or blocked.get("run_id") != run.id):
+            if was_enrolled:
+                superseded.add(identifier)
             note(
                 row,
                 "unknown",
@@ -632,8 +652,6 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
                 report=(previous or {}).get("report"),
             )
             continue
-        if existing:
-            raise ValueError("Saved OCR batch does not cover the frozen candidates")
         if (
             previous
             and previous.get("run_id") != run.id
@@ -647,6 +665,8 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
                 ):
                     raise ValueError("Previous OCR evidence does not prove unsent work")
             except _INVALID:
+                if was_enrolled:
+                    superseded.add(identifier)
                 note(
                     row,
                     "unknown",
@@ -655,7 +675,24 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
                     report=previous.get("report"),
                 )
                 continue
+        if was_enrolled:
+            continue
+        if existing:
+            raise ValueError("Saved OCR batch does not cover the frozen candidates")
         pending.append(row)
+    excluded = superseded | set(stale)
+    if (
+        enrolled.keys() & excluded
+        and enrolled.keys() - excluded
+        and not (root / "started.json").exists()
+        and not seal_path.exists()
+    ):
+        # A prepared request (even with a local plan) proves no provider
+        # admission yet. Keep it intact and plan only the unaffected rows.
+        revision = tempfile.mkdtemp(prefix=f"{run.id}-", dir=batches)
+        run.data["artifacts"]["ocr_request"] = str(Path(revision) / "request.json")
+        run.save(durable=True)
+        return ocr_inputs(settings, book, store, run, rows, stale=stale)
     if existing is None and pending:
         original_ids = [row["document_id"] for row in pending]
         prepared = []
@@ -682,12 +719,6 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
         atomic_json(request_path, existing, durable=True)
         enrolled = _index(prepared)
     if existing is not None:
-        if (
-            existing["schema"] != "dogpdkb-ocr-request-3"
-            or existing["run_id"] != run.id
-            or existing["policy"] != policy
-        ):
-            raise ValueError("Saved OCR batch does not match the frozen run policy")
         run.data["artifacts"]["ocr_request"] = str(request_path)
     current = [row for row in rows if row["document_id"] not in stale]
     validate_inputs(current)
@@ -702,7 +733,7 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
             store,
             run,
             invoke,
-            allow_dispatch=not any(key in stale for key in enrolled),
+            allow_dispatch=not (enrolled.keys() & excluded),
         )
         validate_inputs(current)
         report, plan, docs, records = None, {}, {}, {}
@@ -726,7 +757,7 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
                 artifacts.setdefault(key, str(path))
         for row in candidates:
             identifier = row["document_id"]
-            if identifier not in enrolled or identifier in stale:
+            if identifier not in enrolled or identifier in excluded:
                 continue
             entry = enrolled[identifier]
             result = None

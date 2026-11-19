@@ -9,6 +9,11 @@ and materiality claims are validated before a numeric score can be routed.
 Does not send source
 paths, image payloads or OCR. Scores bind the exact sidecar bytes.
 
+Repeat --document-id ID to score only those eligible, unambiguous document IDs
+in the report. Keep the same scope on resume. The report/index are unchanged.
+In the score result, only admitted rows have a status (scored or unscored);
+unscored entries without a status never entered the tool's request budget.
+
 --request-budget is required; 0 does not start a model. The limit counts
 admissions across resumes, including uncertain outcomes. A separate maximum
 byte size applies per prepared evidence packet; oversized packets are held
