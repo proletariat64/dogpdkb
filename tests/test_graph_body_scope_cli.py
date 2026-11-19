@@ -102,12 +102,11 @@ def test_native_scan_uses_prior_held_body_and_keeps_held_graph_truth(
     assert state["held"]["graph"] == old_graph
     assert not state["held"]["steps"]
     assert state["42"]["steps"]["graph"]["status"] == "completed"
-    assert {
-        n["id"]
-        for n in json.loads((selected.parent / "graphify-out/graph.json").read_text())[
-            "nodes"
-        ]
-    } == {"held", "fresh"}
+    expected_nodes = {"held", "fresh", "Held.md", selected.name}
+    if graphify_inputs == "all":
+        expected_nodes.add("assets/image.png")
+    graph = json.loads((selected.parent / "graphify-out/graph.json").read_text())
+    assert {node["id"] for node in graph["nodes"]} == expected_nodes
     assert state["42"]["graph_baseline"]["source_file"] == selected.name
     assert (
         Path(state["42"]["graph_baseline"]["path"]).read_bytes()

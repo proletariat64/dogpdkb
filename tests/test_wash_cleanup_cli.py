@@ -131,10 +131,11 @@ if tool in ('mdcompare', 'mdocr'):""",
     assert Path(failure["input"]).is_file()
     assert Path(failure["report"]).is_file()
     assert not list(run.parent.glob("graphify-*"))
-    assert (
-        json.loads((tmp_path / "corpus/graphify-out/graph.json").read_text())["nodes"]
-        == []
-    )
+    corpus = tmp_path / "corpus"
+    graph = json.loads((corpus / "graphify-out/graph.json").read_text())
+    published = {p.name for p in corpus.glob("*.md")}
+    assert len(published) == 2
+    assert {node["source_file"] for node in graph["nodes"]} == published
 
 
 def test_paused_run_is_preserved_and_cleaned_run_cannot_resume(tmp_path):
