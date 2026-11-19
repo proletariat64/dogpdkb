@@ -12,8 +12,8 @@ dogpdkb apply --config /srv/kb/dogpdkb.toml --book funds --input /path/differenc
 # 采用 apply 给出的 manifest 路径
 dogpdkb update-graph --config /srv/kb/dogpdkb.toml --book funds --input /path/manifest.json
 
-# 同一实现的串行组合
-dogpdkb sync --config /srv/kb/dogpdkb.toml --book funds --stop-after plan
+# 同一实现的串行组合；--dir 只扫描指定目录，不调用 Skylark
+dogpdkb sync --config /srv/kb/dogpdkb.toml --book funds --dir ./inbox/2026-11-19 --stop-after plan
 dogpdkb sync --config /srv/kb/dogpdkb.toml --book funds --resume /path/run-directory
 ```
 
@@ -22,7 +22,7 @@ dogpdkb sync --config /srv/kb/dogpdkb.toml --book funds --resume /path/run-direc
 恢复只处理原范围；输入缺失、改变或会回退更晚成功版本时需重新生成计划。
 失败或不明步骤不靠恢复自动重试。
 
-`sync` and `apply` use download concurrency 2 by default; `--concurrency 1`, `2`
+`sync` and `apply` use download concurrency 3 by default; `--concurrency 1`, `2`
 or `3` selects the per-invocation limit, capped at three. The download batch still
 settles before comparison. Resume can change the value without refetching verified
 completed inputs or clearing failure suppression. Interruption stops all in-flight
@@ -31,8 +31,10 @@ for examples and the full scope; this is not a Skylark flag or TOML setting.
 
 ## cron 与日志
 
-先配置工具公开入口并执行 doctor；首次运行前以 init-state 登记现有语料。首次
-新增截止为本地文件最新日期；已存在来源按自身版本比较；日期精度同日仍会比较。
+配置工具公开入口后，可用 `doctor` 离线检查选定目标和来源；`--source` 或 `--dir`
+可缩小范围，未选语雀来源时不检查 Skylark。doctor 不是每次同步的必经步骤。首次
+运行前以 init-state 登记现有语料。首次新增截止为本地文件最新日期；已存在来源按
+自身版本比较；日期精度同日仍会比较。
 随后使用完整观察快照。不会回填已过滤历史缺失，不会因远端缺席删除本地知识。
 
 ```cron

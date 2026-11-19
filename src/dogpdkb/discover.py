@@ -20,7 +20,13 @@ from dogpdkb.help import HelpParser
 from dogpdkb.planning import descriptor
 from dogpdkb.processes import diagnostic_argv, run_command
 from dogpdkb.records import UTC8, Run, Store, atomic_json, now_iso, read_json
-from dogpdkb.settings import YuqueSource, document_identity, load_config, select_book
+from dogpdkb.settings import (
+    YuqueSource,
+    document_identity,
+    load_config,
+    select_book,
+    validate_directory_source,
+)
 
 
 class DiscoverError(ValueError):
@@ -210,21 +216,7 @@ def _with_source(rows, source_key):
 
 def _directory_listing(settings, book, run, source):
     root = source.path
-    if not root.is_dir():
-        raise DiscoverError(
-            f"directory source does not exist or is not a directory: {root}"
-        )
-    for target in (
-        book.corpus,
-        settings.graph_for(book),
-        settings.staging,
-        settings.state,
-        settings.ocr_cache,
-        settings.web,
-        settings.results,
-    ):
-        if root.is_relative_to(target) or target.is_relative_to(root):
-            raise DiscoverError(f"directory source overlaps a managed path: {target}")
+    validate_directory_source(settings, book, root)
 
     def raise_scan_error(error):
         raise error

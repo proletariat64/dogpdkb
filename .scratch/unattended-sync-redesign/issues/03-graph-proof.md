@@ -1,6 +1,8 @@
 # graph-proof
 
-Status: ready-for-agent
+Status: in-progress
+
+Progress: Graphify proof is being finished in the independent ticket 03 worktree; not integrated.
 
 Blocked by: none
 

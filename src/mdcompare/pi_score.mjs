@@ -102,15 +102,16 @@ const main = async () => {
     });
     const counts = [reply?.usage?.input, reply?.usage?.output, reply?.usage?.cacheRead, reply?.usage?.cacheWrite];
     if (counts.every(n => Number.isSafeInteger(n) && n >= 0)) usage = counts.reduce((sum, n) => sum+n, 0);
-    if (status === 429) fail('rate_limited', status);
-    if (status === 401 || status === 403) fail('auth_error', status);
     if (attempted && (!status || status >= 500 || (status < 400 && ['aborted', 'error'].includes(reply?.stopReason)))) fail('unknown_outcome', status);
     if (status >= 400) fail('provider_error', status);
     if (!attempted || reply?.stopReason !== 'stop') fail('invalid_response');
     const text = reply.content.filter(item => item.type === 'text').map(item => item.text).join('');
     return {ok: true, reply: text, usage_tokens: usage};
   } catch (error) {
-    return {ok: false, reason: !error.reason && attempted ? 'unknown_outcome' : error.reason || 'bridge_error', http_status: error.status || status, usage_tokens: usage};
+    const reason = status === 429 ? 'rate_limited'
+      : status === 401 || status === 403 ? 'auth_error'
+      : error.reason || (attempted ? 'unknown_outcome' : 'bridge_error');
+    return {ok: false, reason, http_status: status, usage_tokens: usage};
   } finally {
     try { if (runtime && !doctor) await runtime.settleCredentialWrites(); }
     finally { globalThis.fetch = nativeFetch; if (transport.close) await transport.close(); }

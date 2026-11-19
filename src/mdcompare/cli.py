@@ -258,6 +258,13 @@ def main(argv=None) -> int:
     )
     scorer.add_argument("--request-budget", type=nonnegative_int, required=True)
     scorer.add_argument(
+        "--concurrency",
+        type=int,
+        choices=(1, 2, 3),
+        default=3,
+        help="maximum concurrent scoring requests (default: 3)",
+    )
+    scorer.add_argument(
         "--max-evidence-bytes", type=_positive_file_limit, default=65536
     )
     route_parser = sub.add_parser(

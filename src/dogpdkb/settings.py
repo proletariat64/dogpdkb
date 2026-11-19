@@ -19,6 +19,9 @@ else:
     import tomli as tomllib
 
 
+DEFAULT_DOWNLOAD_CONCURRENCY = 3
+
+
 class ConfigError(ValueError):
     """The selected instance cannot be configured."""
 
@@ -364,3 +367,50 @@ def select_book(settings: Settings, key: str | None = None) -> Book:
     if len(matches) != 1:
         raise ConfigError("select exactly one enabled book with --book")
     return matches[0]
+
+
+def select_inputs(
+    settings: Settings, book: Book, keys: list[str] | None, directory: Path | None
+) -> tuple[Source, ...]:
+    if directory is None:
+        return book.select_sources(keys)
+    try:
+        root = directory.expanduser().resolve()
+    except RuntimeError as error:
+        raise ConfigError(f"invalid directory source {directory}: {error}") from error
+    validate_directory_source(settings, book, root)
+    matches = tuple(
+        source
+        for source in book.sources
+        if isinstance(source, DirectorySource) and source.path == root
+    )
+    if len(matches) > 1:
+        raise ConfigError(
+            f"directory matches multiple sources: {root}; choose --source KEY"
+        )
+    if matches:
+        return matches
+    key = "direct-" + document_identity(book.key, str(root)).removeprefix("doc-")
+    if key in book.source_bindings():
+        raise ConfigError(
+            f"generated directory source key conflicts with configured source: {key}"
+        )
+    return (DirectorySource(key, root),)
+
+
+def validate_directory_source(settings: Settings, book: Book, root: Path) -> None:
+    if not root.is_dir():
+        raise ConfigError(
+            f"directory source does not exist or is not a directory: {root}"
+        )
+    for target in (
+        book.corpus,
+        settings.graph_for(book),
+        settings.staging,
+        settings.state,
+        settings.ocr_cache,
+        settings.web,
+        settings.results,
+    ):
+        if root.is_relative_to(target) or target.is_relative_to(root):
+            raise ConfigError(f"directory source overlaps a managed path: {target}")
