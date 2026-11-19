@@ -8,37 +8,40 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+_PI_BRIDGE = Path(__file__).with_name("pi_bridge.mjs")
+
 
 class LlmError(RuntimeError):
     """A public, machine-readable Pi bridge failure."""
 
     def __init__(
-        self, message: str, *, status: int | None = None, reason: str = "bridge_error"
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        reason: str = "bridge_error",
+        usage_tokens: int | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.reason = reason
+        self.usage_tokens = usage_tokens
 
 
 class LlmClient:
-    def __init__(
-        self, model: str, effort: str, *, node: str = "node", timeout: int = 240
-    ) -> None:
+    def __init__(self, model: str, effort: str) -> None:
         self.model = model
         self.effort = effort
-        self.node = node
-        self.timeout = timeout
-        self.worker = Path(__file__).with_name("pi_bridge.mjs")
         self.env = os.environ.copy()
 
     def _invoke(self, request: dict[str, Any]) -> dict[str, Any]:
         try:
             process = subprocess.run(
-                [self.node, str(self.worker)],
+                ["node", str(_PI_BRIDGE)],
                 input=json.dumps(request),
                 text=True,
                 capture_output=True,
-                timeout=self.timeout,
+                timeout=240,
                 env=self.env,
                 check=False,
             )
@@ -56,7 +59,10 @@ class LlmClient:
             result = json.loads(process.stdout)
         except json.JSONDecodeError as exc:
             raise LlmError(
-                "Pi bridge returned invalid protocol data", reason="invalid_response"
+                "Pi bridge returned invalid protocol data",
+                reason="unknown_outcome"
+                if request["op"] == "convert"
+                else "invalid_response",
             ) from exc
         if process.returncode or not result.get("ok"):
             err = result.get("error", {})
@@ -64,6 +70,7 @@ class LlmClient:
                 err.get("message", "Pi bridge failed"),
                 status=err.get("status"),
                 reason=err.get("reason", "bridge_error"),
+                usage_tokens=err.get("usage_tokens"),
             )
         return result
 
