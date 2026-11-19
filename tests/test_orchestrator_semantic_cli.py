@@ -175,6 +175,9 @@ def test_changed_frozen_recovery_is_refused_before_corpus_publication(
         "reference",
         "duplicate_ref",
         "missing_ref",
+        "report_digest",
+        "sidecar_digest",
+        "omitted_operations",
     ],
 )
 def test_invalid_authoritative_artifact_cannot_authorize_publication(tmp_path, mode):
@@ -182,7 +185,7 @@ def test_invalid_authoritative_artifact_cannot_authorize_publication(tmp_path, m
     wrap(
         config,
         tmp_path,
-        f"""import json,subprocess,sys
+        f"""import hashlib,json,subprocess,sys
 from pathlib import Path
 a=sys.argv[1:]
 code=subprocess.call([sys.executable,'-m','mdcompare',*a])
@@ -198,15 +201,27 @@ if a[0]=='semantic' and code in (0,2):
  if mode=='reference':detail['changes'][0]['new_ref']=999999
  if mode=='duplicate_ref':detail['changes'].append(detail['changes'][0])
  if mode=='missing_ref':detail['changes'][0].pop('new_ref')
+ if mode=='omitted_operations':detail['changes']=[]
  if mode=='missing':evidence.unlink()
- else:evidence.write_text(json.dumps(detail))
+ else:
+  evidence.write_text(json.dumps(detail))
+  index['documents'][0]['sha256']=hashlib.sha256(evidence.read_bytes()).hexdigest() if mode!='sidecar_digest' else '0'*64
  out.write_text(json.dumps(report))
+ index['report_sha256']=hashlib.sha256(out.read_bytes()).hexdigest() if mode!='report_digest' else '0'*64
+ diff.write_text(json.dumps(index))
 raise SystemExit(code)
 """,
     )
     result = cli("apply", "--config", config, "--input", differences)
     assert result.returncode == 1, result.stdout + result.stderr
     assert "Traceback" not in result.stderr
+    expected = {
+        "report_digest": "semantic report digest mismatch",
+        "sidecar_digest": "semantic evidence digest mismatch",
+        "omitted_operations": "incomplete semantic occurrence ownership",
+    }
+    if mode in expected:
+        assert expected[mode] in result.stderr
     assert not list((tmp_path / "corpus").glob("*.md"))
     state = load(tmp_path / "state/funds/state.json")["documents"]["42"]
     assert state["steps"]["compare"]["status"] == "unknown"

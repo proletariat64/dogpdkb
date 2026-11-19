@@ -219,3 +219,56 @@ def test_retention_candidate_is_context_not_a_second_operation_target():
         "retained_text_candidate_new_ref": 1,
     }
     assert packet["new_units"][1]["text"] == new[1]["text"]
+
+
+@pytest.mark.parametrize("fail_sync", [False, True])
+def test_score_admission_syncs_directory_before_provider(
+    tmp_path, monkeypatch, fail_sync
+):
+    import os
+    import stat
+
+    from mdcompare import semantic_score
+    from mdcompare.cli import main
+
+    report, index, _, _ = prepared(tmp_path)
+    output = tmp_path / "scores.json"
+    journal = tmp_path / "scores.json.execution.json"
+    original_sync = os.fsync
+    synced = False
+    sent = False
+
+    def fsync(fd):
+        nonlocal synced
+        if stat.S_ISDIR(os.fstat(fd).st_mode) and not synced:
+            if fail_sync:
+                raise OSError("synthetic crash-durability failure")
+            assert (
+                json.loads(journal.read_text())["attempts"][0]["status"] == "admitted"
+            )
+            synced = True
+        original_sync(fd)
+
+    def assess(*_):
+        nonlocal sent
+        assert synced
+        sent = True
+        return {"ok": False, "reason": "unknown_outcome"}
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(semantic_score, "_assess", assess)
+    args = [
+        "semantic-score",
+        "--report",
+        str(report),
+        "--diff-index",
+        str(index),
+        "--output",
+        str(output),
+        "--request-budget",
+        "1",
+    ]
+    assert main(args) == (1 if fail_sync else 2)
+    assert sent is not fail_sync
+    if not fail_sync:
+        assert main(args) == 2

@@ -1,6 +1,7 @@
 """Public semantic artifacts and immutable repair evidence, not tool algorithms."""
 
 import hashlib
+import json
 import shutil
 from pathlib import Path
 
@@ -128,7 +129,7 @@ def _validate_result(item):
         raise SemanticArtifactError("unproven semantic equality")
 
 
-def _validate_evidence(payload, item, row):
+def _validate_evidence(payload, item, result, row):
     if not isinstance(payload, dict) or _identities([payload]) != _identities([item]):
         raise SemanticArtifactError("semantic evidence identity mismatch")
     source_inputs = payload.get("source_inputs")
@@ -186,6 +187,10 @@ def _validate_evidence(payload, item, row):
                     raise SemanticArtifactError(
                         "semantic operation references unavailable evidence"
                     )
+                if units[index].get("exporter_title"):
+                    raise SemanticArtifactError(
+                        "exporter title is not an authored operation target"
+                    )
                 if index in seen[field]:
                     raise SemanticArtifactError(
                         "duplicate semantic occurrence ownership"
@@ -202,11 +207,24 @@ def _validate_evidence(payload, item, row):
         ):
             raise SemanticArtifactError("semantic operation has invalid sides")
 
+    if result["extraction"]["available"]:
+        for ref, units in (("old_ref", "old_units"), ("new_ref", "new_units")):
+            expected = {
+                i
+                for i, unit in enumerate(payload[units])
+                if not unit.get("exporter_title")
+            }
+            if seen[ref] != expected or len(expected) != result["extraction"].get(
+                units
+            ):
+                raise SemanticArtifactError("incomplete semantic occurrence ownership")
+
 
 def read_semantic_artifacts(code, report_path, diff_path, rows, knowledge_base):
     if code not in {0, 2} or not report_path.is_file() or not diff_path.is_file():
         raise SemanticArtifactError("authoritative semantic comparison unavailable")
-    report, diff = read_json(report_path), read_json(diff_path)
+    report_bytes = report_path.read_bytes()
+    report, diff = json.loads(report_bytes), read_json(diff_path)
     if (
         not isinstance(report, dict)
         or report.get("schema_version") != "semantic-1.0"
@@ -218,6 +236,8 @@ def read_semantic_artifacts(code, report_path, diff_path, rows, knowledge_base):
         or diff.get("schema_version") != "mdcompare-semantic-diff-1"
     ):
         raise SemanticArtifactError("invalid semantic diff schema")
+    if diff.get("report_sha256") != hashlib.sha256(report_bytes).hexdigest():
+        raise SemanticArtifactError("semantic report digest mismatch")
     expected = {(knowledge_base, str(row["document_id"])) for row in rows}
     if (
         _identities(report.get("results")) != expected
@@ -226,8 +246,10 @@ def read_semantic_artifacts(code, report_path, diff_path, rows, knowledge_base):
         raise SemanticArtifactError(
             "semantic result or diff identity coverage mismatch"
         )
+    by_result = {}
     for item in report["results"]:
         _validate_result(item)
+        by_result[item["document_id"]] = item
     evidence_dir = diff.get("evidence_directory")
     if (
         not isinstance(evidence_dir, str)
@@ -247,7 +269,13 @@ def read_semantic_artifacts(code, report_path, diff_path, rows, knowledge_base):
         path = (diff_path.parent / reference).resolve()
         if not path.is_relative_to(root.resolve()) or not path.is_file():
             raise SemanticArtifactError("semantic evidence sidecar missing or invalid")
-        _validate_evidence(read_json(path), item, by_id[item["document_id"]])
+        data = path.read_bytes()
+        if item.get("sha256") != hashlib.sha256(data).hexdigest():
+            raise SemanticArtifactError("semantic evidence digest mismatch")
+        identifier = item["document_id"]
+        _validate_evidence(
+            json.loads(data), item, by_result[identifier], by_id[identifier]
+        )
     return report
 
 

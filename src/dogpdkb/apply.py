@@ -500,7 +500,7 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
         score_path = semantic_dir / "scores.json"
         route_path = semantic_dir / "score-route.json"
         run.data["semantic_score_started"] = str(score_path)
-        run.save()
+        run.save(durable=True)
         common = ["--report", semantic_report_path, "--diff-index", semantic_diff_path]
         score_args = [
             "semantic-score",

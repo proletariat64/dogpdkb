@@ -224,6 +224,16 @@ def _save(path, value):
     publish_reports([(path, _json(value) + "\n")])
 
 
+def _save_journal(path, value):
+    _save(path, value)
+    # Renaming a synced file does not make the directory entry crash durable.
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def publish_semantic_scores(args):
     output = args.output.resolve()
     journal = output.with_name(output.name + ".execution.json")
@@ -303,7 +313,7 @@ def publish_semantic_scores(args):
                 binding, status="admitted", packet_sha256=_digest(packet.encode())
             )
             attempts.append(attempt)
-            _save(journal, state)
+            _save_journal(journal, state)
             reply = _assess(args.model, args.effort, packet, prompt)
             if "reply" in reply:
                 attempt["reply"] = reply["reply"]
@@ -316,10 +326,10 @@ def publish_semantic_scores(args):
                 attempt.update(status="unscored", reason=reply["reason"])
                 if reply["reason"] in _STOP:
                     state["stop"] = reply["reason"]
-            _save(journal, state)
+            _save_journal(journal, state)
         public = [{k: v for k, v in a.items() if k != "reply"} for a in attempts]
         scored = [a for a in public if a["status"] == "scored"]
-        _save(journal, state)
+        _save_journal(journal, state)
         _save(
             output,
             {
