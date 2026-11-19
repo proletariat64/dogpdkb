@@ -121,20 +121,29 @@ def test_missing_parser_is_explicit_for_mixed_patch(model, tmp_path, monkeypatch
 @pytest.mark.skipif(
     not os.environ.get("MDOCR_NODE_DEPENDENCIES"), reason="requires real parser"
 )
-def test_real_mermaid_parser_accepts_and_rejects_diagrams(model, tmp_path, monkeypatch):
+@pytest.mark.parametrize("fence", ["```", "````", "~~~"])
+def test_real_mermaid_parser_accepts_and_rejects_diagrams(
+    model, tmp_path, monkeypatch, fence
+):
     import json
 
     monkeypatch.setenv(
         "FAKE_PATCH",
         json.dumps(
-            {"kind": "mixed", "markdown": "```mermaid\nflowchart TD\n A --> B\n```"}
+            {
+                "kind": "mixed",
+                "markdown": f"{fence}mermaid\nflowchart TD\n A --> B\n{fence}",
+            }
         ),
     )
     assert convert(model, tmp_path)["patches"][0]["kind"] == "mixed"
     monkeypatch.setenv(
         "FAKE_PATCH",
         json.dumps(
-            {"kind": "mixed", "markdown": "```mermaid\nflowchart TD\n A -->\n```"}
+            {
+                "kind": "mixed",
+                "markdown": f"{fence}mermaid\nflowchart TD\n A -->\n{fence}",
+            }
         ),
     )
     with pytest.raises(LlmError, match="syntactically invalid Mermaid"):
@@ -163,3 +172,31 @@ exports.fetch = async (url, options) => {
     with pytest.raises(LlmError) as exc:
         convert(model, tmp_path)
     assert exc.value.status == 429
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"id": "wrong", "kind": "text", "markdown": "X"},
+        {"kind": "table", "markdown": "<table><tr><td>X</td></tr></table>"},
+        {"kind": "table", "markdown": "| A | B |\n| --- | --- |\n| X |"},
+    ],
+)
+def test_rejected_patches_preserve_reported_usage(model, tmp_path, monkeypatch, patch):
+    import json
+
+    monkeypatch.setenv("FAKE_PATCH", json.dumps(patch))
+    with pytest.raises(LlmError) as exc:
+        convert(model, tmp_path)
+    assert exc.value.reason == "invalid_response"
+    assert exc.value.usage_tokens == 7
+
+
+def test_markdown_table_accepts_escaped_pipe_in_cell(model, tmp_path, monkeypatch):
+    import json
+
+    markdown = "| A | B |\n| --- | :---: |\n| X \\| Y | Z |"
+    monkeypatch.setenv(
+        "FAKE_PATCH", json.dumps({"kind": "table", "markdown": markdown})
+    )
+    assert convert(model, tmp_path)["patches"][0]["markdown"] == markdown

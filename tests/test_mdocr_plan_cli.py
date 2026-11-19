@@ -216,3 +216,29 @@ def test_plan_preserves_directory_tree_and_explicit_list_order(tmp_path):
         "First.MD",
     ]
     assert not (tmp_path / "out").exists()
+
+
+def test_only_authored_image_outside_multiline_and_nested_code_is_selected(tmp_path):
+    (tmp_path / "source.md").write_bytes(
+        b"Code `line one\n![literal](same.png)` and `` `![also literal](same.png)` ``.\n\n"
+        b"Unmatched ``` run and ![real](same.png).\n"
+    )
+    (tmp_path / "same.png").write_bytes(b"fixture")
+    result = cli(
+        tmp_path,
+        "plan",
+        "--mode",
+        "paddle",
+        "--input",
+        "source.md",
+        "--output",
+        "out.md",
+        "--plan",
+        "plan.json",
+    )
+    assert result.returncode == 0, result.stderr
+    (image,) = json.loads((tmp_path / "plan.json").read_text())["documents"][0][
+        "images"
+    ]
+    text = (tmp_path / "source.md").read_text()
+    assert text[image["start"] : image["end"]] == "![real](same.png)"

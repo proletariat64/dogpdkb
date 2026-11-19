@@ -112,7 +112,7 @@ def _text(path, digest, reason):
     return data
 
 
-def _validate(plan, plan_path, result_path, ledger, artifacts):
+def _validate(plan, plan_path, result_path, ledger, artifacts, lock_paths):
     settings, docs = plan["settings"], plan["documents"]
     if settings["mode"] not in {"paddle", "llm"} or settings["concurrency"] not in {
         1,
@@ -131,10 +131,10 @@ def _validate(plan, plan_path, result_path, ledger, artifacts):
             plan_path,
             result_path,
             ledger,
-            plan_path.with_suffix(plan_path.suffix + ".lock"),
+            *lock_paths,
         )
     }
-    if len(controls) != 4:
+    if len(controls) != 5:
         raise ValueError("overlapping execution artifacts")
     sources, outputs, images = set(), set(), set()
     texts = []
@@ -229,6 +229,11 @@ class Execution:
         self.cache = (
             Path(self.settings["cache_dir"]) if self.settings["cache_dir"] else None
         )
+        if (
+            result.exists()
+            and json.loads(result.read_bytes()).get("plan_sha256") != digest
+        ):
+            raise ValueError("result is owned by another plan")
         if ledger.exists():
             self.state = json.loads(ledger.read_bytes())
             if (self.state.get("plan_sha256"), self.state.get("result_path")) != (
@@ -258,11 +263,14 @@ class Execution:
                 "requests": [],
                 "documents": [],
             }
+        self.limit = self.state["concurrency"]["final"]
         self.latest = {}
         for previous in self.state["requests"]:
             if previous["status"] == "admitted":
                 previous.update(status="unknown", reason="OCR_OUTCOME_UNKNOWN")
             self.latest[previous["key"]] = previous
+        self.reused = self.state.setdefault("reused", {})
+        self.latest.update(self.reused)
         self.budget = self.state["budget"]
         self.state["status"] = "running"
         self.save()
@@ -462,11 +470,12 @@ class Execution:
                     continue
                 cached = self.cached(job)
                 if cached is not None:
-                    self.latest[job.key] = {
+                    self.reused[job.key] = self.latest[job.key] = {
                         "key": job.key,
                         "status": "reused",
                         "patches": cached,
                     }
+                    self.save()
                     continue
                 while active and (
                     len(active) >= self.limit
@@ -629,13 +638,20 @@ def run_command(args) -> int:
     digest = _sha(plan_path.read_bytes())
     ledger = plan_path.with_name(plan_path.name + ".execution.json")
     artifacts = plan_path.with_name(plan_path.name + ".evidence").resolve()
-    texts = _validate(plan, plan_path, result, ledger, artifacts)
-    lock_path = plan_path.with_name(plan_path.name + ".lock")
-    with lock_path.open("a+b") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ValueError("plan is already being executed") from exc
+    lock_paths = tuple(
+        path.with_name(path.name + ".lock") for path in (plan_path, result)
+    )
+    texts = _validate(plan, plan_path, result, ledger, artifacts, lock_paths)
+    result.parent.mkdir(parents=True, exist_ok=True)
+    with (
+        lock_paths[0].open("a+b") as plan_lock,
+        lock_paths[1].open("a+b") as result_lock,
+    ):
+        for name, lock in (("plan", plan_lock), ("result", result_lock)):
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ValueError(f"{name} is already being executed") from exc
         execution = Execution(
             plan, digest, ledger, result, artifacts, args.retry_failed
         )

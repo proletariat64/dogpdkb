@@ -31,12 +31,54 @@ const selectParser = async () => {
     fail('mermaid_parser_unavailable', 'Cannot load Mermaid and jsdom from MDOCR_NODE_DEPENDENCIES');
   }
 };
+const fences = markdown => {
+  const blocks = [];
+  let open;
+  for (const line of markdown.split(/\r?\n/)) {
+    const fence = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (!open) {
+      if (fence && (fence[1][0] !== '`' || !fence[2].includes('`'))) {
+        open = { marker: fence[1][0], width: fence[1].length, info: fence[2].trim(), lines: [] };
+      }
+    } else if (fence && fence[1][0] === open.marker && fence[1].length >= open.width && !fence[2].trim()) {
+      blocks.push({ ...open, closed: true });
+      open = undefined;
+    } else open.lines.push(line);
+  }
+  if (open) blocks.push({ ...open, closed: false });
+  return blocks;
+};
+const cells = line => {
+  const values = [''];
+  let slashes = 0;
+  for (const ch of line.trim()) {
+    if (ch === '|' && slashes % 2 === 0) values.push('');
+    else values[values.length - 1] += ch;
+    slashes = ch === '\\' ? slashes + 1 : 0;
+  }
+  if (values.length > 1 && values[0] === '') values.shift();
+  if (values.length > 1 && values.at(-1) === '' && line.trim().endsWith('|')) values.pop();
+  return values;
+};
+const validateTables = patches => {
+  for (const {kind, markdown} of patches) {
+    if (!['mixed', 'table'].includes(kind)) continue;
+    if (/<\/?(?:table|thead|tbody|tfoot|tr|th|td|caption|colgroup|col)\b/i.test(markdown)) fail('invalid_response', 'Provider returned an HTML table');
+    if (kind !== 'table') continue;
+    const tables = markdown.trim().split(/\r?\n[ \t]*\r?\n/);
+    for (const table of tables) {
+      const lines = table.split(/\r?\n/);
+      if (lines.length < 2 || lines.some(line => !line.includes('|') || /^ {4}|^\t/.test(line))) fail('invalid_response', 'Provider did not return a Markdown table');
+      const [heading, separators, ...rows] = lines.map(cells);
+      if (!separators.every(cell => /^:?-+:?$/.test(cell.trim())) || [heading, ...rows].some(row => row.length !== separators.length)) fail('invalid_response', 'Provider returned inconsistent Markdown table columns');
+    }
+  }
+};
 const validateMermaid = async patches => {
   const blocks = patches.flatMap(p => {
-    const declarations = [...p.markdown.matchAll(/^[ \t]*```mermaid[ \t]*$/gim)];
-    const match = [...p.markdown.matchAll(/^[ \t]*```mermaid[ \t]*\r?\n([\s\S]*?)^[ \t]*```[ \t]*\r?$/gim)];
-    if ((p.kind === 'mermaid' && !match.length) || declarations.length !== match.length) fail('invalid_response', 'Provider returned an incomplete Mermaid block');
-    return match.map(m => m[1]);
+    const diagrams = fences(p.markdown).filter(block => /^mermaid(?:\s|$)/i.test(block.info));
+    if ((p.kind === 'mermaid' && !diagrams.length) || diagrams.some(block => !block.closed)) fail('invalid_response', 'Provider returned an incomplete Mermaid block');
+    return diagrams.map(block => block.lines.join('\n'));
   });
   if (!blocks.length) return;
   const parser = await selectParser();
@@ -151,26 +193,32 @@ const main = async () => {
       },
       onPayload: payload => ({ ...payload, max_output_tokens: 8192, text: { ...payload.text, format } }),
     });
-    if (status && status >= 400) {
-      if (status === 429) fail('rate_limited', 'Provider rate limited the request', status);
-      if ([401, 403].includes(status)) fail('auth_error', 'Provider rejected authentication', status);
-      fail(status >= 500 ? 'unknown_outcome' : 'provider_error', 'Provider did not accept the request', status);
-    }
-    if (attempted && (!status || ['error', 'aborted'].includes(reply.stopReason))) fail('unknown_outcome', 'Provider outcome is unknown');
-    if (!attempted || reply.stopReason !== 'stop') fail('invalid_response', 'Provider did not complete the structured response');
-    const text = reply.content.filter(x => x.type === 'text').map(x => x.text).join('');
-    let parsed;
-    try { parsed = JSON.parse(text); } catch { fail('invalid_response', 'Provider returned invalid JSON'); }
-    const ids = request.images.map(x => x.id);
-    if (!Array.isArray(parsed?.images) || JSON.stringify(parsed.images.map(x => x?.id)) !== JSON.stringify(ids)) fail('invalid_response', 'Response IDs do not match image order');
-    for (const patch of parsed.images) {
-      if (typeof patch.markdown !== 'string' || typeof patch.uncertainty !== 'string' || !schema.properties.images.items.properties.kind.enum.includes(patch.kind)) fail('invalid_response', 'Provider returned an invalid image patch');
-    }
-    const usage = reply.usage;
-    const usageTokens = usage && [usage.input, usage.output, usage.cacheRead, usage.cacheWrite].every(Number.isFinite)
+    const usage = reply?.usage;
+    const usageTokens = usage && [usage.input, usage.output, usage.cacheRead, usage.cacheWrite].every(n => Number.isSafeInteger(n) && n >= 0)
       ? usage.input + usage.output + usage.cacheRead + usage.cacheWrite : null;
-    try { await validateMermaid(parsed.images); } catch (error) { error.usageTokens = usageTokens; throw error; }
-    return { ok: true, patches: parsed.images, usage_tokens: usageTokens };
+    try {
+      if (status && status >= 400) {
+        if (status === 429) fail('rate_limited', 'Provider rate limited the request', status);
+        if ([401, 403].includes(status)) fail('auth_error', 'Provider rejected authentication', status);
+        fail(status >= 500 ? 'unknown_outcome' : 'provider_error', 'Provider did not accept the request', status);
+      }
+      if (attempted && (!status || ['error', 'aborted'].includes(reply.stopReason))) fail('unknown_outcome', 'Provider outcome is unknown');
+      if (!attempted || reply.stopReason !== 'stop') fail('invalid_response', 'Provider did not complete the structured response');
+      const text = reply.content.filter(x => x.type === 'text').map(x => x.text).join('');
+      let parsed;
+      try { parsed = JSON.parse(text); } catch { fail('invalid_response', 'Provider returned invalid JSON'); }
+      const ids = request.images.map(x => x.id);
+      if (!Array.isArray(parsed?.images) || JSON.stringify(parsed.images.map(x => x?.id)) !== JSON.stringify(ids)) fail('invalid_response', 'Response IDs do not match image order');
+      for (const patch of parsed.images) {
+        if (typeof patch.markdown !== 'string' || typeof patch.uncertainty !== 'string' || !schema.properties.images.items.properties.kind.enum.includes(patch.kind)) fail('invalid_response', 'Provider returned an invalid image patch');
+      }
+      validateTables(parsed.images);
+      await validateMermaid(parsed.images);
+      return { ok: true, patches: parsed.images, usage_tokens: usageTokens };
+    } catch (error) {
+      error.usageTokens = usageTokens;
+      throw error;
+    }
   } finally {
     try { if (runtime) await runtime.settleCredentialWrites(); }
     finally {

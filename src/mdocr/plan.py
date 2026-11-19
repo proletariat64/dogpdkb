@@ -61,13 +61,44 @@ def _masked_ranges(markdown: str) -> list[tuple[int, int]]:
             opened = marker = None
     if opened is not None:
         ranges.append((opened, len(markdown)))
-    for pattern in (r"<!-- mdocr:ocr-begin\b.*?<!-- mdocr:ocr-end -->", r"`+[^`\n]*`+"):
-        ranges.extend(
-            (m.start(), m.end())
-            for m in re.finditer(
-                pattern, markdown, re.DOTALL if "ocr-begin" in pattern else 0
-            )
+    ranges.extend(
+        m.span()
+        for m in re.finditer(
+            r"<!-- mdocr:ocr-begin\b.*?<!-- mdocr:ocr-end -->", markdown, re.DOTALL
         )
+    )
+
+    # Inline code may span lines but cannot cross a block boundary. Delimiters
+    # are whole runs: a literal shorter run cannot close a longer opener.
+    def inline(segment, offset):
+        for paragraph in re.finditer(r"(?:[^\n]|\n(?![ \t\r]*\n))+", segment):
+            text = paragraph.group()
+            runs = list(re.finditer(r"`+", text))
+            next_run, closing = {}, {}
+            for i in reversed(range(len(runs))):
+                width = len(runs[i].group())
+                if width in next_run:
+                    closing[i] = next_run[width]
+                next_run[width] = i
+            i = 0
+            while i < len(runs):
+                start = runs[i].start()
+                prefix = text[:start] if start and text[start - 1] == "\\" else ""
+                escaped = (len(prefix) - len(prefix.rstrip("\\"))) % 2
+                if i in closing and not escaped:
+                    j = closing[i]
+                    beginning = offset + paragraph.start()
+                    yield beginning + start, beginning + runs[j].end()
+                    i = j + 1
+                else:
+                    i += 1
+
+    offset = 0
+    for start, end in sorted(ranges):
+        if offset < start:
+            ranges.extend(inline(markdown[offset:start], offset))
+        offset = max(offset, end)
+    ranges.extend(inline(markdown[offset:], offset))
     return sorted(ranges)
 
 

@@ -1,12 +1,13 @@
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Barrier, Lock, Thread
+from threading import Barrier, Event, Lock, Thread
 
 from PIL import Image
 
@@ -201,3 +202,103 @@ def test_zero_llm_request_limit_needs_no_pi_or_provider(tmp_path):
     assert state["budget"]["requests"] == 0
     assert state["causes"] == ["OCR_REQUEST_BUDGET_EXHAUSTED"]
     assert not (tmp_path / "out.md").exists()
+
+
+def _paddle_plan(tmp_path, endpoint, name, *extra):
+    result = cli(
+        tmp_path,
+        "plan",
+        "--mode",
+        "paddle",
+        "--directory",
+        "source",
+        "--output-dir",
+        f"out-{name}",
+        "--plan",
+        f"{name}.json",
+        "--endpoint",
+        endpoint,
+        *extra,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_resume_cache_hit_without_shared_cache(tmp_path):
+    corpus(tmp_path, 1)
+    with service() as (endpoint, calls):
+        for name in ("warm", "reuse"):
+            _paddle_plan(tmp_path, endpoint, name, "--cache-dir", "cache")
+            assert (
+                cli(
+                    tmp_path,
+                    "run",
+                    "--plan",
+                    f"{name}.json",
+                    "--result",
+                    f"{name}-result.json",
+                ).returncode
+                == 0
+            )
+        args = ("run", "--plan", "reuse.json", "--result", "reuse-result.json")
+        assert (
+            json.loads((tmp_path / "reuse-result.json").read_text())["requests"] == []
+        )
+        shutil.rmtree(tmp_path / "cache")
+        result = cli(tmp_path, *args)
+        assert result.returncode == 0, result.stderr
+        assert calls == [1]
+
+
+def test_resume_after_rate_limit_stays_at_one(tmp_path):
+    corpus(tmp_path, 10)
+    first, second = Barrier(3, timeout=6), Barrier(2, timeout=6)
+
+    def status(number):
+        if number <= 3:
+            first.wait()
+        elif number <= 5:
+            second.wait()
+        return 429
+
+    with service(status) as (endpoint, calls):
+        _paddle_plan(tmp_path, endpoint, "throttled")
+        args = ("run", "--plan", "throttled.json", "--result", "result.json")
+        assert cli(tmp_path, *args).returncode == 2
+        assert len(calls) == 6
+        assert cli(tmp_path, *args).returncode == 2
+        assert len(calls) == 7
+
+
+def test_distinct_plans_cannot_share_a_live_result(tmp_path):
+    corpus(tmp_path, 1)
+    entered, release = Event(), Event()
+
+    def status(_):
+        entered.set()
+        assert release.wait(8)
+        return 200
+
+    with service(status) as (endpoint, calls):
+        for name in ("alpha", "beta"):
+            _paddle_plan(tmp_path, endpoint, name)
+        result = []
+        thread = Thread(
+            target=lambda: result.append(
+                cli(tmp_path, "run", "--plan", "alpha.json", "--result", "shared.json")
+            )
+        )
+        thread.start()
+        try:
+            assert entered.wait(8)
+            loser = cli(
+                tmp_path, "run", "--plan", "beta.json", "--result", "shared.json"
+            )
+            assert (
+                loser.returncode == 1
+                and "result is already being executed" in loser.stderr
+            )
+        finally:
+            release.set()
+            thread.join()
+        assert result[0].returncode == 0, result[0].stderr
+        assert calls == [1]
