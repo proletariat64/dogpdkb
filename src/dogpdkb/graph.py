@@ -272,10 +272,11 @@ def _tree_files(root):
 
 
 def _digest(path, algorithm="sha256"):
+    digest = hashlib.new(algorithm, usedforsecurity=algorithm != "md5")
     with path.open("rb") as stream:
-        return hashlib.file_digest(
-            stream, lambda: hashlib.new(algorithm, usedforsecurity=algorithm != "md5")
-        ).hexdigest()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _snapshot(root):

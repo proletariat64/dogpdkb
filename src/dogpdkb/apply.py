@@ -1192,7 +1192,12 @@ def apply_run(
             seal_corpus(run)
         if not sync:
             for document in manifest["documents"]:
-                if file_digest(Path(document["path"])) != document["input_copy_sha256"]:
+                expected = (
+                    document["input_copy_sha256"]
+                    if "input_copy_sha256" in document
+                    else file_digest(Path(document["input_copy"]))
+                )
+                if file_digest(Path(document["path"])) != expected:
                     raise ValueError(
                         "published plan input changed; generate a new plan"
                     )

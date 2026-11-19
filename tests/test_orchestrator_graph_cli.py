@@ -934,3 +934,19 @@ def test_usable_corpus_compiles_despite_separate_apply_failures(tmp_path):
     assert result.returncode == 2, result.stdout + result.stderr
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
     assert state["documents"]["42"]["graph"]["version"] == VERSION
+
+
+def test_graph_digests_work_without_python311_hashlib_helper(tmp_path, monkeypatch):
+    import hashlib
+
+    from dogpdkb.graph import _digest
+
+    monkeypatch.delattr(hashlib, "file_digest", raising=False)
+    source = tmp_path / "large.md"
+    content = b"evidence\n" * 250_000
+    source.write_bytes(content)
+    assert _digest(source) == hashlib.sha256(content).hexdigest()
+    assert (
+        _digest(source, "md5")
+        == hashlib.md5(content, usedforsecurity=False).hexdigest()
+    )

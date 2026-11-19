@@ -138,3 +138,24 @@ def test_final_partial_manifest_resume_does_not_retry_ocr(tmp_path, monkeypatch)
         apply, "ocr_inputs", lambda *args: pytest.fail("OCR budget restarted")
     )
     assert apply.main(["--config", str(config), "--resume", str(run_path)]) == 0
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_resume_final_manifest_without_legacy_digest(tmp_path, changed):
+    config, run_path, _ = setup_plan(tmp_path)
+    first = cli("apply", "--config", config, "--resume", run_path)
+    assert first.returncode == 0, first.stderr
+    run = json.loads(run_path.read_bytes())
+    manifest_path = Path(run["artifacts"]["manifest"])
+    manifest = json.loads(manifest_path.read_bytes())
+    for document in manifest["documents"]:
+        del document["input_copy_sha256"]
+    manifest_path.write_text(json.dumps(manifest))
+    if changed:
+        Path(manifest["documents"][0]["path"]).write_text("Replacement\n")
+    events = (tmp_path / "events").read_bytes()
+    resumed = cli("apply", "--config", config, "--resume", run_path)
+    assert resumed.returncode == int(changed), resumed.stderr
+    if changed:
+        assert "published plan input changed" in resumed.stderr
+    assert (tmp_path / "events").read_bytes() == events
