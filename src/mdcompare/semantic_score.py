@@ -99,8 +99,15 @@ def _packet(data):
     return _json(dict(packet, schema="authored-model-diff-1")), None
 
 
+def _unique_fields(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("duplicate response field")
+    return result
+
+
 def _validate_reply(raw, count):
-    value = json.loads(raw)
+    value = json.loads(raw, object_pairs_hook=_unique_fields)
     if not isinstance(value, dict) or set(value) != {
         "evaluation_status",
         "change_score",
@@ -255,7 +262,9 @@ def _record_outcome(state, attempt, reply):
         attempt["reply"] = reply["reply"]
     attempt["usage_tokens"] = reply.get("usage_tokens")
     if reply.get("ok") is True:
-        attempt.update(status="scored", score=reply["score"], ambiguous=reply["ambiguous"])
+        attempt.update(
+            status="scored", score=reply["score"], ambiguous=reply["ambiguous"]
+        )
         return
     reason = reply["reason"]
     status = reply.get("http_status")
@@ -318,7 +327,9 @@ def _score_pending(args, prompt, directory, journal, state, candidates, lock_fd)
             )
             attempts.append(attempt)
             _save_journal(journal, state)
-            future = pool.submit(_assess, args.model, args.effort, packet, prompt, lock_fd)
+            future = pool.submit(
+                _assess, args.model, args.effort, packet, prompt, lock_fd
+            )
             active[future] = attempt
         while active:
             settle()
@@ -383,9 +394,11 @@ def publish_semantic_scores(args):
             state = json.loads(journal.read_bytes())
             if state["configuration"] != config:
                 raise InputError("SCORE_EXECUTION_BINDING_INVALID")
-        elif output.exists():
-            raise InputError("SCORE_OUTPUT_UNOWNED")
         else:
+            if os.fstat(lock.fileno()).st_size:
+                raise InputError("SCORE_EXECUTION_JOURNAL_MISSING")
+            if output.exists():
+                raise InputError("SCORE_OUTPUT_UNOWNED")
             state = {
                 "configuration": config,
                 "attempts": [],
@@ -393,6 +406,12 @@ def publish_semantic_scores(args):
                 "stop": None,
                 "concurrency": args.concurrency,
             }
+        # Keep the lock inode as a durable witness against a lost journal.
+        # The first journal save syncs the directory before any request.
+        if not os.fstat(lock.fileno()).st_size:
+            lock.write(b"mdcompare-semantic-score\n")
+            lock.flush()
+            os.fsync(lock.fileno())
         attempts = state["attempts"]
         for previous in attempts:
             if previous["status"] == "admitted":

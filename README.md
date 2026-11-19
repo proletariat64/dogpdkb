@@ -184,8 +184,11 @@ compile. Missing scores never enable skips. See
 
 Enable bounded scoring in `dogpdkb apply/sync` with `[semantic_score]` and
 `request_budget = N` (default `0`, offline). Optional `model = "provider/model"`
-overrides the scorer default. Plans freeze the exact score and route artifacts;
-a resume does not call the scorer again. Ambiguity is advisory.
+overrides the scorer default. One scorer handles up to three concurrent
+requests and drains before lowering concurrency on HTTP 429. The scoring
+budget counts admissions, not concurrent slots. Plans freeze the exact
+score and route artifacts; a resume does not call the scorer again.
+Ambiguity is advisory.
 
 ## 多源订阅
 

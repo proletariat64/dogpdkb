@@ -1,7 +1,9 @@
 """Public semantic-score CLI with a local fake Pi SDK and zero network calls."""
 
+import fcntl
 import json
 import shutil
+import signal
 from pathlib import Path
 
 import pytest
@@ -57,6 +59,10 @@ async function waveStatus(evidence) {
     await until(() => JSON.parse(readFileSync(process.env.SCORE_JOURNAL, 'utf8')).concurrency === 2-wave);
   }
   writeFileSync(marker('finished', id), '');
+  if (id === process.env.SCORE_CRASH_AFTER_DRAIN_START) {
+    process.kill(process.ppid, 'SIGKILL');
+    process.exit(0);
+  }
   return {status:rates.includes(id) ? 429 : 200};
 }
 export class ModelRuntime {
@@ -97,7 +103,10 @@ export class ModelRuntime {
 
 def changed_batch(tmp_path, size):
     manifests = []
-    for side, text in (("old", "Rule expires in April"), ("new", "Rule lasts until May")):
+    for side, text in (
+        ("old", "Rule expires in April"),
+        ("new", "Rule lasts until May"),
+    ):
         documents = []
         for n in range(1, size + 1):
             body = tmp_path / f"{side}-{n}.md"
@@ -108,7 +117,11 @@ def changed_batch(tmp_path, size):
                     "document_id": str(n),
                     "content_kind": "raw",
                     "path": str(body),
-                    "metadata": {"name": "Rule", "logical_path": "", "source_ref": f"book:{n}"},
+                    "metadata": {
+                        "name": "Rule",
+                        "logical_path": "",
+                        "source_ref": f"book:{n}",
+                    },
                     "resources": [],
                 }
             )
@@ -164,8 +177,22 @@ def test_score_default_overlaps_three_requests_without_exceeding_budget(
         ("4", "REQUEST_BUDGET_EXHAUSTED")
     ]
     assert run_score(tmp_path, report, index, budget=3).returncode == 2
+    changed_budget = run_score(tmp_path, report, index, budget=4)
+    assert changed_budget.returncode == 1, changed_budget.stderr
+    assert "SCORE_EXECUTION_BINDING_INVALID" in changed_budget.stderr
     assert output.read_bytes() == original
     assert score_runtime.read_text().splitlines() == ["submitted"] * 3
+
+
+def test_zero_budget_never_admits_an_eligible_change(tmp_path, score_runtime):
+    report, index, _, _ = prepared(tmp_path)
+    result = run_score(tmp_path, report, index, budget=0)
+    assert result.returncode == 2, result.stderr
+    saved = json.loads((tmp_path / "scores.json").read_text())
+    assert saved["execution"]["requests"] == 0
+    assert saved["scores"] == []
+    assert saved["unscored"][0]["reason"] == "REQUEST_BUDGET_EXHAUSTED"
+    assert not score_runtime.exists()
 
 
 def test_score_drains_each_rate_limited_tier_and_stops_at_one(
@@ -188,15 +215,50 @@ def test_score_drains_each_rate_limited_tier_and_stops_at_one(
     assert score_runtime.read_text().splitlines() == ["submitted"] * 6
 
 
+def wait_for_orphaned_bridges(tmp_path):
+    with (tmp_path / "scores.json.lock").open("rb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+
+
+def test_score_resume_uses_persisted_lower_tier_after_interrupted_drain(
+    tmp_path, score_runtime, monkeypatch
+):
+    report, index = changed_batch(tmp_path, 6)
+    monkeypatch.setenv("SCORE_WAVES", json.dumps([["1", "2", "3"]]))
+    monkeypatch.setenv("SCORE_429", json.dumps(["1"]))
+    monkeypatch.setenv("SCORE_JOURNAL", str(tmp_path / "scores.json.execution.json"))
+    monkeypatch.setenv("SCORE_CRASH_AFTER_DRAIN_START", "2")
+    assert run_score(tmp_path, report, index, budget=5).returncode == -signal.SIGKILL
+    wait_for_orphaned_bridges(tmp_path)
+    monkeypatch.delenv("SCORE_CRASH_AFTER_DRAIN_START")
+    monkeypatch.delenv("SCORE_429")
+    monkeypatch.setenv("SCORE_WAVES", json.dumps([["4", "5"]]))
+    result = run_score(tmp_path, report, index, budget=5)
+    assert result.returncode == 2, result.stderr
+    saved = json.loads((tmp_path / "scores.json").read_text())
+    assert saved["execution"]["concurrency"] == 2
+    assert [
+        (row["document_id"], row["concurrency"]) for row in saved["scores"][-2:]
+    ] == [
+        ("4", 2),
+        ("5", 2),
+    ]
+    assert [(row["document_id"], row["reason"]) for row in saved["unscored"][:2]] == [
+        ("1", "rate_limited"),
+        ("2", "unknown_outcome"),
+    ]
+    assert saved["unscored"][-1]["reason"] == "REQUEST_BUDGET_EXHAUSTED"
+    assert score_runtime.read_text().splitlines() == ["submitted"] * 5
+
+
 def test_score_resume_never_replays_interrupted_admission_or_refunds_budget(
     tmp_path, score_runtime, monkeypatch
 ):
-    import signal
-
     report, index = changed_batch(tmp_path, 3)
     monkeypatch.setenv("SCORE_TEST_REPLY", "crash")
     args = (tmp_path, report, index, "--concurrency", "1")
     assert run_score(*args, budget=2).returncode == -signal.SIGKILL
+    wait_for_orphaned_bridges(tmp_path)
     journal = tmp_path / "scores.json.execution.json"
     assert [row["status"] for row in json.loads(journal.read_text())["attempts"]] == [
         "admitted"
@@ -212,6 +274,23 @@ def test_score_resume_never_replays_interrupted_admission_or_refunds_budget(
         ("3", "REQUEST_BUDGET_EXHAUSTED"),
     ]
     assert score_runtime.read_text().splitlines() == ["submitted"] * 2
+
+
+def test_score_cannot_restart_when_journal_is_missing_after_admission(
+    tmp_path, score_runtime, monkeypatch
+):
+    report, index = changed_batch(tmp_path, 2)
+    args = (tmp_path, report, index, "--concurrency", "1")
+    monkeypatch.setenv("SCORE_TEST_REPLY", "crash")
+    assert run_score(*args, budget=2).returncode == -signal.SIGKILL
+    wait_for_orphaned_bridges(tmp_path)
+    (tmp_path / "scores.json.execution.json").unlink()
+    assert not (tmp_path / "scores.json").exists()
+    monkeypatch.delenv("SCORE_TEST_REPLY")
+    result = run_score(*args, budget=2)
+    assert result.returncode == 1, result.stderr
+    assert "SCORE_EXECUTION_JOURNAL_MISSING" in result.stderr
+    assert score_runtime.read_text().splitlines() == ["submitted"]
 
 
 def test_score_defaults_route_ambiguous_three_to_skip_and_resume_without_replay(
@@ -303,8 +382,9 @@ def test_budgeted_semantic_scoring_routes_changed_and_resume_verifies_frozen_art
     assert score_runtime.read_text().splitlines() == ["submitted"]
 
 
-def test_score_rejects_incomplete_coverage_and_preserves_reply(
-    tmp_path, score_runtime, monkeypatch
+@pytest.mark.parametrize("duplicate_score", [False, True])
+def test_score_rejects_ambiguous_wire_encoding_or_incomplete_coverage(
+    tmp_path, score_runtime, monkeypatch, duplicate_score
 ):
     report, index, _, _ = prepared(tmp_path)
     value = {
@@ -315,14 +395,19 @@ def test_score_rejects_incomplete_coverage_and_preserves_reply(
         "reason": "no change",
         "missing_evidence": [],
     }
-    monkeypatch.setenv("SCORE_TEST_REPLY", json.dumps(value))
+    if duplicate_score:
+        value["checked_operations"] = [0, 1]  # One addition and one deletion.
+    wire = json.dumps(value)
+    if duplicate_score:
+        wire = '{"change_score":5,' + wire[1:]
+    monkeypatch.setenv("SCORE_TEST_REPLY", wire)
     assert run_score(tmp_path, report, index).returncode == 2
     output = tmp_path / "scores.json"
     scores = json.loads(output.read_text())
     assert scores["scores"] == []
     assert scores["unscored"][0]["reason"] == "invalid_response"
     journal = json.loads(output.with_suffix(".json.execution.json").read_text())
-    assert json.loads(journal["attempts"][0]["reply"]) == value
+    assert journal["attempts"][0]["reply"] == wire
 
 
 def test_retention_candidate_is_context_not_a_second_operation_target():

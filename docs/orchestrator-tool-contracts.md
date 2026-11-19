@@ -98,8 +98,12 @@ schema/example is installed in `mdcompare semantic --help --full`.
 With a positive `[semantic_score].request_budget`, `apply`/`sync` calls public
 `mdcompare semantic-score --report … --diff-index … --output … --request-budget N`
 (default `openai/gpt-6.1-terra`, Pi OAuth only), then public `mdcompare
-semantic-route`. Exit 2 from the scorer is a published partial result, not a
-reason to skip unscored changes. Neither scorer nor router rewrites the input
+semantic-route`. A single scorer invocation owns concurrency (default 3);
+its separate request budget counts durable admissions across resumes. A 429
+drains the active tier, persists a lower limit, or stops sending at limit 1.
+Keep the score output with its private `.execution.json` journal and `.lock`
+file. Exit 2 from the scorer is a published partial result, not a reason to
+skip unscored changes. Neither scorer nor router rewrites the input
 comparison. The plan binds the report, index, scores and route by SHA-256.
 A resume with a frozen plan does not make more scoring calls. An interruption
 before the plan suppresses a second scoring pass in that same dogpdkb run.
