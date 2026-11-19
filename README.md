@@ -22,6 +22,21 @@ mdocr run -h --full
 skylark export -h --full
 ```
 
+Check the running environment before processing files:
+
+```bash
+mdcompare doctor                                      # offline comparison
+mdcompare doctor --mode llm --model openai/gpt-6.1-terra --json
+mdocr doctor --mode prepare                           # no credentials
+mdocr doctor --mode paddle                            # PADDLEOCR_TOKEN presence
+mdocr doctor --mode llm --model openai/gpt-6.1-terra   # Pi OAuth + Mermaid
+```
+
+These diagnostics are local: no model requests, downloads, credential refresh,
+or provider authentication. `--json` writes the report to stdout and excludes
+secrets; a failed readiness check exits `2`.
+
+
 `-h` and `--help` are equivalent at each scope; `--full` requires a help flag.
 Each tool supports root `--version`. Help describes its actual input schemas,
 path rules, output files, side effects, exit meanings and recovery steps. Skylark

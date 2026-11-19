@@ -18,6 +18,28 @@ ROOT_FULL = """Full contract:
   commands retain their own contracts, including mdocr batch --help --full.
 """
 
+DOCTOR = """Examples:
+  mdocr doctor --mode prepare
+  mdocr doctor --mode paddle --json
+  mdocr doctor --mode llm --model openai/gpt-6.1-terra
+
+Default paddle mode checks Python dependencies and PADDLEOCR_TOKEN presence.
+Prepare mode requires no credentials; LLM mode checks Pi, model/effort, stored
+OAuth, and parses a local Mermaid sample. Expired OAuth is a warning.
+No network, inference, refresh, secrets or report files. This does not verify
+acceptance by the provider. --json emits mdocr-doctor-1 on stdout.
+Exit 0: no failing check; 2: environment check or arguments failed.
+Use mdocr doctor --help --full for the complete contract.
+"""
+
+DOCTOR_FULL = """Local readiness details:
+  A usable stored OAuth entry is not proof of account access or quota. Doctor
+  never refreshes it. Run `pi` and use /login if no credential is stored.
+  For LLM mode set MDOCR_PI_SDK_DIR if Pi cannot be located and set
+  MDOCR_NODE_DEPENDENCIES to the Mermaid/jsdom npm prefix.
+  For Paddle mode a present token is not proof of remote acceptance.
+"""
+
 PLAN = """Examples:
   mdocr plan --mode paddle --input doc.md --output enriched.md --plan plan.json
   mdocr plan --mode llm --list paths.json --output-dir enriched --plan plan.json

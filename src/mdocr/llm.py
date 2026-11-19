@@ -8,6 +8,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+DEFAULT_MODEL = "openai/gpt-6.1-terra"
+DEFAULT_EFFORT = "medium"
 _PI_BRIDGE = Path(__file__).with_name("pi_bridge.mjs")
 
 
@@ -34,18 +36,22 @@ class LlmClient:
         self.effort = effort
         self.env = os.environ.copy()
 
-    def _invoke(self, request: dict[str, Any]) -> dict[str, Any]:
+    def _invoke(self, request: dict[str, Any], *, timeout: int = 240) -> dict[str, Any]:
         try:
             process = subprocess.run(
                 ["node", str(_PI_BRIDGE)],
                 input=json.dumps(request),
                 text=True,
                 capture_output=True,
-                timeout=240,
+                timeout=timeout,
                 env=self.env,
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
+            if request["op"] == "doctor":
+                raise LlmError(
+                    "Pi diagnostic timed out", reason="bridge_timeout"
+                ) from exc
             # The worker may have submitted the provider request before timing out.
             raise LlmError(
                 "Pi bridge timed out after possible submission; outcome is unknown",
@@ -64,6 +70,10 @@ class LlmClient:
                 if request["op"] == "convert"
                 else "invalid_response",
             ) from exc
+        if not isinstance(result, dict):
+            raise LlmError(
+                "Pi bridge returned invalid protocol data", reason="invalid_response"
+            )
         if process.returncode or not result.get("ok"):
             err = result.get("error", {})
             raise LlmError(
@@ -73,6 +83,11 @@ class LlmClient:
                 usage_tokens=err.get("usage_tokens"),
             )
         return result
+
+    def doctor(self) -> dict[str, Any]:
+        return self._invoke(
+            {"op": "doctor", "model": self.model, "effort": self.effort}, timeout=15
+        )
 
     def preflight(self) -> dict[str, Any]:
         return self._invoke(

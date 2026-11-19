@@ -104,11 +104,13 @@ def inspect_artifacts(wheel: Path, sdist: Path) -> None:
         "dogpdkb/resources/dogpdkb.toml",
         "dogpdkb/resources/books.json",
         "mdcompare/cli.py",
+        "mdcompare/doctor.py",
         "mdcompare/catalog.py",
         "mdcompare/pi_score.mjs",
         "mdcompare/semantic_score_format.json",
         "mdcompare/semantic_score_prompt.txt",
         "mdocr/cli.py",
+        "mdocr/doctor.py",
         "mdocr/batch.py",
         "mdocr/help.py",
         "mdcompare/help.py",
@@ -262,6 +264,18 @@ def smoke(dist: Path) -> None:
         print(
             f"Installed offline help: {help_checks} flag/version checks passed; "
             "no runtime writes, socket activity, or child processes."
+        )
+        for tool, mode in (("mdcompare", "offline"), ("mdocr", "prepare")):
+            result = json.loads(
+                run(
+                    [environment / "bin" / tool, "doctor", "--mode", mode, "--json"],
+                    extra_env=help_env,
+                )
+            )
+            assert result["schema"] == f"{tool}-doctor-1"
+            assert result["ok"] and not result["network_checked"]
+        assert not audit_log.exists(), (
+            "offline doctor wrote a file, used a socket or launched a process"
         )
         run([command, "doctor", "--package"])
         run([command, "init-config", "-o", work / "portable"])

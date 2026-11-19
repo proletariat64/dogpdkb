@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 import requests
 from markdown_it import MarkdownIt
 
+from .llm import DEFAULT_EFFORT, DEFAULT_MODEL
 from .markdown import IMAGE_RE, parse_image_match
 from .prepare import (
     DEFAULT_ENABLED_EXTENSIONS,
@@ -214,8 +215,8 @@ def plan_command(args) -> int:
         raise ValueError("budgets must be nonnegative")
     if not 0 <= args.max_seconds < float("inf"):
         raise ValueError("deadline must be finite and nonnegative")
-    model = args.model or ("openai/gpt-6.1-terra" if args.mode == "llm" else None)
-    effort = args.effort or ("medium" if args.mode == "llm" else None)
+    model = args.model or (DEFAULT_MODEL if args.mode == "llm" else None)
+    effort = args.effort or (DEFAULT_EFFORT if args.mode == "llm" else None)
     if args.effort and args.effort not in {"low", "medium", "high", "xhigh"}:
         raise ValueError("--effort must be low, medium, high, or xhigh")
     prompt = (

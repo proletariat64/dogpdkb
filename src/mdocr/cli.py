@@ -61,6 +61,21 @@ def build_parser(*, full: bool = False) -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=False)
 
+    doctor = sub.add_parser(
+        "doctor",
+        help="check the local OCR environment",
+        epilog=contracts.DOCTOR + ("\n" + contracts.DOCTOR_FULL if full else ""),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    doctor.add_argument(
+        "--mode", choices=("prepare", "paddle", "llm"), default="paddle"
+    )
+    doctor.add_argument("--model")
+    doctor.add_argument("--effort", choices=("low", "medium", "high", "xhigh"))
+    doctor.add_argument(
+        "--json", action="store_true", help="emit a machine-readable report"
+    )
+
     plan = sub.add_parser(
         "plan",
         help="create an immutable, inference-free conversion plan",
@@ -357,6 +372,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 0
+    if args.command == "doctor":
+        from .doctor import check
+        from .llm import DEFAULT_EFFORT, DEFAULT_MODEL
+
+        if args.mode != "llm" and (args.model is not None or args.effort is not None):
+            parser.error("--model and --effort require --mode llm")
+        args.model = DEFAULT_MODEL if args.model is None else args.model
+        args.effort = args.effort or DEFAULT_EFFORT
+        return check(args)
     if args.command == "plan":
         from .plan import plan_command
 
