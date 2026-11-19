@@ -20,6 +20,11 @@ ocr_cache = "ocr-cache"
 # Passed to mdocr's best-effort batch CLI; in-flight calls retain tool timeouts.
 budget_seconds = 1800
 
+[semantic_score]
+# Explicit maximum model requests per apply/sync run. 0 keeps comparison offline.
+request_budget = 0
+# model = "openai/gpt-6.1-terra"
+
 [skylark]
 mcp_url = "https://example.invalid/mcp"
 proxy_bin = "utoo-proxy"

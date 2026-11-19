@@ -233,6 +233,23 @@ def main(argv=None) -> int:
     semantic.add_argument(
         "--max-diff-work", type=nonnegative_int, default=CompareOptions.max_diff_work
     )
+    from .semantic_score import DEFAULT_EFFORT, DEFAULT_MODEL
+
+    scorer = sub.add_parser(
+        "semantic-score",
+        help="Score authored changes through Pi OAuth",
+        epilog=NORMAL["semantic-score"],
+    )
+    for name in ("report", "diff-index", "output"):
+        scorer.add_argument("--" + name, type=Path, required=True)
+    scorer.add_argument("--model", default=DEFAULT_MODEL)
+    scorer.add_argument(
+        "--effort", choices=("low", "medium", "high", "xhigh"), default=DEFAULT_EFFORT
+    )
+    scorer.add_argument("--request-budget", type=nonnegative_int, required=True)
+    scorer.add_argument(
+        "--max-evidence-bytes", type=_positive_file_limit, default=65536
+    )
     route_parser = sub.add_parser(
         "semantic-route",
         help="Route changed documents from bound offline scores",
@@ -273,6 +290,14 @@ def main(argv=None) -> int:
             print(f"mdcompare: {exc}", file=sys.stderr)
             return 1
         return 0
+    if args.command == "semantic-score":
+        from .semantic_score import publish_semantic_scores
+
+        try:
+            return publish_semantic_scores(args)
+        except (InputError, OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"mdcompare: semantic-score: {exc}", file=sys.stderr)
+            return 1
     if args.command == "semantic-route":
         try:
             publish_semantic_route(args)

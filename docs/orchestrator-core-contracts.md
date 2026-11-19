@@ -192,6 +192,11 @@ Image/OCR changes and enrichment results never promote equality to compilation;
 equivalent documents start no new OCR. Enrichment failures remain reported and
 suppressed, not required pending work. Legacy retain actions remain readable in
 saved artifacts; newly generated plans do not produce HOLD/retain advice.
+An opt-in positive semantic-score request budget permits a separate validated
+score route to override only complete `CHANGED → COMPILE` rows: 1–3 uses
+retained corpus or metadata-only publication; 4–5 and unscored changes compile.
+Ambiguity is advisory. Default scoring budget is zero.
+
 
 A durable `graph_baseline` descriptor preserves the actual successful full body
 outside wash, with path/source_file/version; future comparisons prefer the latest

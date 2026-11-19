@@ -1,5 +1,6 @@
 """Public semantic artifacts and immutable repair evidence, not tool algorithms."""
 
+import hashlib
 import shutil
 from pathlib import Path
 
@@ -248,3 +249,63 @@ def read_semantic_artifacts(code, report_path, diff_path, rows, knowledge_base):
             raise SemanticArtifactError("semantic evidence sidecar missing or invalid")
         _validate_evidence(read_json(path), item, by_id[item["document_id"]])
     return report
+
+
+def read_score_route(code, path, semantic):
+    if code != 0 or not path.is_file():
+        raise SemanticArtifactError("semantic score route unavailable")
+    route = read_json(path)
+    if (
+        route.get("schema_version") != "semantic-route-1.0"
+        or route.get("compile_threshold") != 3
+        or route.get("skip_ambiguity_intercept") != "no"
+        or _identities(route.get("results")) != _identities(semantic["results"])
+    ):
+        raise SemanticArtifactError("invalid score route schema or scope")
+    expected = {(r["knowledge_base"], r["document_id"]): r for r in semantic["results"]}
+    for row in route["results"]:
+        source = expected[row["knowledge_base"], row["document_id"]]
+        if any(row.get(k) != v for k, v in source.items() if k != "action"):
+            raise SemanticArtifactError("score route changed deterministic evidence")
+        score = row.get("score")
+        if score is not None and (
+            type(score) is not int
+            or not 1 <= score <= 5
+            or type(row.get("ambiguous")) is not bool
+        ):
+            raise SemanticArtifactError("invalid semantic score")
+        eligible = (
+            source["semantic_status"] == "CHANGED"
+            and source["action"] == "COMPILE"
+            and source["comparison_complete"]
+            and source["extraction"]["available"]
+        )
+        action = (
+            "SKIP"
+            if eligible and score is not None and score <= 3
+            else source["action"]
+        )
+        reason = (
+            ("SCORE_AT_OR_BELOW_THRESHOLD" if score <= 3 else "SCORE_ABOVE_THRESHOLD")
+            if eligible and score is not None
+            else "DETERMINISTIC_ROUTE"
+        )
+        if row.get("action") != action or row.get("routing_reason") != reason:
+            raise SemanticArtifactError("invalid semantic score decision")
+    return {**semantic, "results": route["results"]}
+
+
+def bind_score_artifacts(paths):
+    return {
+        name: {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for name, path in paths.items()
+    }
+
+
+def verify_score_artifacts(witnesses):
+    paths = {name: Path(row["path"]) for name, row in witnesses.items()}
+    if bind_score_artifacts(paths) != witnesses:
+        raise SemanticArtifactError("frozen semantic scoring artifacts changed")

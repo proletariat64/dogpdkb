@@ -145,17 +145,22 @@ whole published Markdown, including existing inline images/OCR, remains its inpu
 
 ## Optional offline semantic score routing
 
-After `mdcompare semantic`, an external operator/scorer may create a
-`mdcompare-semantic-scores-1` manifest, then call
+After `mdcompare semantic`, use `mdcompare semantic-score` with an explicit
+`--request-budget` (Pi OAuth, default `openai/gpt-6.1-terra`, medium), or supply
+an external `mdcompare-semantic-scores-1` manifest, then call
 `mdcompare semantic-route --report semantic.json --diff-index diff.json --scores scores.json --output route.json`.
 This is a separate policy stage: it never calls a model, network, Graphify or
-compiler and does not alter the deterministic `semantic-1.0` report or dogpdkb
-consumer. Scores bind exact sidecar bytes using SHA-256 and must match the index
+compiler and does not alter the deterministic `semantic-1.0` report. Scores bind exact sidecar bytes using SHA-256 and must match the index
 report digest; invalid/duplicate/stale bindings fail without publishing. Default
 threshold 3 means strictly greater scores compile, lower/equal scores skip;
 `--skip-ambiguity-intercept yes` only converts ambiguous lower/equal skips to
 compile. Missing scores never enable skips. See
 `mdcompare semantic-route --help --full` for the complete schema and path rules.
+
+Enable bounded scoring in `dogpdkb apply/sync` with `[semantic_score]` and
+`request_budget = N` (default `0`, offline). Optional `model = "provider/model"`
+overrides the scorer default. Plans freeze the exact score and route artifacts;
+a resume does not call the scorer again. Ambiguity is advisory.
 
 ## 小订阅
 

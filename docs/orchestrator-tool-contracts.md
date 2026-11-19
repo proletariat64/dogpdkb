@@ -154,6 +154,17 @@ reports are staged together; caught ordinary failures roll back replacements.
 A failed invocation must not make an old report appear newly complete. Full
 schema/example is installed in `mdcompare semantic --help --full`.
 
+With a positive `[semantic_score].request_budget`, `apply`/`sync` calls public
+`mdcompare semantic-score --report … --diff-index … --output … --request-budget N`
+(default `openai/gpt-6.1-terra`, Pi OAuth only), then public `mdcompare
+semantic-route`. Exit 2 from the scorer is a published partial result, not a
+reason to skip unscored changes. Neither scorer nor router rewrites the input
+comparison. The plan binds the report, index, scores and route by SHA-256.
+A resume with a frozen plan does not make more scoring calls. An interruption
+before the plan suppresses a second scoring pass in that same dogpdkb run.
+See `mdcompare semantic-score --help --full` for admission limits and privacy.
+
+
 ## Existing mdcompare reports
 
 `mdcompare knowledge --baseline OLD --incoming NEW --output REPORT` compares body

@@ -25,7 +25,12 @@ from dogpdkb.planning import (
 )
 from dogpdkb.processes import diagnostic_argv, run_command, run_commands
 from dogpdkb.records import Run, Store, atomic_json, read_json, version_key
-from dogpdkb.semantic import freeze_recovery, read_semantic_artifacts
+from dogpdkb.semantic import (
+    bind_score_artifacts,
+    freeze_recovery,
+    read_score_route,
+    read_semantic_artifacts,
+)
 from dogpdkb.settings import load_config, select_book
 
 
@@ -486,6 +491,45 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
     )
     run.data["artifacts"]["semantic"] = str(semantic_report_path)
     run.data["artifacts"]["semantic_diff"] = str(semantic_diff_path)
+    run.data["artifacts"].pop("semantic_scoring", None)
+    if (
+        settings.semantic_score_request_budget
+        and not replan
+        and not run.data.get("semantic_score_started")
+    ):
+        score_path = semantic_dir / "scores.json"
+        route_path = semantic_dir / "score-route.json"
+        run.data["semantic_score_started"] = str(score_path)
+        run.save()
+        common = ["--report", semantic_report_path, "--diff-index", semantic_diff_path]
+        score_args = [
+            "semantic-score",
+            *common,
+            "--output",
+            score_path,
+            "--request-budget",
+            str(settings.semantic_score_request_budget),
+        ]
+        if settings.semantic_score_model:
+            score_args += ["--model", settings.semantic_score_model]
+        score_code = call_tool(settings, run, "mdcompare", score_args)
+        if score_code not in {0, 2} or not score_path.is_file():
+            raise ValueError("semantic score execution did not publish its result")
+        route_code = call_tool(
+            settings,
+            run,
+            "mdcompare",
+            ["semantic-route", *common, "--scores", score_path, "--output", route_path],
+        )
+        semantic = read_score_route(route_code, route_path, semantic)
+        run.data["artifacts"]["semantic_scoring"] = bind_score_artifacts(
+            {
+                "semantic": semantic_report_path,
+                "semantic_diff": semantic_diff_path,
+                "scores": score_path,
+                "route": route_path,
+            }
+        )
     reports = []
     for mode in ("knowledge", "compare"):
         output = workspace / f"{mode}-report.json"

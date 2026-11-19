@@ -110,7 +110,11 @@ def make_plan(book, run, documents, knowledge, comparison, semantic, *, workspac
             and body.get("action") == "COMPILE"
         ):
             action, reasons = "compile", list(body["reason_codes"])
-        elif status == "EQUIVALENT" and body.get("action") == "SKIP":
+        elif body.get("action") == "SKIP" and (
+            status == "EQUIVALENT"
+            or status == "CHANGED"
+            and body.get("routing_reason") == "SCORE_AT_OR_BELOW_THRESHOLD"
+        ):
             action = (
                 "metadata"
                 if full.get(identifier, {}).get("metadata", {}).get("status")
@@ -133,6 +137,11 @@ def make_plan(book, run, documents, knowledge, comparison, semantic, *, workspac
                 reason_codes=reasons,
                 reports=[run.data["artifacts"].get("semantic")],
             )
+        if body.get("routing_reason") in {
+            "SCORE_AT_OR_BELOW_THRESHOLD",
+            "SCORE_ABOVE_THRESHOLD",
+        }:
+            reasons.append(body["routing_reason"])
         rows.append(
             {
                 **row,
@@ -140,6 +149,8 @@ def make_plan(book, run, documents, knowledge, comparison, semantic, *, workspac
                 "reason_codes": reasons,
                 "ocr_resources": None,
                 "semantic_status": status,
+                "semantic_score": body.get("score"),
+                "semantic_ambiguity_advisory": body.get("ambiguous"),
             }
         )
     plan = {
@@ -150,6 +161,7 @@ def make_plan(book, run, documents, knowledge, comparison, semantic, *, workspac
         "semantic_report": run.data["artifacts"].get("semantic"),
         "semantic_diff": run.data["artifacts"].get("semantic_diff"),
         "body_recovery": run.data["artifacts"].get("body_recovery"),
+        "semantic_scoring": run.data["artifacts"].get("semantic_scoring"),
     }
     path = (workspace or run.directory) / "plan.json"
     atomic_json(path, plan)
@@ -165,6 +177,10 @@ def validate_plan(plan, book, store, *, check_baseline=False):
         from dogpdkb.semantic import validate_recovery
 
         validate_recovery(plan["body_recovery"])
+    if plan.get("semantic_scoring"):
+        from dogpdkb.semantic import verify_score_artifacts
+
+        verify_score_artifacts(plan["semantic_scoring"])
     reject_rollback(store, plan["documents"])
     validate_inputs(plan["documents"], check_baseline=check_baseline)
 
