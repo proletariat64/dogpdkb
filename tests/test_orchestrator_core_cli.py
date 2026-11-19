@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tests.source_fixture import team_id
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -19,7 +21,13 @@ def instance(tmp_path: Path) -> Path:
                 {
                     "key": "funds",
                     "name": "Funds",
-                    "url": "https://example.invalid/team/book",
+                    "sources": [
+                        {
+                            "key": "team",
+                            "type": "yuque",
+                            "url": "https://example.invalid/team/book",
+                        }
+                    ],
                     "corpus": "corpus",
                 }
             ]
@@ -66,7 +74,7 @@ def test_status_observes_dead_owner_without_rewriting_run(tmp_path: Path):
     path.write_text(
         json.dumps(
             {
-                "schema": "dogpdkb-run-1",
+                "schema": "dogpdkb-run-2",
                 "run_id": directory.name,
                 "book": {"key": "funds"},
                 "pid": 999999999,
@@ -108,8 +116,10 @@ def test_init_state_keeps_existing_corpus_and_unknown_graph_truth(tmp_path: Path
     assert summary["registered"] == 1
     assert summary["graph_unknown"] == 1
     state = json.loads((tmp_path / "state" / "funds" / "state.json").read_text())
-    assert state["documents"]["42"]["baseline"]["filename_date"] == "2026-11-10"
-    assert "raw" not in state["documents"]["42"]
+    assert (
+        state["documents"][team_id("42")]["baseline"]["filename_date"] == "2026-11-10"
+    )
+    assert "raw" not in state["documents"][team_id("42")]
     assert before == (source.read_bytes(), graph.read_bytes())
 
 
@@ -158,9 +168,9 @@ def test_durable_state_rejects_same_key_with_changed_source_book(tmp_path: Path)
     before = state.read_bytes()
     books = tmp_path / "books.json"
     rows = json.loads(books.read_text())
-    rows[0]["url"] = "https://example.invalid/other/book"
+    rows[0]["sources"][0]["url"] = "https://example.invalid/other/book"
     books.write_text(json.dumps(rows))
     result = cli("status", "--config", str(config), "--json")
     assert result.returncode == 1
-    assert "source book" in result.stderr
+    assert "binding changed for source team" in result.stderr
     assert state.read_bytes() == before

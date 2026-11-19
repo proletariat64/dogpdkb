@@ -29,21 +29,25 @@ graphify = "graphify"
 Minimal books.json:
 
 ```json
-[{"key":"funds","name":"Funds","url":"https://example.invalid/team/book","enabled":true}]
+[{"key":"funds","sources":[{"key":"team","type":"yuque","url":"https://example.invalid/team/book"},{"key":"inbox","type":"directory","path":"./inbox"}]}]
 ```
 
 The example URL is a placeholder: replace it with your authorized book URL.
-The books file is a JSON array of objects. Each key is unique and matches
-[A-Za-z0-9][A-Za-z0-9_-]*. enabled defaults true and must be boolean; disabled
-sources are skipped. Enabled sources require an HTTP(S) url without credentials,
-query or fragment; name defaults to the empty string. corpus, when omitted,
-defaults to paths.corpus/key; an explicit nonempty string is relative to the
-books file. Optional document_ids is a nonempty unique list of nonblank string
-IDs; omission subscribes to the whole book. A complete source listing is still
-validated before subscription filtering. Changing a pinned subscription/source
-or target requires a new key/state or a fresh plan, not silent resume.
---book selects the key, not name or URL; omission must match exactly one enabled
-source. Reusing a key for a different source URL is refused.
+The books file is a JSON array of subscriptions. Subscription keys are unique;
+source keys are unique within each subscription. Both match
+[A-Za-z0-9][A-Za-z0-9_-]*. enabled defaults true and must be boolean. Each
+subscription has one corpus and graph. corpus defaults to paths.corpus/key;
+explicit corpus paths and directory source paths are relative to the books file.
+
+sources is required; legacy top-level url and document_ids are rejected.
+A yuque source requires an HTTP(S) url without credentials, query or fragment.
+Optional document_ids is a nonempty unique list of nonblank string IDs; omission
+subscribes to the whole Yuque book. A complete listing is validated before
+filtering. A directory source requires path and scans Markdown recursively.
+--book selects a subscription; omission requires exactly one enabled subscription.
+--source KEY can repeat on sync and discover, selecting only enabled sources.
+Without --source, all enabled sources are scanned. Reusing a recorded source
+key with a different URL, scope or directory path is refused.
 
 TOML sections are tables. Recognized settings and fallback values:
 
@@ -78,17 +82,13 @@ Do not put credentials into saved plans, manifests or command examples.
 
 ## Run and result schemas
 
-Run JSON (dogpdkb-run-1) is an observational record, not a request to edit manually:
-schema, run_id, command, book (key/name/url), pid, lock (absolute corpus-lock path
-string), status, stage (string or null before the first stage), counts object,
-started_at, updated_at, ended_at (string or null), exit_code (integer or null),
-reason (string or null), artifacts (names mapped to absolute paths), failures
-(evidence objects), targets (object with book_url string and absolute corpus and
-graph path strings). targets.document_ids is an optional nonempty unique string
-array, present only for an explicitly pinned subscription; omission means the
-whole book. Loading a saved run compares the whole frozen targets object with
-the selected book, including document_ids, so changing or removing a pinned
-subscription invalidates resume. lock is the recorded corpus-lock path used by
+Run JSON (dogpdkb-run-2) is an observational record, not a request to edit manually:
+schema, run_id, command, book (key/name/sources), pid, lock (absolute corpus-lock
+path), status, stage, counts, started_at, updated_at, ended_at, exit_code, reason,
+artifacts (named absolute paths), failures and targets. targets holds source
+bindings and absolute corpus and graph paths. Loading a saved run checks all
+bindings and targets; resume does not accept a new --source selection.
+lock is the recorded corpus-lock path used by
 status for liveness observation; its presence does not itself prove a held lock.
 Optional stage/checkpoint fields are added as work progresses. Statuses include
 running, paused, completed, partial, failed and interrupted. A recorded running
@@ -97,7 +97,7 @@ ID, directory or run.json path; persisted paths are absolute. Modified targets,
 missing or changed frozen inputs and intervening publications invalidate resume.
 
 Durable state is separate from wash and keeps observed, raw, corpus and graph
-facts distinct. A normalized version has value and precision (day, instant or opaque),
+facts distinct. A normalized version has value and precision (day, instant, opaque or content),
 optionally utc; unknown remains null and is not a successful version. Failed,
 unknown or in-flight attempts suppress the same version/step; unstarted work and
 new versions are different. Deleting wash does not remove suppression.

@@ -1,7 +1,7 @@
 # Apply manifest and recovery contract
 
 Choose exactly one of --input DIFFERENCES and --resume RUN. Input is the frozen
-dogpdkb-differences-1 JSON emitted by discover, not Markdown. Use discover's saved
+dogpdkb-differences-2 JSON emitted by discover, not Markdown. Use discover's saved
 artifact rather than assembling production selections manually. Its fields are
 schema, book, run_id, captured_at, listing, documents, absent, ignored and cutoff;
 selected document fields include document_id, observed version, title, remote

@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.source_fixture import yuque_binding
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -44,7 +46,13 @@ def instance(tmp_path):
             [
                 {
                     "key": key,
-                    "url": f"https://example.invalid/{key}",
+                    "sources": [
+                        {
+                            "key": "team",
+                            "type": "yuque",
+                            "url": f"https://example.invalid/{key}",
+                        }
+                    ],
                     "corpus": f"corpus/{key}",
                 }
                 for key in ("funds", "other")
@@ -60,12 +68,12 @@ def run_directory(tmp_path, name="run-example", status="completed", book="funds"
     (directory / "run.json").write_text(
         json.dumps(
             {
-                "schema": "dogpdkb-run-1",
+                "schema": "dogpdkb-run-2",
                 "run_id": name,
                 "book": {"key": book},
                 "status": status,
                 "targets": {
-                    "book_url": f"https://example.invalid/{book}",
+                    "sources": yuque_binding(f"https://example.invalid/{book}"),
                     "corpus": str(tmp_path / "corpus" / book),
                     "graph": str(tmp_path / "corpus" / book / "graphify-out"),
                 },
@@ -292,8 +300,11 @@ def test_purge_removes_selected_wash_and_preserves_other_data(tmp_path):
         path.write_text(
             json.dumps(
                 {
-                    "schema": "dogpdkb-state-1",
-                    "book": {"key": "funds", "url": "https://example.invalid/funds"},
+                    "schema": "dogpdkb-state-2",
+                    "book": {
+                        "key": "funds",
+                        "sources": yuque_binding("https://example.invalid/funds"),
+                    },
                     "documents": {},
                 }
             )
@@ -404,7 +415,7 @@ def test_purge_all_rejects_invalid_saved_ownership_before_deleting(tmp_path, inv
     elif invalid == "book":
         data["book"]["key"] = "other"
     elif invalid == "source":
-        data["targets"]["book_url"] = "https://example.invalid/other"
+        data["targets"]["sources"]["team"]["url"] = "https://example.invalid/other"
     else:
         data["run_id"] = "run-elsewhere"
     metadata.write_text(json.dumps(data))

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.source_fixture import team_id, team_row
 from tests.test_orchestrator_apply_cli import ROOT, cli, instance
 
 
@@ -24,7 +25,7 @@ def downloads(tmp_path, count=6):
         json.dumps({key: dict(remote) for key in ids})
     )
     data = json.loads(differences.read_text())
-    data["documents"] = [{**row, "document_id": key} for key in ids]
+    data["documents"] = [{**row, **team_row(key)} for key in ids]
     differences.write_text(json.dumps(data))
     (tmp_path / "started").mkdir()
     (tmp_path / "release").mkdir()
@@ -143,7 +144,7 @@ def test_downloads_overlap_with_a_hard_configured_bound(tmp_path, value, expecte
         result = json.loads(stdout)
         run = json.loads(Path(result["run"]).read_text())
         prepared = json.loads(Path(run["artifacts"]["prepared_inputs"]).read_text())
-        assert set(prepared) == set(ids)
+        assert set(prepared) == {team_id(i) for i in ids}
         assert all(
             Path(row["input_copy"]).read_text().startswith("# Title")
             for row in prepared.values()
@@ -231,12 +232,18 @@ def test_mixed_export_failure_and_version_drift_preserve_healthy_checkpoints(tmp
     assert result.returncode == 0, result.stderr
     run = json.loads(Path(json.loads(result.stdout)["run"]).read_text())
     prepared = json.loads(Path(run["artifacts"]["prepared_inputs"]).read_text())
-    assert set(prepared) == {"1", "4", "5", "6"}
+    assert set(prepared) == {team_id(i) for i in (1, 4, 5, 6)}
     assert {
         item["document_id"] for item in run["failures"] if item["step"] == "export"
-    } == {"2", "3"}
-    assert state(tmp_path)["documents"]["2"]["steps"]["export"]["status"] == "failed"
-    assert state(tmp_path)["documents"]["3"]["steps"]["export"]["status"] == "failed"
+    } == {team_id(2), team_id(3)}
+    assert (
+        state(tmp_path)["documents"][team_id("2")]["steps"]["export"]["status"]
+        == "failed"
+    )
+    assert (
+        state(tmp_path)["documents"][team_id("3")]["steps"]["export"]["status"]
+        == "failed"
+    )
     assert len(list((tmp_path / "started").iterdir())) == len(ids)
 
 
@@ -253,22 +260,23 @@ def test_interruption_stops_every_group_and_resume_keeps_settled_inputs(
         (tmp_path / "release" / "1").touch()
         wait_for(lambda: (tmp_path / "descendant-ready" / "3").exists(), process)
         prepared_path = saved_run(tmp_path).parent / "prepared-inputs.json"
-        assert set(json.loads(prepared_path.read_text())) == {"1"}
+        assert set(json.loads(prepared_path.read_text())) == {team_id("1")}
         assert (
-            state(tmp_path)["documents"]["1"]["steps"]["export"]["status"]
+            state(tmp_path)["documents"][team_id("1")]["steps"]["export"]["status"]
             == "completed"
         )
         frozen = Path(
-            json.loads(prepared_path.read_text())["1"]["input_copy"]
+            json.loads(prepared_path.read_text())[team_id("1")]["input_copy"]
         ).read_bytes()
         process.send_signal(signum)
         process.communicate(timeout=8)
         assert process.returncode == 128 + signum
         assert {p.name for p in (tmp_path / "started").iterdir()} == {"1", "2", "3"}
         facts = state(tmp_path)["documents"]
-        assert facts["1"]["steps"]["export"]["status"] == "completed"
+        assert facts[team_id("1")]["steps"]["export"]["status"] == "completed"
         assert all(
-            facts[key]["steps"]["export"]["status"] == "unknown" for key in ("2", "3")
+            facts[team_id(key)]["steps"]["export"]["status"] == "unknown"
+            for key in ("2", "3")
         )
         assert all(
             not process_exists(int((tmp_path / "started" / key).read_text()))
@@ -295,13 +303,13 @@ def test_interruption_stops_every_group_and_resume_keeps_settled_inputs(
         assert resumed.returncode == 0, resumed.stderr
         run = json.loads(Path(json.loads(resumed.stdout)["run"]).read_text())
         prepared = json.loads(Path(run["artifacts"]["prepared_inputs"]).read_text())
-        assert set(prepared) == {"1", "4", "5", "6"}
-        assert Path(prepared["1"]["input_copy"]).read_bytes() == frozen
+        assert set(prepared) == {team_id(i) for i in (1, 4, 5, 6)}
+        assert Path(prepared[team_id("1")]["input_copy"]).read_bytes() == frozen
         assert {
             item["document_id"]
             for item in run["failures"]
             if item["reason"] == "VERSION_ATTEMPT_SUPPRESSED"
-        } == {"2", "3"}
+        } == {team_id(2), team_id(3)}
     finally:
         if process.poll() is None:
             process.send_signal(signal.SIGKILL)
@@ -337,7 +345,9 @@ def test_checkpoint_error_stops_active_peers_and_records_unknown_attempts(tmp_pa
                 int((tmp_path / "descendant-ready" / identity).read_text())
             )
             assert (
-                state(tmp_path)["documents"][identity]["steps"]["export"]["status"]
+                state(tmp_path)["documents"][team_id(identity)]["steps"]["export"][
+                    "status"
+                ]
                 == "unknown"
             )
     finally:
@@ -384,6 +394,9 @@ def test_missing_export_report_is_unknown_without_discarding_healthy_exports(tmp
     assert result.returncode == 0, result.stderr
     run = json.loads(Path(json.loads(result.stdout)["run"]).read_text())
     prepared = json.loads(Path(run["artifacts"]["prepared_inputs"]).read_text())
-    assert set(prepared) == {"1", "3", "4", "5", "6"}
-    assert state(tmp_path)["documents"]["2"]["steps"]["export"]["status"] == "unknown"
+    assert set(prepared) == {team_id(i) for i in (1, 3, 4, 5, 6)}
+    assert (
+        state(tmp_path)["documents"][team_id("2")]["steps"]["export"]["status"]
+        == "unknown"
+    )
     assert len(list((tmp_path / "started").iterdir())) == len(ids)

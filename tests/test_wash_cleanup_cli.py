@@ -19,7 +19,13 @@ def instance(tmp_path):
                 {
                     "key": "funds",
                     "name": "Funds",
-                    "url": "https://example.invalid/team/book",
+                    "sources": [
+                        {
+                            "key": "team",
+                            "type": "yuque",
+                            "url": "https://example.invalid/team/book",
+                        }
+                    ],
                     "corpus": "corpus",
                 }
             ]

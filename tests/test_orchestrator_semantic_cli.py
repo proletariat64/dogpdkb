@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.source_fixture import team_id
 from tests.test_orchestrator_apply_cli import (
     VERSION,
     cli,
@@ -46,8 +47,8 @@ def test_missing_known_baseline_defers_without_affecting_new_document(tmp_path):
     next((tmp_path / "corpus").glob("*.md")).unlink()
     _, run, plan = pause(config, differences)
     assert [(row["document_id"], row["action"]) for row in plan["documents"]] == [
-        ("42", "defer"),
-        ("43", "compile"),
+        (team_id("42"), "defer"),
+        (team_id("43"), "compile"),
     ]
     report = load(run["artifacts"]["semantic"])
     assert report["results"][0]["semantic_status"] == "UNAVAILABLE"
@@ -70,7 +71,7 @@ def test_usable_uncertainty_compiles_and_complete_diff_survives_wash_purge(tmp_p
     assert plan["documents"][0]["action"] == "compile"
     assert plan["documents"][0]["semantic_status"] == "UNCERTAIN"
     state = load(tmp_path / "state/funds/state.json")
-    assert state["documents"]["42"]["steps"]["compare"]["status"] == "completed"
+    assert state["documents"][team_id("42")]["steps"]["compare"]["status"] == "completed"
     index_path = Path(run["artifacts"]["semantic_diff"])
     index = load(index_path)
     detail = index_path.parent / index["documents"][0]["evidence"]
@@ -102,7 +103,7 @@ def prepared_recovery(tmp_path):
                 "documents": [
                     {
                         "knowledge_base": "funds",
-                        "document_id": "42",
+                        "document_id": team_id("42"),
                         "side": "baseline",
                         "source_copy": "original.md",
                         "insertions": [
@@ -142,7 +143,7 @@ def test_recovery_is_config_relative_and_resume_uses_frozen_evidence(tmp_path):
         load(json.loads(resumed.stdout)["manifest"])["documents"][0]["action"]
         == "reuse"
     )
-    state = load(tmp_path / "state/funds/state.json")["documents"]["42"]
+    state = load(tmp_path / "state/funds/state.json")["documents"][team_id("42")]
     assert "version" not in state["graph"]
     assert "ocr_report" not in run["artifacts"]
 
@@ -223,7 +224,7 @@ raise SystemExit(code)
     if mode in expected:
         assert expected[mode] in result.stderr
     assert not list((tmp_path / "corpus").glob("*.md"))
-    state = load(tmp_path / "state/funds/state.json")["documents"]["42"]
+    state = load(tmp_path / "state/funds/state.json")["documents"][team_id("42")]
     assert state["steps"]["compare"]["status"] == "unknown"
     assert not state.get("graph", {}).get("version")
 
@@ -257,7 +258,7 @@ def test_successful_graph_baseline_does_not_advance_on_equivalent_revision(tmp_p
     manifest = json.loads(first.stdout)["manifest"]
     compiled = cli("update-graph", "--config", config, "--input", manifest)
     assert compiled.returncode == 0, compiled.stdout + compiled.stderr
-    first_state = load(tmp_path / "state/funds/state.json")["documents"]["42"]
+    first_state = load(tmp_path / "state/funds/state.json")["documents"][team_id("42")]
     baseline = first_state["graph_baseline"]
     assert baseline["version"] == VERSION
     witness = Path(baseline["path"]).read_bytes()
@@ -279,7 +280,7 @@ def test_successful_graph_baseline_does_not_advance_on_equivalent_revision(tmp_p
         load(json.loads(skipped.stdout)["manifest"])["documents"][0]["action"]
         == "reuse"
     )
-    state = load(tmp_path / "state/funds/state.json")["documents"]["42"]
+    state = load(tmp_path / "state/funds/state.json")["documents"][team_id("42")]
     assert state["graph_baseline"] == baseline
     assert Path(baseline["path"]).read_bytes() == witness
     assert state["graph"]["version"] == VERSION

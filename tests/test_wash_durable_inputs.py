@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from tests.ocr_fixture import write_ocr_fixture
+from tests.source_fixture import team_id
 from tests.test_orchestrator_apply_cli import cli, instance
 
 
@@ -98,7 +99,7 @@ def test_raw_relative_images_remain_readable_after_wash_deletion(tmp_path):
     assert first.returncode == 0, first.stderr
     shutil.rmtree(Path(json.loads(first.stdout)["run"]).parent)
     state = json.loads((tmp_path / "state" / "funds" / "state.json").read_text())
-    raw = state["documents"]["42"]["raw"]
+    raw = state["documents"][team_id("42")]["raw"]
     assert (Path(raw["path"]).parent / "../images/diagram.png").is_file()
     assert Path(raw["resources"][0]["path"]).is_file()
     remote["42"]["version"] = "2026-11-13T10:00:00Z"
@@ -141,9 +142,9 @@ def test_unknown_ocr_report_remains_partial_and_retains_raw_baseline(tmp_path):
     result = cli("apply", "--config", config, "--input", differences)
     assert result.returncode == 2, result.stderr
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
-    assert state["documents"]["42"]["steps"]["ocr"]["status"] == "unknown"
+    assert state["documents"][team_id("42")]["steps"]["ocr"]["status"] == "unknown"
     shutil.rmtree(Path(json.loads(result.stdout)["run"]).parent)
-    assert Path(state["documents"]["42"]["raw"]["path"]).is_file()
+    assert Path(state["documents"][team_id("42")]["raw"]["path"]).is_file()
 
 
 def test_successful_graph_witness_and_report_survive_wash_deletion(tmp_path):
@@ -221,13 +222,13 @@ doc=json.loads(fixture_request.read_text())['documents'][0]
 body=Path(doc['path']).read_text()
 if not Path(__file__).with_name('allow').exists():
  fixture_result({'schema_version':'mdocr-result-2','causes':['OCR_AUTH_UNAVAILABLE'],'documents':[{'document_id':doc['document_id'],'status':'partial','output':None,'resources':[]}]});raise SystemExit(2)
-if doc['document_id']=='43':
+if doc['document_id']=='SCOPED_PEER':
  target=body.split('](')[1].split(')')[0]
  assert (Path(doc['path']).parent/target).is_file(),target
  with Path(__file__).with_name('valid-images').open('a') as log:log.write('43\\n')
 output=fixture_output;output.parent.mkdir(parents=True,exist_ok=True);output.write_text(body)
 fixture_result({'schema_version':'mdocr-result-2','documents':[{'document_id':doc['document_id'],'status':'completed','output':str(output),'resources':[]}]})
-""",
+""".replace("SCOPED_PEER", team_id("43")),
     )
     first = cli("apply", "--config", config, "--input", differences)
     assert first.returncode == 2, first.stderr
@@ -241,7 +242,9 @@ fixture_result({'schema_version':'mdocr-result-2','documents':[{'document_id':do
     assert (tmp_path / "valid-images").read_text().splitlines() == ["43"]
     next_run = Path(json.loads(second.stdout)["run"]).parent
     comparison = json.loads((next_run / "compare-report.json").read_text())
-    item = next(row for row in comparison["results"] if row["document_id"] == "43")
+    item = next(
+        row for row in comparison["results"] if row["document_id"] == team_id("43")
+    )
     assert item["resources"]["status"] == "NEW"  # Still no successful graph baseline.
     assert item["resources"]["items"][0]["resource_id"] == identifier
 
@@ -425,7 +428,7 @@ def test_real_mdocr_retained_mixed_image_targets_remain_supported(
         if json.loads(
             p.with_name(p.name.replace("-report.json", "-request.json")).read_text()
         )["documents"][0]["document_id"]
-        == "43"
+        == team_id("43")
     )
     assert report.get("causes"), report
     resources = report["documents"][0]["resources"]

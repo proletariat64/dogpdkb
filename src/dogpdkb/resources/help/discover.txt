@@ -1,31 +1,29 @@
 # Discovery inputs and outputs
 
-Without --listing, discover calls configured Skylark listing with the selected
-book URL. --listing instead reads offline skylark-listing-1 JSON from cwd-relative
-path. It must be a complete listing for the selected source, not a selected
-subset, difference file or Markdown body.
+--book selects the subscription. Without --source, all enabled sources are
+scanned. Repeat --source KEY to restrict the scan. A Yuque source calls the
+configured Skylark listing; --listing PATH substitutes a complete offline
+skylark-listing-1 artifact when exactly one Yuque source is selected. The book
+URL, complete flag, advertised count, unique IDs and TOC are validated before
+subscription filtering. Existing unregistered Yuque corpus requires init-state.
 
 ```json
 {"schema":"skylark-listing-1","complete":true,"book":{"book_id":"1","url":"https://example.invalid/team/book","items_count":1},"documents":[{"document_id":"42","title":"Example","version":"2026-11-13T00:00:00Z"}],"toc":[]}
 ```
 
-book identity/URL, exact advertised count, unique IDs and complete:true are
-validated before observations change. Document gateway metadata may include
-content_updated_at/updated_at/version; unknown remains null. Subscription
-filtering happens only after validation of the complete listing. Existing
-unregistered corpus is refused: run init-state before discovery, not backfill.
+A directory source recursively scans regular Markdown, ignoring symlinks,
+hidden entries, and _inventory. Selected Markdown bytes are frozen in wash;
+originals are not changed. Versions are content digests, not timestamps.
 
-The persisted dogpdkb-differences-1 object contains schema, book (key/name/url),
-run_id, captured_at, listing (frozen absolute JSON path), documents (selected
-rows), absent and ignored (ID lists), and cutoff (local newest filename date or
-null). Each selected row has document_id, version (value/precision/optional utc,
-or null), title, path (remote TOC path), source_url, format, metadata (original
-public listing row), reasons (strings), local (known prior facts), and metadata
-aliases name/logical_path/source_ref/type. These are whole-source selections,
-not diff fragments. Pending observations are acknowledged only by actual stage
-success. Do not fabricate raw/corpus/graph versions from listing observations.
+The persisted dogpdkb-differences-2 contains schema, book (key/name/sources),
+run_id, captured_at, selected source keys, per-source listings and cutoffs,
+selected documents, absent and ignored identities. A row has a scoped
+document_id, source_key, source_document_id (Yuque ID or relative filename),
+version, title, path, source_url, format, metadata, reasons, and local facts.
+Directory rows include frozen_input. Pending work is acknowledged only by
+actual stage results, not inferred from discovery.
 
-stdout is a JSON pointer with run and differences paths and selected/absent
-counts. Writes are confined to state and new wash evidence; no document bodies,
-corpus, OCR or graph are produced. Incomplete listing preserves the previous
-observation baseline. Repeating observes again; absent IDs never cause deletion.
+stdout gives run and differences paths and selected/absent counts. When any
+selected scan fails, no combined differences or new observations are committed.
+Unselected sources are not observed or marked absent. Absence never deletes
+published content. Discover changes no corpus or graph and does not run OCR.

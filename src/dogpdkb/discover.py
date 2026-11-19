@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import sys
 from copy import deepcopy
@@ -11,8 +13,8 @@ from pathlib import Path
 
 from dogpdkb.help import HelpParser
 from dogpdkb.processes import diagnostic_argv, run_command
-from dogpdkb.records import UTC8, Run, Store, atomic_json, read_json
-from dogpdkb.settings import load_config, select_book
+from dogpdkb.records import UTC8, Run, Store, atomic_json, now_iso, read_json
+from dogpdkb.settings import YuqueSource, document_identity, load_config, select_book
 
 
 class DiscoverError(ValueError):
@@ -152,36 +154,22 @@ def _rows(payload, book):
     return result
 
 
-def discover(settings, book, store, run, listing=None):
-    """Observe a complete listing inside the caller's lock and run."""
-    if (
-        not store.data.get("observation")
-        and not any(doc.get("baseline") for doc in store.data["documents"].values())
-        and any(
-            re.search(r"\d{4}-\d{2}-\d{2}-\[\d+\]\.md$", path.name)
-            for path in book.corpus.glob("*.md")
-        )
-    ):
-        raise DiscoverError(
-            "existing corpus requires registration: run dogpdkb init-state first"
-        )
-    run.stage("discover")
-    target = run.directory / "listing.json"
+def _yuque_listing(settings, run, source, listing):
+    target = run.directory / "listings" / f"{source.key}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
     if listing is None:
         argv = [
             *settings.command("skylark"),
             "listing",
             "--url",
-            book.url,
+            source.url,
             "--output",
             str(target),
         ]
-        run.data["listing_command"] = diagnostic_argv(argv)
+        run.data.setdefault("listing_commands", {})[source.key] = diagnostic_argv(argv)
         run.save()
         code = run_command(
-            argv,
-            log=run.directory / "listing.log",
-            env=settings.skylark_environment(),
+            argv, log=target.with_suffix(".log"), env=settings.skylark_environment()
         )
         if code:
             raise DiscoverError(
@@ -191,17 +179,90 @@ def discover(settings, book, store, run, listing=None):
         payload = read_json(target)
     else:
         payload = read_json(Path(listing))
-    current = _rows(payload, book)
-    if book.document_ids is not None:
-        current = {key: row for key, row in current.items() if key in book.document_ids}
-    atomic_json(target, payload)
-    previous = store.data.get("observation")
-    before = previous["documents"] if previous else {}
-    documents = store.data["documents"]
+    current = _rows(payload, source)
+    if source.document_ids is not None:
+        current = {
+            key: row for key, row in current.items() if key in source.document_ids
+        }
+    if listing is not None:
+        atomic_json(target, payload)
+    return _with_source(current, source.key), payload.get("captured_at"), str(target)
+
+
+def _with_source(rows, source_key):
+    current = {}
+    for source_id, row in rows.items():
+        identity = document_identity(source_key, source_id)
+        current[identity] = {
+            **row,
+            "document_id": identity,
+            "source_key": source_key,
+            "source_document_id": source_id,
+        }
+    return current
+
+
+def _directory_listing(settings, book, source):
+    root = source.path
+    if not root.is_dir():
+        raise DiscoverError(
+            f"directory source does not exist or is not a directory: {root}"
+        )
+    for target in (
+        book.corpus,
+        settings.graph_for(book),
+        settings.staging,
+        settings.state,
+        settings.ocr_cache,
+        settings.web,
+        settings.results,
+    ):
+        if root.is_relative_to(target) or target.is_relative_to(root):
+            raise DiscoverError(f"directory source overlaps a managed path: {target}")
+
+    def raise_scan_error(error):
+        raise error
+
+    rows = {}
+    for parent, dirs, files in os.walk(root, onerror=raise_scan_error):
+        folder = Path(parent)
+        dirs[:] = sorted(
+            name
+            for name in dirs
+            if not name.startswith(".")
+            and name != "_inventory"
+            and not (folder / name).is_symlink()
+        )
+        for name in sorted(files):
+            path = folder / name
+            if (
+                name.startswith(".")
+                or path.suffix.lower() != ".md"
+                or path.is_symlink()
+                or not path.is_file()
+            ):
+                continue
+            relative = path.relative_to(root).as_posix()
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            rows[relative] = {
+                "version": {"value": f"sha256:{digest}", "precision": "content"},
+                "title": path.stem,
+                "name": path.stem,
+                "path": relative,
+                "logical_path": relative,
+                "source_url": path.as_uri(),
+                "source_ref": path.as_uri(),
+                "format": "md",
+                "type": "md",
+                "metadata": {"relative_path": relative},
+            }
+    return _with_source(rows, source.key), now_iso(), None
+
+
+def _select(current, prior, documents, *, yuque):
+    before = prior["documents"] if prior else {}
     cutoff = (
-        None
-        if previous
-        else max(
+        max(
             (
                 doc.get("baseline", {}).get("filename_date", "")
                 for doc in documents.values()
@@ -209,11 +270,14 @@ def discover(settings, book, store, run, listing=None):
             default="",
         )
         or None
+        if yuque and not prior
+        else None
     )
     selected, ignored = [], []
     for doc_id, row in current.items():
         local = documents.get(doc_id, {})
-        old = before.get(doc_id) or (local.get("observed") if previous else None)
+        old = before.get(doc_id) or (local.get("observed") if prior else None)
+        listed_day = _day(row["version"])
         reasons = []
         if old:
             if not _same(row["version"], old["version"]):
@@ -221,24 +285,21 @@ def discover(settings, book, store, run, listing=None):
             for field in ("title", "path", "source_url", "format"):
                 if row[field] != old[field]:
                     reasons.append(f"{field}-changed")
-        elif previous:
+        elif prior or not yuque:
             reasons.append("new")
         elif local.get("corpus") or local.get("baseline"):
-            prior = normalize_version(
+            previous = normalize_version(
                 local.get("corpus", {}).get("version")
                 or local.get("baseline", {}).get("filename_date")
             )
-            if not row["version"] or not prior:
+            if not row["version"] or not previous:
                 reasons.append("version-unknown")
-            elif prior["precision"] == "day":
-                if (
-                    _day(row["version"]) is None
-                    or _day(row["version"]) >= prior["value"]
-                ):
+            elif previous["precision"] == "day":
+                if listed_day is None or listed_day >= previous["value"]:
                     reasons.append("date-needs-comparison")
-            elif not _same(row["version"], prior):
+            elif not _same(row["version"], previous):
                 reasons.append("version-changed")
-        elif cutoff and _day(row["version"]) and _day(row["version"]) < cutoff:
+        elif cutoff and listed_day and listed_day < cutoff:
             ignored.append(doc_id)
         else:
             reasons.append("new")
@@ -247,28 +308,117 @@ def discover(settings, book, store, run, listing=None):
             reasons = list(dict.fromkeys([*reasons, *pending["reasons"]]))
         if reasons:
             selected.append({**row, "reasons": reasons, "local": deepcopy(local)})
-    expected_ids = (
-        set(book.document_ids)
-        if book.document_ids is not None
-        else set(before) | set(documents)
-    )
-    absent = sorted(expected_ids - set(current))
+    return selected, sorted(ignored), cutoff
+
+
+def discover(settings, book, store, run, listing=None, *, sources=None):
+    """Validate selected scans before recording any observations."""
+    sources = book.select_sources() if sources is None else sources
+    if (
+        listing is not None
+        and sum(isinstance(source, YuqueSource) for source in sources) != 1
+    ):
+        raise DiscoverError("--listing requires exactly one selected Yuque source")
+    previous = store.data.get("observation") or {}
+    documents = store.data["documents"]
+    if any(
+        isinstance(source, YuqueSource) and source.key not in previous
+        for source in sources
+    ):
+        owned = {doc.get("corpus", {}).get("path") for doc in documents.values()}
+        for path in book.corpus.glob("*.md"):
+            match = re.search(r"\d{4}-\d{2}-\d{2}-\[(\d+)\]\.md$", path.name)
+            if (
+                str(path) not in owned
+                and match
+                and any(
+                    isinstance(source, YuqueSource)
+                    and source.key not in previous
+                    and (source.document_ids is None or match[1] in source.document_ids)
+                    for source in sources
+                )
+            ):
+                raise DiscoverError(
+                    "existing corpus requires registration: run dogpdkb init-state first"
+                )
+    run.stage("discover")
+    seen, selected, absent, ignored, listings, cutoffs = {}, [], [], [], {}, {}
+    for source in sources:
+        yuque = isinstance(source, YuqueSource)
+        try:
+            if yuque:
+                current, captured, artifact = _yuque_listing(
+                    settings, run, source, listing
+                )
+            else:
+                current, captured, artifact = _directory_listing(settings, book, source)
+            local = {
+                key: doc
+                for key, doc in documents.items()
+                if doc.get("source_key") == source.key
+            }
+            prior = previous.get(source.key)
+            rows, skipped, cutoff = _select(current, prior, local, yuque=yuque)
+            if not yuque:
+                for row in rows:
+                    body = (source.path / row["source_document_id"]).read_bytes()
+                    if (
+                        f"sha256:{hashlib.sha256(body).hexdigest()}"
+                        != row["version"]["value"]
+                    ):
+                        raise DiscoverError(
+                            f"directory input changed while scanning: {row['source_document_id']}"
+                        )
+                    target = (
+                        run.directory / "directory-inputs" / f"{row['document_id']}.md"
+                    )
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(body)
+                    row["frozen_input"] = str(target)
+        except (OSError, ValueError) as error:
+            raise DiscoverError(
+                f"source {source.key}: {error}", getattr(error, "exit_code", 1)
+            ) from error
+        expected = (
+            {document_identity(source.key, item) for item in source.document_ids}
+            if yuque and source.document_ids is not None
+            else set(prior["documents"] if prior else ()) | set(local)
+        )
+        missing = sorted(expected - set(current))
+        seen[source.key] = {
+            "documents": current,
+            "captured_at": captured,
+            "run_id": run.id,
+        }
+        selected.extend(rows)
+        absent.extend(missing)
+        ignored.extend(skipped)
+        if artifact is not None:
+            listings[source.key] = artifact
+        cutoffs[source.key] = cutoff
+    captured_at = now_iso()
     differences = {
-        "schema": "dogpdkb-differences-1",
+        "schema": "dogpdkb-differences-2",
         "book": store.data["book"],
         "run_id": run.id,
-        "captured_at": payload.get("captured_at"),
-        "listing": str(target),
+        "captured_at": captured_at,
+        "sources": list(seen),
+        "listings": listings,
         "documents": selected,
-        "absent": absent,
+        "absent": sorted(absent),
         "ignored": sorted(ignored),
-        "cutoff": cutoff,
+        "cutoffs": cutoffs,
     }
     path = run.directory / "differences.json"
-    atomic_json(path, differences)
-    for doc_id, row in current.items():
-        store.document(doc_id)["observed"] = row
-        store.document(doc_id).pop("absence", None)
+    for scan in seen.values():
+        for doc_id, row in scan["documents"].items():
+            document = store.document(doc_id)
+            document.update(
+                source_key=row["source_key"],
+                source_document_id=row["source_document_id"],
+                observed=row,
+            )
+            document.pop("absence", None)
     for row in selected:
         store.document(row["document_id"])["pending"] = {
             "version": row["version"],
@@ -278,18 +428,18 @@ def discover(settings, book, store, run, listing=None):
         }
     for doc_id in absent:
         store.document(doc_id)["absence"] = {
-            "captured_at": payload.get("captured_at"),
+            "captured_at": captured_at,
             "run_id": run.id,
         }
-    store.data["observation"] = {
-        "documents": current,
-        "captured_at": payload.get("captured_at"),
-        "run_id": run.id,
-    }
+    store.data["observation"] = {**previous, **seen}
     store.save()
-    run.data["artifacts"].update(listing=str(target), differences=str(path))
+    atomic_json(path, differences)
+    run.data["artifacts"]["differences"] = str(path)
     run.stage(
-        "discover", observed=len(current), selected=len(selected), absent=len(absent)
+        "discover",
+        observed=sum(len(scan["documents"]) for scan in seen.values()),
+        selected=len(selected),
+        absent=len(absent),
     )
     return differences
 
@@ -299,6 +449,7 @@ def main(argv=None):
     parser.add_argument("--config", type=Path)
     parser.add_argument("--book")
     parser.add_argument("--listing", type=Path)
+    parser.add_argument("--source", action="append", metavar="KEY")
     try:
         args = parser.parse_args(argv)
     except SystemExit as error:
@@ -307,10 +458,11 @@ def main(argv=None):
     try:
         settings = load_config(args.config)
         book = select_book(settings, args.book)
+        sources = book.select_sources(args.source)
         store = Store(settings, book)
         with store.lock():
             run = Run.create(store, "discover")
-            result = discover(settings, book, store, run, args.listing)
+            result = discover(settings, book, store, run, args.listing, sources=sources)
             run.finish("completed")
         print(
             json.dumps(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -157,6 +158,12 @@ def make_plan(book, run, documents, knowledge, comparison, semantic, *, workspac
         "schema": "dogpdkb-plan-1",
         "book": book.key,
         "run_id": run.id,
+        "sources": run.data.get("sources", []),
+        "conflicts": [
+            item
+            for item in run.data["failures"]
+            if item.get("reason") == "CORPUS_DESTINATION_CONFLICT"
+        ],
         "documents": rows,
         "semantic_report": run.data["artifacts"].get("semantic"),
         "semantic_diff": run.data["artifacts"].get("semantic_diff"),
@@ -188,11 +195,18 @@ def validate_plan(plan, book, store, *, check_baseline=False):
 def validate_inputs(documents, *, check_baseline=False):
     for row in documents:
         try:
-            if (
-                Path(row["raw_path"]).read_bytes()
-                != Path(row["input_copy"]).read_bytes()
-            ):
+            body = Path(row["raw_path"]).read_bytes()
+            if body != Path(row["input_copy"]).read_bytes():
                 raise ValueError("changed")
+            version = row.get("version")
+            if (
+                isinstance(version, dict)
+                and version.get("precision") == "content"
+                and (
+                    f"sha256:{hashlib.sha256(body).hexdigest()}" != version_key(version)
+                )
+            ):
+                raise ValueError("content version changed")
             if (
                 check_baseline
                 and row.get("baseline_input_copy")

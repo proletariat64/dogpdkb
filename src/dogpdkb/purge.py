@@ -23,6 +23,8 @@ def purge_runs(store, reference=None, *, all_runs=False, force=False):
     if all_runs:
         candidates = sorted(root.glob("run-*"))
     else:
+        if reference is None:
+            raise ValueError("select a run to purge")
         path = Path(reference).expanduser()
         if path.name == "run.json":
             path = path.parent
@@ -62,7 +64,17 @@ def purge_runs(store, reference=None, *, all_runs=False, force=False):
             or not isinstance(data.get("book"), dict)
             or data["book"].get("key") != store.book.key
             or not isinstance(data.get("targets"), dict)
-            or data["targets"].get("book_url") != store.book.url
+        ):
+            raise ValueError("run does not belong to the selected book wash or schema")
+        bindings = data["targets"].get("sources")
+        known = store.data["book"]["sources"]
+        if (
+            not isinstance(bindings, dict)
+            or not bindings
+            or any(
+                key not in known or known[key] != binding
+                for key, binding in bindings.items()
+            )
         ):
             raise ValueError("run does not belong to the selected book wash or schema")
         for key in ("corpus", "graph"):

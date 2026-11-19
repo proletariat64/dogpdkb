@@ -10,6 +10,7 @@ from urllib.parse import unquote, urlsplit
 import pytest
 
 from tests.ocr_fixture import write_ocr_fixture
+from tests.source_fixture import team_id
 from tests.test_orchestrator_apply_cli import cli
 from tests.test_wash_durable_inputs import enriched_instance
 
@@ -73,7 +74,7 @@ def test_local_fragments_survive_ocr_input_publication_and_purge(
         assert path.is_file(), target
     document = json.loads(Path(output["manifest"]).read_text())["documents"][0]
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
-    raw = Path(state["documents"]["42"]["raw"]["path"])
+    raw = Path(state["documents"][team_id("42")]["raw"]["path"])
     assert raw.read_bytes() == (run / "raw/0.md").read_bytes()
     published = Path(document["path"])
     targets = re.findall(r'(?:xlink:)?href="([^"]+)"', published.read_text())
@@ -261,9 +262,11 @@ def test_ocr_request_survives_cleanup_after_earlier_export_failure(tmp_path):
     assert {failure["step"] for failure in record["failures"]} >= {"export", "ocr"}
     request = run_path.parent / "ocr-0-request.json"
     assert request.is_file(), "cleanup lost the actual failed OCR invocation"
-    assert json.loads(request.read_text())["documents"][0]["document_id"] == "2"
+    assert json.loads(request.read_text())["documents"][0]["document_id"] == team_id(
+        "2"
+    )
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
-    assert state["documents"]["2"]["steps"]["ocr"]["input"] == str(request)
+    assert state["documents"][team_id("2")]["steps"]["ocr"]["input"] == str(request)
 
 
 def test_later_run_uses_new_publication_generation(tmp_path):
@@ -291,7 +294,7 @@ def test_later_run_uses_new_publication_generation(tmp_path):
     first_result = json.loads(first.stdout)
     before = json.loads(Path(first_result["manifest"]).read_text())
     old_document = next(
-        row for row in before["documents"] if row["document_id"] == "43"
+        row for row in before["documents"] if row["document_id"] == team_id("43")
     )
     assert (
         old_document["pending_steps"] == []
@@ -305,7 +308,9 @@ def test_later_run_uses_new_publication_generation(tmp_path):
     resumed_result = json.loads(resumed.stdout)
     assert resumed_result["run"] != first_result["run"]
     after = json.loads(Path(resumed_result["manifest"]).read_text())
-    new_document = next(row for row in after["documents"] if row["document_id"] == "43")
+    new_document = next(
+        row for row in after["documents"] if row["document_id"] == team_id("43")
+    )
     assert new_document["pending_steps"] == []
     assert new_document["input_copy"] != str(old_witness)
     assert old_witness.read_bytes() == old_bytes
@@ -352,7 +357,10 @@ def test_catalogued_noninline_resource_survives_wash_purge(tmp_path, markup):
     ][0]
     raw_source = next((run.parent / "raw").glob("*.md")).read_bytes()
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
-    assert Path(state["documents"]["42"]["raw"]["path"]).read_bytes() == raw_source
+    assert (
+        Path(state["documents"][team_id("42")]["raw"]["path"]).read_bytes()
+        == raw_source
+    )
     original_image = run.parent / "images/diagram.png"
     published = Path(document["path"]).read_text()
     assert f"literal target: {original_image}" in published

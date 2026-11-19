@@ -40,7 +40,7 @@ def test_sync_full_help_is_a_local_execution_contract(tmp_path):
         "DOGPDKB_CONFIG",
         "--stop-after plan",
         "Exit codes",
-        "dogpdkb-run-1",
+        "dogpdkb-run-2",
         "schema",
         "partial",
         "suppression",

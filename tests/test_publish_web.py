@@ -16,7 +16,7 @@ def test_explicit_web_sources_do_not_require_enabled_sync_book(tmp_path):
     graph = tmp_path / "graph.json"
     graph.write_text('{"nodes":[],"links":[]}')
     (tmp_path / "books.json").write_text(
-        '[{"key":"disabled","enabled":false,"url":"https://example.invalid/disabled","corpus":"missing"}]'
+        '[{"key":"disabled","enabled":false,"sources":[{"type":"yuque","key":"team","url":"https://example.invalid/disabled"}],"corpus":"missing"}]'
     )
     settings = tmp_path / "instance.toml"
     settings.write_text('[source]\nbooks_file="books.json"\n')

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -23,12 +24,60 @@ class ConfigError(ValueError):
 
 
 @dataclass(frozen=True)
+class YuqueSource:
+    key: str
+    url: str
+    document_ids: tuple[str, ...] | None = None
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class DirectorySource:
+    key: str
+    path: Path
+    enabled: bool = True
+
+
+Source = YuqueSource | DirectorySource
+
+
+def document_identity(source_key: str, source_document_id: str) -> str:
+    # A fixed-width key fits both state filenames and public tool document IDs;
+    # rows also keep the original source key and ID for provenance.
+    identity = json.dumps((source_key, source_document_id), ensure_ascii=True)
+    return "doc-" + hashlib.sha256(identity.encode("ascii")).hexdigest()
+
+
+def source_binding(source: Source) -> dict[str, Any]:
+    if isinstance(source, DirectorySource):
+        return {"type": "directory", "path": str(source.path)}
+    return {
+        "type": "yuque",
+        "url": source.url,
+        "document_ids": list(source.document_ids) if source.document_ids else None,
+    }
+
+
+@dataclass(frozen=True)
 class Book:
     key: str
     name: str
-    url: str
     corpus: Path
-    document_ids: tuple[str, ...] | None = None
+    sources: tuple[Source, ...]
+
+    def source_bindings(self) -> dict[str, dict[str, Any]]:
+        return {source.key: source_binding(source) for source in self.sources}
+
+    def select_sources(self, keys: list[str] | None = None) -> tuple[Source, ...]:
+        known = {source.key: source for source in self.sources if source.enabled}
+        if keys is None:
+            return tuple(known.values())
+        if len(keys) != len(set(keys)):
+            raise ConfigError("duplicate --source selection")
+        for key in keys:
+            if key not in known:
+                raise ConfigError(f"unknown or disabled source: {key}")
+        return tuple(known[key] for key in keys)
 
 
 @dataclass(frozen=True)
@@ -204,6 +253,77 @@ def load_config(path: Path | str | None = None) -> Settings:
     )
 
 
+def _source_key(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_-]*", value
+    ):
+        raise ConfigError(
+            f"{label} key must contain letters, digits, underscore or hyphen"
+        )
+    return value
+
+
+def _parse_sources(row: dict, base: Path, book_key: str) -> tuple[Source, ...]:
+    values = row.get("sources")
+    if (
+        "url" in row
+        or "document_ids" in row
+        or not isinstance(values, list)
+        or not values
+    ):
+        raise ConfigError(
+            f"{book_key}: configure a nonempty sources list instead of top-level url/document_ids"
+        )
+    sources: list[Source] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, dict):
+            raise ConfigError(f"{book_key}: source must be an object")
+        key = _source_key(value.get("key"), "source")
+        if key in seen:
+            raise ConfigError(f"{book_key}: duplicate source key: {key}")
+        seen.add(key)
+        enabled = value.get("enabled", True)
+        if type(enabled) is not bool:
+            raise ConfigError(f"{key}: source enabled must be boolean")
+        kind = value.get("type")
+        if kind == "yuque":
+            if "path" in value:
+                raise ConfigError(f"{key}: yuque source does not accept path")
+            ids = None
+            if "document_ids" in value:
+                raw = value["document_ids"]
+                if (
+                    not isinstance(raw, list)
+                    or not raw
+                    or any(
+                        not isinstance(item, str) or not item.strip() for item in raw
+                    )
+                    or len(set(raw)) != len(raw)
+                ):
+                    raise ConfigError(
+                        f"{key}: document_ids must be nonempty unique string IDs"
+                    )
+                ids = tuple(sorted(raw))
+            sources.append(YuqueSource(key, _url(value.get("url"), key), ids, enabled))
+        elif kind == "directory":
+            if "url" in value or "document_ids" in value:
+                raise ConfigError(
+                    f"{key}: directory source does not accept url/document_ids"
+                )
+            path = value.get("path")
+            if not isinstance(path, str) or not path.strip():
+                raise ConfigError(f"{key}: directory source requires a path")
+            sources.append(
+                DirectorySource(
+                    key, (base / Path(path).expanduser()).resolve(), enabled
+                )
+            )
+        else:
+            raise ConfigError(f"{key}: source type must be yuque or directory")
+    return tuple(sources)
+
+
 def select_book(settings: Settings, key: str | None = None) -> Book:
     try:
         rows = json.loads(settings.books_file.read_text(encoding="utf-8"))
@@ -227,8 +347,11 @@ def select_book(settings: Settings, key: str | None = None) -> Book:
         seen.add(name)
         if type(row.get("enabled", True)) is not bool:
             raise ConfigError("book enabled must be boolean")
+        sources = _parse_sources(row, settings.books_file.parent, name)
         if not row.get("enabled", True):
             continue
+        if not any(source.enabled for source in sources):
+            raise ConfigError(f"{name}: subscription must have an enabled source")
         corpus = settings.corpus / name
         if "corpus" in row:
             if not isinstance(row["corpus"], str) or not row["corpus"]:
@@ -236,30 +359,7 @@ def select_book(settings: Settings, key: str | None = None) -> Book:
             corpus = settings.books_file.parent / Path(row["corpus"]).expanduser()
         if "DOGPDKB_CORPUS" in os.environ:
             corpus = settings.corpus
-        document_ids = row.get("document_ids")
-        if "document_ids" in row:
-            if (
-                not isinstance(document_ids, list)
-                or not document_ids
-                or any(
-                    not isinstance(value, str) or not value.strip()
-                    for value in document_ids
-                )
-                or len(set(document_ids)) != len(document_ids)
-            ):
-                raise ConfigError(
-                    "book document_ids: expected nonempty unique string IDs"
-                )
-            document_ids = tuple(sorted(document_ids))
-        books.append(
-            Book(
-                name,
-                str(row.get("name", "")),
-                _url(row.get("url"), name),
-                corpus.resolve(),
-                document_ids,
-            )
-        )
+        books.append(Book(name, str(row.get("name", "")), corpus.resolve(), sources))
     matches = [book for book in books if key is None or book.key == key]
     if len(matches) != 1:
         raise ConfigError("select exactly one enabled book with --book")
