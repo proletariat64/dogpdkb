@@ -16,7 +16,7 @@ corpus publication. Resume checks saved inputs/witnesses and cannot repair
 deleted/changed plan inputs by downloading them again. A source change or
 intervening incompatible publication requires a fresh discovery and plan.
 
---concurrency N limits simultaneous document exports to 1, 2 or 3 (default 2).
+--concurrency N limits simultaneous document exports to 1, 2 or 3 (default 3).
 Use 1 for serial downloads. Invalid values fail before run creation or tool calls.
 Each export remains an independent Skylark CLI call. The main coordinator records
 settled results and checkpoints; one export failure does not stop other eligible

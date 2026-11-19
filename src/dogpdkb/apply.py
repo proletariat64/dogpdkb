@@ -33,7 +33,7 @@ from dogpdkb.semantic import (
     read_semantic_artifacts,
 )
 from dogpdkb.settings import (
-    DirectorySource,
+    DEFAULT_DOWNLOAD_CONCURRENCY,
     document_identity,
     load_config,
     select_book,
@@ -80,7 +80,9 @@ def corpus_destination(book, identity, previous):
     )
 
 
-def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
+def prepare_inputs(
+    settings, book, store, run, differences, *, concurrency=DEFAULT_DOWNLOAD_CONCURRENCY
+):
     if (
         differences.get("schema") != "dogpdkb-differences-2"
         or differences.get("book", {}).get("key") != book.key
@@ -93,10 +95,18 @@ def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
         or any(not isinstance(key, str) for key in source_keys)
     ):
         raise ValueError("difference requires selected sources")
-    sources = {source.key: source for source in book.select_sources(source_keys)}
+    if run.data["command"] == "sync":
+        bindings = run.data["targets"]["sources"]
+        if "sources" in run.data and source_keys != run.data["sources"]:
+            raise ValueError("difference source selection mismatch")
+    else:
+        book.select_sources(source_keys)
+        bindings = book.source_bindings()
     old_bindings = differences["book"].get("sources", {})
-    bindings = book.source_bindings()
-    if any(old_bindings.get(key) != bindings[key] for key in sources):
+    if len(source_keys) != len(set(source_keys)) or any(
+        key not in bindings or old_bindings.get(key) != bindings[key]
+        for key in source_keys
+    ):
         raise ValueError("difference source binding mismatch")
     selected = differences.get("documents")
     if not isinstance(selected, list):
@@ -111,20 +121,18 @@ def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
     ):
         raise ValueError("difference source IDs must be unique and nonempty")
     for row in selected:
-        source = sources.get(row.get("source_key"))
+        key = row.get("source_key")
+        source = bindings[key] if key in source_keys else None
         source_id = row.get("source_document_id")
         if (
             source is None
             or not isinstance(source_id, str)
             or not source_id
-            or row["document_id"] != document_identity(source.key, source_id)
+            or row["document_id"] != document_identity(key, source_id)
         ):
             raise ValueError("invalid difference document identity")
-        if (
-            not isinstance(source, DirectorySource)
-            and source.document_ids is not None
-            and source_id not in source.document_ids
-        ):
+        scope = source.get("document_ids")
+        if scope is not None and source_id not in scope:
             raise ValueError("difference source IDs outside subscription")
     run.data["sources"] = source_keys
     atomic_json(run.directory / "differences.json", differences)
@@ -168,7 +176,7 @@ def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
         owners.setdefault(output, set()).add(identity)
     frozen = None
     if any(
-        isinstance(sources[row["source_key"]], DirectorySource)
+        bindings[row["source_key"]]["type"] == "directory"
         and row["document_id"] not in prepared
         for row in selected
     ):
@@ -187,8 +195,9 @@ def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
         document = store.document(identifier)
         output = corpus_destination(book, identifier, document.get("corpus", {}))
         if owners[output] != {identifier} or output.is_symlink():
-            if frozen is not None and isinstance(
-                sources[row["source_key"]], DirectorySource
+            if (
+                frozen is not None
+                and bindings[row["source_key"]]["type"] == "directory"
             ):
                 row["raw_path"] = str(
                     frozen.directory
@@ -234,7 +243,7 @@ def prepare_inputs(settings, book, store, run, differences, *, concurrency=2):
         row["previous_graph"] = dict(document.get("graph", {}))
         existing = Path(previous.get("path", ""))
         desired_metadata = descriptor(book, row, existing)["metadata"]
-        if isinstance(sources[row["source_key"]], DirectorySource):
+        if bindings[row["source_key"]]["type"] == "directory":
             assert frozen is not None
             frozen_root = frozen.directory / "directory-inputs" / identifier
             if str(frozen_root / row["source_document_id"]) != row.get("frozen_input"):
@@ -1141,7 +1150,7 @@ def apply_run(
     *,
     stop_after=None,
     resume=False,
-    concurrency=2,
+    concurrency=DEFAULT_DOWNLOAD_CONCURRENCY,
 ):
     if resume and not run.data.get("artifacts", {}).get("plan"):
         frozen = run.data.get("artifacts", {}).get("differences")
@@ -1349,14 +1358,21 @@ def parser_for(command="apply"):
     parser = HelpParser(prog=f"dogpdkb {command}")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--book")
-    parser.add_argument("--concurrency", type=int, choices=[1, 2, 3], default=2)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        choices=[1, 2, 3],
+        default=DEFAULT_DOWNLOAD_CONCURRENCY,
+    )
     selection = parser.add_mutually_exclusive_group(required=command == "apply")
     if command == "apply":
         selection.add_argument("--input", type=Path)
     selection.add_argument("--resume")
     parser.add_argument("--stop-after", choices=["plan"])
     if command == "sync":
-        parser.add_argument("--source", action="append", metavar="KEY")
+        inputs = parser.add_mutually_exclusive_group()
+        inputs.add_argument("--source", action="append", metavar="KEY")
+        inputs.add_argument("--dir", type=Path, metavar="PATH")
         parser.add_argument(
             "--graphify-inputs", choices=["all", "text"], default="text"
         )

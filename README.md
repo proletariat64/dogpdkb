@@ -61,6 +61,8 @@ dogpdkb init-state --config ./instance/dogpdkb.toml --book funds
 dogpdkb sync --config ./instance/dogpdkb.toml --book funds
 # 只扫描指定来源；仍发布到同一个知识库，可重复传 --source
 dogpdkb sync --config ./instance/dogpdkb.toml --book funds --source inbox
+# 只读本地目录，不改订阅配置，不需要 Skylark；路径相对调用时的工作目录
+dogpdkb sync --config ./instance/dogpdkb.toml --book funds --dir ./inbox/2026-11-19
 # 全批获取输入、比较和计划；不会 OCR、写本批语料或编译
 dogpdkb sync --config ./instance/dogpdkb.toml --book funds --stop-after plan
 # RUN 为输出中的 run ID 或目录；只推进未完成步骤
@@ -80,7 +82,7 @@ Markdown 语料；`update-graph --input MANIFEST` 编译。`sync` 共用这套�
 ### Download concurrency
 
 `sync` and `apply` accept `--concurrency N` for document exports only. The default
-is **2**; allowed values are **1, 2 or 3**, with a hard maximum of three. Use one
+is **3**; allowed values are **1, 2 or 3**, with a hard maximum of three. Use one
 for serial downloads. Invalid values fail before run creation or tool calls.
 
 ```bash
@@ -205,7 +207,10 @@ a resume does not call the scorer again. Ambiguity is advisory.
 `_inventory` 和符号链接；不移动或删除原件。非 Markdown 文件不作为独立文档输入；
 Markdown 引用的目录内资源随正文冻结，资源变更也计入版本。
 默认扫描所有启用来源；可重复传 `--source KEY` 选子集，未选来源不访问也不判为缺失。
-任何选中来源扫描失败则不生成计划。`--resume` 不接受 `--source`，只使用冻结输入。
+`sync --dir PATH` 只扫描指定目录，与 `--source` 互斥。规范化路径若匹配唯一登记目录，
+则沿用其身份；否则使用绑定到目标知识库和该路径的独立身份，不修改订阅配置。
+`doctor` 可用相同选择参数离线检查；仅在选中语雀来源时检查 Skylark。
+任何选中来源扫描失败则不生成计划。`--resume` 不接受 `--source` 或 `--dir`，只使用冻结输入。
 
 语雀来源可省略 `document_ids` 订阅整本；列表仍完整读取并验证，再按 ID 筛选。
 来源 key 在订阅内唯一，已记录状态后不允许换绑 URL、订阅范围或目录。
