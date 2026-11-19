@@ -20,12 +20,7 @@ from .prepare import (
 )
 
 DEFAULT_PROMPT = (
-    "Convert each image into faithful, searchable Markdown. Do not invent content. "
-    "Tables must be Markdown tables with headers, units, and values. Flowcharts and "
-    "mind maps must be Mermaid preserving visible direction and labels. For charts "
-    "and explanatory slides, provide visible transcription, separate summary, and "
-    "separate Simplified Chinese translation. Summarize other images as text. Mark "
-    "unreadable text and uncertain relationships explicitly."
+    Path(__file__).with_name("default_prompt.txt").read_text(encoding="utf-8").strip()
 )
 
 
