@@ -65,8 +65,11 @@ TOML sections are tables. Recognized settings and fallback values:
   SKYLARK_MCP_URL overrides it. Empty means retain the tool's gateway default.
 - skylark.timeout_seconds: positive finite number, default 60 seconds; passed
   to Skylark as SKYLARK_TIMEOUT_MS. Existing retry/SSO behavior belongs to Skylark.
-- ocr.budget_seconds: positive finite number, default 1800 seconds shared across
-  serial document OCR calls; in-flight tool deadlines remain tool-owned.
+- ocr.mode: llm (default, OpenAI Pi OAuth) or paddle (explicit opt-in).
+- ocr.request_budget: OCR requests for the whole batch; omit for unlimited,
+  or set 0 to prohibit new requests. Independent of scoring.
+- ocr.budget_seconds: positive finite number, default 1800 seconds; mdocr owns
+  the admission deadline. OCR concurrency defaults to 3.
 - tools.skylark/mdcompare/mdocr/graphify: nonempty executable string or nonempty
   string argv array, default the tool name. This is not shell command text.
   Only argv[0] containing / or starting with ~ is resolved against the TOML;
@@ -77,8 +80,8 @@ TOML sections are tables. Recognized settings and fallback values:
   Publication consumes these optional display settings without changing sync.
 
 Tools are independent public CLIs. Skylark uses existing SSO and gateway settings;
-mdocr uses PADDLEOCR_TOKEN for new batch OCR, while its standalone ocr command
-requires the token at validation. Graphify retains its own provider configuration.
+mdocr uses the OpenAI Pi OAuth route for LLM or PADDLEOCR_TOKEN for explicit
+Paddle mode. Graphify retains its own provider configuration.
 Do not put credentials into saved plans, manifests or command examples.
 
 ## Run and result schemas

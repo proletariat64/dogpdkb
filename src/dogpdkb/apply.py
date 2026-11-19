@@ -9,12 +9,12 @@ import re
 import shutil
 import sys
 import tempfile
-import time
 from contextlib import closing
 from pathlib import Path
 
 from dogpdkb.directory_snapshot import catalog_paths, copy_snapshot
 from dogpdkb.help import HelpParser
+from dogpdkb.ocr_batch import ocr_inputs
 from dogpdkb.planning import (
     descriptor,
     load_plan,
@@ -40,8 +40,10 @@ from dogpdkb.settings import (
 )
 
 
-def call_tool(settings, run, name, arguments, *, timeout=None):
-    argv = settings.command(name) + [str(v) for v in arguments]
+def call_tool(settings, run, name, arguments, *, timeout=None, command=None):
+    argv = (settings.command(name) if command is None else command) + [
+        str(v) for v in arguments
+    ]
     run.data["tool"] = {"name": name, "argv": diagnostic_argv(argv)}
     run.save()
     code = run_command(
@@ -727,225 +729,6 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
     return (*reports, semantic)
 
 
-def _ocr_report(result_path, plan_path, source, output, identifier, identities, code):
-    if code not in {0, 2} or not result_path.is_file():
-        return {}, None
-    payload = read_json(result_path)
-    if (
-        payload.get("schema_version") != "mdocr-result-2"
-        or payload.get("plan_sha256")
-        != hashlib.sha256(plan_path.read_bytes()).hexdigest()
-    ):
-        raise ValueError("OCR result is not bound to the plan")
-    records = payload["documents"]
-    if len(records) != 1 or records[0].get("document_id") != source:
-        raise ValueError("OCR result does not identify its planned source")
-    result = {**records[0], "document_id": identifier}
-    complete = (
-        code == 0 and payload.get("status") == result.get("status") == "completed"
-    )
-    if complete:
-        if result.get("output") != str(output) or not output.is_file():
-            raise ValueError("OCR output does not identify its planned destination")
-        if hashlib.sha256(output.read_bytes()).hexdigest() != result.get(
-            "output_sha256"
-        ):
-            raise ValueError("OCR output bytes disagree with result")
-        evidence = result["ocr"]
-        if evidence.get("contract") != "mdocr-ocr-2":
-            raise ValueError("OCR evidence has the wrong contract")
-        images = evidence["images"]
-        for image in images:
-            for path_key, digest_key in (
-                ("source_path", "source_sha256"),
-                ("artifact", "artifact_sha256"),
-            ):
-                if hashlib.sha256(
-                    Path(image[path_key]).read_bytes()
-                ).hexdigest() != image.get(digest_key):
-                    raise ValueError("OCR evidence bytes disagree with result")
-        by_id = {image["resource_id"]: image for image in images}
-        for resource in result.get("resources", []):
-            if resource["resource_id"] in by_id:
-                resource["artifact"] = by_id[resource["resource_id"]]["artifact"]
-        for resource in [*result.get("resources", []), *images]:
-            key = resource["resource_id"]
-            resource["resource_id"] = identities.get(key, key)
-    else:
-        result.update(status="partial", output=None)
-        result.pop("ocr", None)
-    return result, next(iter(payload.get("causes", [])), None)
-
-
-def _saved_ocr(previous, row, identifier):
-    try:
-        request = read_json(Path(previous["input"]))
-        report = read_json(Path(previous["report"]))
-        if (
-            request.get("schema") != "dogpdkb-ocr-request-2"
-            or report.get("schema_version") != "mdocr-result-2"
-        ):
-            return None
-        (document,) = request["documents"]
-        (result,) = report["documents"]
-        if document["document_id"] != identifier or result["document_id"] != identifier:
-            return None
-        if (
-            hashlib.sha256(Path(row["raw_path"]).read_bytes()).hexdigest()
-            != document["source_sha256"]
-        ):
-            return None
-        if result["status"] != "completed":
-            return None
-        if hashlib.sha256(
-            Path(result["output"]).read_bytes()
-        ).hexdigest() != result.get("output_sha256"):
-            return None
-        return result
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-
-
-def ocr_inputs(settings, book, store, run, rows):
-    from dogpdkb.inputs import ocr_request_input
-
-    run.stage("ocr", total=len(rows))
-    results, stop = {}, None
-    deadline = time.monotonic() + settings.ocr_budget_seconds
-    for index, row in enumerate(rows):
-        validate_inputs([row])
-        identifier, version = row["document_id"], row["version"]
-        if row["action"] in {"retain", "defer", "reuse", "metadata"}:
-            continue
-        previous = store.step(identifier, "ocr")
-        if (
-            previous
-            and previous.get("status") == "completed"
-            and previous.get("exit_code") == 0
-            and same_version(previous["version"], version)
-        ):
-            saved = _saved_ocr(previous, row, identifier)
-            if saved is not None:
-                results[identifier] = saved
-                continue
-        if store.suppressed(identifier, "ocr", version):
-            failure(run, row, "ocr", "VERSION_ATTEMPT_SUPPRESSED")
-            continue
-        remaining = deadline - time.monotonic()
-        if stop or remaining <= 0:
-            results[identifier] = {"document_id": identifier, "status": "unattempted"}
-            failure(
-                run, row, "ocr", stop or "BATCH_DEADLINE_EXCEEDED", status="unattempted"
-            )
-            continue
-        source, selected, identities = ocr_request_input(row, run)
-        source = str(Path(source).resolve())
-        request = run.directory / f"ocr-{index}-request.json"
-        plan = run.directory / f"ocr-{index}-plan.json"
-        report = run.directory / f"ocr-{index}-report.json"
-        bound_report = run.directory / f"ocr-{index}-retained.json"
-        output = run.directory / "ocr" / str(index) / "document.md"
-        atomic_json(
-            request,
-            {
-                "schema": "dogpdkb-ocr-request-2",
-                "documents": [
-                    {
-                        "document_id": identifier,
-                        "path": source,
-                        "source_sha256": hashlib.sha256(
-                            Path(row["raw_path"]).read_bytes()
-                        ).hexdigest(),
-                    }
-                ],
-            },
-        )
-        args = [
-            "plan",
-            "--mode",
-            "paddle",
-            "--input",
-            source,
-            "--output",
-            output,
-            "--plan",
-            plan,
-            "--cache-dir",
-            settings.ocr_cache,
-            "--download",
-            "--max-seconds",
-            remaining,
-        ]
-        if selected is not None:
-            selection = run.directory / f"ocr-{index}-selection.json"
-            atomic_json(selection, {source: selected})
-            args += ["--selection", selection]
-        store.attempt(
-            identifier,
-            "ocr",
-            version,
-            run.id,
-            input=str(request),
-            report=str(bound_report),
-        )
-        code = call_tool(settings, run, "mdocr", args)
-        if code == 0:
-            code = call_tool(
-                settings, run, "mdocr", ["run", "--plan", plan, "--result", report]
-            )
-        try:
-            validate_inputs([row])
-        except ValueError:
-            store.complete(
-                identifier,
-                "ocr",
-                version,
-                "unknown",
-                run.id,
-                report=str(report),
-                input=str(request),
-                exit_code=code,
-            )
-            failure(run, row, "ocr", "PLAN_INPUT_CHANGED", report=str(report))
-            raise
-        result = {}
-        try:
-            result, stop = _ocr_report(
-                report, plan, source, output, identifier, identities, code
-            )
-        except (OSError, ValueError, KeyError, TypeError):
-            failure(run, row, "ocr", "OCR_RESULT_BINDING_INVALID", report=str(report))
-        run.data["artifacts"]["ocr_report"] = str(report)
-        run.save()
-        if result:
-            results[identifier] = result
-            atomic_json(
-                bound_report,
-                {"schema_version": "mdocr-result-2", "documents": [result]},
-            )
-        complete = result.get("status") == "completed"
-        store.complete(
-            identifier,
-            "ocr",
-            version,
-            "completed" if complete else "failed" if result else "unknown",
-            run.id,
-            report=str(bound_report),
-            input=str(request),
-            exit_code=code,
-        )
-        if not complete:
-            failure(
-                run,
-                row,
-                "ocr",
-                "OCR_PARTIAL_OR_UNKNOWN",
-                report=str(report),
-                exit_code=code,
-            )
-    return results
-
-
 def prepare_publication(book, store, run, rows, results):
     """Freeze the complete publication handoff before replacing any corpus file."""
     published = []
@@ -998,13 +781,19 @@ def prepare_publication(book, store, run, rows, results):
                 if resource.get("resource_id") in images:
                     resource["path"] = images[resource["resource_id"]]["source_path"]
         action = row["action"]
+        reasons = row["reason_codes"]
+        if row.get("retry_ocr") and evidence and evidence["images"]:
+            action = "compile"
+            reasons = [*reasons, "OCR_ENRICHMENT_ADDED"]
         metadata = descriptor(book, row, output)["metadata"]
         document = {
             "version": row["version"],
             "path": str(output),
             "metadata": metadata,
             "input_copy": str(witness),
+            "input_copy_sha256": hashlib.sha256(witness.read_bytes()).hexdigest(),
             "resources": resources,
+            "ocr_status": result.get("status", "not_selected"),
         }
         if evidence:
             document["ocr"] = evidence
@@ -1018,7 +807,7 @@ def prepare_publication(book, store, run, rows, results):
                 "baseline_version": row["baseline"].get("version"),
                 "pending_metadata": row.get("metadata", {}),
                 "pending_steps": [],  # Image/OCR enrichment is advisory.
-                "reason_codes": row["reason_codes"],
+                "reason_codes": reasons,
             }
         )
     if baseline_saved:
@@ -1042,6 +831,11 @@ def validate_publication_target(document):
     if output.is_symlink():
         raise ValueError("refusing corpus symlink replacement")
     expected = Path(document["input_copy"]).read_bytes()
+    if document.get("input_copy_sha256") not in (
+        None,
+        hashlib.sha256(expected).hexdigest(),
+    ):
+        raise ValueError("publication witness changed; generate a new plan")
     if output.is_file():
         current = output.read_bytes()
         before = document.get("before_copy")
@@ -1116,6 +910,8 @@ def publish_corpus(book, store, run, plan, publication):
                     "path",
                     "metadata",
                     "input_copy",
+                    "input_copy_sha256",
+                    "ocr_status",
                     "resources",
                     "ocr",
                 )

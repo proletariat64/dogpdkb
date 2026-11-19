@@ -357,6 +357,13 @@ def _select(current, prior, documents, *, yuque):
             ignored.append(doc_id)
         else:
             reasons.append("new")
+        corpus = local.get("corpus", {})
+        if (
+            corpus.get("ocr_status") == "unattempted"
+            and corpus.get("version")
+            and _same(corpus["version"], row["version"])
+        ):
+            reasons.append("ocr_unattempted")
         pending = local.get("pending")
         if pending and _same(pending["version"], row["version"]):
             reasons = list(dict.fromkeys([*reasons, *pending["reasons"]]))

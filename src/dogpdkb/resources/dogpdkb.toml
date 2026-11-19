@@ -17,7 +17,11 @@ ocr_cache = "ocr-cache"
 # body_recovery = "body-recovery.json"
 
 [ocr]
-# Passed to mdocr's best-effort batch CLI; in-flight calls retain tool timeouts.
+# Default LLM uses OpenAI Pi OAuth; set mode = "paddle" to opt in to Paddle.
+# mode = "llm"
+# OCR request limit for the whole batch. Omit for unlimited; 0 sends nothing new.
+# request_budget = 20
+# Admission deadline. In-flight calls retain tool-owned timeouts.
 budget_seconds = 1800
 
 [semantic_score]

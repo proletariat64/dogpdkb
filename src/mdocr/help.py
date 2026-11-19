@@ -56,6 +56,8 @@ PLAN_FULL = """Plan controls:
   mdocr-plan-2 binds source bytes, image occurrences and witnesses, settings,
   and destinations. --selection is a JSON object mapping absolute input
   paths to lists of selected image targets; an empty list selects none.
+  With --download, --download-list restricts remote downloads to a JSON array
+  of absolute input paths. Other documents may still OCR local images.
   --mode llm defaults to openai/gpt-6.1-terra with medium effort. Use
   --model provider/model, --effort, and --prompt-file to override. The response
   schema stays code-owned. --token-budget and --request-budget are run-wide

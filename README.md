@@ -139,11 +139,19 @@ purge 只删除所选 book 的 wash，包括失败材料和运行记录；正式
 `apply`/`sync` consume the independent offline `mdcompare semantic` CLI as the
 body-routing authority: **NEW / CHANGED / UNCERTAIN → compile; demonstrated
 EQUIVALENT → reuse/metadata; UNAVAILABLE → defer**. Authored deletions compile.
-Image changes and OCR failures/results are advisory and never promote equivalent
-body text to compilation. Equivalent documents do not start fresh OCR. Usable
-uncertainty compiles without a model, manual approval or hidden network call.
+Image changes and OCR failures do not change authored-text classification. A
+later OCR success for previously unattempted work can make an equivalent body
+eligible for compilation. Usable uncertainty routes to compile without scoring,
+manual approval or a hidden network call.
 Missing or malformed authoritative reports stop explicitly rather than falling
 back to legacy knowledge advice. Baseline-only IDs never imply remote deletion.
+
+OCR uses one `mdocr` plan for each batch, defaulting to OpenAI Pi OAuth
+(`openai/gpt-6.1-terra`, medium, concurrency 3). Set `[ocr].mode = "paddle"`
+to use Paddle explicitly. `[ocr].request_budget` is independent of scoring:
+omit it for unlimited requests or set it to 0 to prohibit new requests.
+Incomplete OCR publishes the usable raw body without claiming OCR success.
+Original v2 evidence is retained under `state/<book>/ocr/<run>/` outside wash.
 
 Complete `mdcompare-semantic-diff-1` evidence is streamed per document and indexed
 outside wash under `state/<book>/semantic/<run>/`. Preserve the index and its

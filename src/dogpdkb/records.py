@@ -217,7 +217,12 @@ class Store:
         blocked = document.setdefault("blocked_versions", {}).setdefault(name, {})
         if status in {"running", "failed", "unknown"}:
             blocked[key] = {"status": status, "run_id": run_id}
-        elif status == "completed":
+        elif status == "completed" or (
+            name == "ocr"
+            and status == "skipped"
+            and details.get("send_state") == "not_sent"
+            and blocked.get(key, {}).get("run_id") == run_id
+        ):
             blocked.pop(key, None)
         return record
 
