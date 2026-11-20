@@ -23,9 +23,15 @@ def setup_local(root):
     return config, source
 
 
-def test_each_stop_resumes_the_same_frozen_run(tmp_path):
+@pytest.mark.parametrize("frozen_budget", [None, 512])
+def test_each_stop_resumes_the_same_frozen_run(tmp_path, frozen_budget):
     config, source = setup_local(tmp_path)
     (source / "doc.md").write_text("# Frozen body\n")
+    original_config = config.read_text()
+    if frozen_budget is not None:
+        config.write_text(
+            original_config + f"\n[graphify]\ntoken_budget={frozen_budget}\n"
+        )
     args = ("sync", "--config", config)
     path, collect = run_data(
         cli(tmp_path, *args, "--dir", source, "--stop-after", "collect")
@@ -34,7 +40,11 @@ def test_each_stop_resumes_the_same_frozen_run(tmp_path):
     assert "prepared_inputs" in collect["artifacts"]
     assert "semantic" not in collect["artifacts"]
     source.rename(tmp_path / "moved")
-    config.write_text(config.read_text() + '\n[ocr]\nmode="paddle"\nrequest_budget=0\n')
+    config.write_text(
+        original_config
+        + '\n[ocr]\nmode="paddle"\nrequest_budget=0\n'
+        + ("\n[graphify]\ntoken_budget=1024\n" if frozen_budget is None else "")
+    )
     resume = (*args, "--resume", path)
     _, plan = run_data(cli(tmp_path, *resume, "--stop-after", "plan"))
     assert plan["status"] == "paused"
@@ -61,10 +71,17 @@ def test_each_stop_resumes_the_same_frozen_run(tmp_path):
         for r in (ocr, corpus)
     )
     calls = [
-        json.loads(l)[:2]
-        for l in (tmp_path / "commands.jsonl").read_text().splitlines()
+        json.loads(l) for l in (tmp_path / "commands.jsonl").read_text().splitlines()
     ]
-    assert calls == [["mdocr", "plan"], ["mdocr", "run"], ["graphify", "extract"]]
+    assert [c[:2] for c in calls] == [
+        ["mdocr", "plan"],
+        ["mdocr", "run"],
+        ["graphify", "extract"],
+    ]
+    if frozen_budget is None:
+        assert "--token-budget" not in calls[-1]
+    else:
+        assert calls[-1][-2:] == ["--token-budget", str(frozen_budget)]
 
 
 def test_changed_plan_handoff_fails_before_ocr(tmp_path):

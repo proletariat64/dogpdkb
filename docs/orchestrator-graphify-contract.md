@@ -28,7 +28,8 @@ uses its 60,000-token default. It sizes chunks by estimated input tokens,
 not by document count, total tokens/cost or output tokens. A smaller value can
 reduce file omissions in otherwise valid responses, at the cost of more chunks;
 it does not guarantee coverage. The configured value is recorded separately
-from sanitized argv as `graphify_token_budget` (null when unset). An explicit
+from sanitized argv as `graphify_token_budget` (null when unset). A normal
+`sync --resume` keeps the original budget, including an unset budget. An explicit
 `--retry-graph` may change this execution setting without changing the sealed
 input scope. Native cache reads and publication proof remain active.
 
