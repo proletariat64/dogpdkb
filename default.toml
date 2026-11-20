@@ -27,6 +27,10 @@ graphify = "graphify"
 # ["node", "/opt/pi-skylark/dist/cli.mjs"].
 skylark = "skylark"
 
+[graphify]
+# Optional native semantic chunk input-token estimate; unset uses 60000.
+# token_budget = 16000
+
 [ocr]
 # Default LLM uses OpenAI Pi OAuth; set mode = "paddle" to opt in to Paddle.
 # mode = "llm"

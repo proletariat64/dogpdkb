@@ -105,6 +105,7 @@ class Settings:
     semantic_score_model: str | None = None
     ocr_mode: str = "llm"
     ocr_request_budget: int | None = None
+    graphify_token_budget: int | None = None
 
     def ocr_policy(self) -> dict:
         llm = self.ocr_mode == "llm"
@@ -251,6 +252,11 @@ def load_config(path: Path | str | None = None) -> Settings:
         raise ConfigError("ocr.mode: expected llm or paddle")
     if ocr_requests is not None and (type(ocr_requests) is not int or ocr_requests < 0):
         raise ConfigError("ocr.request_budget: expected a nonnegative integer")
+    graphify_budget = data.get("graphify", {}).get("token_budget")
+    if graphify_budget is not None and (
+        type(graphify_budget) is not int or graphify_budget <= 0
+    ):
+        raise ConfigError("graphify.token_budget: expected a positive integer")
     return Settings(
         file=selected,
         books_file=(selected.parent / Path(books).expanduser()).resolve(),
@@ -271,6 +277,7 @@ def load_config(path: Path | str | None = None) -> Settings:
         ocr_budget_seconds=number("ocr", "budget_seconds", 1800),
         ocr_mode=ocr_mode,
         ocr_request_budget=ocr_requests,
+        graphify_token_budget=graphify_budget,
         body_recovery=configured_path("body_recovery"),
         semantic_score_request_budget=score_requests,
         semantic_score_model=model,

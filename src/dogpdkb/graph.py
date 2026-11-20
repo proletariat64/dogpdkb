@@ -106,8 +106,8 @@ _NATIVE_ENV = {
 }
 
 
-def _native_extract(command, corpus, workspace):
-    return [
+def _native_extract(command, corpus, workspace, token_budget):
+    argv = [
         *command,
         "extract",
         str(corpus),
@@ -119,9 +119,12 @@ def _native_extract(command, corpus, workspace):
         "--max-concurrency",
         "3",
     ]
+    if token_budget is not None:
+        argv.extend(["--token-budget", str(token_budget)])
+    return argv
 
 
-def _native_preflight(command, workspace):
+def _native_preflight(command, workspace, token_budget):
     """Check the attested CLI protocol without reading live credentials or documents."""
     isolated = {
         **_NATIVE_ENV,
@@ -146,7 +149,7 @@ def _native_preflight(command, workspace):
     )
     log = workspace / "capability.log"
     code = run_command(
-        _native_extract(command, probe, workspace / "capability-output"),
+        _native_extract(command, probe, workspace / "capability-output", token_budget),
         log=log,
         cwd=workspace,
         timeout=15,
@@ -775,7 +778,8 @@ def run_graph(
             raise ValueError("saved graph input tree changed; generate a new plan")
         run.save(durable=True)
     command = settings.command("graphify")
-    preflight, preflight_log = _native_preflight(command, workspace)
+    token_budget = settings.graphify_token_budget
+    preflight, preflight_log = _native_preflight(command, workspace, token_budget)
     if preflight:
         run.failure(
             step="graph",
@@ -819,7 +823,7 @@ def run_graph(
         durable=True,
     )
     run.stage("graphify", total=len(pending), completed=0, failed=0, phase="tools")
-    argv = _native_extract(command, corpus, workspace)
+    argv = _native_extract(command, corpus, workspace, token_budget)
     log = workspace / "extract.log"
     code = run_command(
         argv,
@@ -875,6 +879,7 @@ def run_graph(
         "input_sha256": snapshot,
         "corpus": str(corpus),
         "graphify_inputs": graphify_inputs,
+        "graphify_token_budget": token_budget,
         "omitted_deferred_sources": sorted(omitted),
         "reason": reason,
     }

@@ -204,8 +204,14 @@ def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):
     assert graph["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
 
 
-def test_complete_source_calls_only_public_graphify_and_records_success(tmp_path):
+@pytest.mark.parametrize("budget", [None, 16000])
+def test_complete_source_calls_only_public_graphify_and_records_success(
+    tmp_path, budget
+):
     config, manifest, source = fixture(tmp_path)
+    if budget is not None:
+        with config.open("a") as stream:
+            stream.write(f"\n[graphify]\ntoken_budget = {budget}\n")
     result = cli(config, manifest)
     assert result.returncode == 0, result.stdout + result.stderr
     calls = [
@@ -215,12 +221,29 @@ def test_complete_source_calls_only_public_graphify_and_records_success(tmp_path
     assert Path(calls[0][1]) != source.parent
     assert (Path(calls[0][1]) / source.name).read_bytes() == source.read_bytes()
     assert "--no-cluster" in calls[0]
+    if budget is None:
+        assert "--token-budget" not in calls[0]
+    else:
+        assert calls[0][-2:] == ["--token-budget", str(budget)]
     state = json.loads((tmp_path / "state/funds/state.json").read_text())["documents"][
         "42"
     ]
     assert state["graph"]["version"] == VERSION
     assert state["steps"]["graph"]["status"] == "completed"
     assert not state.get("pending")
+
+
+@pytest.mark.parametrize("budget", ['"512"', "true", "512.0", "0", "-1"])
+def test_invalid_graphify_token_budget_fails_before_extraction(tmp_path, budget):
+    config, manifest, _ = fixture(tmp_path)
+    with config.open("a") as stream:
+        stream.write(f"\n[graphify]\ntoken_budget = {budget}\n")
+
+    result = cli(config, manifest)
+
+    assert result.returncode == 1
+    assert "graphify.token_budget: expected a positive integer" in result.stderr
+    assert not list(manifest.parent.glob("graphify-*"))
 
 
 def test_source_failure_keeps_graph_version_and_is_not_retried(tmp_path):
@@ -839,7 +862,7 @@ def test_original_graphify_incremental_directory_preserves_other_sources(tmp_pat
         server.server_close()
 
 
-def test_installed_graphify_oauth_parallelism_caps_inflight_chunks_at_three(tmp_path):
+def test_installed_graphify_budget_recovers_omissions_with_three_inflight(tmp_path):
     import shutil
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -847,11 +870,44 @@ def test_installed_graphify_oauth_parallelism_caps_inflight_chunks_at_three(tmp_
     executable = shutil.which("graphify")
     if not executable:
         pytest.skip("patched Graphify CLI is not installed")
-    corpus = tmp_path / "corpus"
-    corpus.mkdir()
-    names = {f"source-{i}.md" for i in range(5)}
-    for name in names:
-        (corpus / name).write_text(f"# {name}\n\n" + "knowledge topic sentence. " * 120)
+    config, manifest, source = fixture(tmp_path)
+    corpus = source.parent
+    batch = json.loads(manifest.read_text())
+    first = batch["documents"][0]
+    state_path = tmp_path / "state/funds/state.json"
+    state = json.loads(state_path.read_text())
+    for index in range(5):
+        doc_id = str(42 + index)
+        path = corpus / f"source-{index}.md" if index else source
+        witness = manifest.parent / f"published/{index}.md"
+        path.write_text(f"# {path.name}\n\n" + "knowledge topic sentence. " * 120)
+        witness.write_bytes(path.read_bytes())
+        if index:
+            batch["documents"].append(
+                {
+                    **first,
+                    "document_id": doc_id,
+                    "path": str(path),
+                    "input_copy": str(witness),
+                }
+            )
+            state["documents"][doc_id] = {
+                **state["documents"]["42"],
+                "corpus": {
+                    **state["documents"]["42"]["corpus"],
+                    "path": str(path),
+                    "input_copy": str(witness),
+                },
+            }
+    write(manifest, batch)
+    write(state_path, state)
+    config.write_text(
+        config.read_text().split("[tools]")[0]
+        + "[tools]\ngraphify="
+        + json.dumps(executable)
+        + "\n"
+    )
+    names = {Path(row["path"]).name for row in batch["documents"]}
     condition = threading.Condition()
     dispatched = []
     peak = active = 0
@@ -870,9 +926,10 @@ def test_installed_graphify_oauth_parallelism_caps_inflight_chunks_at_three(tmp_
                 active += 1
                 peak = max(peak, active)
                 condition.notify_all()
-                if condition.wait_for(lambda: peak >= 3, timeout=1):
+                if len(found) == 1 and condition.wait_for(lambda: peak >= 3, timeout=1):
                     condition.wait_for(lambda: peak > 3, timeout=0.2)
                 active -= 1
+            # A well-formed response that omits files only when batched together.
             result = graphify_sse(
                 [
                     {
@@ -881,7 +938,7 @@ def test_installed_graphify_oauth_parallelism_caps_inflight_chunks_at_three(tmp_
                         "source_file": name,
                         "file_type": "concept",
                     }
-                    for name in found
+                    for name in sorted(found)[:1]
                 ]
             )
             self.send_response(200)
@@ -893,33 +950,49 @@ def test_installed_graphify_oauth_parallelism_caps_inflight_chunks_at_three(tmp_
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        result = subprocess.run(
-            [
-                executable,
-                "extract",
-                str(corpus),
-                "--no-cluster",
-                "--backend",
-                "openai-oauth",
-                "--max-concurrency",
-                "3",
-                "--token-budget",
-                "512",
-            ],
-            env={
-                **graphify_offline_env(tmp_path, server.server_port),
-                "GRAPHIFY_OPENAI_OAUTH_PARALLEL": "1",
-            },
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=15,
+        environment = graphify_offline_env(tmp_path, server.server_port)
+        result = cli(config, manifest, environment)
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert dispatched == [names]
+        failed = json.loads(
+            next(manifest.parent.glob("graphify-*/result.json")).read_text()
         )
+        assert failed["exit_code"] == 0
+        assert "GRAPHIFY_INCOMPLETE_EXTRACTION" in failed["reason"]
+        log = Path(failed["native_log"]).read_text()
+        assert "chunk 1/1 done" in log
+        assert (
+            "4 dispatched file(s) produced no nodes and 0 came back truncated or hollow"
+            in log
+        )
+        public_graph = corpus / "graphify-out/graph.json"
+        assert not public_graph.exists()
+        assert all(
+            not row.get("graph")
+            for row in json.loads(state_path.read_text())["documents"].values()
+        )
+        assert cli(config, manifest, environment).returncode == 2
+        assert dispatched == [names]  # same-version suppression still applies
+
+        with config.open("a") as stream:
+            stream.write("\n[graphify]\ntoken_budget = 512\n")
+        dispatched.clear()
+        peak = 0
+        result = cli(config, manifest, environment, retry_graph=True)
         assert result.returncode == 0, result.stdout + result.stderr
         assert len(dispatched) == len(names)
         assert set.union(*dispatched) == names
         assert peak == 3
-        assert "chunk 5/5 done" in result.stdout
+        assert {
+            n["source_file"] for n in json.loads(public_graph.read_text())["nodes"]
+        } == names
+        documents = json.loads(state_path.read_text())["documents"]
+        assert all(
+            row["steps"]["graph"]["status"] == "completed" for row in documents.values()
+        )
+        report = json.loads(Path(documents["42"]["graph"]["report"]).read_text())
+        assert report["graphify_token_budget"] == 512
+        assert "chunk 5/5 done" in Path(report["native_log"]).read_text()
     finally:
         server.shutdown()
         server.server_close()
