@@ -31,8 +31,9 @@ verifiable against their legacy plan and schema. Do not create replacement plans
 replay previously unknown admissions.
 A failed `svg_profile_cleanup_failed` occurrence can carry `send_state: "not_sent"`
 only when every admission for the image key failed before a provider request.
-Missing `send_state` is not proof of no send, including after a prior fixable failure.
-
+Admissions carry `source_sha256` so the orchestrator can check the claim against
+all attempts for the frozen image in the sealed native journal. Missing or
+contradictory history is not proof of no send. A cache hit alone is not a send.
 
 The orchestrator passes `[ocr].concurrency` to `mdocr plan --concurrency`
 (1-100, default 3). mdocr may lower the active limit after throttling.

@@ -257,7 +257,7 @@ raise SystemExit(main())
 def test_cleanup_failure_proves_unsent_only_without_an_earlier_send(
     tmp_path, earlier_send
 ):
-    from dogpdkb.ocr_batch import _load_plan, _verified_result
+    from dogpdkb.ocr_batch import _load_plan, _request_history, _verified_result
 
     config, differences = _native_instance(tmp_path)
     config.write_text(
@@ -289,9 +289,37 @@ def test_cleanup_failure_proves_unsent_only_without_an_earlier_send(
         None if earlier_send else "not_sent"
     )
     expected = ("failed", "settled") if earlier_send else ("skipped", "not_sent")
-    assert (
-        _verified_result(root, plan, docs[entry["path"]], entry, row)[1:3] == expected
-    )
+    history = _request_history(report)
+    doc = docs[entry["path"]]
+    assert _verified_result(root, plan, doc, entry, row, history)[1:3] == expected
+    row["resources"][0]["send_state"] = "not_sent"
+    if earlier_send:
+        with pytest.raises(ValueError, match="Invalid OCR pre-send occurrence"):
+            _verified_result(root, plan, doc, entry, row, history)
+    else:
+        other = next(d for d in docs.values() if d is not doc)
+        (reused,) = other["images"]
+        doc["images"].append({**reused, "id": "cached-peer"})
+        original = next(e for e in request["documents"] if e is not entry)
+        entry["assets"].update(original["assets"])
+        row["resources"].append(
+            {
+                "id": "cached-peer",
+                "resource_id": reused["resource_id"],
+                "status": "reused",
+            }
+        )
+        assert _verified_result(root, plan, doc, entry, row, history)[1:3] == (
+            "failed",
+            "settled",
+        )
+        history.pop(reused["sha256"])
+        assert _verified_result(root, plan, doc, entry, row, history)[1:3] == (
+            "skipped",
+            "not_sent",
+        )
+        with pytest.raises(ValueError, match="Invalid OCR pre-send occurrence"):
+            _verified_result(root, plan, doc, entry, row)
     assert len((tmp_path / "requests").read_text().splitlines()) == 1
 
 

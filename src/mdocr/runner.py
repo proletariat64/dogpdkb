@@ -351,6 +351,11 @@ class Execution:
         if (
             not self.latest.keys() <= jobs.keys()
             or not self.repair_attempts.keys() <= jobs.keys()
+            or any(
+                "source_sha256" in attempt
+                and attempt["source_sha256"] != jobs[attempt["key"]]["sha256"]
+                for attempt in self.state["requests"]
+            )
         ):
             raise ValueError(
                 "saved OCR request identities do not match this runtime; no requests sent"
@@ -561,7 +566,12 @@ class Execution:
         reservation = self.reserve()
         if reservation is None:
             return
-        attempt = {"key": key, "status": "admitted", "reserved_tokens": reservation}
+        attempt = {
+            "key": key,
+            "source_sha256": image["sha256"],
+            "status": "admitted",
+            "reserved_tokens": reservation,
+        }
         if repair is None:
             self.latest[key] = attempt
             if fix:
