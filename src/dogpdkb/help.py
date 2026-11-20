@@ -137,6 +137,8 @@ class HelpParser(argparse.ArgumentParser):
             if isinstance(action, argparse._SubParsersAction):
                 for choice in action._choices_actions:
                     choice.help = SUMMARIES.get(choice.dest, choice.help)
+            elif self.scope == "recover-ocr" and action.dest in {"run", "resume"}:
+                continue
             elif action.dest in ARGUMENTS:
                 action.help = ARGUMENTS[action.dest]
             elif action.dest == "input":

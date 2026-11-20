@@ -80,3 +80,48 @@ def test_attempt_history_accepts_known_failed_retry_but_not_clean_repair():
     journal["requests"][1] = success
     with pytest.raises(ValueError, match="invalid journal attempt history"):
         _validate_attempts(journal, settings)
+
+
+def test_attempt_history_preserves_fix_cap_across_ordinary_retry():
+    settings = {"request_budget": 4, "fix": 2}
+    failed = {"key": "key", "status": "failed", "reason": "response_json_invalid"}
+    fix = {**failed, "fix_round": 1}
+    journal = {
+        "requests": [failed, fix, failed, {**fix, "fix_round": 2}],
+        "budget": {"requests": 4},
+        "documents": [],
+    }
+    _validate_attempts(journal, settings)
+    journal["requests"][-1] = fix
+    with pytest.raises(ValueError, match="invalid journal attempt history"):
+        _validate_attempts(journal, settings)
+
+
+def test_failed_repair_does_not_enable_ordinary_retry():
+    settings = {"request_budget": 3, "mermaid_repair_rounds": 1}
+    warning = ["response_mermaid_syntax_invalid"]
+    patch = {
+        "kind": "text",
+        "markdown": "OCR text",
+        "uncertainty": "",
+        "warnings": warning,
+    }
+    success = {
+        "key": "key",
+        "status": "success",
+        "warnings": warning,
+        "patches": [patch],
+    }
+    failed = {
+        "key": "key",
+        "status": "failed",
+        "reason": "response_json_invalid",
+        "repair_round": 1,
+    }
+    journal = {
+        "requests": [success, failed, success],
+        "budget": {"requests": 3},
+        "documents": [],
+    }
+    with pytest.raises(ValueError, match="invalid journal attempt history"):
+        _validate_attempts(journal, settings)

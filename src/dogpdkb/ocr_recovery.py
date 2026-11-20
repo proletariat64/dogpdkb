@@ -44,12 +44,14 @@ _WITNESSES = {"request.json", "plan.json", _JOURNAL, "result.json"}
 def _source(store, run_id):
     if not re.fullmatch(r"run-\d{8}-\d{6}-[0-9a-f]{8}", run_id):
         raise ValueError("invalid source run ID")
-    run = Run.load(store, run_id)
     batches = store.path.parent / "ocr"
-    request_path = _path(
-        batches,
-        run.data["artifacts"].get("ocr_request", batches / run_id / "request.json"),
-    )
+    conventional = batches / run_id / "request.json"
+    run_path = store.runs / run_id / "run.json"
+    request = conventional
+    if run_path.exists():
+        run = Run.load(store, run_path)
+        request = run.data["artifacts"].get("ocr_request", conventional)
+    request_path = _path(batches, request)
     root = request_path.parent
     if request_path.name != "request.json" or root.parent != batches:
         raise ValueError("original OCR request must be a direct book batch artifact")
@@ -441,17 +443,22 @@ def resume(store, run_id):
         raise ValueError("run has no frozen OCR recovery publication")
     receipt = read_checkpoint(run, "ocr", "recovery")
     if "corpus" in run.data["checkpoints"]:
-        read_checkpoint(run, "corpus", "manifest")
+        from dogpdkb.graph import _manifest
+
+        data = read_checkpoint(run, "corpus", "manifest")
+        _manifest(store.settings, store.book, store, run, data)
         manifest = Path(run.data["artifacts"]["manifest"])
+        partial = any(
+            row["disposition"] == "partial" for row in receipt["documents"].values()
+        )
+        status = "partial" if partial else "completed"
+        if run.data["stage"] == "corpus" and run.data["status"] == "running":
+            run.finish(status, 2 if partial else 0)
         return {
             "run": str(run.path),
             "manifest": str(manifest),
             "manifest_sha256": file_digest(manifest),
-            "status": "partial"
-            if any(
-                row["disposition"] == "partial" for row in receipt["documents"].values()
-            )
-            else "completed",
+            "status": status,
         }
     snapshot = _check_receipt(store, receipt)
     report = read_checkpoint(run, "ocr", "assembly")
@@ -464,7 +471,8 @@ def changed_graph_scope(store, run, data):
     """Prove a new input identity, not a retry of an interrupted same-version body."""
     receipt = read_checkpoint(run, "ocr", "recovery")
     _check_receipt(store, receipt)
-    old = Run.load(store, receipt["source_run_id"])
+    old_path = store.runs / receipt["source_run_id"] / "run.json"
+    old = Run.load(store, old_path) if old_path.exists() else None
     scope = set()
     for row in data["documents"]:
         doc_id = row["document_id"]
@@ -479,6 +487,7 @@ def changed_graph_scope(store, run, data):
         step = store.step(doc_id, "graph") or {}
         if (
             not store.suppressed(doc_id, "graph", row["version"])
+            or old is None
             or step.get("run_id") != old.id
         ):
             continue

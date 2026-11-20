@@ -159,9 +159,25 @@ def test_offline_recovery_freezes_new_manifest_and_never_replays(tmp_path, pre_s
     assert commands.count(["mdocr", "run"]) == 2
     assert commands.count(["mdocr", "assemble"]) == 2
     assert commands.count(["graphify", "extract"]) == 1
+    # Simulate a crash after the manifest seal but before the terminal run write.
+    unfinished = read(proved["run"])
+    for key in ("exit_code", "ended_at"):
+        unfinished.pop(key)
+    unfinished["status"] = "running"
+    Path(proved["run"]).write_text(json.dumps(unfinished))
     replay = cli("recover-ocr", "--config", config, "--resume", manifest["run_id"])
     assert replay.returncode == 2, replay.stderr
     assert json.loads(replay.stdout)["manifest_sha256"] == proved["manifest_sha256"]
+    settled = read(proved["run"])
+    assert settled["exit_code"] == 2 and settled["ended_at"]
+    assert settled["graph_retry"] == unfinished["graph_retry"]
+    exact = changed[0].read_bytes()
+    changed[0].write_bytes(exact + b"\nunapproved edit\n")
+    drift = cli("recover-ocr", "--config", config, "--resume", manifest["run_id"])
+    assert drift.returncode == 1 and "corpus input changed" in drift.stderr
+    assert changed[0].read_bytes() == exact + b"\nunapproved edit\n"
+    assert read(proved["run"]) == settled
+    changed[0].write_bytes(exact)
     extracted = cli("update-graph", "--config", config, "--input", proved["manifest"])
     assert extracted.returncode == 2, extracted.stderr
     run = read(proved["run"])
@@ -207,3 +223,22 @@ def test_recovery_help_without_configuration():
     result = cli("recover-ocr", "--help", "--full")
     assert result.returncode == 0, result.stderr
     assert "Recovery does not dispatch OCR" in result.stdout
+    assert "prepare from the original sealed OCR run ID" in result.stdout
+
+
+def test_conventional_batch_prepares_after_wash_record_is_removed(tmp_path):
+    config, original_id, _ = recovery_case(tmp_path)
+    (tmp_path / "runs" / "funds" / original_id / "run.json").unlink()
+    result = cli(
+        "recover-ocr",
+        "--config",
+        config,
+        "--run",
+        original_id,
+        "--execution-version",
+        "0.3.4",
+        "--output-dir",
+        tmp_path / "private",
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["documents"]["replace"] == 1

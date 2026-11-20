@@ -26,7 +26,7 @@ def _validate_attempts(journal, settings):
         or (limit is not None and count > limit)
     ):
         raise ValueError("journal is not an incomplete admission history")
-    last_by_key = {}
+    last_by_key, fixes = {}, {}
     for attempt in attempts:
         key, status = attempt["key"], attempt["status"]
         if status not in {"success", "failed", "unknown", "admitted"}:
@@ -40,7 +40,7 @@ def _validate_attempts(journal, settings):
                 and "repair_round" not in last
                 and type(fix) is int
                 and 1 <= fix <= settings.get("fix", 0)
-                and fix == last.get("fix_round", 0) + 1
+                and fix == fixes.get(key, 0) + 1
                 and (
                     (
                         last["status"] == "failed"
@@ -67,11 +67,15 @@ def _validate_attempts(journal, settings):
                 and repair == last.get("repair_round", 0) + 1
             )
         else:
-            bounded = last is None or last["status"] == "failed"
+            bounded = last is None or (
+                last["status"] == "failed" and "repair_round" not in last
+            )
         if not bounded or (status != "success" and "patches" in attempt):
             raise ValueError("invalid journal attempt history")
         if status == "success":
             _patches(attempt["patches"], 1)
+        if "fix_round" in attempt:
+            fixes[key] = fix
         last_by_key[key] = attempt
     for key, entry in journal.get("reused", {}).items():
         if key != entry["key"] or entry["status"] != "reused":
