@@ -3,6 +3,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+from mdocr.assemble import _validate_attempts
+
 
 def cli(cwd, *args):
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
@@ -53,3 +57,26 @@ def test_assemble_help_is_offline():
     result = cli(Path.cwd(), "assemble", "--help")
     assert result.returncode == 0
     assert "--execution-version" in result.stdout
+
+
+def test_attempt_history_accepts_known_failed_retry_but_not_clean_repair():
+    settings = {"request_budget": 2, "mermaid_repair_rounds": 1}
+    patch = {"kind": "text", "markdown": "OCR text", "uncertainty": ""}
+    first = {"key": "key", "status": "failed", "reason": "response_json_invalid"}
+    success = {"key": "key", "status": "success", "patches": [patch]}
+    journal = {"requests": [first, success], "budget": {"requests": 2}, "documents": []}
+    _validate_attempts(journal, settings)
+    journal["requests"] = [success, {**success, "repair_round": 1}]
+    with pytest.raises(ValueError, match="invalid journal attempt history"):
+        _validate_attempts(journal, settings)
+    warning = ["response_mermaid_syntax_invalid"]
+    journal["requests"][0] = {
+        **success,
+        "warnings": warning,
+        "patches": [{**patch, "warnings": warning}],
+    }
+    _validate_attempts(journal, settings)
+    journal["requests"][0] = {"key": "key", "status": "unknown"}
+    journal["requests"][1] = success
+    with pytest.raises(ValueError, match="invalid journal attempt history"):
+        _validate_attempts(journal, settings)

@@ -5,6 +5,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from tests.test_orchestrator_apply_cli import cli
 from tests.test_wash_cleanup_cli import instance
 
@@ -13,7 +15,7 @@ def read(path):
     return json.loads(Path(path).read_bytes())
 
 
-def recovery_case(tmp_path):
+def recovery_case(tmp_path, *, pre_send=False):
     config, tool = instance(tmp_path)
     body = (
         tool.read_text()
@@ -30,7 +32,7 @@ def recovery_case(tmp_path):
         if doc['document_id'] in ('1', '3'):
             image = path.parent / (doc['document_id'] + '.png')
             image.write_bytes(doc['document_id'].encode())
-            path.write_text(path.read_text() + f'\\n![photo]({image.name})\\n')
+            path.write_text(path.read_text() + f'\\n![photo]({image.name})\\n[download]({image.name})\\n')
         rows.append({**doc,""",
     )
     body = body.replace(
@@ -54,6 +56,14 @@ def recovery_case(tmp_path):
     raise SystemExit(1)
 if tool in ('mdcompare', 'mdocr'):""",
     )
+    if pre_send:
+        body = body.replace(
+            "        e.state['requests'].append(item)",
+            """        item['source_sha256'] = job['sha256']
+        if item['status'] == 'admitted':
+            item.update(status='failed', reason='svg_profile_cleanup_failed')
+        e.state['requests'].append(item)""",
+        )
     tool.write_text(body)
     interrupted = cli("sync", "--config", config, "--stop-after", "corpus")
     assert interrupted.returncode == 0, interrupted.stderr
@@ -63,8 +73,9 @@ if tool in ('mdcompare', 'mdocr'):""",
     return config, old["run_id"], original
 
 
-def test_offline_recovery_freezes_new_manifest_and_never_replays(tmp_path):
-    config, original_id, original = recovery_case(tmp_path)
+@pytest.mark.parametrize("pre_send", [False, True])
+def test_offline_recovery_freezes_new_manifest_and_never_replays(tmp_path, pre_send):
+    config, original_id, original = recovery_case(tmp_path, pre_send=pre_send)
     witnesses = {p: p.read_bytes() for p in original.glob("*.json")}
     graph = tmp_path / "corpus/graphify-out/graph.json"
     graph_before = graph.read_bytes()
@@ -84,7 +95,10 @@ def test_offline_recovery_freezes_new_manifest_and_never_replays(tmp_path):
     )
     assert prepared.returncode == 0, prepared.stderr
     approval = json.loads(prepared.stdout)
-    assert approval["requests"] == {"success": 1, "admitted": 1}
+    assert approval["requests"] == {
+        "success": 1,
+        "failed" if pre_send else "admitted": 1,
+    }
     assert approval["documents"] == {"replace": 1, "unchanged": 1, "partial": 1}
     assert all(p.read_bytes() == data for p, data in md_before.items())
     assert graph.read_bytes() == graph_before
@@ -135,6 +149,8 @@ def test_offline_recovery_freezes_new_manifest_and_never_replays(tmp_path):
     changed = [p for p, data in md_before.items() if p.read_bytes() != data]
     assert len(changed) == 1 and b"Known OCR phrase." in changed[0].read_bytes()
     assert graph.read_bytes() == graph_before
+    link = changed[0].read_text().split("[download](", 1)[1].split(")", 1)[0]
+    assert Path(link).is_absolute() and Path(link).read_bytes() == b"1"
     assert all(p.read_bytes() == data for p, data in witnesses.items())
     commands = [
         json.loads(line)[:2]
@@ -161,6 +177,9 @@ def test_offline_recovery_freezes_new_manifest_and_never_replays(tmp_path):
     relative = Path(deferred["path"]).name
     assert native_after[relative] == native_before[relative]
     assert run["counts"]["completed"] == 1
+    replay = cli("recover-ocr", "--config", config, "--resume", manifest["run_id"])
+    assert replay.returncode == 2, replay.stderr
+    assert read(proved["run"]) == run
     assert all(p.read_bytes() == data for p, data in witnesses.items())
 
 
@@ -182,3 +201,9 @@ def test_source_witness_tamper_is_rejected_before_assembly(tmp_path):
     assert result.returncode == 1
     assert "OCR witness changed" in result.stderr
     assert not (tmp_path / "private").exists()
+
+
+def test_recovery_help_without_configuration():
+    result = cli("recover-ocr", "--help", "--full")
+    assert result.returncode == 0, result.stderr
+    assert "Recovery does not dispatch OCR" in result.stdout

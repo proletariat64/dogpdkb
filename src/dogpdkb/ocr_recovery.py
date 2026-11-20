@@ -13,14 +13,17 @@ from dogpdkb.apply import (
     seal_corpus,
 )
 from dogpdkb.help import HelpParser
+from dogpdkb.inputs import publication_body
 from dogpdkb.ocr_batch import (
     _index,
     _load_plan,
     _path,
+    _request_history,
     _settled_report,
     _tool_result,
     _verified_result,
     _verify_running_journal,
+    digest,
     file_digest,
 )
 from dogpdkb.phases import (
@@ -41,7 +44,15 @@ _WITNESSES = {"request.json", "plan.json", _JOURNAL, "result.json"}
 def _source(store, run_id):
     if not re.fullmatch(r"run-\d{8}-\d{6}-[0-9a-f]{8}", run_id):
         raise ValueError("invalid source run ID")
-    root = _path(store.path.parent / "ocr", store.path.parent / "ocr" / run_id)
+    run = Run.load(store, run_id)
+    batches = store.path.parent / "ocr"
+    request_path = _path(
+        batches,
+        run.data["artifacts"].get("ocr_request", batches / run_id / "request.json"),
+    )
+    root = request_path.parent
+    if request_path.name != "request.json" or root.parent != batches:
+        raise ValueError("original OCR request must be a direct book batch artifact")
     seal_path = _path(root, root / "settled.json")
     seal_hash = file_digest(seal_path)
     seal = read_json(seal_path)
@@ -150,6 +161,7 @@ def _read_assembly(source, hashes, request, plan, docs, state, directory, versio
             {**doc, "output": str(directory / "documents" / f"{pos}.md")},
             entry,
             row,
+            request_history=lambda: _request_history(report),
             output_root=directory,
         )
         results[entry["document_id"]] = result
@@ -162,9 +174,18 @@ def _snapshot(store, request, results):
         identifier = entry["document_id"]
         baseline = _baseline(store, entry)
         result = results[identifier]
+        output_sha = (
+            digest(
+                publication_body(
+                    Path(result["output"]), baseline["raw"]["resources"], result
+                )
+            )
+            if result
+            else None
+        )
         if result is None:
             disposition = "partial"
-        elif result["output_sha256"] == baseline["corpus_sha256"]:
+        elif output_sha == baseline["corpus_sha256"]:
             disposition = "unchanged"
         elif result["ocr"]["images"]:
             if baseline["corpus"].get("ocr"):
@@ -179,7 +200,7 @@ def _snapshot(store, request, results):
         rows[identifier] = {
             "disposition": disposition,
             "baseline": baseline,
-            "output_sha256": result["output_sha256"] if result else None,
+            "output_sha256": output_sha,
         }
     return rows
 
@@ -301,6 +322,14 @@ def _freeze_publication(store, run, receipt, snapshot, results):
         rows.append(row)
         if disposition == "replace":
             replacements.append(row)
+            result = results[identifier]
+            target = run.directory / "recovery-publication" / f"{len(replacements)}.md"
+            body = publication_body(Path(result["output"]), raw["resources"], result)
+            if digest(body) != saved["output_sha256"]:
+                raise ValueError("publication-ready recovery body changed")
+            target.parent.mkdir(exist_ok=True)
+            target.write_bytes(body)
+            results[identifier] = {**result, "output": str(target)}
         else:
             # Unchanged/partial rows keep the exact published corpus facts;
             # deferred rows use existing native retention/omission rules.
@@ -396,6 +425,9 @@ def publish(settings, store, path, sha):
         run.data["artifacts"].update(recovery=str(frozen), assembly=str(assembly))
         _freeze_publication(store, run, receipt, snapshot, results)
         return _finish_publication(store, run, receipt)
+    except InterruptedError as error:
+        run.finish("interrupted", error.args[0])
+        raise
     except (OSError, ValueError, KeyError, TypeError) as error:
         run.finish("failed", 1, str(error))
         raise
@@ -408,6 +440,19 @@ def resume(store, run_id):
     ):
         raise ValueError("run has no frozen OCR recovery publication")
     receipt = read_checkpoint(run, "ocr", "recovery")
+    if "corpus" in run.data["checkpoints"]:
+        read_checkpoint(run, "corpus", "manifest")
+        manifest = Path(run.data["artifacts"]["manifest"])
+        return {
+            "run": str(run.path),
+            "manifest": str(manifest),
+            "manifest_sha256": file_digest(manifest),
+            "status": "partial"
+            if any(
+                row["disposition"] == "partial" for row in receipt["documents"].values()
+            )
+            else "completed",
+        }
     snapshot = _check_receipt(store, receipt)
     report = read_checkpoint(run, "ocr", "assembly")
     directory = Path(report["result_path"]).parent

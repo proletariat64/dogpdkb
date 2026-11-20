@@ -1,0 +1,4 @@
+Recovery does not dispatch OCR or retry interrupted requests.
+Review the prepared receipt before publishing. Unchanged and unresolved rows
+are deferred in the new Graphify manifest. Run update-graph separately.
+Exit: 0 complete/prepared, 2 partial, 1 refusal, 64 usage, 130/143 interrupted.

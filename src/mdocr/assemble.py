@@ -60,12 +60,14 @@ def _validate_attempts(journal, settings):
             bounded = (
                 last is not None
                 and last["status"] == "success"
+                and last.get("warnings") == ["response_mermaid_syntax_invalid"]
+                and last["patches"][0].get("warnings") == last["warnings"]
                 and type(repair) is int
                 and 1 <= repair <= settings.get("mermaid_repair_rounds", 0)
                 and repair == last.get("repair_round", 0) + 1
             )
         else:
-            bounded = last is None
+            bounded = last is None or last["status"] == "failed"
         if not bounded or (status != "success" and "patches" in attempt):
             raise ValueError("invalid journal attempt history")
         if status == "success":
@@ -101,11 +103,21 @@ def assemble_command(args):
     if result_path.resolve() != result_path or result_path.parent != plan_path.parent:
         raise ValueError("original result must be a canonical sibling path")
     original_artifacts = plan_path.with_name(plan_path.name + ".evidence")
-    if output.is_relative_to(plan_path.parent) or any(
-        Path(doc["output"]).is_relative_to(output) for doc in plan["documents"]
+    locks = tuple(p.with_name(p.name + ".lock") for p in (plan_path, result_path))
+    protected = [plan_path, journal_path, result_path, original_artifacts, *locks]
+    cache = plan["settings"]["cache_dir"]
+    if cache:
+        protected.append(Path(cache))
+    for doc in plan["documents"]:
+        protected.extend(Path(doc[key]) for key in ("path", "output"))
+        protected.extend(
+            Path(im["source_path"]) for im in doc["images"] if im.get("source_path")
+        )
+    if any(
+        output.is_relative_to(path) or path.is_relative_to(output)
+        for path in map(Path.resolve, protected)
     ):
         raise ValueError("assembly destination overlaps original execution artifacts")
-    locks = tuple(p.with_name(p.name + ".lock") for p in (plan_path, result_path))
     texts = _validate(
         plan, plan_path, result_path, journal_path, original_artifacts, locks
     )

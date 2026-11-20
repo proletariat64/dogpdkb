@@ -87,32 +87,36 @@ def retain_inputs(store, run, rows, results):
         result = results.setdefault(identifier, {})
         enriched = result.get("status") == "completed"
         source = Path(result["output"]) if enriched else target
-        targets = {
-            r["resource_id"]: _local_destination(r["path"], r["resource_id"])
-            for r in resources
-            if r.get("path") and Path(r["path"]).is_file()
-        }
-        if enriched:
-            # Respell remaining relative links only in the publication copy.
-            # The original tool output and v2 artifact keep their exact bytes.
-            targets.update(
-                {
-                    _local_destination(relative, asset["resource_id"]): targets.get(
-                        asset["resource_id"],
-                        _local_destination(asset["path"], asset["resource_id"]),
-                    )
-                    for relative, asset in result["assets"].items()
-                }
-            )
         output = directory / "corpus-input.md"
         output.write_bytes(
-            relocate_targets(
-                source.read_bytes().decode("utf-8"),
-                targets,
-            ).encode("utf-8")
+            publication_body(source, resources, result if enriched else {})
         )
         result["output"] = str(output)
     store.save()
+
+
+def publication_body(source, resources, result):
+    """Relocate catalogued destinations without editing the original tool output."""
+    targets = {
+        r["resource_id"]: _local_destination(r["path"], r["resource_id"])
+        for r in resources
+        if r.get("path") and Path(r["path"]).is_file()
+    }
+    if result:
+        # Respell remaining relative links only in the publication copy.
+        # The original tool output and v2 artifact keep their exact bytes.
+        targets.update(
+            {
+                _local_destination(relative, asset["resource_id"]): targets.get(
+                    asset["resource_id"],
+                    _local_destination(asset["path"], asset["resource_id"]),
+                )
+                for relative, asset in result["assets"].items()
+            }
+        )
+    return relocate_targets(source.read_bytes().decode("utf-8"), targets).encode(
+        "utf-8"
+    )
 
 
 def relocate_targets(text, replacements):
