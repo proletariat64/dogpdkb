@@ -229,6 +229,7 @@ class Execution:
         self.repair_rounds = self.settings.get("mermaid_repair_rounds", 0)
         self.repairs = {}
         self.repair_attempts = {}
+        self.published_images = set()
         self.fix_limit = self.settings.get("fix", 0)
         self.fixes = {}
         self.result, self.ledger, self.artifacts = result, ledger, artifacts
@@ -318,7 +319,7 @@ class Execution:
 
     def plan_jobs(self):
         jobs, layout, pipelines = {}, [], []
-        for doc in self.docs:
+        for position, doc in enumerate(self.docs):
             selected = [
                 im for im in doc["images"] if im["selected"] and not im["error"]
             ]
@@ -327,6 +328,10 @@ class Execution:
                 key = _sha(_json([self.cache_config, image["sha256"]]))
                 jobs.setdefault(key, image)
                 bindings[image["id"]] = key
+                # Publication may have written immutable evidence before the
+                # journal was marked terminal. Never change an emitted patch.
+                if (self.artifacts / str(position) / f"{image['id']}.md").exists():
+                    self.published_images.add(key)
             context = None
             if self.mode == "llm" and selected:
                 # Document evidence only: never sent to the engine or used as a cache key.
@@ -366,15 +371,20 @@ class Execution:
         except (KeyError, TypeError, ValueError, NotCompleted):
             return None
 
-    def reserve(self):
+    def admission_open(self):
         if self.stop:
-            return None
+            return False
         if time.monotonic() >= self.deadline:
             self.stop = "BATCH_DEADLINE_EXCEEDED"
-            return None
+            return False
         requests_limit = self.settings["request_budget"]
         if requests_limit is not None and self.budget["requests"] >= requests_limit:
             self.stop = "OCR_REQUEST_BUDGET_EXHAUSTED"
+            return False
+        return True
+
+    def reserve(self):
+        if not self.admission_open():
             return None
         token_limit = self.settings["token_budget"]
         if token_limit is None:
@@ -569,12 +579,15 @@ class Execution:
         pending = {
             key: attempt["patches"][0]
             for key, latest in self.latest.items()
-            if (attempt := self.repair_attempts.get(key, latest))["status"] == "success"
+            if key not in self.published_images
+            and key not in self.repairs
+            and (attempt := self.repair_attempts.get(key, latest))["status"]
+            == "success"
             and attempt.get("repair_round", 0) < self.repair_rounds
             and attempt.get("warnings")
             and attempt.get("patches")
         }
-        if not pending:
+        if not pending or not self.admission_open():
             return
         parser = LlmClient(self.settings["model"], self.settings["effort"])
         for key, patch in pending.items():
@@ -590,7 +603,6 @@ class Execution:
                 } | {"errors": errors}
 
     def dispatch(self, jobs, pipelines):
-        self.restore_repairs()
         pending = {}
         for key, image in jobs.items():
             previous = self.latest.get(key)
@@ -627,6 +639,7 @@ class Execution:
             if not pending:
                 break
             self.dispatch_pending(pending, pipelines, fix=True)
+        self.restore_repairs()
         while self.repairs and not self.stop:
             repairs = {
                 key: repair

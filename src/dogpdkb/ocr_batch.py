@@ -410,8 +410,10 @@ def _start_args(root, request):
     return args
 
 
-# Public mdocr result-contract reasons that may precede a fix_round.
+# Validate historical admissions as well as those made by the current runner.
+# Old plans allowed Paddle's generic rejection here; new admissions do not.
 _FIXABLE_FAILURES = {
+    "OCR_PROVIDER_FAILED",
     "OCR_RATE_LIMITED",
     "rate_limited",
     "response_incomplete",

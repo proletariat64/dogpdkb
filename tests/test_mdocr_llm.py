@@ -881,6 +881,98 @@ cli.main(['run','--plan','resume.json','--result','resume-result.json'])
     )
 
 
+@pytest.mark.skipif(
+    not os.environ.get("MDOCR_NODE_DEPENDENCIES"), reason="requires real parser"
+)
+@pytest.mark.parametrize("terminal", [False, True])
+def test_resume_never_repairs_already_emitted_mermaid_evidence(
+    model, tmp_path, monkeypatch, terminal
+):
+    trace = fixture_images(tmp_path, monkeypatch, {"diagram": 200, "throttled": 429})
+    (tmp_path / "a.md").write_text("![flow](diagram.png)\n\n![peer](throttled.png)\n")
+    initial = "```mermaid\nflowchart TD\n A -->\n```"
+    monkeypatch.setenv(
+        "FAKE_PATCH", json.dumps({"kind": "mermaid", "markdown": initial})
+    )
+    plan_batch(tmp_path, "stable", ["a.md"], 4, "--concurrency", "1")
+    if terminal:
+        before = run_batch(tmp_path, "stable", 2)
+    else:
+        interrupted = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+import os
+from mdocr import cli, runner
+original = runner.Execution.save
+def interrupted(self):
+    if self.state['status'] == 'partial':
+        os._exit(75)
+    return original(self)
+runner.Execution.save = interrupted
+cli.main(['run','--plan','stable.json','--result','stable-result.json'])
+""",
+            ],
+            cwd=tmp_path,
+            check=False,
+            capture_output=True,
+            timeout=25,
+        )
+        assert interrupted.returncode == 75, interrupted.stderr
+        before = json.loads((tmp_path / "stable.json.execution.json").read_bytes())
+        assert before["status"] == "running"
+    (witness,) = (tmp_path / "stable.json.evidence").glob("*/*.md")
+    sealed = witness.read_bytes()
+    monkeypatch.setenv(
+        "FAKE_REPAIR_PATCH",
+        json.dumps(
+            {"kind": "mermaid", "markdown": initial.replace("A -->", "A --> B")}
+        ),
+    )
+    after = run_batch(tmp_path, "stable", 2)
+    assert after["requests"] == before["requests"]
+    assert witness.read_bytes() == sealed and initial.encode() in sealed
+    assert trace.read_text().splitlines()[::2] == ["begin diagram", "begin throttled"]
+
+
+@pytest.mark.skipif(
+    not os.environ.get("MDOCR_NODE_DEPENDENCIES"), reason="requires real parser"
+)
+def test_exhausted_batch_publishes_saved_warning_without_requiring_parser(
+    model, tmp_path, monkeypatch
+):
+    trace = fixture_images(tmp_path, monkeypatch, {"diagram": 200})
+    (tmp_path / "a.md").write_text("![flow](diagram.png)\n")
+    initial = "```mermaid\nflowchart TD\n A -->\n```"
+    monkeypatch.setenv(
+        "FAKE_PATCH", json.dumps({"kind": "mermaid", "markdown": initial})
+    )
+    plan_batch(tmp_path, "stable", ["a.md"], 1)
+    interrupted = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import os
+from mdocr import cli, runner
+runner.Execution.publish = lambda *_: os._exit(75)
+cli.main(['run','--plan','stable.json','--result','stable-result.json'])
+""",
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        timeout=25,
+    )
+    assert interrupted.returncode == 75, interrupted.stderr
+    monkeypatch.setenv("MDOCR_NODE_DEPENDENCIES", str(tmp_path / "missing-parser"))
+    after = run_batch(tmp_path, "stable", 0)
+    assert after["budget"]["requests"] == 1
+    assert initial in Path(after["documents"][0]["output"]).read_text()
+    assert trace.read_text().splitlines() == ["begin diagram", "end diagram"]
+
+
 def test_optional_bridge_usage_may_be_omitted(model, tmp_path, monkeypatch):
     monkeypatch.setenv(
         "FAKE_WIRE",

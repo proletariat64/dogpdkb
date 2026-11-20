@@ -431,6 +431,20 @@ def test_batch_resume_rejects_retry_of_definitive_refusal():
         _verify_running_journal(state, 3, fix=2)
 
 
+def test_running_journal_accepts_historical_paddle_fix_admission():
+    from dogpdkb.ocr_batch import _verify_running_journal
+
+    state = {
+        "status": "running",
+        "budget": {"requests": 2},
+        "requests": [
+            {"key": "k", "status": "failed", "reason": "OCR_PROVIDER_FAILED"},
+            {"key": "k", "status": "admitted", "fix_round": 1},
+        ],
+    }
+    _verify_running_journal(state, 3, fix=2)
+
+
 @pytest.mark.parametrize(
     "reason", ["response_schema_invalid", "connection_outcome_unknown"]
 )
