@@ -649,7 +649,7 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
     run.data["artifacts"]["semantic_diff"] = str(semantic_diff_path)
     run.data["artifacts"].pop("semantic_scoring", None)
     if (
-        settings.semantic_score_request_budget
+        settings.semantic_score_request_budget != 0
         and not replan
         and not run.data.get("semantic_score_started")
     ):
@@ -782,13 +782,14 @@ def _score_inputs(settings, book, store, run, rows, semantic, report, diff_index
         durable=True,
     )
     common = ["--report", report, "--diff-index", diff_index]
+    request_budget = settings.semantic_score_request_budget
     score_args = [
         "semantic-score",
         *common,
         "--output",
         score_path,
         "--request-budget",
-        str(settings.semantic_score_request_budget),
+        str(len(records) if request_budget is None else request_budget),
     ]
     for identifier in records:
         score_args += ["--document-id", identifier]

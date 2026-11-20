@@ -108,7 +108,10 @@ reports are staged together; caught ordinary failures roll back replacements.
 A failed invocation must not make an old report appear newly complete. Full
 schema/example is installed in `mdcompare semantic --help --full`.
 
-With a positive `[semantic_score].request_budget`, `apply`/`sync` calls public
+By default `apply`/`sync` scores eligible `CHANGED` documents. The optional
+`[semantic_score].request_budget` caps admissions; `0` disables scoring. With
+no cap, the admission bound is the number of eligible, reserved documents.
+For this work, the orchestrator calls public
 `mdcompare semantic-score --report … --diff-index … --output … --request-budget N`
 (default `openai/gpt-6.1-terra`, Pi OAuth only), then public `mdcompare
 semantic-route`. A single scorer invocation owns concurrency (default 3);

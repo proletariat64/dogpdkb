@@ -65,11 +65,17 @@ TOML sections are tables. Recognized settings and fallback values:
   SKYLARK_MCP_URL overrides it. Empty means retain the tool's gateway default.
 - skylark.timeout_seconds: positive finite number, default 60 seconds; passed
   to Skylark as SKYLARK_TIMEOUT_MS. Existing retry/SSO behavior belongs to Skylark.
+- semantic_score.request_budget: score eligible CHANGED evidence by default.
+  Omit for no extra cap, set a positive integer to cap requests, or 0 to disable.
+- semantic_score.model: provider/model, default openai/gpt-6.1-terra via Pi OAuth.
+- graphify.token_budget: native estimated input tokens per chunk. The installed
+  sample uses 5500; when unset, Graphify uses its own default.
 - ocr.mode: llm (default, OpenAI Pi OAuth) or paddle (explicit opt-in).
 - ocr.request_budget: OCR requests for the whole batch; omit for unlimited,
   or set 0 to prohibit new requests. Independent of scoring.
 - ocr.budget_seconds: positive finite number, default 1800 seconds; mdocr owns
-  the admission deadline. OCR concurrency defaults to 3.
+  the admission deadline. The installed sample uses 7200 seconds.
+  OCR concurrency defaults to 3.
 - tools.skylark/mdcompare/mdocr/graphify: nonempty executable string or nonempty
   string argv array, default the tool name. This is not shell command text.
   Only argv[0] containing / or starting with ~ is resolved against the TOML;

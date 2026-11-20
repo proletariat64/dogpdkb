@@ -355,22 +355,32 @@ def test_oversized_evidence_is_not_sent_or_clipped(tmp_path, score_runtime):
     assert saved["unscored"][0]["reason"] == "OVERSIZED_EVIDENCE"
 
 
-def test_budgeted_semantic_scoring_routes_changed_and_resume_verifies_frozen_artifacts(
-    tmp_path, score_runtime
+@pytest.mark.parametrize("budget", [None, 0, 1])
+def test_semantic_scoring_routes_changed_and_resume_verifies_frozen_artifacts(
+    tmp_path, score_runtime, budget
 ):
     config, differences = instance(tmp_path)
     two_sources(tmp_path, differences)
     seed_body_baseline(tmp_path, config, "# Title\n\nPrevious rule.\n")
-    config.write_text(config.read_text() + "\n[semantic_score]\nrequest_budget = 1\n")
+    if budget is not None:
+        config.write_text(
+            config.read_text() + f"\n[semantic_score]\nrequest_budget = {budget}\n"
+        )
     run_path, _, plan = pause(config, differences)
     changed, new = plan["documents"]
+    assert new["semantic_status"] == "NEW" and new["action"] == "compile"
+    if budget == 0:
+        assert (
+            changed["semantic_status"] == "CHANGED" and changed["action"] == "compile"
+        )
+        assert not score_runtime.exists()
+        return
     assert (
         changed["semantic_status"],
         changed["action"],
         changed["semantic_score"],
         changed["semantic_ambiguity_advisory"],
     ) == ("CHANGED", "reuse", 3, True)
-    assert new["semantic_status"] == "NEW" and new["action"] == "compile"
     assert score_runtime.read_text().splitlines() == ["submitted"]
     route = Path(plan["semantic_scoring"]["route"]["path"])
     route.write_text(route.read_text() + " ")

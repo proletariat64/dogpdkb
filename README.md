@@ -200,9 +200,10 @@ threshold 3 means strictly greater scores compile, lower/equal scores skip;
 compile. Missing scores never enable skips. See
 `mdcompare semantic-route --help --full` for the complete schema and path rules.
 
-Enable bounded scoring in `dogpdkb apply/sync` with `[semantic_score]` and
-`request_budget = N` (default `0`, offline). Optional `model = "provider/model"`
-overrides the scorer default. One scorer handles up to three concurrent
+In `dogpdkb apply/sync`, semantic scoring is on by default for `CHANGED`
+documents with eligible evidence. Omit `[semantic_score].request_budget` to
+admit every eligible document, set a positive cap to limit requests, or set
+`0` to stay offline. Optional `model = "provider/model"` overrides the scorer default. One scorer handles up to three concurrent
 requests and drains before lowering concurrency on HTTP 429. The scoring
 budget counts admissions, not concurrent slots. Plans freeze the exact
 score and route artifacts; a resume does not call the scorer again.

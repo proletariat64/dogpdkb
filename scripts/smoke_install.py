@@ -159,6 +159,10 @@ def inspect_artifacts(wheel: Path, sdist: Path) -> None:
     }
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
+        sample = tomllib.loads(archive.read("dogpdkb/resources/dogpdkb.toml").decode())
+        assert sample["semantic_score"] == {"model": "openai/gpt-6.1-terra"}
+        assert sample["graphify"]["token_budget"] == 5500
+        assert sample["ocr"] == {"mode": "llm", "budget_seconds": 7200}
     with tarfile.open(sdist) as archive:
         source_names = {name.split("/", 1)[-1] for name in archive.getnames()}
     if (
@@ -358,6 +362,7 @@ def smoke(dist: Path) -> None:
         config.write_text(
             '[source]\nbooks_file="books.json"\n'
             '[paths]\nstate="state"\nstaging="runs"\nocr_cache="ocr-cache"\n'
+            "[semantic_score]\nrequest_budget=0\n"
             "[tools]\n" + commands + "\n"
         )
         status = json.loads(run([command, "status", "--config", config, "--json"]))

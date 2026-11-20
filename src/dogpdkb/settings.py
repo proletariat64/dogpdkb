@@ -101,7 +101,7 @@ class Settings:
     tools: dict[str, tuple[str, ...]] = field(default_factory=dict)
     web_options: dict[str, Any] = field(default_factory=dict)
     body_recovery: Path | None = None
-    semantic_score_request_budget: int = 0
+    semantic_score_request_budget: int | None = None
     semantic_score_model: str | None = None
     ocr_mode: str = "llm"
     ocr_request_budget: int | None = None
@@ -239,8 +239,10 @@ def load_config(path: Path | str | None = None) -> Settings:
     score = data.get("semantic_score", {})
     if not isinstance(score, dict):
         raise ConfigError("semantic_score: expected a TOML table")
-    score_requests, model = score.get("request_budget", 0), score.get("model")
-    if type(score_requests) is not int or score_requests < 0:
+    score_requests, model = score.get("request_budget"), score.get("model")
+    if score_requests is not None and (
+        type(score_requests) is not int or score_requests < 0
+    ):
         raise ConfigError(
             "semantic_score.request_budget: expected a nonnegative integer"
         )
