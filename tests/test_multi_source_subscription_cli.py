@@ -10,12 +10,12 @@ from urllib.parse import unquote
 from scripts.smoke_install import REMOTE_CLI
 
 
-def cli(tmp_path, row, command="status", *flags, remote=False):
+def cli(tmp_path, row, command="status", *flags, remote=False, remote_cli=REMOTE_CLI):
     (tmp_path / "books.json").write_text(json.dumps([row]), encoding="utf-8")
     config = tmp_path / "instance.toml"
     if remote:
         fixture = tmp_path / "remote.py"
-        fixture.write_text(REMOTE_CLI, encoding="utf-8")
+        fixture.write_text(remote_cli, encoding="utf-8")
         commands = "\n".join(
             f"{name}={json.dumps([sys.executable, str(fixture), name])}"
             for name in ("skylark", "graphify", "mdcompare", "mdocr")
@@ -31,7 +31,15 @@ def cli(tmp_path, row, command="status", *flags, remote=False):
         encoding="utf-8",
     )
     return subprocess.run(
-        [sys.executable, "-m", "dogpdkb", command, "--config", str(config), *flags],
+        [
+            sys.executable,
+            "-m",
+            "dogpdkb",
+            command,
+            "--config",
+            str(config),
+            *map(str, flags),
+        ],
         env={
             **os.environ,
             "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
@@ -371,3 +379,73 @@ def test_paused_apply_owns_snapshot_after_purging_discovery(tmp_path):
     source = json.loads(new_scan.stdout)
     [incoming] = json.loads(Path(source["differences"]).read_text())["documents"]
     assert incoming["version"] != document["version"]
+
+
+def test_blacklist_sync_admits_new_and_keeps_frozen_and_previously_published_ids(
+    tmp_path,
+):
+    """The fake listing is complete each round; real sync controls every export."""
+    from tests.source_fixture import team_id
+
+    source = {
+        "key": "team",
+        "type": "yuque",
+        "url": "https://example.invalid/team/book",
+        "exclude_document_ids": ["2"],
+    }
+    book = {"key": "funds", "sources": [source]}
+    remote = (
+        REMOTE_CLI.replace("'items_count':2", "'items_count':len(ids)")
+        .replace("for i in (1,2)", "for i in ids")
+        .replace(
+            "if tool == 'skylark' and args[0] == 'listing':",
+            "if tool == 'skylark' and args[0] == 'listing':\n    ids=json.loads((root/'ids.json').read_text())",
+        )
+    )
+
+    def sync(ids, *args):
+        (tmp_path / "ids.json").write_text(json.dumps(ids))
+        result = cli(tmp_path, book, "sync", *args, remote=True, remote_cli=remote)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    paused = sync([1, 2, 4], "--stop-after", "collect")
+    first_run = Path(paused["run"])
+    diff = json.loads((first_run.parent / "differences.json").read_text())
+    assert {row["source_document_id"] for row in diff["documents"]} == {"1", "4"}
+    assert (
+        json.loads(Path(diff["listings"]["team"]).read_text())["book"]["items_count"]
+        == 3
+    )
+    source["exclude_document_ids"] = ["1", "2"]
+    sync([], "--resume", first_run)
+    state_path = tmp_path / "state/funds/state.json"
+    before = json.loads(state_path.read_text())["documents"]
+    assert all(before[team_id(i)]["graph"]["status"] == "completed" for i in ("1", "4"))
+
+    next_round = sync([1, 2, 3], "--stop-after", "collect")
+    run = Path(next_round["run"])
+    diff = json.loads((run.parent / "differences.json").read_text())
+    [(identifier, reasons)] = [
+        (row["source_document_id"], row["reasons"]) for row in diff["documents"]
+    ]
+    assert identifier == "3" and reasons == ["new"]
+    assert diff["absent"] == [team_id("4")]
+    sync([], "--resume", run)
+    after = json.loads(state_path.read_text())["documents"]
+    assert set(after) == {team_id(i) for i in ("1", "3", "4")}
+    assert after[team_id("3")]["graph"]["status"] == "completed"
+    for i in ("1", "4"):
+        for fact in ("raw", "corpus", "graph"):
+            assert after[team_id(i)][fact] == before[team_id(i)][fact]
+    assert "absence" not in after[team_id("1")] and "absence" in after[team_id("4")]
+    calls = [
+        json.loads(line)[:2]
+        for line in (tmp_path / "commands.jsonl").read_text().splitlines()
+    ]
+    assert calls.count(["skylark", "export"]) == 3
+
+    source["exclude_document_ids"] = ["2"]
+    restored = sync([1, 2, 3, 4], "--stop-after", "collect")
+    diff = json.loads((Path(restored["run"]).parent / "differences.json").read_text())
+    assert not diff["documents"] and not diff["absent"]

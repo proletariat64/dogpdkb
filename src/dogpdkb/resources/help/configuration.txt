@@ -41,14 +41,18 @@ explicit corpus paths and directory source paths are relative to the books file.
 
 sources is required; legacy top-level url and document_ids are rejected.
 A yuque source requires an HTTP(S) url without credentials, query or fragment.
-Optional document_ids is a nonempty unique list of nonblank string IDs; omission
-subscribes to the whole Yuque book. A complete listing is validated before
-filtering. A directory source requires path and scans Markdown recursively.
+Optional include_document_ids selects only the listed IDs; exclude_document_ids
+omits the listed IDs. Use at most one. Legacy source-level document_ids is an
+alias for include_document_ids. Each list must be nonempty with unique nonblank
+string IDs. With neither, subscribe to the whole book. The complete listing is
+validated before filtering. Filters take effect on fresh discovery; resume uses
+the saved scope. Excluding an ID does not delete previously published content.
+A directory source requires path and scans Markdown recursively.
 --book selects a subscription; omission requires exactly one enabled subscription.
 --source KEY can repeat on sync, discover and doctor, selecting enabled sources.
 --dir PATH on sync or doctor selects a single directory without changing this file.
 Without --source, all enabled sources are scanned. Reusing a recorded source
-key with a different URL, scope or directory path is refused.
+key with a different type, URL or directory path is refused.
 
 TOML sections are tables. Recognized settings and fallback values:
 

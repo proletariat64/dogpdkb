@@ -218,7 +218,7 @@ Ambiguity is advisory.
   {
     "key": "funds",
     "sources": [
-      {"key": "team", "type": "yuque", "url": "https://example.invalid/team/book", "document_ids": ["123", "456"]},
+      {"key": "team", "type": "yuque", "url": "https://example.invalid/team/book", "include_document_ids": ["123", "456"]},
       {"key": "inbox", "type": "directory", "path": "./inbox"}
     ]
   }
@@ -234,9 +234,14 @@ Markdown 引用的目录内资源随正文冻结，资源变更也计入版本�
 `doctor` 可用相同选择参数离线检查；仅在选中语雀来源时检查 Skylark。
 任何选中来源扫描失败则不生成计划。`--resume` 不接受 `--source` 或 `--dir`，只使用冻结输入。
 
-语雀来源可省略 `document_ids` 订阅整本；列表仍完整读取并验证，再按 ID 筛选。
-来源 key 在订阅内唯一，已记录状态后不允许换绑 URL、订阅范围或目录。
-旧的顶层 `url` / `document_ids` 配置不再接受；使用新版前请先升级实例配置。
+语雀来源只可选一种 ID 规则：`include_document_ids`（白名单）或
+`exclude_document_ids`（黑名单）。两者都不写则订阅整本，旧的来源级 `document_ids`
+仍可作为白名单别名。列表始终完整读取并校验，再按 ID 筛选。黑名单模式会自然接纳
+未被排除的线上新文档，不需要修改配置。修改名单从新一轮发现生效，暂停续跑保留
+冻结范围。主动排除不记为线上缺席，不删除已发布正文或图谱。恢复跟踪时，有既有
+观测的文档按之前记录比较；从未跟踪的 ID 作为该库的新文档处理。
+来源 key 在订阅内唯一，已记录状态后不允许换绑 URL、类型或目录。
+这些字段只能放在 `sources` 下，不接受旧的顶层 URL 或名单。
 
 ## 配置与工具边界
 

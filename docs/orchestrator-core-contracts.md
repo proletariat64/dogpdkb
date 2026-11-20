@@ -57,8 +57,9 @@ Graph-only recovery does not re-enter the export scheduler.
 
 `dogpdkb.records.Store(settings, book)` reads/writes the new state file at
 `settings.state / book.key / state.json`. It never imports old run/state formats.
-Rebinding a registered source key to a different type, URL, scope or path is
-rejected. State schema `dogpdkb-state-2` has `book`, `observation` and
+Rebinding a registered source key to a different type, URL or path is
+rejected. Yuque ID filters may change between fresh discoveries without
+changing the source identity. State schema `dogpdkb-state-2` has `book`, `observation` and
 `documents`; observations are keyed by source. Document keys combine source
 key and underlying ID, preserving the components in record fields. Product
 stages own factual changes and persist them via `store.save()`.
@@ -137,8 +138,9 @@ stage, counts, started_at, updated_at, ended_at, exit_code, reason, artifacts an
 failures. Status is observationally interrupted when `running` has no live owner.
 `targets` freezes source bindings and absolute corpus/graph targets. A new sync
 freezes only selected sources and checks them against durable bindings. Loading
-a run for execution rejects changed targets before any tool call or publication;
-use a newly generated plan for a different source or target.
+a run for execution rejects changed source identities or write targets before any
+tool call or publication. Yuque inclusion/exclusion filters are kept from the
+saved run; start a fresh discovery to apply changed filters.
 
 ### Sync phase handoffs
 

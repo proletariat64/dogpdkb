@@ -56,8 +56,18 @@ on first discovery stays filtered until it changes.
 
 ## Document subscriptions
 
-A Yuque source may specify nonempty unique string `document_ids`. Omission
-subscribes to the whole book. The complete listing is validated and frozen first;
-its counts are not rewritten. Only the selected IDs enter observation, state,
-and candidate work. Changing the scope requires a new source key; saved runs
-pin bindings and publication targets.
+A Yuque source accepts `include_document_ids` (allowlist),
+`exclude_document_ids` (blocklist), or neither (whole book). Each list contains
+unique nonblank string IDs and must not be empty. The old source-level
+`document_ids` is an alias for `include_document_ids`; combining any of the
+three fields is rejected before discovery. The full listing is validated and
+frozen before filtering, without rewriting its counts. Only eligible IDs enter
+observations and candidate work. A known document filtered out by policy is not
+a new absence; its earlier observations and publication facts are preserved.
+When re-admitted, it compares against its last recorded observation if present.
+
+A fresh scan applies the current selection policy. Paused runs keep the saved
+policy and inputs. Changing only the lists does not rebind the durable source
+identity (source key, type and URL). Changing the URL or source type still
+requires a new source key. Saved binding JSON keeps `document_ids` as the
+inclusion field for compatibility, plus `exclude_document_ids` when configured.

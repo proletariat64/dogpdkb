@@ -20,6 +20,7 @@ from dogpdkb.settings import (
     YuqueSource,
     document_identity,
     source_binding,
+    source_identity,
 )
 
 STATE_SCHEMA = "dogpdkb-state-2"
@@ -131,7 +132,7 @@ class Store:
                 )
             registered = self.data["book"]["sources"]
             for key in configured.keys() & registered.keys():
-                if configured[key] != registered[key]:
+                if source_identity(configured[key]) != source_identity(registered[key]):
                     raise ValueError(
                         f"binding changed for source {key}; use a new source key"
                     )
@@ -292,11 +293,7 @@ def initialize(settings: Settings, book: Book) -> dict:
             if str(path) in owned:
                 continue
             date, doc_id = match.groups()
-            candidates = [
-                source
-                for source in yuque_sources
-                if source.document_ids is None or doc_id in source.document_ids
-            ]
+            candidates = [source for source in yuque_sources if source.allows(doc_id)]
             if not candidates:
                 ignored += 1
                 continue
@@ -529,7 +526,7 @@ class Run:
             bindings = {source.key: source_binding(source) for source in sources}
             registered = store.data["book"]["sources"]
             if any(
-                registered[key] != bindings[key]
+                source_identity(registered[key]) != source_identity(bindings[key])
                 for key in bindings.keys() & registered.keys()
             ):
                 raise ValueError("selected source binding changed")
@@ -584,14 +581,20 @@ class Run:
             raise ValueError("run does not belong to the selected book or schema")
         targets = data.get("targets")
         expected = store.run_targets()
-        if data.get("command") == "sync" and isinstance(targets, dict):
+        if isinstance(targets, dict):
             frozen = targets.get("sources")
             known = store.data["book"]["sources"]
             if (
                 isinstance(frozen, dict)
                 and frozen
+                and (
+                    data.get("command") == "sync"
+                    or frozen.keys() == expected["sources"].keys()
+                )
                 and all(
-                    key in known and known[key] == binding
+                    key in known
+                    and isinstance(binding, dict)
+                    and source_identity(known[key]) == source_identity(binding)
                     for key, binding in frozen.items()
                 )
             ):

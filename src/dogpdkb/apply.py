@@ -110,12 +110,11 @@ def prepare_inputs(
     ):
         raise ValueError("difference requires selected sources")
     if run.data["command"] == "sync":
-        bindings = run.data["targets"]["sources"]
         if "sources" in run.data and source_keys != run.data["sources"]:
             raise ValueError("difference source selection mismatch")
     else:
         book.select_sources(source_keys)
-        bindings = book.source_bindings()
+    bindings = run.data["targets"]["sources"]
     old_bindings = differences["book"].get("sources", {})
     if len(source_keys) != len(set(source_keys)) or any(
         key not in bindings or old_bindings.get(key) != bindings[key]
@@ -134,6 +133,15 @@ def prepare_inputs(
         or len(set(identifiers)) != len(identifiers)
     ):
         raise ValueError("difference source IDs must be unique and nonempty")
+    scopes = {
+        key: (
+            None
+            if bindings[key].get("document_ids") is None
+            else set(bindings[key]["document_ids"]),
+            set(bindings[key].get("exclude_document_ids", ())),
+        )
+        for key in source_keys
+    }
     for row in selected:
         key = row.get("source_key")
         source = bindings[key] if key in source_keys else None
@@ -145,8 +153,8 @@ def prepare_inputs(
             or row["document_id"] != document_identity(key, source_id)
         ):
             raise ValueError("invalid difference document identity")
-        scope = source.get("document_ids")
-        if scope is not None and source_id not in scope:
+        include, exclude = scopes[key]
+        if (include is not None and source_id not in include) or source_id in exclude:
             raise ValueError("difference source IDs outside subscription")
     run.data["sources"] = source_keys
     atomic_json(run.directory / "differences.json", differences)

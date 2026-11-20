@@ -919,16 +919,20 @@ def test_imported_difference_rejects_another_source_book_before_export(tmp_path)
 
 
 @pytest.mark.parametrize("include_subscribed", [False, True])
+@pytest.mark.parametrize("policy", ["include_document_ids", "exclude_document_ids"])
 def test_apply_rejects_unsubscribed_difference_before_export_or_saved_inputs(
-    tmp_path, include_subscribed
+    tmp_path, include_subscribed, policy
 ):
     config, differences = instance(tmp_path)
     books_path = tmp_path / "books.json"
     books = json.loads(books_path.read_text())
-    books[0]["sources"][0]["document_ids"] = ["43"]
+    exclude = policy == "exclude_document_ids"
+    books[0]["sources"][0][policy] = ["42"] if exclude else ["43"]
     books_path.write_text(json.dumps(books))
     data = json.loads(differences.read_text())
-    data["book"]["sources"]["team"]["document_ids"] = ["43"]
+    data["book"]["sources"]["team"][policy if exclude else "document_ids"] = (
+        ["42"] if exclude else ["43"]
+    )
     if include_subscribed:
         subscribed = {**data["documents"][0], **team_row("43")}
         data["documents"].insert(0, subscribed)
