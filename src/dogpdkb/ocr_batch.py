@@ -184,6 +184,17 @@ def _verified_result(root, plan, doc, entry, row):
             for key, item in resources.items()
             if occurrences[key]["selected"]
         ]
+        if any(
+            "send_state" in item
+            and (
+                item["send_state"] != "not_sent"
+                or item["status"] != "failed"
+                or item.get("reason") != "svg_profile_cleanup_failed"
+                or im["error"]
+            )
+            for item, im in selected
+        ):
+            raise ValueError("Invalid OCR pre-send occurrence evidence")
         states = {item["status"] for item, _ in selected}
         reasons = sorted({item["reason"] for item, _ in selected if item.get("reason")})
         reason = reasons[0] if reasons else "OCR_PARTIAL_OR_UNKNOWN"
@@ -196,10 +207,15 @@ def _verified_result(root, plan, doc, entry, row):
         allowed = {"failed", "held", "reused", "success", "unattempted"}
         if not states <= allowed:
             raise ValueError("Unrecognized OCR occurrence state")
-        if states == {"unattempted"}:
+        if all(
+            item["status"] == "unattempted" or item.get("send_state") == "not_sent"
+            for item, _ in selected
+        ):
             return None, "skipped", "not_sent", reason
         sent = any(
-            item["status"] in {"failed", "held", "success"} and not im["error"]
+            item["status"] in {"failed", "held", "success"}
+            and item.get("send_state") != "not_sent"
+            and not im["error"]
             for item, im in selected
         )
         return None, "failed", "settled" if sent else "not_sent", reason

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import errno
 import io
+import logging
 import math
 import os
 import re
@@ -35,25 +36,35 @@ class SvgCleanupError(ImageError):
     """The local SVG profile could not be removed before provider conversion."""
 
 
+def _cleanup_svg_workspace(directory):
+    # A Chrome helper may still be writing profile data after Chrome exits.
+    # Retry this particular teardown race without rerendering or resending.
+    for delay in (0.05, 0.15, 0.30, None):
+        try:
+            directory.cleanup()
+        except OSError as exc:
+            if exc.errno != errno.ENOTEMPTY:
+                raise ImageError("SVG profile cleanup failed") from exc
+            if delay is None:
+                raise SvgCleanupError("SVG profile cleanup did not settle") from exc
+            time.sleep(delay)
+        else:
+            return
+
+
 @contextmanager
 def _svg_workspace():
     directory = tempfile.TemporaryDirectory(prefix="mdocr-svg-")
     try:
         yield directory.name
-    finally:
-        # A Chrome helper may still be writing profile data after Chrome exits.
-        # Retry this particular teardown race without rerendering or resending.
-        for delay in (0.05, 0.15, 0.30, None):
-            try:
-                directory.cleanup()
-            except OSError as exc:
-                if exc.errno != errno.ENOTEMPTY:
-                    raise ImageError("SVG profile cleanup failed") from exc
-                if delay is None:
-                    raise SvgCleanupError("SVG profile cleanup did not settle") from exc
-                time.sleep(delay)
-            else:
-                break
+    except BaseException:
+        try:
+            _cleanup_svg_workspace(directory)
+        except ImageError:
+            logging.getLogger(__name__).warning("SVG profile cleanup also failed")
+        raise
+    else:
+        _cleanup_svg_workspace(directory)
 
 
 def vision_image(data: bytes) -> tuple[bytes, str]:

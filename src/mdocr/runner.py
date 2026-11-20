@@ -707,6 +707,12 @@ class Execution:
                 self.settle(active)
 
     def publish(self, texts, layout):
+        possibly_sent = {
+            attempt["key"]
+            for attempt in self.state["requests"]
+            if attempt["status"] != "failed"
+            or attempt.get("reason") != "svg_profile_cleanup_failed"
+        }
         rows = []
         for position, (doc, text, (bindings, context)) in enumerate(
             zip(self.docs, texts, layout)
@@ -739,6 +745,12 @@ class Execution:
                         attempt.get("reason") if attempt else self.stop
                     )
                     record.update(status=status, reason=reason)
+                    if (
+                        status == "failed"
+                        and reason == "svg_profile_cleanup_failed"
+                        and bindings[identifier] not in possibly_sent
+                    ):
+                        record["send_state"] = "not_sent"
                     continue
                 (patch,) = attempt["patches"]
                 if patch.get("kind") == "hold":

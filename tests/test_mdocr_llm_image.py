@@ -57,9 +57,11 @@ def test_invalid_or_externally_referenced_images_are_not_sent(payload):
         vision_image(payload)
 
 
-@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize(
+    "persistent,bad_render", [(False, False), (True, False), (True, True)]
+)
 def test_svg_profile_cleanup_race_is_scoped_to_its_attachment(
-    monkeypatch, tmp_path, persistent
+    monkeypatch, tmp_path, persistent, bad_render
 ):
     import errno
     from pathlib import Path
@@ -79,7 +81,8 @@ def test_svg_profile_cleanup_race_is_scoped_to_its_attachment(
         )
         profile = screenshot.parent / "profile/Default"
         profile.mkdir(parents=True)
-        Image.new("RGB", (300, 150), "red").save(screenshot)
+        size = (301, 150) if bad_render else (300, 150)
+        Image.new("RGB", size, "red").save(screenshot)
 
     def clean(path, *args, **kwargs):
         if Path(path).name.startswith("mdocr-svg-"):
@@ -95,8 +98,13 @@ def test_svg_profile_cleanup_race_is_scoped_to_its_attachment(
     monkeypatch.setattr(llm_image.subprocess, "run", render)
     monkeypatch.setattr(llm_image.shutil, "rmtree", clean)
     source = b'<svg xmlns="http://www.w3.org/2000/svg"/>'
-    if persistent:
-        with pytest.raises(ImageError, match="cleanup"):
+    if bad_render:
+        with pytest.raises(ImageError, match="unexpected image") as error:
+            vision_image(source)
+        assert not isinstance(error.value, llm_image.SvgCleanupError)
+        assert len(calls) == 4
+    elif persistent:
+        with pytest.raises(llm_image.SvgCleanupError, match="cleanup"):
             vision_image(source)
     else:
         rendered, mime = vision_image(source)

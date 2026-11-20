@@ -253,6 +253,48 @@ raise SystemExit(main())
     return config, differences
 
 
+@pytest.mark.parametrize("earlier_send", [False, True])
+def test_cleanup_failure_proves_unsent_only_without_an_earlier_send(
+    tmp_path, earlier_send
+):
+    from dogpdkb.ocr_batch import _load_plan, _verified_result
+
+    config, differences = _native_instance(tmp_path)
+    config.write_text(
+        config.read_text().replace("request_budget=1", "request_budget=3\nfix=1")
+    )
+    driver = tmp_path / "offline_mdocr.py"
+    old = driver.read_text()
+    marker = "        assert isinstance(image, bytes)"
+    new = f"""
+        if image == b'synthetic image bytes':
+            marker = root / 'earlier-send'
+            if {earlier_send!r} and not marker.exists():
+                marker.touch()
+                raise runner.LlmError('bad response', reason='response_json_invalid')
+            raise runner.LlmError('local cleanup error', reason='svg_profile_cleanup_failed')
+"""
+    driver.write_text(old.replace(marker, marker + new))
+    outcome = cli("apply", "--config", config, "--input", differences)
+    assert outcome.returncode == 2, outcome.stderr
+    (root,) = (tmp_path / "state/funds/ocr").glob("run-*")
+    request = json.loads((root / "request.json").read_bytes())
+    plan, docs = _load_plan(root, request)
+    entry = next(
+        row for row in request["documents"] if row["document_id"] == team_id("42")
+    )
+    report = json.loads((root / "result.json").read_bytes())
+    row = next(row for row in report["documents"] if row["path"] == entry["path"])
+    assert row["resources"][0].get("send_state") == (
+        None if earlier_send else "not_sent"
+    )
+    expected = ("failed", "settled") if earlier_send else ("skipped", "not_sent")
+    assert (
+        _verified_result(root, plan, docs[entry["path"]], entry, row)[1:3] == expected
+    )
+    assert len((tmp_path / "requests").read_text().splitlines()) == 1
+
+
 def test_native_result_with_wrong_context_uses_raw_fallback(tmp_path):
     config, differences = _native_instance(tmp_path)
     driver = tmp_path / "offline_mdocr.py"
