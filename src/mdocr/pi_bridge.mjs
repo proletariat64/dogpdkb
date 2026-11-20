@@ -10,8 +10,8 @@ const fields = ['kind', 'markdown', 'uncertainty'];
 const schema = {
   type: 'object', additionalProperties: false, required: fields,
   properties: {
-    kind: { type: 'string', enum: kinds },
-    markdown: { type: 'string' },
+    kind: { type: 'string', enum: kinds, description: 'Use table only for pipe tables without headings, captions, prose or code fences; use mixed for a faithful transcription with other blocks.' },
+    markdown: { type: 'string', description: 'For table, use one Markdown pipe table per block, with a header and dash separator, followed by rows. Use exactly the same column count on every line, keep empty cells, escape literal pipes as \\|, and do not use multiline cells or HTML tables. Preserve source values and cell associations.' },
     uncertainty: { type: 'string' },
   },
 };
