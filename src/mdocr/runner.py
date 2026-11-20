@@ -90,6 +90,10 @@ def _patches(value, count):
             raise NotCompleted("OCR_RESPONSE_INVALID")
         if any(re.search(r"<!--\s*mdocr:", patch[k], re.IGNORECASE) for k in keys):
             raise NotCompleted("OCR_DELIMITER_RESERVED")
+        if "warnings" in patch and patch["warnings"] != [
+            "response_mermaid_syntax_invalid"
+        ]:
+            raise NotCompleted("OCR_RESPONSE_INVALID")
         if patch.get("kind") == "hold":
             if patch["markdown"] or not patch["uncertainty"].strip():
                 raise NotCompleted("OCR_RESPONSE_INVALID")
@@ -585,6 +589,8 @@ class Execution:
                     )
                     continue
                 record["status"] = attempt["status"]
+                if patch.get("warnings"):
+                    record["warnings"] = patch["warnings"]
                 block = _block(image, self.mode, patch)
                 replacements.append((image["start"], image["end"], f"\n\n{block}\n\n"))
                 resource = image["resource_id"]

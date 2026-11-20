@@ -83,18 +83,20 @@ const validateTables = patches => {
     }
   }
 };
-const validateMermaid = async patches => {
+const mermaidWarnings = async patches => {
   const blocks = patches.flatMap(p => {
     const diagrams = fences(p.markdown).filter(block => /^mermaid(?:\s|$)/i.test(block.info));
     if ((p.kind === 'mermaid' && !diagrams.length) || diagrams.some(block => !block.closed)) fail('response_mermaid_fence_invalid', 'Provider returned an incomplete Mermaid block');
     return diagrams.map(block => block.lines.join('\n'));
   });
-  if (!blocks.length) return;
+  if (!blocks.length) return [];
   const parser = await selectParser();
   for (const block of blocks) {
-    try { await parser.parse(block); }
-    catch { fail('response_mermaid_syntax_invalid', 'Provider returned syntactically invalid Mermaid'); }
+    if (await parser.parse(block, { suppressErrors: true }) === false) {
+      return ['response_mermaid_syntax_invalid'];
+    }
   }
+  return [];
 };
 const findSdk = () => {
   const starts = [];
@@ -169,8 +171,8 @@ const validateResponse = async (reply, attempted, status, refused) => {
       !fields.every(field => Object.hasOwn(parsed, field) && typeof parsed[field] === 'string') ||
       !kinds.includes(parsed.kind)) fail('response_schema_invalid', 'Provider returned invalid image content');
   validateTables([parsed]);
-  await validateMermaid([parsed]);
-  return parsed;
+  const warnings = await mermaidWarnings([parsed]);
+  return warnings.length ? { ...parsed, warnings } : parsed;
 };
 const main = async () => {
   const request = JSON.parse(await new Promise((resolve, reject) => {
@@ -215,7 +217,8 @@ const main = async () => {
     if (doctor) {
       const credential = readStoredCredential(provider, authPath);
       if (credential?.type !== 'oauth' || !credential.access || !credential.refresh || !Number.isFinite(credential.expires)) fail('oauth_required', 'No stored Pi OAuth credential for the selected route');
-      await validateMermaid([{ kind: 'mermaid', markdown: '```mermaid\nflowchart LR\n  A --> B\n```' }]);
+      const warnings = await mermaidWarnings([{ kind: 'mermaid', markdown: '```mermaid\nflowchart LR\n  A --> B\n```' }]);
+      if (warnings.length) fail('mermaid_parser_unavailable', 'Mermaid parser rejected its local diagnostic diagram');
       return { ok: true, node: process.versions.node, oauth: credential.expires <= Date.now() ? 'expired' : 'stored' };
     }
     if (!runtime.isUsingOAuth(provider)) fail('oauth_required', `Pi OAuth credentials are required for ${provider}`);

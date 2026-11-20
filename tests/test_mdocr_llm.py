@@ -475,7 +475,7 @@ def test_missing_parser_is_explicit_for_mixed_patch(model, tmp_path, monkeypatch
     not os.environ.get("MDOCR_NODE_DEPENDENCIES"), reason="requires real parser"
 )
 @pytest.mark.parametrize("fence", ["```", "````", "~~~"])
-def test_real_mermaid_parser_accepts_and_rejects_diagrams(
+def test_real_mermaid_parser_warns_without_changing_content(
     model, tmp_path, monkeypatch, fence
 ):
     import json
@@ -489,18 +489,47 @@ def test_real_mermaid_parser_accepts_and_rejects_diagrams(
             }
         ),
     )
-    assert convert(model, tmp_path)["image"]["kind"] == "mixed"
+    assert "warnings" not in convert(model, tmp_path)["image"]
+    malformed = f"{fence}mermaid\nflowchart TD\n A -->\n{fence}"
     monkeypatch.setenv(
-        "FAKE_PATCH",
-        json.dumps(
-            {
-                "kind": "mixed",
-                "markdown": f"{fence}mermaid\nflowchart TD\n A -->\n{fence}",
-            }
-        ),
+        "FAKE_PATCH", json.dumps({"kind": "mixed", "markdown": malformed})
     )
-    with pytest.raises(LlmError, match="syntactically invalid Mermaid"):
-        convert(model, tmp_path)
+    patch = convert(model, tmp_path)["image"]
+    assert patch["markdown"] == malformed
+    assert patch["warnings"] == ["response_mermaid_syntax_invalid"]
+
+
+@pytest.mark.skipif(
+    not os.environ.get("MDOCR_NODE_DEPENDENCIES"), reason="requires real parser"
+)
+def test_mermaid_warning_publishes_and_survives_cache_reuse(
+    model, tmp_path, monkeypatch
+):
+    malformed = "```mermaid\nflowchart TD\n A -->\n```"
+    monkeypatch.setenv(
+        "FAKE_PATCH", json.dumps({"kind": "mermaid", "markdown": malformed})
+    )
+    trace = fixture_images(tmp_path, monkeypatch, {"diagram": 200})
+    image = tmp_path / "diagram.png"
+    (tmp_path / "a.md").write_text("# Body\n\n![flow](diagram.png)\n")
+    for name, budget, status in (("initial", 1, "success"), ("reuse", 0, "reused")):
+        plan_batch(tmp_path, name, ["a.md"], budget)
+        result = run_batch(tmp_path, name, 0)
+        assert (
+            result["status"] == "completed" and result["budget"]["requests"] == budget
+        )
+        (doc,) = result["documents"]
+        (resource,) = doc["resources"]
+        assert doc["status"] == "completed" and resource["status"] == status
+        assert resource["id"] and resource["resource_id"] == "diagram.png"
+        assert resource["warnings"] == ["response_mermaid_syntax_invalid"]
+        (evidence,) = doc["ocr"]["images"]
+        assert (
+            evidence["source_sha256"] == hashlib.sha256(image.read_bytes()).hexdigest()
+        )
+        assert malformed in Path(evidence["artifact"]).read_text()
+        assert malformed in Path(doc["output"]).read_text()
+    assert trace.read_text().splitlines() == ["begin diagram", "end diagram"]
 
 
 def test_bridge_honors_https_proxy_without_direct_fallback(
