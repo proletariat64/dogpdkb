@@ -187,15 +187,15 @@ def _native_instance(tmp_path, *, crash=False):
     two_sources(tmp_path, differences)
     remote_path = tmp_path / "remote.json"
     remote = json.loads(remote_path.read_text())
-    for row in remote.values():
-        row["body"] += "![diagram](diagram.png)\n"
+    for document_id, row in remote.items():
+        row["body"] += f"![diagram](diagram-{document_id}.png)\n"
     remote_path.write_text(json.dumps(remote))
     exporter = tmp_path / "skylark.py"
     exporter.write_text(
         exporter.read_text().replace(
             "path.write_text(doc['body'])",
             "path.write_bytes(doc['body'].replace('\\n','\\r\\n').encode()); "
-            "(path.parent/'diagram.png').write_bytes("
+            "(path.parent/f\"diagram-{item['document_id']}.png\").write_bytes("
             "b'synthetic image bytes' + (b'' if item['document_id'] == '42' else b'-other'))",
         )
     )
