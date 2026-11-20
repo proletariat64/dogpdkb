@@ -5,11 +5,13 @@ import shutil
 import sys
 from pathlib import Path
 
+import pytest
+
 from tests.source_fixture import team_id
 from tests.test_orchestrator_apply_cli import cli, instance, two_sources
 
 
-def batch_instance(tmp_path, body):
+def batch_instance(tmp_path, body, *, concurrency=3):
     config, differences = instance(tmp_path)
     two_sources(tmp_path, differences)
     tool = tmp_path / "batch_ocr.py"
@@ -47,12 +49,15 @@ def payload(rows, status):
             json.dumps([sys.executable, "-m", "mdocr.cli"]),
             json.dumps([sys.executable, str(tool)]),
         )
-        + "\n[ocr]\nrequest_budget=1\n"
+        + f"\n[ocr]\nrequest_budget=1\nconcurrency={concurrency}\n"
     )
     return config, differences
 
 
-def test_partial_batch_accepts_verified_peer_and_preserves_exact_output(tmp_path):
+@pytest.mark.parametrize(("concurrency", "expected"), [(3, "3"), (10, "10")])
+def test_partial_batch_accepts_verified_peer_and_preserves_exact_output(
+    tmp_path, concurrency, expected
+):
     config, differences = batch_instance(
         tmp_path,
         """first, second = plan['documents']
@@ -61,6 +66,7 @@ result.write_text(json.dumps(payload([completed(first), dict(
     resources=[])], 'partial')))
 raise SystemExit(2)
 """,
+        concurrency=concurrency,
     )
     applied = cli("apply", "--config", config, "--input", differences)
     assert applied.returncode == 2, applied.stderr
@@ -72,7 +78,7 @@ raise SystemExit(2)
     assert flags["--mode"] == "llm"
     assert flags["--model"] == "openai/gpt-6.1-terra"
     assert flags["--effort"] == "medium"
-    assert flags["--concurrency"] == "3"
+    assert flags["--concurrency"] == expected
     assert flags["--request-budget"] == "1"
     manifest = json.loads(Path(json.loads(applied.stdout)["manifest"]).read_text())
     docs = {doc["document_id"]: doc for doc in manifest["documents"]}

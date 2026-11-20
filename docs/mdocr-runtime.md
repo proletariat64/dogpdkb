@@ -26,8 +26,9 @@ It does not include authored Markdown, paths, occurrence IDs or peer images. The
 strict JSON response contains `kind`, `markdown` and `uncertainty`. The runner builds
 the v2 wrapper and document evidence from the original plan.
 
-In LLM mode up to three Markdown pipelines run by default, processing selected
-images sequentially within each document. A 429 drains active requests before
+`mdocr plan --concurrency` accepts 1–10 workers (default 3). In LLM mode this
+caps concurrent Markdown pipelines; each document processes selected images
+sequentially. A 429 drains active requests before
 admission continues at the lower concurrency, finishing already-started pipelines
 before admitting more documents. A 429 at one stops further admission. Paddle
 keeps its per-image concurrency. The global request budget counts image admissions
@@ -45,7 +46,7 @@ The LLM journal records fixed reason codes and aggregate token usage when
 available. `response_refusal` is a typed provider refusal, not inferred from text.
 `response_output_limit`, `response_content_filter`, and `response_incomplete`
 identify terminal incomplete responses. Other `response_*` codes distinguish JSON,
-schema, table and Mermaid validation; `mermaid_parser_unavailable` indicates
+schema, table and Mermaid fence validation; `mermaid_parser_unavailable` indicates
 local configuration. No refusal message, raw provider reason, or rejected output
 is included in these diagnostics. Missing terminal evidence or invalid bridge
 protocol after possible submission is `unknown_outcome`, not a retryable failure.
@@ -53,6 +54,13 @@ Older `invalid_response` journal entries do not record which check failed.
 
 ## Mermaid and inference limits
 
-Install the local Mermaid parser once with `npm install --prefix "$HOME/.local/share/mdocr/node" --ignore-scripts mermaid@12.3.0 jsdom@26.1.0`. Set `MDOCR_NODE_DEPENDENCIES` to that prefix. The parser loads locally, can run offline, and receives no OAuth credential. The bridge refuses malformed diagrams or explicit Mermaid output when the parser is unavailable; it does not pretend a regex validates Mermaid syntax.
+Install the local Mermaid parser once with `npm install --prefix "$HOME/.local/share/mdocr/node" --ignore-scripts mermaid@12.3.0 jsdom@26.1.0`. Set `MDOCR_NODE_DEPENDENCIES` to that prefix. The parser loads locally, can run offline, and receives no OAuth credential. The bridge still refuses missing/unclosed Mermaid fences or Mermaid output when
+the parser is unavailable, including when an individual diagram parser cannot
+load. If a closed Mermaid diagram has a recognized syntax error, the otherwise
+valid OCR text is preserved unchanged. The `mdocr-result-2`
+document resource entry records `warnings: ["response_mermaid_syntax_invalid"]`
+alongside that image’s ID and resource ID, including on cache reuse. The warning
+does not change completion status, the original-byte witness, or graph
+publication requirements.
 
 The bridge exposes no live vision input token ceiling from the installed provider descriptors. A hard total-token limit must fail closed unless the runner has a justified upper bound. Request-count limits are independent and unaffected. Do not interpret a successful local runtime preflight as real inference acceptance for either provider.

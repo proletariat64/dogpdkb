@@ -90,6 +90,10 @@ def _patches(value, count):
             raise NotCompleted("OCR_RESPONSE_INVALID")
         if any(re.search(r"<!--\s*mdocr:", patch[k], re.IGNORECASE) for k in keys):
             raise NotCompleted("OCR_DELIMITER_RESERVED")
+        if "warnings" in patch and patch["warnings"] != [
+            "response_mermaid_syntax_invalid"
+        ]:
+            raise NotCompleted("OCR_RESPONSE_INVALID")
         if patch.get("kind") == "hold":
             if patch["markdown"] or not patch["uncertainty"].strip():
                 raise NotCompleted("OCR_RESPONSE_INVALID")
@@ -107,11 +111,11 @@ def _text(path, digest, reason):
 
 def _validate(plan, plan_path, result_path, ledger, artifacts, lock_paths):
     settings, docs = plan["settings"], plan["documents"]
-    if settings["mode"] not in {"paddle", "llm"} or settings["concurrency"] not in {
-        1,
-        2,
-        3,
-    }:
+    if (
+        settings["mode"] not in {"paddle", "llm"}
+        or type(settings["concurrency"]) is not int
+        or not 1 <= settings["concurrency"] <= 10
+    ):
         raise ValueError("invalid plan settings")
     if settings["mode"] == "llm" and settings.get("llm_schema") != IMAGE_SCHEMA:
         # A legacy document-level admission cannot authorize per-image retries.
@@ -585,6 +589,8 @@ class Execution:
                     )
                     continue
                 record["status"] = attempt["status"]
+                if patch.get("warnings"):
+                    record["warnings"] = patch["warnings"]
                 block = _block(image, self.mode, patch)
                 replacements.append((image["start"], image["end"], f"\n\n{block}\n\n"))
                 resource = image["resource_id"]

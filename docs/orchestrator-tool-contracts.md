@@ -30,6 +30,9 @@ Legacy document-context plans cannot be executed; existing terminal reports rema
 verifiable against their legacy plan and schema. Do not create replacement plans to
 replay previously unknown admissions.
 
+The orchestrator passes `[ocr].concurrency` to `mdocr plan --concurrency`
+(1-10, default 3). mdocr may lower the active limit after throttling.
+
 Failed, held or unknown rows cannot claim a completed Markdown output. The plan-side
 journal prevents resubmission if result mirroring was interrupted. LLM admissions and
 the global request budget are per image; concurrency limits active Markdown pipelines,

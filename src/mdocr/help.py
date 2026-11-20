@@ -62,9 +62,9 @@ PLAN_FULL = """Plan controls:
   --model provider/model, --effort, and --prompt-file to override. The response
   schema stays code-owned. --token-budget and --request-budget are run-wide
   nonnegative ceilings; omit them for unlimited. A hard token budget refuses
-  admission if a trustworthy upper bound is unavailable. Both modes start at
-  concurrency 3 by default (active Markdown pipelines for LLM, active image
-  jobs for Paddle). The request budget counts image admissions, not documents.
+  admission if a trustworthy upper bound is unavailable. --concurrency accepts
+  1 through 10 (default 3): active Markdown pipelines for LLM, active image
+  jobs for Paddle. The request budget counts image admissions, not documents.
   --max-seconds is an admission deadline (default 900).
 """
 
@@ -87,8 +87,9 @@ RUN_FULL = """Execution and recovery:
   not written. Do not delete or move it to restart an incomplete plan.
   Legacy document-context LLM plans cannot be executed. In LLM mode images
   run sequentially within each Markdown pipeline; only an image is sent.
-  HTTP 429 reduces later admission 3 → 2 → 1, then stops. Known failed requests
-  require --retry-failed; unknown outcomes are never automatically replayed.
+  HTTP 429 lowers the active concurrency limit by one; at 1 it stops new
+  admissions. Known failed requests require --retry-failed; unknown outcomes
+  are never automatically replayed.
   Total token accounting includes vision and provider-reported output. Each
   mdocr-result-2 document row records output digest and mdocr-ocr-2 evidence
   only if complete. Local original image paths in OCR blocks stay traceable.

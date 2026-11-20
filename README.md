@@ -157,8 +157,10 @@ Missing or malformed authoritative reports stop explicitly rather than falling
 back to legacy knowledge advice. Baseline-only IDs never imply remote deletion.
 
 OCR uses one `mdocr` plan for each batch, defaulting to OpenAI Pi OAuth
-(`openai/gpt-6.1-terra`, medium, concurrency 3). Set `[ocr].mode = "paddle"`
-to use Paddle explicitly. `[ocr].request_budget` is independent of scoring:
+(`openai/gpt-6.1-terra`, medium, default concurrency 3). Set
+`[ocr].concurrency` to 1-10 to control active Markdown pipelines; mdocr can
+lower the effective limit after throttling. Set `[ocr].mode = "paddle"` to use
+Paddle explicitly. `[ocr].request_budget` is independent of scoring:
 omit it for unlimited requests or set it to 0 to prohibit new requests.
 Incomplete OCR publishes the usable raw body without claiming OCR success.
 Original v2 evidence is retained under `state/<book>/ocr/<run>/` outside wash.

@@ -33,12 +33,16 @@ model = "openai/gpt-6.1-terra"
 # request_budget = 0 # Disable model scoring for an offline run.
 
 [graphify]
+# Native extraction chunk limit (positive integer).
+concurrency = 3
 # Native Graphify OpenAI OAuth model ID.
 model = "gpt-6.1-terra"
 # Estimated input tokens per chunk, not a spending cap.
 token_budget = 5500
 
 [ocr]
+# OCR workers, 1-10 (mdocr may reduce its limit after throttling).
+concurrency = 3
 # Default LLM uses OpenAI Pi OAuth; set mode = "paddle" to opt in to Paddle.
 mode = "llm"
 # OCR request limit for the whole batch. Omit for unlimited; 0 sends nothing new.
