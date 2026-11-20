@@ -206,8 +206,8 @@ def _validate(plan, plan_path, result_path, ledger, artifacts, lock_paths):
     return texts
 
 
-# Only known unsuccessful provider attempts where submitting the same image
-# can help. A typed connection interruption is retried separately below.
+# Only failures where another image attempt can help, including a proven
+# pre-send cleanup failure. Typed connection interruptions are separate.
 _FIXABLE_FAILURES = {
     "OCR_RATE_LIMITED",
     "rate_limited",
@@ -218,6 +218,7 @@ _FIXABLE_FAILURES = {
     "response_schema_invalid",
     "response_table_invalid",
     "response_unexpected_stop",
+    "svg_profile_cleanup_failed",
 }
 
 
@@ -350,10 +351,24 @@ class Execution:
         if (
             not self.latest.keys() <= jobs.keys()
             or not self.repair_attempts.keys() <= jobs.keys()
+            or any(
+                "source_sha256" in attempt
+                and attempt["source_sha256"] != jobs[attempt["key"]]["sha256"]
+                for attempt in self.state["requests"]
+            )
         ):
             raise ValueError(
                 "saved OCR request identities do not match this runtime; no requests sent"
             )
+        # Keep historic attempt records unchanged. Expose their resolved
+        # source bindings separately, after validating the frozen job keys.
+        legacy = {
+            attempt["key"]: jobs[attempt["key"]]["sha256"]
+            for attempt in self.state["requests"]
+            if "source_sha256" not in attempt
+        }
+        if legacy:
+            self.state["legacy_request_sources"] = legacy
         return jobs, pipelines, layout
 
     def cached(self, key):
@@ -516,7 +531,10 @@ class Execution:
                 attempt["usage_tokens"] = usage
                 if self.settings["token_budget"] is not None and usage > reservation:
                     self.stop = "OCR_TOKEN_BOUND_BREACH"
-            elif status in {401, 403, 429} and not unknown:
+            elif not unknown and (
+                status in {401, 403, 429}
+                or attempt.get("reason") == "svg_profile_cleanup_failed"
+            ):
                 self.budget["reserved_tokens"] -= reservation
             if status in {401, 403} and not self.stop:
                 self.stop = (
@@ -557,7 +575,12 @@ class Execution:
         reservation = self.reserve()
         if reservation is None:
             return
-        attempt = {"key": key, "status": "admitted", "reserved_tokens": reservation}
+        attempt = {
+            "key": key,
+            "source_sha256": image["sha256"],
+            "status": "admitted",
+            "reserved_tokens": reservation,
+        }
         if repair is None:
             self.latest[key] = attempt
             if fix:
@@ -703,6 +726,12 @@ class Execution:
                 self.settle(active)
 
     def publish(self, texts, layout):
+        possibly_sent = {
+            attempt["key"]
+            for attempt in self.state["requests"]
+            if attempt["status"] != "failed"
+            or attempt.get("reason") != "svg_profile_cleanup_failed"
+        }
         rows = []
         for position, (doc, text, (bindings, context)) in enumerate(
             zip(self.docs, texts, layout)
@@ -735,6 +764,12 @@ class Execution:
                         attempt.get("reason") if attempt else self.stop
                     )
                     record.update(status=status, reason=reason)
+                    if (
+                        status == "failed"
+                        and reason == "svg_profile_cleanup_failed"
+                        and bindings[identifier] not in possibly_sent
+                    ):
+                        record["send_state"] = "not_sent"
                     continue
                 (patch,) = attempt["patches"]
                 if patch.get("kind") == "hold":

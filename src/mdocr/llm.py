@@ -117,11 +117,15 @@ class LlmClient:
         self, original: bytes, prompt: str, *, mermaid_diagnostics=False, repair=None
     ) -> dict[str, Any]:
         # Image dependencies belong to conversion; doctor probes them separately.
-        from .llm_image import vision_image
+        from .llm_image import SvgCleanupError, vision_image
         from .prepare import ImageError
 
         try:
             data, mime = vision_image(original)
+        except SvgCleanupError as exc:
+            raise LlmError(
+                "Cannot clean SVG renderer profile", reason="svg_profile_cleanup_failed"
+            ) from exc
         except ImageError as exc:
             raise LlmError(
                 "Cannot prepare vision image", reason="invalid_image"

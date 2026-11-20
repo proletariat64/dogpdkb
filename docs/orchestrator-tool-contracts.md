@@ -29,6 +29,13 @@ no ASCII escaping, and a trailing LF. New LLM plans declare
 Legacy document-context plans cannot be executed; existing terminal reports remain
 verifiable against their legacy plan and schema. Do not create replacement plans to
 replay previously unknown admissions.
+A failed `svg_profile_cleanup_failed` occurrence can carry `send_state: "not_sent"`
+only when every admission for the image key failed before a provider request.
+Admissions carry `source_sha256` so the orchestrator can check the claim against
+all attempts for the frozen image in the sealed native journal. Same-version
+legacy admissions bind through the separate `legacy_request_sources` map
+derived from validated job keys without rewriting attempts. Missing or
+contradictory history is not proof of no send. A cache hit alone is not a send.
 
 The orchestrator passes `[ocr].concurrency` to `mdocr plan --concurrency`
 (1-100, default 3). mdocr may lower the active limit after throttling.

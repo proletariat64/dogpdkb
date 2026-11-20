@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import base64
+import errno
 import io
+import logging
 import math
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -26,6 +30,41 @@ _NATIVE_MIME = {
 _SVG_NAMESPACE = "{http://www.w3.org/2000/svg}"
 _SVG_MAX_EDGE = 8192
 _SVG_MAX_AREA = 24_000_000
+
+
+class SvgCleanupError(ImageError):
+    """The local SVG profile could not be removed before provider conversion."""
+
+
+def _cleanup_svg_workspace(directory):
+    # A Chrome helper may still be writing profile data after Chrome exits.
+    # Retry this particular teardown race without rerendering or resending.
+    for delay in (0.05, 0.15, 0.30, None):
+        try:
+            directory.cleanup()
+        except OSError as exc:
+            if exc.errno != errno.ENOTEMPTY:
+                raise ImageError("SVG profile cleanup failed") from exc
+            if delay is None:
+                raise SvgCleanupError("SVG profile cleanup did not settle") from exc
+            time.sleep(delay)
+        else:
+            return
+
+
+@contextmanager
+def _svg_workspace():
+    directory = tempfile.TemporaryDirectory(prefix="mdocr-svg-")
+    try:
+        yield directory.name
+    except BaseException:
+        try:
+            _cleanup_svg_workspace(directory)
+        except ImageError:
+            logging.getLogger(__name__).warning("SVG profile cleanup also failed")
+        raise
+    else:
+        _cleanup_svg_workspace(directory)
 
 
 def vision_image(data: bytes) -> tuple[bytes, str]:
@@ -105,7 +144,7 @@ def _render_svg(data: bytes) -> bytes:
     )
     if not chrome:
         raise ImageError("SVG OCR requires Google Chrome or Chromium on PATH")
-    with tempfile.TemporaryDirectory(prefix="mdocr-svg-") as tmp:
+    with _svg_workspace() as tmp:
         root = Path(tmp)
         wrapper, screenshot = root / "image.html", root / "image.png"
         source = base64.b64encode(data).decode("ascii")

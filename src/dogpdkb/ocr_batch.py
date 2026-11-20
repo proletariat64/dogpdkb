@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import tempfile
+from functools import cache
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -165,7 +166,23 @@ def _tool_result(root, path, plan_sha):
     return report
 
 
-def _verified_result(root, plan, doc, entry, row):
+def _request_history(report):
+    attempts = report["requests"]
+    if not attempts or report["budget"]["requests"] != len(attempts):
+        return None
+    history, keys = {}, {}
+    legacy = report.get("legacy_request_sources", {})
+    for attempt in attempts:
+        source = attempt.get("source_sha256", legacy.get(attempt["key"], ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", source):
+            return None  # Older admissions cannot prove the new pre-send claim.
+        if keys.setdefault(attempt["key"], source) != source:
+            raise ValueError("OCR request key changed source identity")
+        history.setdefault(source, []).append(attempt)
+    return history
+
+
+def _verified_result(root, plan, doc, entry, row, request_history=None):
     _verify_input(root, entry, doc)
     if row["path"] != doc["path"]:
         raise ValueError("OCR row source path is not its planned source")
@@ -184,6 +201,27 @@ def _verified_result(root, plan, doc, entry, row):
             for key, item in resources.items()
             if occurrences[key]["selected"]
         ]
+        pre_send, history = set(), None
+        for item, im in selected:
+            if "send_state" not in item:
+                continue
+            if history is None and request_history is not None:
+                history = request_history()
+            attempts = history.get(im["sha256"]) if history is not None else None
+            if (
+                item["send_state"] != "not_sent"
+                or item["status"] != "failed"
+                or item.get("reason") != "svg_profile_cleanup_failed"
+                or im["error"]
+                or not attempts
+                or any(
+                    attempt["status"] != "failed"
+                    or attempt.get("reason") != "svg_profile_cleanup_failed"
+                    for attempt in attempts
+                )
+            ):
+                raise ValueError("Invalid OCR pre-send occurrence evidence")
+            pre_send.add(item["id"])
         states = {item["status"] for item, _ in selected}
         reasons = sorted({item["reason"] for item, _ in selected if item.get("reason")})
         reason = reasons[0] if reasons else "OCR_PARTIAL_OR_UNKNOWN"
@@ -196,10 +234,25 @@ def _verified_result(root, plan, doc, entry, row):
         allowed = {"failed", "held", "reused", "success", "unattempted"}
         if not states <= allowed:
             raise ValueError("Unrecognized OCR occurrence state")
-        if states == {"unattempted"}:
+        if states == {"unattempted"} or (
+            pre_send
+            and all(
+                item["id"] in pre_send
+                or (
+                    item["status"] in {"unattempted", "reused"}
+                    and im["sha256"] not in history
+                )
+                for item, im in selected
+            )
+        ):
             return None, "skipped", "not_sent", reason
         sent = any(
-            item["status"] in {"failed", "held", "success"} and not im["error"]
+            (
+                item["status"] in {"failed", "held", "success"}
+                or (pre_send and im["sha256"] in history)
+            )
+            and item["id"] not in pre_send
+            and not im["error"]
             for item, im in selected
         )
         return None, "failed", "settled" if sent else "not_sent", reason
@@ -308,6 +361,17 @@ def _settled_report(root, seal):
     return None
 
 
+def _settled_request_history(report, seal):
+    @cache
+    def history():
+        witnesses = seal["witnesses"]
+        if witnesses.get("plan.json.execution.json") != witnesses[seal["report"]]:
+            return None  # An unmirrored result cannot prove a pre-send claim.
+        return _request_history(report)
+
+    return history
+
+
 def _previous_ocr_evidence(previous, row):
     root = Path(previous["input"]).parent
     seal_path = root / "settled.json"
@@ -336,6 +400,7 @@ def _previous_ocr_evidence(previous, row):
         docs[entry["path"]],
         entry,
         _index(payload["documents"])[entry["path"]],
+        _settled_request_history(payload, seal),
     )
 
 
@@ -423,6 +488,7 @@ _FIXABLE_FAILURES = {
     "response_schema_invalid",
     "response_table_invalid",
     "response_unexpected_stop",
+    "svg_profile_cleanup_failed",
 }
 
 
@@ -477,7 +543,10 @@ def _verify_running_journal(state, budget, mirror=None, *, fix=0, repair=0):
     if mirror is not None:
         prior = mirror["requests"]
         if len(prior) > count or any(
-            any(old.get(k) != new.get(k) for k in ("key", "fix_round", "repair_round"))
+            any(
+                old.get(k) != new.get(k)
+                for k in ("key", "source_sha256", "fix_round", "repair_round")
+            )
             or (old["status"] != "admitted" and old != new)
             for old, new in zip(prior, attempts)
         ):
@@ -592,6 +661,12 @@ def _execute(root, request, store, run, call_tool, *, allow_dispatch=True):
             reason = "OCR_RESULT_UNAVAILABLE"
     if report is not None:
         try:
+            if (
+                code in {0, 2}
+                and journal.exists()
+                and journal.read_bytes() != report.read_bytes()
+            ):
+                raise ValueError("Terminal OCR report differs from native journal")
             payload = _tool_result(root, report, initial["plan.json"])
             if (
                 payload["status"] not in {"completed", "partial"}
@@ -812,12 +887,14 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
         )
         validate_inputs(current)
         report, plan, docs, records = None, {}, {}, {}
+        history = None
         batch_reason = seal["reason"]
         try:
             report = _settled_report(root, seal)
             if report is not None:
                 plan, docs = _load_plan(root, existing)
                 records = _index(report["documents"])
+                history = _settled_request_history(report, seal)
                 reports = run.data["artifacts"]
                 reports["ocr_report"] = str(root / seal["report"])
         except _INVALID:
@@ -846,7 +923,12 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
             else:
                 try:
                     result, status, send, reason = _verified_result(
-                        root, plan, docs[entry["path"]], entry, records[entry["path"]]
+                        root,
+                        plan,
+                        docs[entry["path"]],
+                        entry,
+                        records[entry["path"]],
+                        history,
                     )
                 except _INVALID:
                     status, send, reason = (

@@ -253,6 +253,129 @@ raise SystemExit(main())
     return config, differences
 
 
+@pytest.mark.parametrize("earlier_send", [False, True])
+def test_cleanup_failure_proves_unsent_only_without_an_earlier_send(
+    tmp_path, earlier_send
+):
+    from dogpdkb.ocr_batch import _load_plan, _request_history, _verified_result
+    from mdocr.runner import Execution
+
+    config, differences = _native_instance(tmp_path)
+    config.write_text(
+        config.read_text().replace("request_budget=1", "request_budget=3\nfix=1")
+    )
+    driver = tmp_path / "offline_mdocr.py"
+    old = driver.read_text()
+    marker = "        assert isinstance(image, bytes)"
+    new = f"""
+        if image == b'synthetic image bytes':
+            marker = root / 'earlier-send'
+            if {earlier_send!r} and not marker.exists():
+                marker.touch()
+                raise runner.LlmError('bad response', reason='response_json_invalid')
+            raise runner.LlmError('local cleanup error', reason='svg_profile_cleanup_failed')
+"""
+    driver.write_text(old.replace(marker, marker + new))
+    outcome = cli("apply", "--config", config, "--input", differences)
+    assert outcome.returncode == 2, outcome.stderr
+    (root,) = (tmp_path / "state/funds/ocr").glob("run-*")
+    request = json.loads((root / "request.json").read_bytes())
+    plan, docs = _load_plan(root, request)
+    entry = next(
+        row for row in request["documents"] if row["document_id"] == team_id("42")
+    )
+    report = json.loads((root / "result.json").read_bytes())
+    row = next(row for row in report["documents"] if row["path"] == entry["path"])
+    assert row["resources"][0].get("send_state") == (
+        None if earlier_send else "not_sent"
+    )
+    expected = ("failed", "settled") if earlier_send else ("skipped", "not_sent")
+    history = _request_history(report)
+    execution = Execution(
+        plan,
+        report["plan_sha256"],
+        root / "plan.json.execution.json",
+        root / "result.json",
+        root / "plan.json.evidence",
+        False,
+    )
+    peer = next(
+        attempt
+        for attempt in execution.state["requests"]
+        if attempt["status"] == "success"
+    )
+    peer_sha = peer.pop(
+        "source_sha256"
+    )  # Simulate a same-version historical admission.
+    execution.plan_jobs()
+    assert "source_sha256" not in peer
+    assert execution.state["legacy_request_sources"] == {peer["key"]: peer_sha}
+    assert _request_history(execution.state)[peer_sha] == [peer]
+    doc = docs[entry["path"]]
+    assert (
+        _verified_result(root, plan, doc, entry, row, lambda: history)[1:3] == expected
+    )
+    row["resources"][0]["send_state"] = "not_sent"
+    if earlier_send:
+        with pytest.raises(ValueError, match="Invalid OCR pre-send occurrence"):
+            _verified_result(root, plan, doc, entry, row, lambda: history)
+    else:
+        other = next(d for d in docs.values() if d is not doc)
+        (reused,) = other["images"]
+        doc["images"].append({**reused, "id": "cached-peer"})
+        original = next(e for e in request["documents"] if e is not entry)
+        entry["assets"].update(original["assets"])
+        row["resources"].append(
+            {
+                "id": "cached-peer",
+                "resource_id": reused["resource_id"],
+                "status": "reused",
+            }
+        )
+        assert _verified_result(root, plan, doc, entry, row, lambda: history)[1:3] == (
+            "failed",
+            "settled",
+        )
+        history.pop(reused["sha256"])
+        assert _verified_result(root, plan, doc, entry, row, lambda: history)[1:3] == (
+            "skipped",
+            "not_sent",
+        )
+        with pytest.raises(ValueError, match="Invalid OCR pre-send occurrence"):
+            _verified_result(root, plan, doc, entry, row)
+    assert len((tmp_path / "requests").read_text().splitlines()) == 1
+
+
+def test_malformed_partial_row_cannot_discard_independent_completed_peer(tmp_path):
+    config, differences = _native_instance(tmp_path)
+    driver = tmp_path / "offline_mdocr.py"
+    driver.write_text(
+        driver.read_text().replace(
+            "raise SystemExit(main())",
+            """code = main()
+if sys.argv[1] == 'run':
+    import json
+    result = Path(sys.argv[sys.argv.index('--result')+1])
+    plan = Path(sys.argv[sys.argv.index('--plan')+1])
+    data = json.loads(result.read_bytes())
+    good = next(row for row in data['documents'] if row['status'] == 'completed')
+    bad = next(row for row in data['documents'] if row['status'] == 'partial')
+    del bad['resources']
+    data['documents'] = [bad, good]
+    for path in (result, plan.with_name(plan.name + '.execution.json')):
+        path.write_text(json.dumps(data))
+raise SystemExit(code)""",
+        )
+    )
+    outcome = cli("apply", "--config", config, "--input", differences)
+    assert outcome.returncode == 2, outcome.stderr
+    manifest = json.loads(Path(json.loads(outcome.stdout)["manifest"]).read_bytes())
+    docs = {row["document_id"]: row for row in manifest["documents"]}
+    assert docs[team_id("43")]["ocr_status"] == "unknown"
+    assert docs[team_id("42")]["ocr_status"] == "completed"
+    assert b"Recognized offline." in Path(docs[team_id("42")]["path"]).read_bytes()
+
+
 def test_native_result_with_wrong_context_uses_raw_fallback(tmp_path):
     config, differences = _native_instance(tmp_path)
     driver = tmp_path / "offline_mdocr.py"
