@@ -407,6 +407,70 @@ def test_each_image_is_private_and_success_survives_unknown_peer(
     assert trace.read_text().splitlines() == calls
 
 
+@pytest.mark.parametrize("fix", [0, 1])
+def test_svg_cleanup_failure_publishes_peer_and_only_fixes_failed_image(
+    model, tmp_path, monkeypatch, fix
+):
+    trace = fixture_images(tmp_path, monkeypatch, {"peer": 200, "attachment": 200})
+    (tmp_path / "peer.md").write_text("![peer](peer.png)\n")
+    source = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"/>'
+    (tmp_path / "diagram.svg").write_bytes(source)
+    (tmp_path / "svg.md").write_text("![svg](diagram.svg)\n")
+    plan_batch(tmp_path, "cleanup", ["peer.md", "svg.md"], 3, "--fix", str(fix))
+    run = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import errno, shutil, subprocess
+from pathlib import Path
+from mdocr import cli, llm_image
+original_run, original_which, original_rmtree = subprocess.run, shutil.which, shutil.rmtree
+render_calls = 0
+def render(args, **kwargs):
+    global render_calls
+    if args[0] != '/fixture/chromium':
+        return original_run(args, **kwargs)
+    render_calls += 1
+    screenshot = Path(next(x.split('=', 1)[1] for x in args if x.startswith('--screenshot=')))
+    screenshot.write_bytes(Path('attachment.png').read_bytes())
+def clean(path, *args, **kwargs):
+    if Path(path).name.startswith('mdocr-svg-') and render_calls == 1:
+        raise OSError(errno.ENOTEMPTY, 'Directory not empty', str(Path(path) / 'profile/Default'))
+    return original_rmtree(path, *args, **kwargs)
+llm_image.shutil.which = lambda name: '/fixture/chromium' if name == 'google-chrome' else original_which(name)
+llm_image.subprocess.run = render
+llm_image.shutil.rmtree = clean
+raise SystemExit(cli.main(['run','--plan','cleanup.json','--result','cleanup-result.json']))
+""",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=25,
+        check=False,
+    )
+    assert run.returncode == (0 if fix else 2), run.stderr
+    result = json.loads((tmp_path / "cleanup-result.json").read_bytes())
+    peer, svg = result["documents"]
+    assert peer["status"] == "completed"
+    (first_failure,) = [r for r in result["requests"] if r["status"] == "failed"]
+    assert first_failure["reason"] == "svg_profile_cleanup_failed"
+    assert svg["status"] == ("completed" if fix else "partial")
+    calls = trace.read_text().splitlines()
+    assert (
+        calls
+        == ["begin peer", "end peer"] + ["begin attachment", "end attachment"] * fix
+    )
+    if fix:
+        assert result["requests"][-1]["fix_round"] == 1
+        assert result["requests"][-1]["key"] == first_failure["key"]
+        assert (
+            svg["ocr"]["images"][0]["source_sha256"]
+            == hashlib.sha256(source).hexdigest()
+        )
+
+
 def test_three_markdown_pipelines_overlap_but_images_within_one_do_not(
     model, tmp_path, monkeypatch
 ):

@@ -206,8 +206,8 @@ def _validate(plan, plan_path, result_path, ledger, artifacts, lock_paths):
     return texts
 
 
-# Only known unsuccessful provider attempts where submitting the same image
-# can help. A typed connection interruption is retried separately below.
+# Only failures where another image attempt can help, including a proven
+# pre-send cleanup failure. Typed connection interruptions are separate.
 _FIXABLE_FAILURES = {
     "OCR_RATE_LIMITED",
     "rate_limited",
@@ -218,6 +218,7 @@ _FIXABLE_FAILURES = {
     "response_schema_invalid",
     "response_table_invalid",
     "response_unexpected_stop",
+    "svg_profile_cleanup_failed",
 }
 
 
@@ -516,7 +517,10 @@ class Execution:
                 attempt["usage_tokens"] = usage
                 if self.settings["token_budget"] is not None and usage > reservation:
                     self.stop = "OCR_TOKEN_BOUND_BREACH"
-            elif status in {401, 403, 429} and not unknown:
+            elif not unknown and (
+                status in {401, 403, 429}
+                or attempt.get("reason") == "svg_profile_cleanup_failed"
+            ):
                 self.budget["reserved_tokens"] -= reservation
             if status in {401, 403} and not self.stop:
                 self.stop = (

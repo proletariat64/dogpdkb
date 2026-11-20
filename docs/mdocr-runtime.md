@@ -19,6 +19,13 @@ SVG scripts. A separate referenced image must be embedded first. SVG plans
 and OCR evidence retain the **original SVG bytes, SHA-256 and link**, not the
 screenshot. Raster-only LLM runs and all Paddle runs do not start Chrome.
 
+Chromium SVG profiles are per-image. If profile files race with teardown,
+mdocr retries the local cleanup without re-rendering or sending the image.
+Persistent `ENOTEMPTY` is a known pre-send image failure, eligible for the
+bounded batch fixer; it does not abort other images or document assembly.
+Invalid or unbound batch results are not OCR retry signals. Recovering accepted
+patches requires their original plan and verified request journal, not a resend.
+
 ## Requests, caching and resume
 
 A provider request includes exactly one image and the configured OCR instructions.

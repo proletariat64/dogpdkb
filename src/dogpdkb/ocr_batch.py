@@ -423,6 +423,7 @@ _FIXABLE_FAILURES = {
     "response_schema_invalid",
     "response_table_invalid",
     "response_unexpected_stop",
+    "svg_profile_cleanup_failed",
 }
 
 
