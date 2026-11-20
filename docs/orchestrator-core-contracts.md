@@ -219,7 +219,7 @@ pruned. Newly created disposable graph workspace files can still be reclaimed.
 Manual `purge` deletes only
 selected wash; force permits discarding unfinished runs but never bypasses locks
 or clears durable facts, corpus, graphs, persistent inputs or tool caches.
-Purge validates the saved schema, book key, source bindings and run ID against
+Purge validates the saved schema, book key, source identities and run ID against
 the selected wash; it does not require the saved corpus/graph execution targets to match the
 current configuration. Protected-path and live-owner checks still apply.
 Saved corpus/graph targets must be absolute and cannot overlap selected wash.

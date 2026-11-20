@@ -403,6 +403,28 @@ def test_purge_owned_wash_after_execution_target_changes(
     )
 
 
+@pytest.mark.parametrize("selection", ["single", "all"])
+def test_purge_owns_old_scope_after_subscription_changes(tmp_path, selection):
+    config = instance(tmp_path)
+    run = run_directory(tmp_path, status="paused")
+    saved = run / "run.json"
+    data = json.loads(saved.read_text())
+    data["targets"]["sources"]["team"]["document_ids"] = ["42"]
+    saved.write_text(json.dumps(data))
+    books = tmp_path / "books.json"
+    rows = json.loads(books.read_text())
+    rows[0]["sources"][0]["exclude_document_ids"] = ["43"]
+    books.write_text(json.dumps(rows))
+    artifact = tmp_path / "state/funds/inputs/source.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("# Preserve durable input\n")
+    args = ["--all"] if selection == "all" else ["--run", run.name]
+    result = cli(config, "--book", "funds", *args, "--force")
+    assert result.returncode == 0, result.stderr
+    assert not run.exists()
+    assert artifact.read_text() == "# Preserve durable input\n"
+
+
 @pytest.mark.parametrize("invalid", ["schema", "book", "source", "run-id"])
 def test_purge_all_rejects_invalid_saved_ownership_before_deleting(tmp_path, invalid):
     config = instance(tmp_path)
