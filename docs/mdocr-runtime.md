@@ -26,8 +26,9 @@ It does not include authored Markdown, paths, occurrence IDs or peer images. The
 strict JSON response contains `kind`, `markdown` and `uncertainty`. The runner builds
 the v2 wrapper and document evidence from the original plan.
 
-In LLM mode up to three Markdown pipelines run by default, processing selected
-images sequentially within each document. A 429 drains active requests before
+`mdocr plan --concurrency` accepts 1–10 workers (default 3). In LLM mode this
+caps concurrent Markdown pipelines; each document processes selected images
+sequentially. A 429 drains active requests before
 admission continues at the lower concurrency, finishing already-started pipelines
 before admitting more documents. A 429 at one stops further admission. Paddle
 keeps its per-image concurrency. The global request budget counts image admissions

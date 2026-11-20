@@ -73,6 +73,7 @@ TOML sections are tables. Recognized settings and fallback values:
   Omit for no extra cap, set a positive integer to cap requests, or 0 to disable.
 - semantic_score.model: provider/model, default openai/gpt-6.1-terra via Pi OAuth.
 - graphify.model: native OpenAI OAuth model ID; installed sample: gpt-6.1-terra.
+- graphify.concurrency: native semantic chunk limit, positive integer; default 3.
 - graphify.token_budget: native estimated input tokens per chunk. The installed
   sample uses 5500; when unset, Graphify uses its own default.
 - ocr.mode: llm (default, OpenAI Pi OAuth) or paddle (explicit opt-in).
@@ -80,7 +81,8 @@ TOML sections are tables. Recognized settings and fallback values:
   or set 0 to prohibit new requests. Independent of scoring.
 - ocr.budget_seconds: positive finite number, default 1800 seconds; mdocr owns
   the admission deadline. The installed sample uses 7200 seconds.
-  OCR concurrency defaults to 3.
+- ocr.concurrency: OCR worker limit, integer 1-10; default 3.
+  mdocr can lower the effective limit after provider throttling.
 - tools.skylark/mdcompare/mdocr/graphify: nonempty executable string or nonempty
   string argv array, default the tool name. This is not shell command text.
   Only argv[0] containing / or starting with ~ is resolved against the TOML;

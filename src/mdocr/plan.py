@@ -213,6 +213,8 @@ def plan_command(args) -> int:
             raise ValueError("--download-list names an unknown input document")
     if args.mode not in {"paddle", "llm"}:
         raise ValueError("--mode must be paddle or llm")
+    if type(args.concurrency) is not int or not 1 <= args.concurrency <= 10:
+        raise ValueError("--concurrency must be between 1 and 10")
     if args.mode == "paddle" and any(
         value is not None
         for value in (

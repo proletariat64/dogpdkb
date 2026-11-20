@@ -106,7 +106,7 @@ _NATIVE_ENV = {
 }
 
 
-def _native_extract(command, corpus, workspace, token_budget, model):
+def _native_extract(command, corpus, workspace, token_budget, model, concurrency):
     argv = [
         *command,
         "extract",
@@ -117,7 +117,7 @@ def _native_extract(command, corpus, workspace, token_budget, model):
         "--backend",
         "openai-oauth",
         "--max-concurrency",
-        "3",
+        str(concurrency),
     ]
     if model is not None:
         argv.extend(["--model", model])
@@ -126,7 +126,7 @@ def _native_extract(command, corpus, workspace, token_budget, model):
     return argv
 
 
-def _native_preflight(command, workspace, token_budget, model):
+def _native_preflight(command, workspace, token_budget, model, concurrency):
     """Check the attested CLI protocol without reading live credentials or documents."""
     isolated = {
         **_NATIVE_ENV,
@@ -152,7 +152,12 @@ def _native_preflight(command, workspace, token_budget, model):
     log = workspace / "capability.log"
     code = run_command(
         _native_extract(
-            command, probe, workspace / "capability-output", token_budget, model
+            command,
+            probe,
+            workspace / "capability-output",
+            token_budget,
+            model,
+            concurrency,
         ),
         log=log,
         cwd=workspace,
@@ -784,8 +789,9 @@ def run_graph(
     command = settings.command("graphify")
     token_budget = settings.graphify_token_budget
     model = settings.graphify_model
+    concurrency = settings.graphify_concurrency
     preflight, preflight_log = _native_preflight(
-        command, workspace, token_budget, model
+        command, workspace, token_budget, model, concurrency
     )
     if preflight:
         run.failure(
@@ -830,7 +836,7 @@ def run_graph(
         durable=True,
     )
     run.stage("graphify", total=len(pending), completed=0, failed=0, phase="tools")
-    argv = _native_extract(command, corpus, workspace, token_budget, model)
+    argv = _native_extract(command, corpus, workspace, token_budget, model, concurrency)
     log = workspace / "extract.log"
     code = run_command(
         argv,
@@ -888,6 +894,7 @@ def run_graph(
         "graphify_inputs": graphify_inputs,
         "graphify_model": model,
         "graphify_token_budget": token_budget,
+        "graphify_concurrency": concurrency,
         "omitted_deferred_sources": sorted(omitted),
         "reason": reason,
     }

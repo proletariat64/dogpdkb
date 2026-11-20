@@ -44,6 +44,7 @@ def freeze_policy(settings, store, run, graphify_inputs):
                     "ocr_mode",
                     "ocr_request_budget",
                     "ocr_budget_seconds",
+                    "ocr_concurrency",
                     "timeout_seconds",
                     "mcp_url",
                     "proxy_bin",
@@ -59,14 +60,17 @@ def freeze_policy(settings, store, run, graphify_inputs):
         }
         policy["graphify_model"] = settings.graphify_model
         policy["graphify_token_budget"] = settings.graphify_token_budget
+        policy["graphify_concurrency"] = settings.graphify_concurrency
         run.data["sync_policy"] = policy
         run.save(durable=True)
     frozen = replace(
         settings,
-        **policy["settings"],
+        **({"ocr_concurrency": 3} | policy["settings"]),
         # Policies saved before this setting existed used the native default.
         graphify_model=policy.get("graphify_model"),
         graphify_token_budget=policy.get("graphify_token_budget"),
+        # Legacy policies lacked concurrency; preserve historical CLI default.
+        graphify_concurrency=policy.get("graphify_concurrency", 3),
         tools=policy["tools"],
         ocr_cache=Path(policy["ocr_cache"]),
         body_recovery=Path(policy["body_recovery"])

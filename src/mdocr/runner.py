@@ -111,11 +111,11 @@ def _text(path, digest, reason):
 
 def _validate(plan, plan_path, result_path, ledger, artifacts, lock_paths):
     settings, docs = plan["settings"], plan["documents"]
-    if settings["mode"] not in {"paddle", "llm"} or settings["concurrency"] not in {
-        1,
-        2,
-        3,
-    }:
+    if (
+        settings["mode"] not in {"paddle", "llm"}
+        or type(settings["concurrency"]) is not int
+        or not 1 <= settings["concurrency"] <= 10
+    ):
         raise ValueError("invalid plan settings")
     if settings["mode"] == "llm" and settings.get("llm_schema") != IMAGE_SCHEMA:
         # A legacy document-level admission cannot authorize per-image retries.

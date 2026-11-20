@@ -130,6 +130,8 @@ class Settings:
     ocr_request_budget: int | None = None
     graphify_model: str | None = None
     graphify_token_budget: int | None = None
+    ocr_concurrency: int = 3
+    graphify_concurrency: int = 3
 
     def ocr_policy(self) -> dict:
         llm = self.ocr_mode == "llm"
@@ -137,7 +139,7 @@ class Settings:
             "mode": self.ocr_mode,
             "model": "openai/gpt-6.1-terra" if llm else None,
             "effort": "medium" if llm else None,
-            "concurrency": 3,
+            "concurrency": self.ocr_concurrency,
             "request_budget": self.ocr_request_budget,
             "max_seconds": self.ocr_budget_seconds,
             "cache_dir": str(self.ocr_cache),
@@ -291,6 +293,12 @@ def load_config(path: Path | str | None = None) -> Settings:
         type(graphify_budget) is not int or graphify_budget <= 0
     ):
         raise ConfigError("graphify.token_budget: expected a positive integer")
+    graphify_concurrency = graphify.get("concurrency", 3)
+    if type(graphify_concurrency) is not int or graphify_concurrency < 1:
+        raise ConfigError("graphify.concurrency: expected a positive integer")
+    ocr_concurrency = ocr.get("concurrency", 3)
+    if type(ocr_concurrency) is not int or not 1 <= ocr_concurrency <= 10:
+        raise ConfigError("ocr.concurrency: expected an integer from 1 to 10")
     return Settings(
         file=selected,
         books_file=(selected.parent / Path(books).expanduser()).resolve(),
@@ -313,6 +321,8 @@ def load_config(path: Path | str | None = None) -> Settings:
         ocr_request_budget=ocr_requests,
         graphify_model=graphify_model,
         graphify_token_budget=graphify_budget,
+        graphify_concurrency=graphify_concurrency,
+        ocr_concurrency=ocr_concurrency,
         body_recovery=configured_path("body_recovery"),
         semantic_score_request_budget=score_requests,
         semantic_score_model=model,

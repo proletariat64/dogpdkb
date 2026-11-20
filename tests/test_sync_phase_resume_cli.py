@@ -31,7 +31,8 @@ def test_each_stop_resumes_the_same_frozen_run(tmp_path, frozen_budget):
     if frozen_budget is not None:
         config.write_text(
             original_config
-            + f'\n[graphify]\ntoken_budget={frozen_budget}\nmodel="gpt-6.1-terra"\n'
+            + "\n[ocr]\nconcurrency=10\n"
+            + f'\n[graphify]\ntoken_budget={frozen_budget}\nmodel="gpt-6.1-terra"\nconcurrency=12\n'
         )
     args = ("sync", "--config", config)
     path, collect = run_data(
@@ -43,12 +44,8 @@ def test_each_stop_resumes_the_same_frozen_run(tmp_path, frozen_budget):
     source.rename(tmp_path / "moved")
     config.write_text(
         original_config
-        + '\n[ocr]\nmode="paddle"\nrequest_budget=0\n'
-        + (
-            '\n[graphify]\ntoken_budget=1024\nmodel="gpt-6-luna"\n'
-            if frozen_budget is None
-            else ""
-        )
+        + '\n[ocr]\nmode="paddle"\nrequest_budget=0\nconcurrency=4\n'
+        + '\n[graphify]\ntoken_budget=1024\nmodel="gpt-6-luna"\nconcurrency=6\n'
     )
     resume = (*args, "--resume", path)
     _, plan = run_data(cli(tmp_path, *resume, "--stop-after", "plan"))
@@ -83,6 +80,12 @@ def test_each_stop_resumes_the_same_frozen_run(tmp_path, frozen_budget):
         ["mdocr", "run"],
         ["graphify", "extract"],
     ]
+    assert calls[0][calls[0].index("--concurrency") + 1] == (
+        "3" if frozen_budget is None else "10"
+    )
+    assert calls[-1][calls[-1].index("--max-concurrency") + 1] == (
+        "3" if frozen_budget is None else "12"
+    )
     if frozen_budget is None:
         assert "--token-budget" not in calls[-1]
         assert "--model" not in calls[-1]

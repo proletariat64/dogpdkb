@@ -379,7 +379,7 @@ def _start_args(root, request):
         "--cache-dir",
         policy["cache_dir"],
         "--concurrency",
-        policy["concurrency"],
+        str(policy["concurrency"]),
         "--max-seconds",
         policy["max_seconds"],
     ]
@@ -564,6 +564,9 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
 
     plan_path = run.data["artifacts"]["plan"]
     policy = read_json(Path(plan_path)).get("ocr_policy") or settings.ocr_policy()
+    # Older run plans predate configurable OCR concurrency. Their frozen public
+    # CLI behavior was always the mdocr default of three.
+    policy.setdefault("concurrency", 3)
     batches = store.path.parent / "ocr"
     request_path = _path(
         batches,

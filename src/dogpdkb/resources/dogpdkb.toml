@@ -26,10 +26,14 @@ model = "openai/gpt-6.1-terra"
 model = "gpt-6.1-terra"
 # Estimated input tokens per chunk, not a spending cap.
 token_budget = 5500
+# Maximum concurrent native extraction chunks (default 3).
+concurrency = 3
 
 [ocr]
 # Default LLM uses OpenAI Pi OAuth; set mode = "paddle" to opt in to Paddle.
 mode = "llm"
+# Concurrent OCR workers, 1–10 (default 3).
+concurrency = 3
 # OCR request limit for the whole batch. Omit for unlimited; 0 sends nothing new.
 # request_budget = 20
 # Admission deadline. In-flight calls retain tool-owned timeouts.

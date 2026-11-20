@@ -62,9 +62,9 @@ PLAN_FULL = """Plan controls:
   --model provider/model, --effort, and --prompt-file to override. The response
   schema stays code-owned. --token-budget and --request-budget are run-wide
   nonnegative ceilings; omit them for unlimited. A hard token budget refuses
-  admission if a trustworthy upper bound is unavailable. Both modes start at
-  concurrency 3 by default (active Markdown pipelines for LLM, active image
-  jobs for Paddle). The request budget counts image admissions, not documents.
+  admission if a trustworthy upper bound is unavailable. --concurrency accepts
+  1 through 10 (default 3): active Markdown pipelines for LLM, active image
+  jobs for Paddle. The request budget counts image admissions, not documents.
   --max-seconds is an admission deadline (default 900).
 """
 

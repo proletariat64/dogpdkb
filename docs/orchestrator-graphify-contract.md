@@ -16,16 +16,22 @@ including resources. For a newly sealed sync batch, recovery inherits the saved
 mode and refuses a different one. Apply and older unbound batches retain their
 per-invocation option. The execution report records `graphify_inputs`.
 
-`graphify extract CORPUS --out WORKSPACE --no-cluster --backend openai-oauth --max-concurrency 3`
+`graphify extract CORPUS --out WORKSPACE --no-cluster --backend openai-oauth --max-concurrency N`
 scans that source tree, with `GRAPHIFY_OPENAI_OAUTH_PARALLEL=1` and force mode
-explicitly disabled. This is one directory subprocess with up to three native
-semantic chunks in flight, not three subprocesses. Graphify owns its OAuth
-login, token refresh and retries; dogpdkb does not use Pi or API-key fallback.
+explicitly disabled. `[graphify].concurrency` sets the native semantic chunk
+limit (positive integer, default 3) for a single directory subprocess. The
+OAuth environment setting enables parallelism; it is not a worker limit.
+Graphify owns its OAuth login, token refresh and retries; dogpdkb does not use
+Pi or API-key fallback.
 
 The installed sample sets `[graphify].model = "gpt-6.1-terra"`, forwarded as
 native `--model` on the OpenAI OAuth backend. If omitted, Graphify selects its
 model as usual. Ordinary resume retains the saved model selection, while an
 explicit graph retry uses the current configuration.
+
+Ordinary sync resume retains its saved concurrency (3 for older runs).
+Explicit `--retry-graph` uses the current configuration. This setting does not
+affect OCR or surrounding serial stages.
 
 Optional `[graphify].token_budget` (positive integer) is passed as native
 `--token-budget N` to the preflight and to extraction. When unset, Graphify
