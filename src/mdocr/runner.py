@@ -223,7 +223,7 @@ _FIXABLE_FAILURES = {
 
 
 class Execution:
-    def __init__(self, plan, digest, ledger, result, artifacts, retry):
+    def __init__(self, plan, digest, ledger, result, artifacts, retry, *, version=None):
         self.docs = plan["documents"]
         self.settings = plan["settings"]
         self.mode = self.settings["mode"]
@@ -237,7 +237,10 @@ class Execution:
         self.retry = retry
         self.deadline = time.monotonic() + self.settings["max_seconds"]
         self.limit = self.settings["concurrency"]
-        self.config = {"mode": self.mode, "version": __version__}
+        self.config = {
+            "mode": self.mode,
+            "version": __version__ if version is None else version,
+        }
         if self.mode == "llm":
             self.config |= {
                 "model": self.settings["model"],
@@ -315,7 +318,8 @@ class Execution:
 
     def save(self):
         data = _json(self.state)
-        _atomic(self.ledger, data)
+        if self.ledger is not None:
+            _atomic(self.ledger, data)
         _atomic(self.result, data)
 
     def plan_jobs(self):

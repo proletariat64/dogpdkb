@@ -200,6 +200,32 @@ pending fields/failures remain readable; usable bodies proceed to Graphify.
 Explicit recovery of older failed runs belongs to the external agent; there is
 no automatic historical migration or retry layer.
 
+### Explicit recovery of a sealed interrupted OCR batch
+
+Use `dogpdkb recover-ocr --config CONFIG --book BOOK --run ORIGINAL_ID
+--execution-version VERSION --output-dir NEW_PRIVATE_DIRECTORY` to preflight
+and create a checksummed recovery receipt. Only a sealed global result-binding
+failure with matching native running journal and result mirror is eligible.
+This reads the source and current baselines without the write lock; it does not
+mutate original receipts or publish. `mdocr assemble` does not make new requests.
+
+After reviewing the receipt, `dogpdkb recover-ocr --config CONFIG --book BOOK
+--publish RECEIPT --receipt-sha256 SHA256` takes the standard write lock and
+revalidates source, current versions/bytes, scope and graph generation. It
+reassembles offline into a new durable recovery run before publishing. It only
+replaces verified complete Markdown whose bytes changed due to OCR. A partial
+exit (2) returns a bound compile manifest; unresolved and unchanged documents
+are explicitly deferred, and their existing corpus bytes stay intact. To resume
+an interrupted local publication after its checkpoint, use `recover-ocr --resume
+RECOVERY_ID` under the same configuration. No old seal or journal is rewritten.
+
+Use `update-graph --input NEW_MANIFEST` as a separate action. An interrupted old
+graph attempt for the same document version may authorize only a newly proven
+body SHA, after verifying the original graph manifest and frozen body witness.
+Unchanged or partial rows are retained at proved old graph inputs or excluded
+when no native graph owns them. This does not import an interrupted Graphify
+candidate or retry its unchanged/unknown inputs.
+
 Cleaned completed/partial runs are not ordinarily resumable. Explicit
 `sync --resume RUN --retry-graph` uses only a retained final compile manifest,
 including after cleanup, and revalidates it through the graph stage. It never

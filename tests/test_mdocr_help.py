@@ -146,12 +146,14 @@ def test_abbreviated_full_is_rejected_before_preparation(tmp_path):
     assert not (tmp_path / "out").exists()
 
 
-@pytest.mark.parametrize("command", ["plan", "run"])
-def test_plan_run_help_advertise_full_contract(tmp_path, command):
+@pytest.mark.parametrize("command", ["plan", "run", "assemble"])
+def test_batch_commands_advertise_full_contract(tmp_path, command):
     brief = run_cli(tmp_path, command, "--help")
     expanded = run_cli(tmp_path, command, "--help", "--full")
     assert brief.returncode == expanded.returncode == 0
     assert f"mdocr {command} --help --full" in brief.stdout
+    if command == "assemble":
+        assert "--full" in brief.stdout.split("Example:", 1)[0]
     assert len(expanded.stdout) > len(brief.stdout)
 
 
