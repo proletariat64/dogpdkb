@@ -12,7 +12,7 @@ from pathlib import Path
 
 from dogpdkb.help import HelpParser
 from dogpdkb.records import RUN_SCHEMA, Store, process_alive, read_json
-from dogpdkb.settings import load_config, select_book
+from dogpdkb.settings import load_config, select_book, source_identity
 
 
 def purge_runs(store, reference=None, *, all_runs=False, force=False):
@@ -72,7 +72,9 @@ def purge_runs(store, reference=None, *, all_runs=False, force=False):
             not isinstance(bindings, dict)
             or not bindings
             or any(
-                key not in known or known[key] != binding
+                key not in known
+                or not isinstance(binding, dict)
+                or source_identity(known[key]) != source_identity(binding)
                 for key, binding in bindings.items()
             )
         ):

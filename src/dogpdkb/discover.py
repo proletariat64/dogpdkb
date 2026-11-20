@@ -192,10 +192,7 @@ def _yuque_listing(settings, run, source, listing):
     else:
         payload = read_json(Path(listing))
     current = _rows(payload, source)
-    if source.document_ids is not None:
-        current = {
-            key: row for key, row in current.items() if key in source.document_ids
-        }
+    current = {key: row for key, row in current.items() if source.allows(key)}
     if listing is not None:
         atomic_json(target, payload)
     return _with_source(current, source.key), payload.get("captured_at"), str(target)
@@ -395,7 +392,7 @@ def discover(settings, book, store, run, listing=None, *, sources=None):
                 and any(
                     isinstance(source, YuqueSource)
                     and source.key not in previous
-                    and (source.document_ids is None or match[1] in source.document_ids)
+                    and source.allows(match[1])
                     for source in sources
                 )
             ):
@@ -432,11 +429,20 @@ def discover(settings, book, store, run, listing=None, *, sources=None):
             raise DiscoverError(
                 f"source {source.key}: {error}", getattr(error, "exit_code", 1)
             ) from error
-        expected = (
-            {document_identity(source.key, item) for item in source.document_ids}
-            if yuque and source.document_ids is not None
-            else set(prior["documents"] if prior else ()) | set(local)
-        )
+        previously_tracked = {**(prior["documents"] if prior else {}), **local}
+        if not yuque:
+            expected = set(previously_tracked)
+        elif source.include_document_ids is not None:
+            expected = {
+                document_identity(source.key, item)
+                for item in source.include_document_ids
+            }
+        else:
+            expected = {
+                key
+                for key, row in previously_tracked.items()
+                if source.allows(row["source_document_id"])
+            }
         missing = sorted(expected - set(current))
         seen[source.key] = {
             "documents": current,

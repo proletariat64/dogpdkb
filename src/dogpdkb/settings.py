@@ -30,8 +30,14 @@ class ConfigError(ValueError):
 class YuqueSource:
     key: str
     url: str
-    document_ids: tuple[str, ...] | None = None
+    include_document_ids: frozenset[str] | None = None
+    exclude_document_ids: frozenset[str] = frozenset()
     enabled: bool = True
+
+    def allows(self, document_id: str) -> bool:
+        if self.include_document_ids is not None:
+            return document_id in self.include_document_ids
+        return document_id not in self.exclude_document_ids
 
 
 @dataclass(frozen=True)
@@ -54,10 +60,27 @@ def document_identity(source_key: str, source_document_id: str) -> str:
 def source_binding(source: Source) -> dict[str, Any]:
     if isinstance(source, DirectorySource):
         return {"type": "directory", "path": str(source.path)}
-    return {
+    result = {
         "type": "yuque",
         "url": source.url,
-        "document_ids": list(source.document_ids) if source.document_ids else None,
+        # Keep the internal inclusion field stable for v0.3.0 state and runs.
+        "document_ids": sorted(source.include_document_ids)
+        if source.include_document_ids is not None
+        else None,
+    }
+    if source.exclude_document_ids:
+        result["exclude_document_ids"] = sorted(source.exclude_document_ids)
+    return result
+
+
+def source_identity(binding: dict) -> dict:
+    """Only the upstream URL or directory binds the durable source identity."""
+    if binding.get("type") != "yuque":
+        return binding
+    return {
+        key: value
+        for key, value in binding.items()
+        if key not in {"document_ids", "exclude_document_ids"}
     }
 
 
@@ -308,11 +331,25 @@ def _source_key(value: Any, label: str) -> str:
     return value
 
 
+_SCOPE_KEYS = ("document_ids", "include_document_ids", "exclude_document_ids")
+
+
+def _subscription_ids(value, source_key, field):
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(item, str) or not item.strip() for item in value)
+        or len(set(value)) != len(value)
+    ):
+        raise ConfigError(f"{source_key}: {field} must be nonempty unique string IDs")
+    return frozenset(value)
+
+
 def _parse_sources(row: dict, base: Path, book_key: str) -> tuple[Source, ...]:
     values = row.get("sources")
     if (
         "url" in row
-        or "document_ids" in row
+        or any(field in row for field in _SCOPE_KEYS)
         or not isinstance(values, list)
         or not values
     ):
@@ -335,26 +372,26 @@ def _parse_sources(row: dict, base: Path, book_key: str) -> tuple[Source, ...]:
         if kind == "yuque":
             if "path" in value:
                 raise ConfigError(f"{key}: yuque source does not accept path")
-            ids = None
-            if "document_ids" in value:
-                raw = value["document_ids"]
-                if (
-                    not isinstance(raw, list)
-                    or not raw
-                    or any(
-                        not isinstance(item, str) or not item.strip() for item in raw
-                    )
-                    or len(set(raw)) != len(raw)
-                ):
-                    raise ConfigError(
-                        f"{key}: document_ids must be nonempty unique string IDs"
-                    )
-                ids = tuple(sorted(raw))
-            sources.append(YuqueSource(key, _url(value.get("url"), key), ids, enabled))
-        elif kind == "directory":
-            if "url" in value or "document_ids" in value:
+            fields = [field for field in _SCOPE_KEYS if field in value]
+            if len(fields) > 1:
                 raise ConfigError(
-                    f"{key}: directory source does not accept url/document_ids"
+                    f"{key}: document_ids, include_document_ids and exclude_document_ids are mutually exclusive"
+                )
+            include, exclude = None, frozenset()
+            if fields:
+                field = fields[0]
+                ids = _subscription_ids(value[field], key, field)
+                if field == "exclude_document_ids":
+                    exclude = ids
+                else:
+                    include = ids
+            sources.append(
+                YuqueSource(key, _url(value.get("url"), key), include, exclude, enabled)
+            )
+        elif kind == "directory":
+            if "url" in value or any(field in value for field in _SCOPE_KEYS):
+                raise ConfigError(
+                    f"{key}: directory source does not accept url or document ID policies"
                 )
             path = value.get("path")
             if not isinstance(path, str) or not path.strip():

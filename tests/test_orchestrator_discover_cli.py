@@ -315,7 +315,7 @@ def test_saved_tool_log_keeps_recoverable_command_with_credential_values_redacte
     assert "fixture-private-password" not in log
 
 
-def test_document_subscription_filters_after_complete_listing_and_pins_scope(tmp_path):
+def test_legacy_whitelist_and_new_include_key_share_state(tmp_path):
     config = tmp_path / "instance.toml"
     config.write_text(
         '[source]\nbooks_file="books.json"\n[paths]\nstate="state"\nstaging="runs"\n'
@@ -350,16 +350,23 @@ def test_document_subscription_filters_after_complete_listing_and_pins_scope(tmp
     state = json.loads(before)
     assert set(state["documents"]) == {team_id("2")}
     assert state["book"]["sources"]["team"]["document_ids"] == ["2"]
-    source["sources"][0]["document_ids"] = ["1", "2"]
+    del source["sources"][0]["document_ids"]
+    source["sources"][0]["include_document_ids"] = ["1", "2"]
     books.write_text(json.dumps([source]))
-    changed = cli("discover", "--config", config, "--listing", path)
-    assert changed.returncode == 1
-    assert "binding changed" in changed.stderr
-    assert state_path.read_bytes() == before
+    changed = difference(cli("discover", "--config", config, "--listing", path))
+    # ID 2 still has unconsumed pending work from the first discovery.
+    assert {r["source_document_id"] for r in changed["documents"]} == {"1", "2"}
+    assert not changed["absent"]
+    assert json.loads(state_path.read_text())["book"]["sources"]["team"][
+        "document_ids"
+    ] == ["1", "2"]
 
 
-@pytest.mark.parametrize("scope", [None, [], ["2", "2"], [2], "2"])
-def test_invalid_subscription_cannot_expand_to_entire_book(tmp_path, scope):
+@pytest.mark.parametrize(
+    "field", ["include_document_ids", "exclude_document_ids", "document_ids"]
+)
+@pytest.mark.parametrize("scope", [None, [], ["2", "2"], [2], "2", [" "]])
+def test_invalid_subscription_cannot_expand_to_entire_book(tmp_path, field, scope):
     config = tmp_path / "instance.toml"
     config.write_text('[source]\nbooks_file="books.json"\n')
     (tmp_path / "books.json").write_text(
@@ -367,15 +374,66 @@ def test_invalid_subscription_cannot_expand_to_entire_book(tmp_path, scope):
             [
                 {
                     "key": "funds",
-                    "url": "https://example.invalid/book",
-                    "document_ids": scope,
+                    "sources": [
+                        {
+                            "key": "team",
+                            "type": "yuque",
+                            "url": "https://example.invalid/book",
+                            field: scope,
+                        }
+                    ],
                 }
             ]
         )
     )
     result = cli("discover", "--config", config)
     assert result.returncode == 1
-    assert "document_ids" in result.stderr
+    assert field in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("kind", "scope", "message"),
+    [
+        (
+            "yuque",
+            {"include_document_ids": ["2"], "exclude_document_ids": ["3"]},
+            "mutually exclusive",
+        ),
+        (
+            "yuque",
+            {"document_ids": ["2"], "exclude_document_ids": ["3"]},
+            "mutually exclusive",
+        ),
+        (
+            "yuque",
+            {"document_ids": ["2"], "include_document_ids": ["2"]},
+            "mutually exclusive",
+        ),
+        ("directory", {"exclude_document_ids": ["2"]}, "directory source"),
+        ("directory", {"include_document_ids": ["2"]}, "directory source"),
+    ],
+)
+def test_scope_is_unambiguous_and_only_for_yuque(tmp_path, kind, scope, message):
+    cfg = tmp_path / "dogpdkb.toml"
+    cfg.write_text("")
+    endpoint = (
+        {"url": "https://example.invalid/book"}
+        if kind == "yuque"
+        else {"path": "inbox"}
+    )
+    (tmp_path / "books.json").write_text(
+        json.dumps(
+            [
+                {
+                    "key": "funds",
+                    "sources": [{"key": "team", "type": kind, **endpoint, **scope}],
+                }
+            ]
+        )
+    )
+    result = cli("discover", "--config", cfg)
+    assert result.returncode == 1 and message in result.stderr
+    assert not (tmp_path / "state").exists()
 
 
 def test_subscription_init_state_does_not_mark_other_corpus_ids_absent(tmp_path):
