@@ -32,7 +32,7 @@ concurrency = 3
 [ocr]
 # Default LLM uses OpenAI Pi OAuth; set mode = "paddle" to opt in to Paddle.
 mode = "llm"
-# Concurrent OCR workers, 1–10 (default 3).
+# Concurrent OCR workers, 1–100 (default 3).
 concurrency = 3
 # Extra attempts per eligible failed image after the first pass.
 fix = 1

@@ -31,7 +31,7 @@ verifiable against their legacy plan and schema. Do not create replacement plans
 replay previously unknown admissions.
 
 The orchestrator passes `[ocr].concurrency` to `mdocr plan --concurrency`
-(1-10, default 3). mdocr may lower the active limit after throttling.
+(1-100, default 3). mdocr may lower the active limit after throttling.
 `[ocr].fix` passes `mdocr plan --fix N`. The installed sample sets `1`;
 missing or `0` disables it. The batch freezes this limit. After the initial
 pass the same journal records retries as `fix_round`, bounded per image.

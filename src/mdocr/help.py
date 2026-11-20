@@ -63,7 +63,7 @@ PLAN_FULL = """Plan controls:
   schema stays code-owned. --token-budget and --request-budget are run-wide
   nonnegative ceilings; omit them for unlimited. A hard token budget refuses
   admission if a trustworthy upper bound is unavailable. --concurrency accepts
-  1 through 10 (default 3): active Markdown pipelines for LLM, active image
+  1 through 100 (default 3): active Markdown pipelines for LLM, active image
   jobs for Paddle. The request budget counts image admissions, not documents.
   --max-seconds is an admission deadline (default 900). --fix N sets at most
   N extra batch-end requests per eligible failed image (default 0).

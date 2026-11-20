@@ -302,8 +302,8 @@ def load_config(path: Path | str | None = None) -> Settings:
     if type(graphify_concurrency) is not int or graphify_concurrency < 1:
         raise ConfigError("graphify.concurrency: expected a positive integer")
     ocr_concurrency = ocr.get("concurrency", 3)
-    if type(ocr_concurrency) is not int or not 1 <= ocr_concurrency <= 10:
-        raise ConfigError("ocr.concurrency: expected an integer from 1 to 10")
+    if type(ocr_concurrency) is not int or not 1 <= ocr_concurrency <= 100:
+        raise ConfigError("ocr.concurrency: expected an integer from 1 to 100")
     return Settings(
         file=selected,
         books_file=(selected.parent / Path(books).expanduser()).resolve(),

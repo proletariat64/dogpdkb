@@ -28,7 +28,7 @@ IDs or peer images. The
 strict JSON response contains `kind`, `markdown` and `uncertainty`. The runner builds
 the v2 wrapper and document evidence from the original plan.
 
-`mdocr plan --concurrency` accepts 1–10 workers (default 3). In LLM mode this
+`mdocr plan --concurrency` accepts 1–100 workers (default 3). In LLM mode this
 caps concurrent Markdown pipelines; each document processes selected images
 sequentially. A 429 drains active requests before
 admission continues at the lower concurrency, finishing already-started pipelines
