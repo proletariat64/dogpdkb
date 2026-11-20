@@ -21,6 +21,17 @@ scans that source tree, with `GRAPHIFY_OPENAI_OAUTH_PARALLEL=1` and force mode
 explicitly disabled. This is one directory subprocess with up to three native
 semantic chunks in flight, not three subprocesses. Graphify owns its OAuth
 login, token refresh and retries; dogpdkb does not use Pi or API-key fallback.
+
+Optional `[graphify].token_budget` (positive integer) is passed as native
+`--token-budget N` to the preflight and to extraction. When unset, Graphify
+uses its 60,000-token default. It sizes chunks by estimated input tokens,
+not by document count, total tokens/cost or output tokens. A smaller value can
+reduce file omissions in otherwise valid responses, at the cost of more chunks;
+it does not guarantee coverage. The configured value is recorded separately
+from sanitized argv as `graphify_token_budget` (null when unset). An explicit
+`--retry-graph` may change this execution setting without changing the sealed
+input scope. Native cache reads and publication proof remain active.
+
 Only `compile` manifest rows request a new graph attempt; `reuse`,
 `metadata`, `retain` and `defer` do not claim extraction or advance graph facts.
 An all-retained batch makes no Graphify call. A deferred row keeps the result
