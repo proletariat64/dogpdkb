@@ -9,9 +9,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from .llm_image import vision_image
-from .prepare import ImageError
-
 DEFAULT_MODEL = "openai/gpt-6.1-terra"
 DEFAULT_EFFORT = "medium"
 IMAGE_SCHEMA = "mdocr-image-content-1"
@@ -100,6 +97,10 @@ class LlmClient:
         )
 
     def convert(self, original: bytes, prompt: str) -> dict[str, Any]:
+        # Image dependencies belong to conversion; doctor probes them separately.
+        from .llm_image import vision_image
+        from .prepare import ImageError
+
         try:
             data, mime = vision_image(original)
         except ImageError as exc:

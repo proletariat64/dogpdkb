@@ -172,11 +172,10 @@ def test_catchup_only_sends_unattempted_document_and_recompiles_enrichment(tmp_p
     config, _ = _native_instance(tmp_path)
     source = tmp_path / "inbox"
     source.mkdir()
-    (source / "diagram.png").write_bytes(b"synthetic image bytes")
     for n in (1, 2):
-        (source / f"doc{n}.md").write_text(
-            f"# Document {n}\n\n![diagram](diagram.png)\n"
-        )
+        image = f"diagram-{n}.png"
+        (source / image).write_bytes(f"synthetic image bytes {n}".encode())
+        (source / f"doc{n}.md").write_text(f"# Document {n}\n\n![diagram]({image})\n")
     tools = tmp_path / "graph-fixture.py"
     tools.write_text(REMOTE_CLI)
     config.write_text(

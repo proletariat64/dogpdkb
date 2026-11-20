@@ -159,9 +159,10 @@ def ocr_instance(root, names, *, crash=False):
     config, _ = _native_instance(root, crash=crash)
     source = root / "inbox"
     source.mkdir()
-    (source / "diagram.png").write_bytes(b"synthetic image bytes")
     for name in names:
-        (source / f"{name}.md").write_text(f"# {name}\n\n![diagram](diagram.png)\n")
+        image = f"diagram-{name}.png"
+        (source / image).write_bytes(f"synthetic image bytes {name}".encode())
+        (source / f"{name}.md").write_text(f"# {name}\n\n![diagram]({image})\n")
     tools = root / "graph-fixture.py"
     tools.write_text(REMOTE_CLI)
     config.write_text(
