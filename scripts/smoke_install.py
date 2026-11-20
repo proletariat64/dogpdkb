@@ -161,7 +161,7 @@ def inspect_artifacts(wheel: Path, sdist: Path) -> None:
         names = set(archive.namelist())
         sample = tomllib.loads(archive.read("dogpdkb/resources/dogpdkb.toml").decode())
         assert sample["semantic_score"] == {"model": "openai/gpt-6.1-terra"}
-        assert sample["graphify"]["token_budget"] == 5500
+        assert sample["graphify"] == {"model": "gpt-6.1-terra", "token_budget": 5500}
         assert sample["ocr"] == {"mode": "llm", "budget_seconds": 7200}
     with tarfile.open(sdist) as archive:
         source_names = {name.split("/", 1)[-1] for name in archive.getnames()}

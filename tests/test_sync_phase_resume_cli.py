@@ -30,7 +30,8 @@ def test_each_stop_resumes_the_same_frozen_run(tmp_path, frozen_budget):
     original_config = config.read_text()
     if frozen_budget is not None:
         config.write_text(
-            original_config + f"\n[graphify]\ntoken_budget={frozen_budget}\n"
+            original_config
+            + f'\n[graphify]\ntoken_budget={frozen_budget}\nmodel="gpt-6.1-terra"\n'
         )
     args = ("sync", "--config", config)
     path, collect = run_data(
@@ -43,7 +44,11 @@ def test_each_stop_resumes_the_same_frozen_run(tmp_path, frozen_budget):
     config.write_text(
         original_config
         + '\n[ocr]\nmode="paddle"\nrequest_budget=0\n'
-        + ("\n[graphify]\ntoken_budget=1024\n" if frozen_budget is None else "")
+        + (
+            '\n[graphify]\ntoken_budget=1024\nmodel="gpt-6-luna"\n'
+            if frozen_budget is None
+            else ""
+        )
     )
     resume = (*args, "--resume", path)
     _, plan = run_data(cli(tmp_path, *resume, "--stop-after", "plan"))
@@ -80,8 +85,14 @@ def test_each_stop_resumes_the_same_frozen_run(tmp_path, frozen_budget):
     ]
     if frozen_budget is None:
         assert "--token-budget" not in calls[-1]
+        assert "--model" not in calls[-1]
     else:
-        assert calls[-1][-2:] == ["--token-budget", str(frozen_budget)]
+        assert calls[-1][-4:] == [
+            "--model",
+            "gpt-6.1-terra",
+            "--token-budget",
+            str(frozen_budget),
+        ]
 
 
 def test_changed_plan_handoff_fails_before_ocr(tmp_path):

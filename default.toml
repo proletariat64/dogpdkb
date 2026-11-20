@@ -33,6 +33,8 @@ model = "openai/gpt-6.1-terra"
 # request_budget = 0 # Disable model scoring for an offline run.
 
 [graphify]
+# Native Graphify OpenAI OAuth model ID.
+model = "gpt-6.1-terra"
 # Estimated input tokens per chunk, not a spending cap.
 token_budget = 5500
 

@@ -105,6 +105,7 @@ class Settings:
     semantic_score_model: str | None = None
     ocr_mode: str = "llm"
     ocr_request_budget: int | None = None
+    graphify_model: str | None = None
     graphify_token_budget: int | None = None
 
     def ocr_policy(self) -> dict:
@@ -254,7 +255,15 @@ def load_config(path: Path | str | None = None) -> Settings:
         raise ConfigError("ocr.mode: expected llm or paddle")
     if ocr_requests is not None and (type(ocr_requests) is not int or ocr_requests < 0):
         raise ConfigError("ocr.request_budget: expected a nonnegative integer")
-    graphify_budget = data.get("graphify", {}).get("token_budget")
+    graphify = data.get("graphify", {})
+    if not isinstance(graphify, dict):
+        raise ConfigError("graphify: expected a TOML table")
+    graphify_model = graphify.get("model")
+    if graphify_model is not None and (
+        not isinstance(graphify_model, str) or not graphify_model.strip()
+    ):
+        raise ConfigError("graphify.model: expected a nonempty model ID")
+    graphify_budget = graphify.get("token_budget")
     if graphify_budget is not None and (
         type(graphify_budget) is not int or graphify_budget <= 0
     ):
@@ -279,6 +288,7 @@ def load_config(path: Path | str | None = None) -> Settings:
         ocr_budget_seconds=number("ocr", "budget_seconds", 1800),
         ocr_mode=ocr_mode,
         ocr_request_budget=ocr_requests,
+        graphify_model=graphify_model,
         graphify_token_budget=graphify_budget,
         body_recovery=configured_path("body_recovery"),
         semantic_score_request_budget=score_requests,

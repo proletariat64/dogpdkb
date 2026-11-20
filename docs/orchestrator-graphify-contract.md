@@ -22,6 +22,11 @@ explicitly disabled. This is one directory subprocess with up to three native
 semantic chunks in flight, not three subprocesses. Graphify owns its OAuth
 login, token refresh and retries; dogpdkb does not use Pi or API-key fallback.
 
+The installed sample sets `[graphify].model = "gpt-6.1-terra"`, forwarded as
+native `--model` on the OpenAI OAuth backend. If omitted, Graphify selects its
+model as usual. Ordinary resume retains the saved model selection, while an
+explicit graph retry uses the current configuration.
+
 Optional `[graphify].token_budget` (positive integer) is passed as native
 `--token-budget N` to the preflight and to extraction. When unset, Graphify
 uses its 60,000-token default. It sizes chunks by estimated input tokens,

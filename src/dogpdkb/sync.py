@@ -57,6 +57,7 @@ def freeze_policy(settings, store, run, graphify_inputs):
             "body_recovery": str(source) if source else None,
             "graphify_inputs": graphify_inputs,
         }
+        policy["graphify_model"] = settings.graphify_model
         policy["graphify_token_budget"] = settings.graphify_token_budget
         run.data["sync_policy"] = policy
         run.save(durable=True)
@@ -64,6 +65,7 @@ def freeze_policy(settings, store, run, graphify_inputs):
         settings,
         **policy["settings"],
         # Policies saved before this setting existed used the native default.
+        graphify_model=policy.get("graphify_model"),
         graphify_token_budget=policy.get("graphify_token_budget"),
         tools=policy["tools"],
         ocr_cache=Path(policy["ocr_cache"]),

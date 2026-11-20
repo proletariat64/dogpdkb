@@ -910,6 +910,7 @@ def test_installed_graphify_budget_recovers_omissions_with_three_inflight(tmp_pa
     names = {Path(row["path"]).name for row in batch["documents"]}
     condition = threading.Condition()
     dispatched = []
+    models = []
     peak = active = 0
 
     class Handler(BaseHTTPRequestHandler):
@@ -923,6 +924,7 @@ def test_installed_graphify_budget_recovers_omissions_with_three_inflight(tmp_pa
             found = {name for name in names if name in body}
             with condition:
                 dispatched.append(found)
+                models.append(request["model"])
                 active += 1
                 peak = max(peak, active)
                 condition.notify_all()
@@ -975,14 +977,16 @@ def test_installed_graphify_budget_recovers_omissions_with_three_inflight(tmp_pa
         assert dispatched == [names]  # same-version suppression still applies
 
         with config.open("a") as stream:
-            stream.write("\n[graphify]\ntoken_budget = 512\n")
+            stream.write('\n[graphify]\ntoken_budget = 512\nmodel = "gpt-6.1-terra"\n')
         dispatched.clear()
+        models.clear()
         peak = 0
         result = cli(config, manifest, environment, retry_graph=True)
         assert result.returncode == 0, result.stdout + result.stderr
         assert len(dispatched) == len(names)
         assert set.union(*dispatched) == names
         assert peak == 3
+        assert models == ["gpt-6.1-terra"] * len(names)
         assert {
             n["source_file"] for n in json.loads(public_graph.read_text())["nodes"]
         } == names
@@ -991,6 +995,7 @@ def test_installed_graphify_budget_recovers_omissions_with_three_inflight(tmp_pa
             row["steps"]["graph"]["status"] == "completed" for row in documents.values()
         )
         report = json.loads(Path(documents["42"]["graph"]["report"]).read_text())
+        assert report["graphify_model"] == "gpt-6.1-terra"
         assert report["graphify_token_budget"] == 512
         assert "chunk 5/5 done" in Path(report["native_log"]).read_text()
     finally:
