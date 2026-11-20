@@ -603,6 +603,8 @@ class Execution:
                 } | {"errors": errors}
 
     def dispatch(self, jobs, pipelines):
+        # Check whether saved warnings can be repaired before admitting new jobs.
+        self.restore_repairs()
         pending = {}
         for key, image in jobs.items():
             previous = self.latest.get(key)
@@ -639,7 +641,6 @@ class Execution:
             if not pending:
                 break
             self.dispatch_pending(pending, pipelines, fix=True)
-        self.restore_repairs()
         while self.repairs and not self.stop:
             repairs = {
                 key: repair

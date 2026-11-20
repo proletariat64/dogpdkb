@@ -973,6 +973,59 @@ cli.main(['run','--plan','stable.json','--result','stable-result.json'])
     assert trace.read_text().splitlines() == ["begin diagram", "end diagram"]
 
 
+@pytest.mark.skipif(
+    not os.environ.get("MDOCR_NODE_DEPENDENCIES"), reason="requires real parser"
+)
+def test_resume_fails_before_new_requests_if_saved_repair_parser_is_missing(
+    model, tmp_path, monkeypatch
+):
+    trace = fixture_images(tmp_path, monkeypatch, {"diagram": 200, "pending": 200})
+    (tmp_path / "a.md").write_text("![flow](diagram.png)\n\n![peer](pending.png)\n")
+    initial = "```mermaid\nflowchart TD\n A -->\n```"
+    monkeypatch.setenv(
+        "FAKE_PATCH", json.dumps({"kind": "mermaid", "markdown": initial})
+    )
+    plan_batch(tmp_path, "stable", ["a.md"], 3, "--concurrency", "1")
+    interrupted = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import os
+from mdocr import cli, runner
+original = runner.Execution.save
+def interrupted(self):
+    original(self)
+    if any(a['status']=='success' for a in self.state['requests']):
+        os._exit(75)
+runner.Execution.save = interrupted
+cli.main(['run','--plan','stable.json','--result','stable-result.json'])
+""",
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        timeout=25,
+    )
+    assert interrupted.returncode == 75, interrupted.stderr
+    journal = tmp_path / "stable.json.execution.json"
+    before = journal.read_bytes()
+    monkeypatch.setenv("MDOCR_NODE_DEPENDENCIES", str(tmp_path / "missing-parser"))
+    monkeypatch.setenv(
+        "FAKE_PATCH", json.dumps({"kind": "text", "markdown": "Recognized"})
+    )
+    resumed = batch_cli(
+        tmp_path, "run", "--plan", "stable.json", "--result", "stable-result.json"
+    )
+    assert resumed.returncode == 1
+    assert (
+        "cannot restore Mermaid diagnostics: mermaid_parser_unavailable"
+        in resumed.stderr
+    )
+    assert journal.read_bytes() == before
+    assert trace.read_text().splitlines() == ["begin diagram", "end diagram"]
+
+
 def test_optional_bridge_usage_may_be_omitted(model, tmp_path, monkeypatch):
     monkeypatch.setenv(
         "FAKE_WIRE",
