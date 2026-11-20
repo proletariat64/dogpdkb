@@ -98,7 +98,7 @@ def build_parser(*, full: bool = False) -> argparse.ArgumentParser:
     plan.add_argument(
         "--fix", type=int, default=0, help="batch-end retries per failed image"
     )
-    plan.add_argument("--concurrency", type=int, choices=range(1, 11), default=3)
+    plan.add_argument("--concurrency", type=int, choices=range(1, 101), default=3)
     plan.add_argument("--max-seconds", type=float, default=900)
     plan.add_argument("--endpoint")
     plan.add_argument("--download", action="store_true")

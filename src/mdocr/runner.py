@@ -114,7 +114,7 @@ def _validate(plan, plan_path, result_path, ledger, artifacts, lock_paths):
     if (
         settings["mode"] not in {"paddle", "llm"}
         or type(settings["concurrency"]) is not int
-        or not 1 <= settings["concurrency"] <= 10
+        or not 1 <= settings["concurrency"] <= 100
     ):
         raise ValueError("invalid plan settings")
     if settings["mode"] == "llm" and settings.get("llm_schema") != IMAGE_SCHEMA:

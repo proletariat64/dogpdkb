@@ -135,11 +135,13 @@ def test_plan_accepts_maximum_concurrency_and_rejects_above_maximum(tmp_path):
             "--endpoint",
             endpoint,
         )
-        accepted = cli(tmp_path, *args, "--plan", "max.json", "--concurrency", "10")
+        accepted = cli(tmp_path, *args, "--plan", "max.json", "--concurrency", "100")
         assert accepted.returncode == 0, accepted.stderr
         settings = json.loads((tmp_path / "max.json").read_bytes())["settings"]
-        assert settings["concurrency"] == 10
-        rejected = cli(tmp_path, *args, "--plan", "invalid.json", "--concurrency", "11")
+        assert settings["concurrency"] == 100
+        rejected = cli(
+            tmp_path, *args, "--plan", "invalid.json", "--concurrency", "101"
+        )
         assert rejected.returncode == 2
         assert "--concurrency" in rejected.stderr
         assert not (tmp_path / "invalid.json").exists()
@@ -147,7 +149,7 @@ def test_plan_accepts_maximum_concurrency_and_rejects_above_maximum(tmp_path):
         run = cli(tmp_path, "run", "--plan", "max.json", "--result", "result.json")
         assert run.returncode == 0, run.stderr
         result = json.loads((tmp_path / "result.json").read_bytes())
-        assert result["concurrency"]["initial"] == 10
+        assert result["concurrency"]["initial"] == 100
     assert len(calls) == 1
 
 

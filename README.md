@@ -158,7 +158,7 @@ back to legacy knowledge advice. Baseline-only IDs never imply remote deletion.
 
 OCR uses one `mdocr` plan for each batch, defaulting to OpenAI Pi OAuth
 (`openai/gpt-6.1-terra`, medium, default concurrency 3). Set
-`[ocr].concurrency` to 1-10 to control active Markdown pipelines; mdocr can
+`[ocr].concurrency` to 1-100 to control active Markdown pipelines; mdocr can
 lower the effective limit after throttling. Set `[ocr].mode = "paddle"` to use
 Paddle explicitly. `[ocr].request_budget` is independent of scoring:
 omit it for unlimited requests or set it to 0 to prohibit new requests.

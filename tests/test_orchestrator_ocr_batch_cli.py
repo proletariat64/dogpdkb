@@ -54,7 +54,7 @@ def payload(rows, status):
     return config, differences
 
 
-@pytest.mark.parametrize(("concurrency", "expected"), [(3, "3"), (10, "10")])
+@pytest.mark.parametrize(("concurrency", "expected"), [(3, "3"), (100, "100")])
 def test_partial_batch_accepts_verified_peer_and_preserves_exact_output(
     tmp_path, concurrency, expected
 ):
@@ -97,6 +97,14 @@ raise SystemExit(2)
     repeated = cli("apply", "--config", config, "--input", differences)
     assert repeated.returncode == 2, repeated.stderr
     assert len((tmp_path / "ocr-argv").read_text().splitlines()) == 2
+
+
+def test_ocr_concurrency_above_maximum_rejected_before_any_tool_call(tmp_path):
+    config, differences = batch_instance(tmp_path, "", concurrency=101)
+    applied = cli("apply", "--config", config, "--input", differences)
+    assert applied.returncode == 1
+    assert "1 to 100" in applied.stderr
+    assert not (tmp_path / "ocr-argv").exists()  # Config rejected before mdocr ran.
 
 
 def test_missing_journal_does_not_allow_resume_or_next_run_to_redispatch(tmp_path):
