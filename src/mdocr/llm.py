@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import subprocess
@@ -15,6 +14,7 @@ from .prepare import ImageError
 
 DEFAULT_MODEL = "openai/gpt-6.1-terra"
 DEFAULT_EFFORT = "medium"
+IMAGE_SCHEMA = "mdocr-image-content-1"
 _PI_BRIDGE = Path(__file__).with_name("pi_bridge.mjs")
 
 
@@ -99,74 +99,29 @@ class LlmClient:
             {"op": "preflight", "model": self.model, "effort": self.effort}
         )
 
-    def convert(
-        self, markdown: str, images: list[dict[str, str]], prompt: str
-    ) -> dict[str, Any]:
+    def convert(self, original: bytes, prompt: str) -> dict[str, Any]:
+        try:
+            data, mime = vision_image(original)
+        except ImageError as exc:
+            raise LlmError(
+                "Cannot prepare vision image", reason="invalid_image"
+            ) from exc
         with TemporaryDirectory(prefix="mdocr-vision-") as tmp:
-            attachments = []
-            for i, image in enumerate(images):
-                try:
-                    original = Path(image["path"]).read_bytes()
-                except OSError as exc:
-                    raise LlmError(
-                        f"Cannot read vision image {image['id']}",
-                        reason="IMAGE_DRIFT" if "sha256" in image else "invalid_image",
-                    ) from exc
-                if (
-                    "sha256" in image
-                    and hashlib.sha256(original).hexdigest() != image["sha256"]
-                ):
-                    raise LlmError(
-                        "Planned image bytes changed before vision preparation",
-                        reason="IMAGE_DRIFT",
-                    )
-                try:
-                    data, mime = vision_image(original)
-                except ImageError as exc:
-                    raise LlmError(
-                        f"Cannot prepare vision image {image['id']}: {exc}",
-                        reason="invalid_image",
-                    ) from exc
-                # Keep a private copy even for native images: the bridge must
-                # read exactly the bytes just validated, not a mutable source.
-                path = Path(tmp) / str(i)
-                path.write_bytes(data)
-                attachments.append(
-                    {"id": image["id"], "path": str(path), "mime_type": mime}
-                )
-                del original, data
+            path = Path(tmp) / "attachment"
+            path.write_bytes(data)
             result = self._invoke(
                 {
                     "op": "convert",
                     "model": self.model,
                     "effort": self.effort,
-                    "markdown": markdown,
-                    "images": attachments,
+                    "image": {"path": str(path), "mime_type": mime},
                     "prompt": prompt,
                 }
             )
-        expected = [item["id"] for item in images]
-        patches = result.get("patches")
-        if not isinstance(patches, list) or [p.get("id") for p in patches] != expected:
-            raise LlmError(
-                "Response image IDs do not exactly match planned occurrence order",
-                reason="invalid_response",
-            )
-        if any(
-            p.get("kind") not in {"mermaid", "table", "ui", "text", "mixed", "hold"}
-            or not isinstance(p.get("markdown"), str)
-            or not isinstance(p.get("uncertainty"), str)
-            or "<!-- mdocr:" in p["markdown"].lower()
-            for p in patches
-        ):
-            raise LlmError(
-                "Response contains an invalid or reserved patch payload",
-                reason="invalid_response",
-            )
         usage = result.get("usage_tokens")
-        if usage is not None and (not isinstance(usage, int) or usage < 0):
+        if usage is not None and (type(usage) is not int or usage < 0):
             raise LlmError("Response token usage is invalid", reason="invalid_response")
-        return {"patches": patches, "usage_tokens": usage}
+        return {"image": result["image"], "usage_tokens": usage}
 
     def token_upper_bound(self, *_: Any, **__: Any) -> None:
         # No trustworthy provider/model bound for vision input is exposed here.

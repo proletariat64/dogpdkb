@@ -5,15 +5,17 @@ import { createRequire } from 'node:module';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+const kinds = ['mermaid', 'table', 'ui', 'text', 'mixed', 'hold'];
+const fields = ['kind', 'markdown', 'uncertainty'];
 const schema = {
-  type: 'object', additionalProperties: false, required: ['images'],
-  properties: { images: { type: 'array', items: {
-    type: 'object', additionalProperties: false,
-    required: ['id', 'kind', 'markdown', 'uncertainty'],
-    properties: { id: { type: 'string' }, kind: { type: 'string', enum: ['mermaid', 'table', 'ui', 'text', 'mixed', 'hold'] }, markdown: { type: 'string' }, uncertainty: { type: 'string' } },
-  } } },
+  type: 'object', additionalProperties: false, required: fields,
+  properties: {
+    kind: { type: 'string', enum: kinds },
+    markdown: { type: 'string' },
+    uncertainty: { type: 'string' },
+  },
 };
-const format = { type: 'json_schema', name: 'mdocr_image_patches_1', strict: true, schema };
+const format = { type: 'json_schema', name: 'mdocr_image_content_1', strict: true, schema };
 const fail = (reason, message, status = null) => { const e = new Error(message); e.reason = reason; e.status = status; throw e; };
 const selectParser = async () => {
   const root = process.env.MDOCR_NODE_DEPENDENCIES;
@@ -184,28 +186,32 @@ const main = async () => {
     if (!authStatus || authStatus.type !== 'oauth') fail('oauth_required', `Pi OAuth credentials are required for ${provider}`);
     if (request.op === 'preflight') return { ok: true, model: request.model, effort: request.effort };
     if (request.op !== 'convert') fail('bridge_error', 'Unknown bridge operation');
-    const content = [{ type: 'text', text: `${request.markdown}\n\nStable image occurrences are named in the source.` }];
-    for (const image of request.images) {
-      const bytes = await readFile(image.path);
-      const mimeType = image.mime_type;
-      if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(mimeType)) fail('invalid_image', `Invalid transport encoding for ${image.id}`);
-      content.push({ type: 'text', text: `Original image occurrence: ${image.id}` }, { type: 'image', mimeType, data: bytes.toString('base64') });
-    }
+    const { path, mime_type: mimeType } = request.image;
+    if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(mimeType)) fail('invalid_image', 'Invalid vision transport encoding');
+    const bytes = await readFile(path);
+    const content = [{ type: 'image', mimeType, data: bytes.toString('base64') }];
     let attempted = false;
     let status = null;
-    const reply = await runtime.completeSimple(model, { systemPrompt: request.prompt, messages: [{ role: 'user', content, timestamp: Date.now() }] }, {
-      maxTokens: 8192, samplingParams: { max_output_tokens: 8192 }, reasoning: request.effort,
-      maxRetries: 0, timeoutMs: 230000, transport: 'sse', cacheRetention: 'none', env: {},
-      fetch: async (input, init) => {
-        const url = requestUrl(input);
-        if (url.href !== expected || attempted) fail('unsupported_transport', 'Pi attempted an unauthorized route or duplicate submission');
-        attempted = true;
-        const response = await transport.fetch(input, init);
-        status = response.status;
-        return response;
-      },
-      onPayload: payload => ({ ...payload, max_output_tokens: 8192, text: { ...payload.text, format } }),
-    });
+    let reply;
+    try {
+      reply = await runtime.completeSimple(model, { systemPrompt: request.prompt, messages: [{ role: 'user', content, timestamp: Date.now() }] }, {
+        maxTokens: 8192, samplingParams: { max_output_tokens: 8192 }, reasoning: request.effort,
+        maxRetries: 0, timeoutMs: 230000, transport: 'sse', cacheRetention: 'none', env: {},
+        fetch: async (input, init) => {
+          const url = requestUrl(input);
+          if (url.href !== expected || attempted) fail('unsupported_transport', 'Pi attempted an unauthorized route or duplicate submission');
+          attempted = true;
+          const response = await transport.fetch(input, init);
+          status = response.status;
+          return response;
+        },
+        onPayload: payload => ({ ...payload, max_output_tokens: 8192, text: { ...payload.text, format } }),
+      });
+    } catch (error) {
+      if (!attempted) throw error;
+      // The SDK can throw instead of returning stopReason=error after transport.
+      reply = { stopReason: 'error' };
+    }
     const usage = reply?.usage;
     const usageTokens = usage && [usage.input, usage.output, usage.cacheRead, usage.cacheWrite].every(n => Number.isSafeInteger(n) && n >= 0)
       ? usage.input + usage.output + usage.cacheRead + usage.cacheWrite : null;
@@ -220,14 +226,12 @@ const main = async () => {
       const text = reply.content.filter(x => x.type === 'text').map(x => x.text).join('');
       let parsed;
       try { parsed = JSON.parse(text); } catch { fail('invalid_response', 'Provider returned invalid JSON'); }
-      const ids = request.images.map(x => x.id);
-      if (!Array.isArray(parsed?.images) || JSON.stringify(parsed.images.map(x => x?.id)) !== JSON.stringify(ids)) fail('invalid_response', 'Response IDs do not match image order');
-      for (const patch of parsed.images) {
-        if (typeof patch.markdown !== 'string' || typeof patch.uncertainty !== 'string' || !schema.properties.images.items.properties.kind.enum.includes(patch.kind)) fail('invalid_response', 'Provider returned an invalid image patch');
-      }
-      validateTables(parsed.images);
-      await validateMermaid(parsed.images);
-      return { ok: true, patches: parsed.images, usage_tokens: usageTokens };
+      if (!parsed || Object.keys(parsed).length !== fields.length ||
+          !fields.every(field => Object.hasOwn(parsed, field) && typeof parsed[field] === 'string') ||
+          !kinds.includes(parsed.kind)) fail('invalid_response', 'Provider returned invalid image content');
+      validateTables([parsed]);
+      await validateMermaid([parsed]);
+      return { ok: true, image: parsed, usage_tokens: usageTokens };
     } catch (error) {
       error.usageTokens = usageTokens;
       throw error;

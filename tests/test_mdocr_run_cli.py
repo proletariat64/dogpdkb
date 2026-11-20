@@ -35,7 +35,7 @@ def service(statuses=lambda _: 200):
     lock = Lock()
 
     class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *_args):
+        def log_message(self, format, *args):
             pass
 
         def send(self, value, status=200):
@@ -66,18 +66,17 @@ def service(statuses=lambda _: 200):
                     {
                         "data": {
                             "state": "done",
-                            "resultUrl": {
-                                "jsonUrl": f"http://127.0.0.1:{self.server.server_port}/result"
-                            },
+                            "resultUrl": {"jsonUrl": f"{base_url}/result"},
                         }
                     }
                 )
 
     with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        base_url = f"http://127.0.0.1:{server.server_port}"
         thread = Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            yield f"http://127.0.0.1:{server.server_port}/jobs", calls
+            yield f"{base_url}/jobs", calls
         finally:
             server.shutdown()
             thread.join()
@@ -315,17 +314,14 @@ def test_paddle_and_llm_publish_same_v2_block_shape(tmp_path, monkeypatch):
         def preflight(self):
             return {"ok": True}
 
-        def convert(self, _body, images, _prompt):
+        def convert(self, image, _prompt):
+            assert image == Path("source/0.png").read_bytes()
             return {
-                "patches": [
-                    {
-                        "id": image["id"],
-                        "kind": "text",
-                        "markdown": "Recognized.",
-                        "uncertainty": "",
-                    }
-                    for image in images
-                ],
+                "image": {
+                    "kind": "text",
+                    "markdown": "Recognized.",
+                    "uncertainty": "",
+                },
                 "usage_tokens": None,
             }
 

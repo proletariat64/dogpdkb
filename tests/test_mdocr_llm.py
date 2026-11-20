@@ -27,7 +27,9 @@ def model(tmp_path, monkeypatch):
     (sdk / "dist/index.js").write_text(r"""
 import assert from 'node:assert/strict';
 import {join} from 'node:path';
-import {writeFileSync} from 'node:fs';
+import {appendFileSync, readFileSync, writeFileSync} from 'node:fs';
+import {createHash} from 'node:crypto';
+import {setTimeout as delay} from 'node:timers/promises';
 export class ModelRuntime {
  static async create(options) {
    assert.equal(options.authPath, join(process.env.PI_CODING_AGENT_DIR, 'auth.json'));
@@ -47,26 +49,49 @@ export class ModelRuntime {
    assert.equal(payload.max_output_tokens, 8192);
    assert.equal(payload.text.format.strict, true);
    assert.equal(payload.text.format.type, 'json_schema');
-   const image = context.messages[0].content[2];
+   const [message] = context.messages;
+   assert.equal(context.messages.length, 1);
+   const [image] = message.content;
+   assert.equal(message.content.length, 1);
+   assert.equal(image.type, 'image');
    assert.equal(image.mimeType, 'image/png');
+   assert.equal(payload.text.format.schema.additionalProperties, false);
+   assert.deepEqual(payload.text.format.schema.required, ['kind', 'markdown', 'uncertainty']);
    const bytes = Buffer.from(image.data, 'base64');
+   const digest = createHash('sha256').update(bytes).digest('hex');
+   const cases = process.env.FAKE_OCR_CASES && JSON.parse(process.env.FAKE_OCR_CASES);
+   const trace = process.env.FAKE_OCR_TRACE;
+   const record = cases?.[digest];
+   if (cases) {
+     assert.ok(record, 'expected exact bytes from one planned image');
+     assert.ok(!context.systemPrompt.includes('PRIVATE_BODY'));
+     appendFileSync(trace, `begin ${record.name}\n`);
+     if (record.barrier) {
+       const expires = Date.now() + 5000;
+       while (readFileSync(trace, 'utf8').split('\n').filter(line => /^begin [abc]1$/.test(line)).length < 3) {
+         if (Date.now() >= expires) throw new Error('Three documents did not overlap');
+         await delay(10);
+       }
+     }
+   }
    if (process.env.FAKE_ATTACHMENT) {
      writeFileSync(process.env.FAKE_ATTACHMENT, bytes);
-   } else {
+   } else if (!cases) {
      assert.equal(context.systemPrompt, 'prompt');
      assert.deepEqual(bytes, Buffer.from(process.env.FAKE_PNG_HEX, 'hex'));
    }
    globalThis.fetch = async () => {
-     if(process.env.FAKE_PROVIDER_OUTCOME === 'unknown') throw new TypeError('socket closed');
-     return new Response('{}', {status: Number(process.env.FAKE_PROVIDER_OUTCOME || 200)});
+     const outcome = record?.outcome || process.env.FAKE_PROVIDER_OUTCOME || 200;
+     if (outcome === 'unknown') throw new TypeError('socket closed');
+     return new Response('{}', {status: Number(outcome)});
    };
    let status;
    try { status = (await options.fetch('https://api.openai.com/v1/responses')).status; }
    catch { return {stopReason: 'error'}; }
+   finally { if (record) appendFileSync(trace, `end ${record.name}\n`); }
    if (status !== 200) return {stopReason: 'error'};
-   const patch = process.env.FAKE_PATCH ? JSON.parse(process.env.FAKE_PATCH) : {kind:'text', markdown:'Faithful'};
-   const id = context.messages[0].content[1].text.split(': ').at(-1);
-   return {stopReason:'stop', content:[{type:'text',text:JSON.stringify({images:[{id, uncertainty:'', ...patch}]})}], usage:{input:4,output:3,cacheRead:0,cacheWrite:0}};
+   const patch = process.env.FAKE_PATCH ? JSON.parse(process.env.FAKE_PATCH) : {kind:'text', markdown:record?.name || 'Faithful'};
+   return {stopReason:'stop', content:[{type:'text',text:JSON.stringify({uncertainty:'', ...patch})}], usage:{input:4,output:3,cacheRead:0,cacheWrite:0}};
  }
  async settleCredentialWrites() {}
 }
@@ -84,17 +109,13 @@ def convert(model, tmp_path):
     img = tmp_path / "image.opaque"
     Image.new("RGB", (8, 8), "white").save(img, "PNG")
     model.env["FAKE_PNG_HEX"] = img.read_bytes().hex()
-    return model.convert(
-        "before ![x](image-1) after", [{"id": "image-1", "path": str(img)}], "prompt"
-    )
+    return model.convert(img.read_bytes(), "prompt")
 
 
 def test_bridge_submits_exact_images_to_allowed_oauth_model(model, tmp_path):
     assert model.preflight()["model"] == "openai/gpt-6.1-terra"
     assert convert(model, tmp_path) == {
-        "patches": [
-            {"id": "image-1", "kind": "text", "markdown": "Faithful", "uncertainty": ""}
-        ],
+        "image": {"kind": "text", "markdown": "Faithful", "uncertainty": ""},
         "usage_tokens": 7,
     }
 
@@ -184,6 +205,158 @@ def test_cli_svg_plan_and_result_bind_original_not_attachment(
         assert rgb.getpixel((260, 100)) == (255, 0, 0)
 
 
+def batch_cli(tmp_path, *args):
+    return subprocess.run(
+        [sys.executable, "-m", "mdocr.cli", *args],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=25,
+        check=False,
+    )
+
+
+def fixture_images(tmp_path, monkeypatch, outcomes, barrier=False):
+    cases = {}
+    for index, (name, outcome) in enumerate(outcomes.items()):
+        image = tmp_path / f"{name}.png"
+        Image.new("RGB", (8, 8), (index, 11, 30)).save(image)
+        cases[hashlib.sha256(image.read_bytes()).hexdigest()] = {
+            "name": name,
+            "outcome": outcome,
+            "barrier": barrier and name in {"a1", "b1", "c1"},
+        }
+    trace = tmp_path / "trace"
+    monkeypatch.setenv("FAKE_OCR_CASES", json.dumps(cases))
+    monkeypatch.setenv("FAKE_OCR_TRACE", str(trace))
+    return trace
+
+
+def plan_batch(tmp_path, name, sources, budget):
+    (tmp_path / f"{name}-inputs.json").write_text(json.dumps(sources))
+    plan = batch_cli(
+        tmp_path,
+        "plan",
+        "--mode",
+        "llm",
+        "--list",
+        f"{name}-inputs.json",
+        "--output-dir",
+        f"out-{name}",
+        "--plan",
+        f"{name}.json",
+        "--cache-dir",
+        "cache",
+        "--request-budget",
+        str(budget),
+    )
+    assert plan.returncode == 0, plan.stderr
+
+
+def run_batch(tmp_path, name, expected, *options):
+    run = batch_cli(
+        tmp_path,
+        "run",
+        "--plan",
+        f"{name}.json",
+        "--result",
+        f"{name}-result.json",
+        *options,
+    )
+    assert run.returncode == expected, (run.stdout, run.stderr)
+    return json.loads((tmp_path / f"{name}-result.json").read_bytes())
+
+
+def test_each_image_is_private_and_success_survives_unknown_peer(
+    model, tmp_path, monkeypatch
+):
+    trace = fixture_images(tmp_path, monkeypatch, {"a1": "unknown", "a2": 200})
+    (tmp_path / "a.md").write_text("PRIVATE_BODY\n\n![x](a1.png)\n\n![y](a2.png)\n")
+    plan_batch(tmp_path, "first", ["a.md"], 2)
+    result = run_batch(tmp_path, "first", 2)
+    assert result["budget"] == {"requests": 2, "tokens": 7, "reserved_tokens": 0}
+    (doc,) = result["documents"]
+    assert [r["status"] for r in doc["resources"]] == ["unknown", "success"]
+    assert doc["output"] is None and "ocr" not in doc
+    assert not (tmp_path / "out-first/a.md").exists()
+    calls = ["begin a1", "end a1", "begin a2", "end a2"]
+    assert trace.read_text().splitlines() == calls
+    assert run_batch(tmp_path, "first", 2, "--retry-failed") == result
+
+    # Different body, occurrence ID, source path and resource ID; same image bytes.
+    shutil.copyfile(tmp_path / "a2.png", tmp_path / "copy.png")
+    (tmp_path / "copy.md").write_text(
+        "# Different authored body\n\n![copy](copy.png)\n"
+    )
+    plan_batch(tmp_path, "cache", ["copy.md"], 0)
+    reused = run_batch(tmp_path, "cache", 0)
+    assert reused["budget"]["requests"] == 0
+    (copied,) = reused["documents"]
+    assert copied["resources"][0]["status"] == "reused"
+    (evidence,) = copied["ocr"]["images"]
+    assert evidence["resource_id"] == "copy.png"
+    assert b"\na2\n<!-- mdocr:ocr-end -->" in Path(evidence["artifact"]).read_bytes()
+    assert trace.read_text().splitlines() == calls
+
+
+def test_three_markdown_pipelines_overlap_but_images_within_one_do_not(
+    model, tmp_path, monkeypatch
+):
+    trace = fixture_images(
+        tmp_path,
+        monkeypatch,
+        {name: 200 for name in ("a1", "a2", "b1", "b2", "c1", "c2", "d1")},
+        barrier=True,
+    )
+    for doc in "abcd":
+        links = [f"![first]({doc}1.png)"]
+        if doc != "d":
+            links.append(f"![second]({doc}2.png)")
+        (tmp_path / f"{doc}.md").write_text("PRIVATE_BODY\n\n" + "\n\n".join(links))
+    plan_batch(tmp_path, "pipelines", [f"{doc}.md" for doc in "abcd"], 7)
+    result = run_batch(tmp_path, "pipelines", 0)
+    assert result["budget"]["requests"] == 7
+    assert result["concurrency"] == {"initial": 3, "final": 3, "transitions": []}
+    events = trace.read_text().splitlines()
+    assert len(events) == 14
+    assert set(events[:3]) == {"begin a1", "begin b1", "begin c1"}
+    for doc in "abc":
+        assert events.index(f"end {doc}1") < events.index(f"begin {doc}2")
+    assert min(events.index(f"end {doc}2") for doc in "abc") < events.index("begin d1")
+
+
+def test_rate_limit_drains_pipeline_tiers_and_preserves_budget_on_resume(
+    model, tmp_path, monkeypatch
+):
+    trace = fixture_images(
+        tmp_path,
+        monkeypatch,
+        {name: 429 for name in ("a1", "a2", "b1", "b2", "c1", "c2")} | {"d1": 200},
+        barrier=True,
+    )
+    for doc in "abc":
+        (tmp_path / f"{doc}.md").write_text(f"![1]({doc}1.png)\n\n![2]({doc}2.png)\n")
+    (tmp_path / "d.md").write_text("![1](d1.png)\n")
+    plan_batch(tmp_path, "throttle", [f"{doc}.md" for doc in "abcd"], 7)
+    result = run_batch(tmp_path, "throttle", 2)
+    assert result["concurrency"]["transitions"] == [
+        {"from": 3, "to": 2},
+        {"from": 2, "to": 1},
+    ]
+    assert result["budget"]["requests"] == 6
+    assert result["causes"] == ["OCR_RATE_LIMITED"]
+    events = trace.read_text().splitlines()
+    assert set(events[:3]) == {"begin a1", "begin b1", "begin c1"}
+    assert set(events[3:6]) == {"end a1", "end b1", "end c1"}
+    assert events[-2:] == ["begin c2", "end c2"]
+    assert result["documents"][-1]["resources"][0]["status"] == "unattempted"
+    resumed = run_batch(tmp_path, "throttle", 2)
+    assert resumed["concurrency"]["final"] == 1
+    assert resumed["budget"]["requests"] == 7
+    assert resumed["documents"][-1]["status"] == "completed"
+    assert trace.read_text().splitlines() == [*events, "begin d1", "end d1"]
+
+
 def test_rejects_non_oauth_provider_route_before_request(model):
     model.model = "anthropic/claude"
     with pytest.raises(LlmError, match="allowlisted"):
@@ -236,7 +409,7 @@ def test_real_mermaid_parser_accepts_and_rejects_diagrams(
             }
         ),
     )
-    assert convert(model, tmp_path)["patches"][0]["kind"] == "mixed"
+    assert convert(model, tmp_path)["image"]["kind"] == "mixed"
     monkeypatch.setenv(
         "FAKE_PATCH",
         json.dumps(
@@ -299,4 +472,4 @@ def test_markdown_table_accepts_escaped_pipe_in_cell(model, tmp_path, monkeypatc
     monkeypatch.setenv(
         "FAKE_PATCH", json.dumps({"kind": "table", "markdown": markdown})
     )
-    assert convert(model, tmp_path)["patches"][0]["markdown"] == markdown
+    assert convert(model, tmp_path)["image"]["markdown"] == markdown

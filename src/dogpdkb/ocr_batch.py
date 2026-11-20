@@ -11,6 +11,10 @@ from dogpdkb.inputs import _local_destination, relocate_targets
 from dogpdkb.planning import same_version, validate_inputs
 from dogpdkb.records import atomic_json, read_json
 
+# Public mdocr artifact schemas; never import the tool implementation.
+_IMAGE_SCHEMA = "mdocr-image-content-1"
+_LEGACY_SCHEMA = "mdocr-image-patches-1"
+
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
@@ -101,6 +105,9 @@ def _load_plan(root, request):
     if plan["schema_version"] != "mdocr-plan-2" or docs.keys() != expected.keys():
         raise ValueError("OCR plan set differs from requested documents")
     policy = request["policy"]
+    settings = plan["settings"]
+    if "llm_schema" in settings and settings["llm_schema"] != _IMAGE_SCHEMA:
+        raise ValueError("OCR plan uses an unsupported LLM schema")
     for key in (
         "mode",
         "model",
@@ -210,7 +217,7 @@ def _verified_result(root, plan, doc, entry, row):
         config["model"] != settings["model"]
         or config["effort"] != settings["effort"]
         or config["prompt_sha256"] != digest(settings["prompt"].encode())
-        or config["schema"] != "mdocr-image-patches-1"
+        or config["schema"] != settings.get("llm_schema", _LEGACY_SCHEMA)
     ):
         raise ValueError("OCR evidence configuration differs from plan")
     selected = {}
@@ -443,7 +450,7 @@ def _execute(root, request, store, run, call_tool, *, allow_dispatch=True):
             reason = "OCR_PLAN_REJECTED"
     if reason is None:
         try:
-            _, docs = _load_plan(root, request)
+            plan, docs = _load_plan(root, request)
             initial["plan.json"] = plan_sha = file_digest(plan_path)
             if dispatched and read_json(start_path) != initial:
                 raise ValueError("OCR immutable plan or request changed")
@@ -479,6 +486,14 @@ def _execute(root, request, store, run, call_tool, *, allow_dispatch=True):
             elif report_path.exists() or journal.exists():
                 raise ValueError("unowned OCR execution artifacts")
             if report is None:
+                settings = plan["settings"]
+                if (
+                    settings["mode"] == "llm"
+                    and settings.get("llm_schema") != _IMAGE_SCHEMA
+                ):
+                    # Terminal legacy reports are verifiable above; an
+                    # unsettled document-level send cannot be split safely.
+                    raise ValueError("OCR plan does not support single-image admission")
                 # Native execution needs every staged input intact. A terminal
                 # batch is no longer executed and can be checked per document.
                 for entry in request["documents"]:

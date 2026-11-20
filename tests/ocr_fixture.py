@@ -28,7 +28,7 @@ def _complete(row, doc):
     config = {'mode': settings['mode']}
     if settings['mode'] == 'llm':
         config.update(model=settings['model'], effort=settings['effort'],
-                      prompt_sha256=_sha(settings['prompt'].encode()), schema='mdocr-image-patches-1')
+                      prompt_sha256=_sha(settings['prompt'].encode()), schema=settings.get('llm_schema', 'mdocr-image-patches-1'))
     for image in doc['images']:
         key = image['resource_id']
         status = 'success' if image['selected'] else 'unselected'

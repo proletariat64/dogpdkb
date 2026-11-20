@@ -21,11 +21,20 @@ JSON array of absolute inputs, so a mixed batch does not fetch live directory-so
 concurrency transitions and ordered document rows. Complete rows have `output`,
 `output_sha256`, and `mdocr-ocr-2` evidence containing effective mode configuration,
 resource IDs, and original image and OCR-block paths/byte digests. LLM evidence also
-binds its context with the SHA-256 of `[document_sha256, [[occurrence_id, image_sha256], ...]]`,
-using plan occurrence order and selected images only. The serialization is UTF-8 JSON with
-two-space indentation, no ASCII escaping, and a trailing LF. Failed, held or unknown
-rows cannot claim a completed Markdown output. The internal plan-side journal prevents resubmission if result mirroring was
-interrupted. Exit 0 means complete, 2 incomplete, and 1 fatal invocation or artifact error.
+binds the **document evidence**, not provider context, with the SHA-256 of
+`[document_sha256, [[occurrence_id, image_sha256], ...]]`, using plan occurrence order
+and selected images only. The serialization is UTF-8 JSON with two-space indentation,
+no ASCII escaping, and a trailing LF. New LLM plans declare
+`settings.llm_schema: "mdocr-image-content-1"`, which must match evidence configuration.
+Legacy document-context plans cannot be executed; existing terminal reports remain
+verifiable against their legacy plan and schema. Do not create replacement plans to
+replay previously unknown admissions.
+
+Failed, held or unknown rows cannot claim a completed Markdown output. The plan-side
+journal prevents resubmission if result mirroring was interrupted. LLM admissions and
+the global request budget are per image; concurrency limits active Markdown pipelines,
+with one image at a time per document. Exit 0 means complete, 2 incomplete, and 1 fatal
+invocation or artifact error.
 
 ## mdcompare catalog
 

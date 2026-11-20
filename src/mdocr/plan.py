@@ -14,7 +14,7 @@ import requests
 from markdown_it import MarkdownIt
 from markdown_it.common.html_re import HTML_TAG_RE
 
-from .llm import DEFAULT_EFFORT, DEFAULT_MODEL
+from .llm import DEFAULT_EFFORT, DEFAULT_MODEL, IMAGE_SCHEMA
 from .markdown import IMAGE_RE, parse_image_match
 from .prepare import (
     DEFAULT_ENABLED_EXTENSIONS,
@@ -349,6 +349,8 @@ def plan_command(args) -> int:
         "max_seconds": args.max_seconds,
         "cache_dir": str(Path(args.cache_dir).resolve()) if args.cache_dir else None,
     }
+    if args.mode == "llm":
+        settings["llm_schema"] = IMAGE_SCHEMA
     result = {"schema_version": "mdocr-plan-2", "settings": settings, "documents": docs}
     _atomic_json(plan_path, result)
     return 0

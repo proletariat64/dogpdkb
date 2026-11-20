@@ -35,7 +35,7 @@ def completed(doc):
                 output=doc['output'], output_sha256=sha(output.read_bytes()), resources=[],
                 ocr=dict(contract='mdocr-ocr-2', images=[], configuration=dict(
                     mode=settings['mode'], model=settings['model'], effort=settings['effort'],
-                    prompt_sha256=sha(settings['prompt'].encode()), schema='mdocr-image-patches-1')))
+                    prompt_sha256=sha(settings['prompt'].encode()), schema=settings.get('llm_schema', 'mdocr-image-patches-1'))))
 def payload(rows, status):
     return dict(schema_version='mdocr-result-2', plan_sha256=sha(plan_path.read_bytes()),
                 result_path=str(result), status=status, documents=rows)
@@ -195,7 +195,8 @@ def _native_instance(tmp_path, *, crash=False):
         exporter.read_text().replace(
             "path.write_text(doc['body'])",
             "path.write_bytes(doc['body'].replace('\\n','\\r\\n').encode()); "
-            "(path.parent/'diagram.png').write_bytes(b'synthetic image bytes')",
+            "(path.parent/'diagram.png').write_bytes("
+            "b'synthetic image bytes' + (b'' if item['document_id'] == '42' else b'-other'))",
         )
     )
     driver = tmp_path / "offline_mdocr.py"
@@ -212,16 +213,16 @@ class SyntheticLLM:
         assert (model, effort) == ('openai/gpt-6.1-terra', 'medium')
     def preflight(self):
         return {}
-    def convert(self, body, images, prompt):
+    def convert(self, image, prompt):
+        assert isinstance(image, bytes)
         with (root / 'requests').open('a') as log:
-            log.write(images[0]['path'] + '\\n')
+            log.write(repr(image) + '\\n')
         if (root / 'crash').exists():
             (root / 'crash').unlink()
             Path(sys.argv[sys.argv.index('--result')+1]).unlink()
             os._exit(143)
-        return dict(patches=[dict(id=image['id'], kind='text',
-                                  markdown='Recognized offline.', uncertainty='')
-                             for image in images], usage_tokens=12)
+        return dict(image=dict(kind='text', markdown='Recognized offline.',
+                               uncertainty=''), usage_tokens=12)
 runner.LlmClient = SyntheticLLM
 raise SystemExit(main())
 """
@@ -372,6 +373,37 @@ def test_native_resume_keeps_original_admission_after_result_loss(tmp_path):
         "unknown",
         "unattempted",
     }
+
+
+def test_legacy_unsettled_admission_cannot_resume_as_single_image_jobs(tmp_path):
+    import hashlib
+
+    config, differences = _native_instance(tmp_path, crash=True)
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 143, first.stderr
+    (run,) = (tmp_path / "runs/funds").glob("run-*/run.json")
+    (journal,) = (tmp_path / "state/funds/ocr").glob("*/plan.json.execution.json")
+    plan = journal.with_name("plan.json")
+    started = journal.with_name("started.json")
+    legacy = json.loads(plan.read_bytes())
+    del legacy["settings"]["llm_schema"]
+    legacy_bytes = json.dumps(legacy).encode()
+    plan.write_bytes(legacy_bytes)
+    sha = hashlib.sha256(legacy_bytes).hexdigest()
+    witness = json.loads(started.read_bytes())
+    witness["plan.json"] = sha
+    started.write_text(json.dumps(witness))
+    admitted = json.loads(journal.read_bytes())
+    admitted["plan_sha256"] = sha
+    journal.write_text(json.dumps(admitted))
+    before = journal.read_bytes()
+
+    direct = cli("apply", "--config", config, "--resume", run)
+    assert direct.returncode == 2, direct.stderr
+    assert journal.read_bytes() == before
+    assert (tmp_path / "commands").read_text().splitlines() == ["plan", "run"]
+    manifest = json.loads(Path(json.loads(direct.stdout)["manifest"]).read_bytes())
+    assert {row["ocr_status"] for row in manifest["documents"]} == {"unknown"}
 
 
 def test_terminal_resume_checks_staged_damage_per_document(tmp_path):
