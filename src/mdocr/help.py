@@ -85,6 +85,18 @@ invalid result binding, or other preflight/write failure.
 Use mdocr run --help --full for the complete contract.
 """
 
+ASSEMBLE = """Example:
+  mdocr assemble --plan plan.json --journal plan.json.execution.json --execution-version 0.3.3 --output-dir recovered
+
+Offline assembly verifies the immutable plan and native running journal, then
+writes a new result and completed documents without dispatching OCR.
+Exit codes: 0 complete; 2 partial; 1 invalid inputs or write failure.
+"""
+
+ASSEMBLE_FULL = """Assembly never writes to the original plan, journal, result mirror,
+outputs, cache, or evidence directory. The destination must not exist.
+"""
+
 RUN_FULL = """Execution and recovery:
   Reuse the same plan and result paths when resuming. The private plan-side
   journal is authoritative for prior submissions, even if the result mirror was

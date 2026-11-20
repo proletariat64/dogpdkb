@@ -53,6 +53,18 @@ the global request budget are per image; concurrency limits active Markdown pipe
 with one image at a time per document. Exit 0 means complete, 2 incomplete, and 1 fatal
 invocation or artifact error.
 
+### Explicit offline assembly
+
+`mdocr assemble --plan PLAN --journal PLAN.execution.json --execution-version VERSION
+--output-dir NEW_DIRECTORY` checks frozen input byte witnesses, historical request
+keys and bounded rounds, then assembles locally using accepted journal patches.
+The original journal/result/plan are read-only. There is no provider, cache,
+download, or resume-dispatch path. The original result must be a bound sibling
+of the plan. The new `assembly.json` is plan-bound and records `recovery` with
+original journal SHA-256 and runtime version; output/evidence are scoped to the
+fresh directory. Crash-only admissions are represented as unknown, not as
+unattempted. Exit 2 means some rows cannot be assembled; 1 rejects the artifact.
+
 ## mdcompare catalog
 
 ```

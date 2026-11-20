@@ -443,7 +443,7 @@ def _previous_graph_input(store, doc_id, document):
     return descriptor
 
 
-def _unowned_deferred_sources(settings, book, store, data):
+def _unowned_deferred_sources(settings, book, store, data, *, initial_recovery=False):
     """Omit only new deferred sources absent from both native ownership artifacts."""
     candidates = {}
     for row in data["documents"]:
@@ -455,10 +455,10 @@ def _unowned_deferred_sources(settings, book, store, data):
     if not candidates:
         return set()
     native = settings.graph_for(book)
-    if (
-        not (native / "graph.json").is_file()
-        or not (native / "manifest.json").is_file()
-    ):
+    files = tuple((native / name).is_file() for name in ("graph.json", "manifest.json"))
+    if not any(files) and initial_recovery:
+        return set(candidates)  # No published generation can own these deferred paths.
+    if not all(files):
         return set()
     manifest = read_json(native / "manifest.json")
     if not isinstance(manifest, dict):
@@ -666,7 +666,15 @@ def run_graph(
         return 2
     selected = {row["document_id"] for row in pending}
     manifest_ids = {row["document_id"] for row in data["documents"]}
-    omitted = _unowned_deferred_sources(settings, book, store, data)
+    recovery = run.data.get("command") == "recover-ocr"
+    recovered_scope = set()
+    if recovery:
+        from dogpdkb.ocr_recovery import changed_graph_scope
+
+        recovered_scope = changed_graph_scope(store, run, data)
+    omitted = _unowned_deferred_sources(
+        settings, book, store, data, initial_recovery=recovery
+    )
     # A directory scan could otherwise silently retry a blocked source from an
     # earlier batch, even when the new plan selected different documents.
     for doc_id, document in store.data["documents"].items():
@@ -684,6 +692,12 @@ def run_graph(
                 retained_input = True
         if version and store.suppressed(doc_id, "graph", version):
             previous = store.step(doc_id, "graph") or {}
+            if doc_id in recovered_scope and (
+                doc_id in selected or retained_input or doc_id in omitted
+            ):
+                # Interrupted old bytes were not published. Only changed bodies
+                # enter this new request; retained/omitted peers are not replayed.
+                continue
             # Replanning can retain or omit an own-run source that used to be
             # selected. Authorize only its validated mirror representation;
             # leave its failed record intact because it is not acknowledged.
@@ -727,6 +741,11 @@ def run_graph(
             return 2
     else:
         selected = {Path(row["path"]).resolve() for row in pending}
+        selected.update(
+            Path(row["path"]).resolve()
+            for row in data["documents"]
+            if row["document_id"] in omitted
+        )
         if any(
             path.resolve() not in selected
             for path in book.corpus.rglob("*")

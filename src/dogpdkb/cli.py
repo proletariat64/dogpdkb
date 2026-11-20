@@ -58,6 +58,10 @@ def _dispatch(argv: list[str] | None = None):
         from dogpdkb.apply import main as apply_main
 
         return apply_main(arguments[1:])
+    if arguments and arguments[0] == "recover-ocr":
+        from dogpdkb.ocr_recovery import main as recover_main
+
+        return recover_main(arguments[1:])
     if arguments and arguments[0] == "publish-web":
         from dogpdkb.workflows.publish_web import main as web_main
 
@@ -78,7 +82,14 @@ def _dispatch(argv: list[str] | None = None):
         version = "uninstalled"
     parser.add_argument("--version", action="version", version=f"dogpdkb {version}")
     commands = parser.add_subparsers(dest="command")
-    for name in ("discover", "apply", "update-graph", "sync", "publish-web"):
+    for name in (
+        "discover",
+        "apply",
+        "update-graph",
+        "sync",
+        "recover-ocr",
+        "publish-web",
+    ):
         commands.add_parser(name, help=f"run {name}; use {name} --help for options")
     commands.add_parser(
         "status", help="read-only sync batch status; use status --help for options"

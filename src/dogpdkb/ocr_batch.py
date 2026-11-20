@@ -182,7 +182,9 @@ def _request_history(report):
     return history
 
 
-def _verified_result(root, plan, doc, entry, row, request_history=None):
+def _verified_result(
+    root, plan, doc, entry, row, request_history=None, *, output_root=None
+):
     _verify_input(root, entry, doc)
     if row["path"] != doc["path"]:
         raise ValueError("OCR row source path is not its planned source")
@@ -259,7 +261,8 @@ def _verified_result(root, plan, doc, entry, row, request_history=None):
 
     if row["output"] != doc["output"]:
         raise ValueError("OCR output does not identify its planned destination")
-    output = _path(root, row["output"]).read_bytes()
+    output_root = root if output_root is None else output_root
+    output = _path(output_root, row["output"]).read_bytes()
     output.decode("utf-8")
     if digest(output) != row["output_sha256"]:
         raise ValueError("OCR output bytes changed")
@@ -314,7 +317,7 @@ def _verified_result(root, plan, doc, entry, row, request_history=None):
             image["source_sha256"],
         ) != (im["source_path"], im["sha256"]):
             raise ValueError("OCR original image differs from the planned image")
-        artifact = _path(root, image["artifact"]).read_bytes()
+        artifact = _path(output_root, image["artifact"]).read_bytes()
         marker = f"<!-- mdocr:ocr-begin v=2 id={im['id']} -->\n".encode()
         if (
             not artifact.startswith(marker)

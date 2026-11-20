@@ -116,6 +116,17 @@ def build_parser(*, full: bool = False) -> argparse.ArgumentParser:
     run.add_argument("--result", required=True)
     run.add_argument("--retry-failed", action="store_true")
 
+    assemble = sub.add_parser(
+        "assemble",
+        help="assemble a sealed running journal offline",
+        epilog=contracts.ASSEMBLE + ("\\n" + contracts.ASSEMBLE_FULL if full else ""),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    assemble.add_argument("--plan", required=True)
+    assemble.add_argument("--journal", required=True)
+    assemble.add_argument("--execution-version", required=True)
+    assemble.add_argument("--output-dir", required=True)
+
     command = sub.add_parser(
         "prepare",
         help="copy Markdown with local Prepared image JPEGs; no model calls",
@@ -314,6 +325,14 @@ def main(argv: list[str] | None = None) -> int:
             return execute_plan(args)
         except (OSError, ValueError, TypeError) as exc:
             print(f"mdocr: run: {exc}", file=sys.stderr)
+            return 1
+    if args.command == "assemble":
+        from .assemble import assemble_command
+
+        try:
+            return assemble_command(args)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"mdocr: assemble: {exc}", file=sys.stderr)
             return 1
     try:
         return run_command(args)
