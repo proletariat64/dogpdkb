@@ -184,7 +184,36 @@ const connection = entry => {
 const interruptedConnectionCodes = new Set([
   'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ETIMEDOUT',
   'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET', 'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
 ]);
+const isConnectionInterruption = error => interruptedConnectionCodes.has(error?.code) ||
+  interruptedConnectionCodes.has(error?.cause?.code);
+const observeStreamErrors = (response, onError) => {
+  if (!response.ok || !response.body) return response;
+  const reader = response.body.getReader();
+  const readable = new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) controller.close();
+        else controller.enqueue(value);
+      } catch (error) {
+        // Record the transport failure before waking the SDK's SSE reader.
+        onError(error);
+        controller.error(error);
+      }
+    },
+    cancel: reason => reader.cancel(reason),
+  }, { highWaterMark: 0 });
+  // Preserve URL, headers and other fetch metadata on the original Response.
+  return new Proxy(response, {
+    get(target, key) {
+      if (key === 'body') return readable;
+      const value = Reflect.get(target, key, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+};
 const assertCompleted = (reply, attempted, status) => {
   if (status >= 400) {
     if (status === 429) fail('rate_limited', 'Provider rate limited the request', status);
@@ -292,6 +321,7 @@ fence lines, non-Mermaid text, kind or uncertainty. Return the full corrected JS
     if (repair) content.push({ type: 'text', text: JSON.stringify(repair) });
     let attempted = false;
     let connectionInterrupted = false;
+    const noteConnectionError = error => { connectionInterrupted ||= isConnectionInterruption(error); };
     let status = null;
     let refused = false;
     let reply;
@@ -306,10 +336,9 @@ fence lines, non-Mermaid text, kind or uncertainty. Return the full corrected JS
           try {
             const response = await transport.fetch(input, init);
             status = response.status;
-            return response;
+            return observeStreamErrors(response, noteConnectionError);
           } catch (error) {
-            connectionInterrupted = interruptedConnectionCodes.has(error?.code) ||
-              interruptedConnectionCodes.has(error?.cause?.code);
+            noteConnectionError(error);
             throw error;
           }
         },
@@ -333,7 +362,9 @@ fence lines, non-Mermaid text, kind or uncertainty. Return the full corrected JS
     const total = tokens?.every(n => Number.isSafeInteger(n) && n >= 0) ? tokens.reduce((a, b) => a + b, 0) : null;
     const usageTokens = Number.isSafeInteger(total) ? total : null;
     try {
-      if (connectionInterrupted) fail('connection_outcome_unknown', 'Provider connection was interrupted; outcome is unknown');
+      if (connectionInterrupted && reply?.stopReason !== 'stop') {
+        fail('connection_outcome_unknown', 'Provider connection was interrupted; outcome is unknown');
+      }
       const { image, mermaid_errors } = await validateResponse(reply, attempted, status, refused, repair);
       return { ok: true, image, usage_tokens: usageTokens,
         ...(request.mermaid_diagnostics ? { mermaid_errors } : {}) };

@@ -97,11 +97,32 @@ export class ModelRuntime {
        : 0;
      const current = number ? outcome[Math.min(number - 1, outcome.length - 1)] : outcome;
      if (current === 'connection') throw new TypeError('fetch failed', {cause: {code: 'ECONNREFUSED'}});
+     if (current === 'complete_stream') {
+       return new Response('data: [DONE]\n\n', {status: 200, headers: {'content-type': 'text/event-stream'}});
+     }
+     if (current === 'dropped_stream' || current === 'invalid_stream') {
+       const body = new ReadableStream({
+         pull(controller) {
+           const cause = current === 'dropped_stream' ? {code: 'UND_ERR_SOCKET'} : undefined;
+           controller.error(new TypeError('stream ended', {cause}));
+         },
+       });
+       return new Response(body, {status: 200, headers: {'content-type': 'text/event-stream'}});
+     }
      if (current === 'unknown') throw new TypeError('socket closed');
      return new Response('{}', {status: Number(current)});
    };
    let status;
-   try { status = (await options.fetch('https://api.openai.com/v1/responses')).status; }
+   try {
+     const response = await options.fetch('https://api.openai.com/v1/responses');
+     status = response.status;
+     if (response.headers.get('content-type') === 'text/event-stream') {
+       const reader = response.body.getReader();
+       const first = await reader.read();
+       assert.equal(new TextDecoder().decode(first.value), 'data: [DONE]\n\n');
+       assert.equal((await reader.read()).done, true);
+     }
+   }
    catch { return {stopReason: 'error'}; }
    finally { if (record) appendFileSync(trace, `end ${record.name}\n`); }
    if (repairMode && process.env.FAKE_INTERRUPT_REPAIR) {
@@ -333,12 +354,11 @@ def test_batch_fix_retries_only_eligible_failed_images(
 
 
 @pytest.mark.parametrize("fix", [0, 1, 2])
+@pytest.mark.parametrize("failure", ["connection", "dropped_stream"])
 def test_batch_fix_retries_observed_connection_interruptions(
-    model, tmp_path, monkeypatch, fix
+    model, tmp_path, monkeypatch, fix, failure
 ):
-    trace = fixture_images(
-        tmp_path, monkeypatch, {"diagram": ["connection", "connection", 200]}
-    )
+    trace = fixture_images(tmp_path, monkeypatch, {"diagram": [failure, failure, 200]})
     (tmp_path / "a.md").write_text("![flow](diagram.png)\n")
     plan_batch(tmp_path, "connection", ["a.md"], 4, "--fix", str(fix))
     result = run_batch(tmp_path, "connection", 0 if fix == 2 else 2)
@@ -514,6 +534,11 @@ def test_malformed_bridge_protocol_after_submission_is_not_retried(
     assert trace.read_text().splitlines() == ["begin a1", "end a1"]
 
 
+def test_passes_completed_stream_bytes_to_sdk(model, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_PROVIDER_OUTCOME", "complete_stream")
+    assert convert(model, tmp_path)["image"]["markdown"] == "Faithful"
+
+
 def test_rejects_non_oauth_provider_route_before_request(model):
     model.model = "anthropic/claude"
     with pytest.raises(LlmError, match="allowlisted"):
@@ -527,6 +552,8 @@ def test_rejects_non_oauth_provider_route_before_request(model):
         ("403", 403, "auth_error"),
         ("unknown", None, "unknown_outcome"),
         ("connection", None, "connection_outcome_unknown"),
+        ("dropped_stream", None, "connection_outcome_unknown"),
+        ("invalid_stream", None, "unknown_outcome"),
     ],
 )
 def test_preserves_http_status_or_unknown_after_sdk_return(

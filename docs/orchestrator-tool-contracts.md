@@ -35,8 +35,8 @@ The orchestrator passes `[ocr].concurrency` to `mdocr plan --concurrency`
 `[ocr].fix` passes `mdocr plan --fix N`. The installed sample sets `1`;
 missing or `0` disables it. The batch freezes this limit. After the initial
 pass the same journal records retries as `fix_round`, bounded per image.
-Only an observed connection failure (`connection_outcome_unknown`) may be
-retried despite an unknown result; the previous outcome remains unknown and
+Only an observed connection failure before headers or during an SSE body read
+(`connection_outcome_unknown`) may be retried despite an unknown result; the previous outcome remains unknown and
 the retry may incur duplicate usage. Other unknowns are not replayed. Fixes do
 not override request/deadline/throttle stops. Mermaid repairs remain separate.
 
