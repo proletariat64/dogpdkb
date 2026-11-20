@@ -120,6 +120,12 @@ def _validate(plan, plan_path, result_path, ledger, artifacts, lock_paths):
     if settings["mode"] == "llm" and settings.get("llm_schema") != IMAGE_SCHEMA:
         # A legacy document-level admission cannot authorize per-image retries.
         raise ValueError("unsupported LLM plan schema; legacy plans cannot be executed")
+    fix = settings.get("fix", 0)
+    if type(fix) is not int or fix < 0:
+        raise ValueError("invalid batch fix limit")
+    rounds = settings.get("mermaid_repair_rounds", 0)
+    if type(rounds) is not int or rounds < 0 or (rounds and settings["mode"] != "llm"):
+        raise ValueError("invalid Mermaid repair rounds")
     for budget in (settings["token_budget"], settings["request_budget"]):
         if budget is not None and (type(budget) is not int or budget < 0):
             raise ValueError("invalid plan budget")
@@ -200,11 +206,32 @@ def _validate(plan, plan_path, result_path, ledger, artifacts, lock_paths):
     return texts
 
 
+# Only known unsuccessful provider attempts where submitting the same image
+# can help. A typed connection interruption is retried separately below.
+_FIXABLE_FAILURES = {
+    "OCR_RATE_LIMITED",
+    "rate_limited",
+    "response_incomplete",
+    "response_json_invalid",
+    "response_mermaid_fence_invalid",
+    "response_output_limit",
+    "response_schema_invalid",
+    "response_table_invalid",
+    "response_unexpected_stop",
+}
+
+
 class Execution:
     def __init__(self, plan, digest, ledger, result, artifacts, retry):
         self.docs = plan["documents"]
         self.settings = plan["settings"]
         self.mode = self.settings["mode"]
+        self.repair_rounds = self.settings.get("mermaid_repair_rounds", 0)
+        self.repairs = {}
+        self.repair_attempts = {}
+        self.published_images = set()
+        self.fix_limit = self.settings.get("fix", 0)
+        self.fixes = {}
         self.result, self.ledger, self.artifacts = result, ledger, artifacts
         self.retry = retry
         self.deadline = time.monotonic() + self.settings["max_seconds"]
@@ -222,6 +249,11 @@ class Execution:
                 "model": _MODEL,
                 "jpeg_quality": JPEG_QUALITY,
                 "endpoint": self.settings["endpoint"],
+            }
+        self.cache_config = self.config
+        if self.repair_rounds:
+            self.cache_config = self.config | {
+                "mermaid_repair_rounds": self.repair_rounds
             }
         self.client = None
         self.causes = []
@@ -266,14 +298,19 @@ class Execution:
         self.limit = self.state["concurrency"]["final"]
         self.latest = {}
         for previous in self.state["requests"]:
+            if "fix_round" in previous:
+                self.fixes[previous["key"]] = previous["fix_round"]
             if previous["status"] == "admitted":
                 previous.update(status="unknown", reason="OCR_OUTCOME_UNKNOWN")
+            if "repair_round" in previous:
+                self.repair_attempts[previous["key"]] = previous
+                if "patches" not in previous or previous.get("warnings"):
+                    continue
             self.latest[previous["key"]] = previous
         self.reused = self.state.setdefault("reused", {})
         self.latest.update(self.reused)
         self.budget = self.state["budget"]
         self.state["status"] = "running"
-        self.save()
 
     def save(self):
         data = _json(self.state)
@@ -282,15 +319,19 @@ class Execution:
 
     def plan_jobs(self):
         jobs, layout, pipelines = {}, [], []
-        for doc in self.docs:
+        for position, doc in enumerate(self.docs):
             selected = [
                 im for im in doc["images"] if im["selected"] and not im["error"]
             ]
             bindings = {}
             for image in selected:
-                key = _sha(_json([self.config, image["sha256"]]))
+                key = _sha(_json([self.cache_config, image["sha256"]]))
                 jobs.setdefault(key, image)
                 bindings[image["id"]] = key
+                # Publication may have written immutable evidence before the
+                # journal was marked terminal. Never change an emitted patch.
+                if (self.artifacts / str(position) / f"{image['id']}.md").exists():
+                    self.published_images.add(key)
             context = None
             if self.mode == "llm" and selected:
                 # Document evidence only: never sent to the engine or used as a cache key.
@@ -306,6 +347,13 @@ class Execution:
             elif self.mode == "paddle":
                 pipelines.extend([key] for key in bindings.values())
             layout.append((bindings, context))
+        if (
+            not self.latest.keys() <= jobs.keys()
+            or not self.repair_attempts.keys() <= jobs.keys()
+        ):
+            raise ValueError(
+                "saved OCR request identities do not match this runtime; no requests sent"
+            )
         return jobs, pipelines, layout
 
     def cached(self, key):
@@ -323,15 +371,20 @@ class Execution:
         except (KeyError, TypeError, ValueError, NotCompleted):
             return None
 
-    def reserve(self):
+    def admission_open(self):
         if self.stop:
-            return None
+            return False
         if time.monotonic() >= self.deadline:
             self.stop = "BATCH_DEADLINE_EXCEEDED"
-            return None
+            return False
         requests_limit = self.settings["request_budget"]
         if requests_limit is not None and self.budget["requests"] >= requests_limit:
             self.stop = "OCR_REQUEST_BUDGET_EXHAUSTED"
+            return False
+        return True
+
+    def reserve(self):
+        if not self.admission_open():
             return None
         token_limit = self.settings["token_budget"]
         if token_limit is None:
@@ -350,7 +403,7 @@ class Execution:
             return bound
         return None
 
-    def convert(self, image):
+    def convert(self, image, repair=None):
         client = self.client
         try:
             data = _text(image["source_path"], image["sha256"], "IMAGE_DRIFT")
@@ -359,10 +412,21 @@ class Execution:
         if self.mode == "llm":
             if not isinstance(client, LlmClient):
                 raise TypeError("LLM job admitted before preflight")
-            result = client.convert(data, self.settings["prompt"])
+            result = client.convert(
+                data,
+                self.settings["prompt"],
+                mermaid_diagnostics=bool(self.repair_rounds),
+                repair=repair,
+            )
             usage = result["usage_tokens"]
             try:
-                return _patches([result["image"]], 1), usage
+                patches = _patches([result["image"]], 1)
+                errors = result.get("mermaid_errors", [])
+                if self.repair_rounds and bool(errors) != bool(
+                    patches[0].get("warnings")
+                ):
+                    raise NotCompleted("OCR_RESPONSE_INVALID")
+                return patches, usage, errors
             except NotCompleted as exc:
                 raise LlmError(
                     exc.reason, reason=exc.reason, usage_tokens=usage
@@ -398,7 +462,7 @@ class Execution:
                 ) from exc
             except (OSError, ValueError, RuntimeError) as exc:
                 raise NotCompleted("OCR_OUTCOME_UNKNOWN", unknown=True) from exc
-        return _patches([{"markdown": text, "uncertainty": ""}], 1), None
+        return _patches([{"markdown": text, "uncertainty": ""}], 1), None, []
 
     def settle(self, active):
         done, _ = wait(active, return_when=FIRST_COMPLETED)
@@ -409,20 +473,30 @@ class Execution:
             reservation = attempt["reserved_tokens"]
             status, unknown, usage = None, False, None
             try:
-                patches, usage = future.result()
+                patches, usage, errors = future.result()
             except (LlmError, NotCompleted) as exc:
                 status = exc.status
-                unknown = (
-                    getattr(exc, "unknown", False) or exc.reason == "unknown_outcome"
-                )
+                unknown = getattr(exc, "unknown", False) or exc.reason in {
+                    "unknown_outcome",
+                    "connection_outcome_unknown",
+                }
                 usage = getattr(exc, "usage_tokens", None)
                 attempt.update(
                     status="unknown" if unknown else "failed", reason=exc.reason
                 )
             else:
                 attempt.update(status="success", patches=patches)
-                if self.cache is not None and not any(
-                    p.get("kind") == "hold" for p in patches
+                if "repair_round" not in attempt or not errors:
+                    self.latest[key] = attempt
+                if errors:
+                    attempt["warnings"] = ["response_mermaid_syntax_invalid"]
+                    self.repairs[key] = {
+                        k: patches[0][k] for k in ("kind", "markdown", "uncertainty")
+                    } | {"errors": errors}
+                if (
+                    self.cache is not None
+                    and not errors
+                    and not any(p.get("kind") == "hold" for p in patches)
                 ):
                     _atomic(
                         self.cache / f"{key}.json",
@@ -459,7 +533,7 @@ class Execution:
                     )
             self.save()
 
-    def admit(self, pool, active, key, image):
+    def admit(self, pool, active, key, image, *, repair=None, fix=False):
         if self.client is None:
             # Zero new requests is evaluated before checking credentials.
             if self.settings["request_budget"] == 0:
@@ -484,14 +558,53 @@ class Execution:
         if reservation is None:
             return
         attempt = {"key": key, "status": "admitted", "reserved_tokens": reservation}
+        if repair is None:
+            self.latest[key] = attempt
+            if fix:
+                self.fixes[key] = attempt["fix_round"] = self.fixes.get(key, 0) + 1
+        else:
+            attempt["repair_round"] = (
+                self.repair_attempts.get(key, {}).get("repair_round", 0) + 1
+            )
+            self.repair_attempts[key] = attempt
         self.state["requests"].append(attempt)
-        self.latest[key] = attempt
         self.budget["requests"] += 1
         self.budget["reserved_tokens"] += reservation
         self.save()
-        active[pool.submit(self.convert, image)] = (key, attempt, self.limit)
+        active[pool.submit(self.convert, image, repair)] = (key, attempt, self.limit)
+
+    def restore_repairs(self):
+        if not self.repair_rounds:
+            return
+        pending = {
+            key: attempt["patches"][0]
+            for key, latest in self.latest.items()
+            if key not in self.published_images
+            and key not in self.repairs
+            and (attempt := self.repair_attempts.get(key, latest))["status"]
+            == "success"
+            and attempt.get("repair_round", 0) < self.repair_rounds
+            and attempt.get("warnings")
+            and attempt.get("patches")
+        }
+        if not pending or not self.admission_open():
+            return
+        parser = LlmClient(self.settings["model"], self.settings["effort"])
+        for key, patch in pending.items():
+            try:
+                errors = parser.mermaid_diagnostics(patch)
+            except LlmError as exc:
+                raise ValueError(
+                    f"cannot restore Mermaid diagnostics: {exc.reason}"
+                ) from exc
+            if errors:
+                self.repairs[key] = {
+                    k: patch[k] for k in ("kind", "markdown", "uncertainty")
+                } | {"errors": errors}
 
     def dispatch(self, jobs, pipelines):
+        # Check whether saved warnings can be repaired before admitting new jobs.
+        self.restore_repairs()
         pending = {}
         for key, image in jobs.items():
             previous = self.latest.get(key)
@@ -507,6 +620,42 @@ class Execution:
                     "patches": cached,
                 }
         self.save()
+        self.dispatch_pending(pending, pipelines)
+        while self.fix_limit and not self.stop:
+            pending = {
+                key: image
+                for key, image in jobs.items()
+                if self.fixes.get(key, 0) < self.fix_limit
+                and (last := self.latest.get(key)) is not None
+                and (
+                    (
+                        last["status"] == "failed"
+                        and last.get("reason") in _FIXABLE_FAILURES
+                    )
+                    or (
+                        last["status"] == "unknown"
+                        and last.get("reason") == "connection_outcome_unknown"
+                    )
+                )
+            }
+            if not pending:
+                break
+            self.dispatch_pending(pending, pipelines, fix=True)
+        while self.repairs and not self.stop:
+            repairs = {
+                key: repair
+                for key, repair in self.repairs.items()
+                if self.repair_attempts.get(key, {}).get("repair_round", 0)
+                < self.repair_rounds
+            }
+            self.repairs = {}
+            self.dispatch_pending(
+                {key: jobs[key] for key in repairs}, pipelines, repairs
+            )
+        self.repairs.clear()
+
+    def dispatch_pending(self, pending, pipelines, repairs=None, *, fix=False):
+        repairs = {} if repairs is None else repairs
         waiting = deque(
             deque(key for key in pipeline if key in pending) for pipeline in pipelines
         )
@@ -537,7 +686,14 @@ class Execution:
                     key = slot[0]
                     if key in in_flight:
                         continue
-                    self.admit(pool, active, key, pending.pop(key))
+                    self.admit(
+                        pool,
+                        active,
+                        key,
+                        pending.pop(key),
+                        repair=repairs.get(key),
+                        fix=fix,
+                    )
                     if self.stop:
                         break
                     in_flight.add(key)

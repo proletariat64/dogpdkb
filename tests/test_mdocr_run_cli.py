@@ -92,6 +92,35 @@ def corpus(tmp_path, count):
         )
 
 
+def test_batch_fix_does_not_resubmit_permanent_paddle_rejection(tmp_path):
+    corpus(tmp_path, 1)
+    with service(lambda _: 413) as (endpoint, calls):
+        planned = cli(
+            tmp_path,
+            "plan",
+            "--mode",
+            "paddle",
+            "--input",
+            "source/0.md",
+            "--output",
+            "out.md",
+            "--plan",
+            "plan.json",
+            "--endpoint",
+            endpoint,
+            "--request-budget",
+            "3",
+            "--fix",
+            "2",
+        )
+        assert planned.returncode == 0, planned.stderr
+        run = cli(tmp_path, "run", "--plan", "plan.json", "--result", "result.json")
+        assert run.returncode == 2, run.stderr
+    (attempt,) = json.loads((tmp_path / "result.json").read_bytes())["requests"]
+    assert attempt["reason"] == "OCR_PROVIDER_FAILED" and attempt["status"] == "failed"
+    assert calls == [1]
+
+
 def test_plan_accepts_maximum_concurrency_and_rejects_above_maximum(tmp_path):
     corpus(tmp_path, 1)
     with service() as (endpoint, calls):
@@ -344,7 +373,7 @@ def test_paddle_and_llm_publish_same_v2_block_shape(tmp_path, monkeypatch):
         def preflight(self):
             return {"ok": True}
 
-        def convert(self, image, _prompt):
+        def convert(self, image, _prompt, *, mermaid_diagnostics, repair):
             assert image == Path("source/0.png").read_bytes()
             return {
                 "image": {

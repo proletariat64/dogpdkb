@@ -122,12 +122,15 @@ export UV_HTTP_RETRIES="${UV_HTTP_RETRIES:-2}"
 mkdir -p "$PREFIX/versions"
 ENV_DIR=$(mktemp -d "$PREFIX/versions/$VERSION.XXXXXX")
 "$UV" venv --no-config --no-project --no-python-downloads --python "${DOGPDKB_PYTHON:-3.12}" "$ENV_DIR"
-"$UV" pip install --no-config --python "$ENV_DIR/bin/python" --default-index "$INDEX" "$TMP/$WHEEL"
+"$UV" pip install --no-config --link-mode copy --python "$ENV_DIR/bin/python" --default-index "$INDEX" "$TMP/$WHEEL"
 [[ "$("$ENV_DIR/bin/dogpdkb" --version)" == "dogpdkb $VERSION" ]] || fail 'Installed version does not match the Release.'
 "$ENV_DIR/bin/mdcompare" --version
 npm install --prefix "$ENV_DIR/skylark" --omit=dev --ignore-scripts --no-audit --no-fund pi-skylark@latest
 ln -s ../skylark/node_modules/.bin/skylark "$ENV_DIR/bin/skylark"
 "$ENV_DIR/bin/skylark" --help
+npm install --prefix "$ENV_DIR" --omit=dev --ignore-scripts --no-audit --no-fund mermaid@12.3.0 jsdom@26.1.0
+MDOCR_BRIDGE=$("$ENV_DIR/bin/python" -I -c 'from mdocr.llm import _PI_BRIDGE; print(_PI_BRIDGE)')
+env -u MDOCR_NODE_DEPENDENCIES node "$MDOCR_BRIDGE" <<<'{"op":"verify_mermaid"}'
 "$ENV_DIR/bin/dogpdkb" doctor --package
 # This marker records paths, not authority to remove arbitrary directories.
 printf '1\n%s\n%s\n%s\n' "$PREFIX" "$BIN_DIR" "$CONFIG_DIR" > "$ENV_DIR/.dogpdkb-managed"

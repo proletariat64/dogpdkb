@@ -219,7 +219,7 @@ class SyntheticLLM:
         assert (model, effort) == ('openai/gpt-6.1-terra', 'medium')
     def preflight(self):
         return {}
-    def convert(self, image, prompt):
+    def convert(self, image, prompt, *, mermaid_diagnostics, repair):
         assert isinstance(image, bytes)
         with (root / 'requests').open('a') as log:
             log.write(repr(image) + '\\n')
@@ -378,6 +378,115 @@ def test_native_resume_keeps_original_admission_after_result_loss(tmp_path):
     assert {doc["ocr_status"] for doc in manifest["documents"]} == {
         "unknown",
         "unattempted",
+    }
+
+
+def test_changed_mdocr_version_refuses_to_resend_unknown_old_admissions(tmp_path):
+    config, differences = _native_instance(tmp_path, crash=True)
+    config.write_text(
+        config.read_text().replace("request_budget=1", "request_budget=3")
+    )
+    driver = tmp_path / "offline_mdocr.py"
+    initial_driver = driver.read_text()
+    driver.write_text(
+        initial_driver.replace(
+            "runner.LlmClient = SyntheticLLM",
+            "runner.__version__ = '0.3.2'\nrunner.LlmClient = SyntheticLLM",
+        )
+    )
+    assert cli("apply", "--config", config, "--input", differences).returncode == 143
+    (run,) = (tmp_path / "runs/funds").glob("run-*/run.json")
+    (journal,) = (tmp_path / "state/funds/ocr").glob("*/plan.json.execution.json")
+    before = journal.read_bytes()
+    driver.write_text(
+        initial_driver.replace(
+            "runner.LlmClient = SyntheticLLM",
+            "runner.__version__ = '0.3.3'\nrunner.LlmClient = SyntheticLLM",
+        )
+    )
+    resumed = cli("apply", "--config", config, "--resume", run)
+    assert resumed.returncode == 2, resumed.stderr
+    assert "saved OCR request identities do not match" in resumed.stderr
+    assert journal.read_bytes() == before
+    assert len((tmp_path / "requests").read_text().splitlines()) == 1
+
+
+def test_batch_resume_rejects_retry_of_definitive_refusal():
+    from dogpdkb.ocr_batch import _verify_running_journal
+
+    state = {
+        "status": "running",
+        "budget": {"requests": 2},
+        "requests": [
+            {"key": "k", "status": "failed", "reason": "response_refusal"},
+            {
+                "key": "k",
+                "status": "failed",
+                "reason": "response_json_invalid",
+                "fix_round": 1,
+            },
+        ],
+    }
+    with pytest.raises(ValueError, match="invalid retry round"):
+        _verify_running_journal(state, 3, fix=2)
+
+
+def test_running_journal_accepts_historical_paddle_fix_admission():
+    from dogpdkb.ocr_batch import _verify_running_journal
+
+    state = {
+        "status": "running",
+        "budget": {"requests": 2},
+        "requests": [
+            {"key": "k", "status": "failed", "reason": "OCR_PROVIDER_FAILED"},
+            {"key": "k", "status": "admitted", "fix_round": 1},
+        ],
+    }
+    _verify_running_journal(state, 3, fix=2)
+
+
+@pytest.mark.parametrize(
+    "reason", ["response_schema_invalid", "connection_outcome_unknown"]
+)
+def test_interrupted_batch_fix_stays_unknown_on_orchestrator_resume(tmp_path, reason):
+    config, differences = _native_instance(tmp_path)
+    config.write_text(
+        config.read_text().replace("request_budget=1", "request_budget=4\nfix=2")
+    )
+    driver = tmp_path / "offline_mdocr.py"
+    driver.write_text(
+        driver.read_text().replace(
+            "        if (root / 'crash').exists():",
+            f"""        if image == b'synthetic image bytes':
+            marker = root / 'once'
+            if not marker.exists():
+                marker.touch()
+                raise runner.LlmError('synthetic failure', reason={reason!r})
+            os._exit(143)
+        if (root / 'crash').exists():""",
+        )
+    )
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 143, first.stderr
+    (run,) = (tmp_path / "runs/funds").glob("run-*/run.json")
+    (journal,) = (tmp_path / "state/funds/ocr").glob("*/plan.json.execution.json")
+    initial = json.loads(journal.read_bytes())
+    assert initial["budget"]["requests"] == 3
+    fix = initial["requests"][-1]
+    assert fix["status"] == "admitted" and fix["fix_round"] == 1
+    resumed = cli("apply", "--config", config, "--resume", run)
+    assert resumed.returncode == 2, resumed.stderr
+    assert (tmp_path / "commands").read_text().splitlines() == ["plan", "run", "run"]
+    assert len((tmp_path / "requests").read_text().splitlines()) == 3
+    final = json.loads(journal.read_bytes())
+    assert final["budget"] == initial["budget"]
+    assert final["requests"][-1] == dict(
+        fix, status="unknown", reason="OCR_OUTCOME_UNKNOWN"
+    )
+    manifest = json.loads(Path(json.loads(resumed.stdout)["manifest"]).read_bytes())
+    assert {row["ocr_status"] for row in manifest["documents"]} == {
+        "completed",
+        "unknown",
     }
 
 

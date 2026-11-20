@@ -32,6 +32,13 @@ replay previously unknown admissions.
 
 The orchestrator passes `[ocr].concurrency` to `mdocr plan --concurrency`
 (1-10, default 3). mdocr may lower the active limit after throttling.
+`[ocr].fix` passes `mdocr plan --fix N`. The installed sample sets `1`;
+missing or `0` disables it. The batch freezes this limit. After the initial
+pass the same journal records retries as `fix_round`, bounded per image.
+Only an observed connection failure before headers or during an SSE body read
+(`connection_outcome_unknown`) may be retried despite an unknown result; the previous outcome remains unknown and
+the retry may incur duplicate usage. Other unknowns are not replayed. Fixes do
+not override request/deadline/throttle stops. Mermaid repairs remain separate.
 
 Failed, held or unknown rows cannot claim a completed Markdown output. The plan-side
 journal prevents resubmission if result mirroring was interrupted. LLM admissions and

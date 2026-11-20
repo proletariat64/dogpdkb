@@ -31,7 +31,7 @@ def test_each_stop_resumes_the_same_frozen_run(tmp_path, frozen_budget):
     if frozen_budget is not None:
         config.write_text(
             original_config
-            + "\n[ocr]\nconcurrency=10\n"
+            + "\n[ocr]\nconcurrency=10\nfix=2\n"
             + f'\n[graphify]\ntoken_budget={frozen_budget}\nmodel="gpt-6.1-terra"\nconcurrency=12\n'
         )
     args = ("sync", "--config", config)
@@ -44,7 +44,7 @@ def test_each_stop_resumes_the_same_frozen_run(tmp_path, frozen_budget):
     source.rename(tmp_path / "moved")
     config.write_text(
         original_config
-        + '\n[ocr]\nmode="paddle"\nrequest_budget=0\nconcurrency=4\n'
+        + '\n[ocr]\nmode="paddle"\nrequest_budget=0\nconcurrency=4\nfix=4\n'
         + '\n[graphify]\ntoken_budget=1024\nmodel="gpt-6-luna"\nconcurrency=6\n'
     )
     resume = (*args, "--resume", path)
@@ -83,6 +83,10 @@ def test_each_stop_resumes_the_same_frozen_run(tmp_path, frozen_budget):
     assert calls[0][calls[0].index("--concurrency") + 1] == (
         "3" if frozen_budget is None else "10"
     )
+    if frozen_budget is None:
+        assert "--fix" not in calls[0]
+    else:
+        assert calls[0][calls[0].index("--fix") + 1] == "2"
     assert calls[-1][calls[-1].index("--max-concurrency") + 1] == (
         "3" if frozen_budget is None else "12"
     )

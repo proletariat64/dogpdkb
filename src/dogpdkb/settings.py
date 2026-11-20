@@ -131,6 +131,7 @@ class Settings:
     graphify_model: str | None = None
     graphify_token_budget: int | None = None
     ocr_concurrency: int = 3
+    ocr_fix: int = 0
     graphify_concurrency: int = 3
 
     def ocr_policy(self) -> dict:
@@ -140,6 +141,7 @@ class Settings:
             "model": "openai/gpt-6.1-terra" if llm else None,
             "effort": "medium" if llm else None,
             "concurrency": self.ocr_concurrency,
+            "fix": self.ocr_fix,
             "request_budget": self.ocr_request_budget,
             "max_seconds": self.ocr_budget_seconds,
             "cache_dir": str(self.ocr_cache),
@@ -280,6 +282,9 @@ def load_config(path: Path | str | None = None) -> Settings:
         raise ConfigError("ocr.mode: expected llm or paddle")
     if ocr_requests is not None and (type(ocr_requests) is not int or ocr_requests < 0):
         raise ConfigError("ocr.request_budget: expected a nonnegative integer")
+    ocr_fix = ocr.get("fix", 0)
+    if type(ocr_fix) is not int or ocr_fix < 0:
+        raise ConfigError("ocr.fix: expected a nonnegative integer")
     graphify = data.get("graphify", {})
     if not isinstance(graphify, dict):
         raise ConfigError("graphify: expected a TOML table")
@@ -323,6 +328,7 @@ def load_config(path: Path | str | None = None) -> Settings:
         graphify_token_budget=graphify_budget,
         graphify_concurrency=graphify_concurrency,
         ocr_concurrency=ocr_concurrency,
+        ocr_fix=ocr_fix,
         body_recovery=configured_path("body_recovery"),
         semantic_score_request_budget=score_requests,
         semantic_score_model=model,
