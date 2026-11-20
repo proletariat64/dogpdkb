@@ -1,7 +1,8 @@
 # Graphify native CLI integration
 
-Graphify is an unmodified external dependency. No fork, patch, private Python
-imports, custom commands or foreign merge/replacement algorithms are permitted.
+Graphify is an external dependency. This repository uses the separately
+installed 0.9.111 CLI with the existing `openai-oauth` patch. Dogpdkb does not
+patch or import Graphify, add custom commands, or implement graph merge logic.
 
 ## Invocation and scope
 
@@ -11,10 +12,32 @@ and the original `.gitignore` / `.graphifyignore` scan controls. Images, PDF,
 code and other non-Markdown files are not copied into that input tree. Original
 corpus resources remain unchanged for OCR and publication; OCR text already in
 Markdown is preserved byte for byte. `all` keeps the previous complete-tree scan,
-including resources. The choice applies per invocation, including explicit graph
-recovery; the execution report records `graphify_inputs`.
+including resources. For a newly sealed sync batch, recovery inherits the saved
+mode and refuses a different one. Apply and older unbound batches retain their
+per-invocation option. The execution report records `graphify_inputs`.
 
-`graphify extract CORPUS --out WORKSPACE --no-cluster` scans that source tree.
+`graphify extract CORPUS --out WORKSPACE --no-cluster --backend openai-oauth --max-concurrency 3`
+scans that source tree, with `GRAPHIFY_OPENAI_OAUTH_PARALLEL=1` and force mode
+explicitly disabled. This is one directory subprocess with up to three native
+semantic chunks in flight, not three subprocesses. Graphify owns its OAuth
+login, token refresh and retries; dogpdkb does not use Pi or API-key fallback.
+
+The installed sample sets `[graphify].model = "gpt-6.1-terra"`, forwarded as
+native `--model` on the OpenAI OAuth backend. If omitted, Graphify selects its
+model as usual. Ordinary resume retains the saved model selection, while an
+explicit graph retry uses the current configuration.
+
+Optional `[graphify].token_budget` (positive integer) is passed as native
+`--token-budget N` to the preflight and to extraction. When unset, Graphify
+uses its 60,000-token default. It sizes chunks by estimated input tokens,
+not by document count, total tokens/cost or output tokens. A smaller value can
+reduce file omissions in otherwise valid responses, at the cost of more chunks;
+it does not guarantee coverage. The configured value is recorded separately
+from sanitized argv as `graphify_token_budget` (null when unset). A normal
+`sync --resume` keeps the original budget, including an unset budget. An explicit
+`--retry-graph` may change this execution setting without changing the sealed
+input scope. Native cache reads and publication proof remain active.
+
 Only `compile` manifest rows request a new graph attempt; `reuse`,
 `metadata`, `retain` and `defer` do not claim extraction or advance graph facts.
 An all-retained batch makes no Graphify call. A deferred row keeps the result
@@ -57,11 +80,13 @@ non-Markdown sources: Graphify may natively prune their existing graph records
 when the mode changes from all to text. No graph/manifest/cache records are
 rewritten by the orchestrator to hide that transition, and publication still
 requires native extraction success. Choose all to retain the prior source scope.
-Native zero-node recovery can still dispatch Markdown beyond the requested body
-candidates; all mode also allows resource/cache work. Candidate counts do not bound
-model-call counts. Frozen previous bodies prevent the latest uncertain held
-body from being submitted as an implicit full-document fallback. Native baseline
-and ownership semantics remain authoritative; no hash or manifest is fabricated.
+Historical Markdown not selected for compilation must already have a native
+current-byte semantic stamp and graph ownership in the frozen view. Otherwise
+zero-node recovery or a missing stamp could silently redispatch it. This guard
+also stops unselected Markdown whose scan exclusion cannot be proven without
+extracting. All mode additionally allows native resource/cache work. Candidate
+counts do not bound model-call counts. Native baseline and ownership semantics
+remain authoritative; no hash or manifest is fabricated.
 Mirroring requires a portable relative-key native manifest. Legacy absolute-key
 manifests return `GRAPHIFY_PORTABLE_BASELINE_REQUIRED` rather than causing a broad
 re-extraction after relocation. This check never rewrites native entries.
@@ -108,14 +133,32 @@ its manifest/cache. Invoke the original CLI with `GRAPHIFY_OUT=graphify-out`, so
 custom instance graph locations still use the same native output convention.
 Graphify extraction and cache writes occur only in this workspace.
 
-Require exit zero, a readable graph JSON with public node/edge arrays, and a
-manifest JSON object. Do not reject Graphify's internal duplicate/chunk semantics.
-Recheck all frozen inputs, copy native auxiliary/cache artifacts, then atomically
-write the complete graph artifact and its native manifest. No node, edge,
-hyperedge, source identity or metadata is rewritten. The Graphify manifest is
-published after the graph, so it cannot make a later scan skip an absent graph.
-A failed extraction leaves public graph and manifest unchanged. Publication I/O
-failure or interruption is unknown and keeps evidence for the cleanup agent.
+Before submitting corpus inputs, check the pinned CLI version and use a
+synthetic missing-login probe with an isolated home and no live credential.
+An unknown version or absent OAuth backend keeps the graph partial without
+sending corpus data. The probe checks CLI compatibility, not live auth or
+proof of a particular installation's provenance.
+
+Exit zero and valid JSON are necessary but insufficient. Require the native
+write/no-change diagnostic. If native semantic work was dispatched, require
+all numbered chunks to complete with one consistent total, and reject native
+incomplete-extraction, manifest or cache errors. Every frozen Markdown source
+requires a current native semantic stamp and graph ownership by a node or a
+nonempty hyperedge with existing members. Sources without that evidence in the
+previous public generation must be accounted for by native dispatch or cache
+hit counts; a terminal write alone cannot prove new work. Validate other present
+manifest stamps against their frozen bytes. The native manifest
+uses MD5 as a change stamp; dogpdkb records SHA-256 input witnesses separately.
+No size growth or shrink threshold substitutes for these checks.
+
+Recheck the full frozen input tree, source witnesses and prior public generation.
+Fsync and exchange the candidate directory with the old one on the public
+filesystem (Linux `renameat2(RENAME_EXCHANGE)`). The graph, native manifest,
+cache and auxiliary files switch together, with the same lock inode. No native
+record is rewritten. Extraction or proof failure leaves the public generation
+unchanged. Publication I/O failure or interruption is unknown and keeps
+evidence; a crash after the swap but before state acknowledgment does not
+constitute automatic resend permission.
 
 Only the complete successful batch advances selected documents' graph facts.
 Its successful full input descriptor (body witness, relative source path,
@@ -124,17 +167,21 @@ for subsequent comparison and mixed-batch mirrors. Retained/deferred graph
 facts and their extraction witnesses stay unchanged.
 A nonzero extraction fails the entire batch; there is no per-source success
 claim. `dogpdkb-graph-result-1` is the orchestrator's own execution evidence, not a
-schema required from Graphify. Directory scans are not remote atomic snapshots.
-Execution evidence includes the actual sanitized argv and exit code. Successful
-graph witnesses and latest reports live outside wash; completed/partial sync
-reclaims the duplicate candidate workspace while retaining necessary failure
-reports and source inputs. Manual purge never removes the published graph/cache.
+schema required from Graphify. Graph facts include SHA-256 of the actual input
+bytes. An unsuccessful wrapper exit is not evidence about provider transmission;
+only a proven pre-dispatch failure is `not_sent` in the handoff. Directory scans
+are not remote atomic snapshots.
+Execution evidence includes the actual sanitized argv, exit code and native log.
+Successful graph witnesses and reports live outside wash in attempt-specific
+paths; completed/partial sync reclaims the duplicate candidate workspace while
+retaining necessary failure reports, logs and source inputs. Manual purge never removes the published graph/cache.
 
 ## Verification
 
 Tests cover exact native argv, baseline guards, unchanged/changed input,
 whole-batch failure, interruption, suppression and publication. An isolated real
-CLI probe uses a localhost OpenAI-compatible test provider: two initial sources,
+CLI probe uses a loopback SSE fixture with synthetic Graphify OAuth credentials:
+two initial sources,
 one changed source, then an unchanged scan. No production graph or paid provider
 is used. Installed Graphify is selected via the existing `[tools].graphify` argv;
 provider settings remain its own environment/configuration.

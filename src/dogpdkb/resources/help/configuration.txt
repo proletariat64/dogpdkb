@@ -45,7 +45,8 @@ Optional document_ids is a nonempty unique list of nonblank string IDs; omission
 subscribes to the whole Yuque book. A complete listing is validated before
 filtering. A directory source requires path and scans Markdown recursively.
 --book selects a subscription; omission requires exactly one enabled subscription.
---source KEY can repeat on sync and discover, selecting only enabled sources.
+--source KEY can repeat on sync, discover and doctor, selecting enabled sources.
+--dir PATH on sync or doctor selects a single directory without changing this file.
 Without --source, all enabled sources are scanned. Reusing a recorded source
 key with a different URL, scope or directory path is refused.
 
@@ -64,8 +65,18 @@ TOML sections are tables. Recognized settings and fallback values:
   SKYLARK_MCP_URL overrides it. Empty means retain the tool's gateway default.
 - skylark.timeout_seconds: positive finite number, default 60 seconds; passed
   to Skylark as SKYLARK_TIMEOUT_MS. Existing retry/SSO behavior belongs to Skylark.
-- ocr.budget_seconds: positive finite number, default 1800 seconds shared across
-  serial document OCR calls; in-flight tool deadlines remain tool-owned.
+- semantic_score.request_budget: score eligible CHANGED evidence by default.
+  Omit for no extra cap, set a positive integer to cap requests, or 0 to disable.
+- semantic_score.model: provider/model, default openai/gpt-6.1-terra via Pi OAuth.
+- graphify.model: native OpenAI OAuth model ID; installed sample: gpt-6.1-terra.
+- graphify.token_budget: native estimated input tokens per chunk. The installed
+  sample uses 5500; when unset, Graphify uses its own default.
+- ocr.mode: llm (default, OpenAI Pi OAuth) or paddle (explicit opt-in).
+- ocr.request_budget: OCR requests for the whole batch; omit for unlimited,
+  or set 0 to prohibit new requests. Independent of scoring.
+- ocr.budget_seconds: positive finite number, default 1800 seconds; mdocr owns
+  the admission deadline. The installed sample uses 7200 seconds.
+  OCR concurrency defaults to 3.
 - tools.skylark/mdcompare/mdocr/graphify: nonempty executable string or nonempty
   string argv array, default the tool name. This is not shell command text.
   Only argv[0] containing / or starting with ~ is resolved against the TOML;
@@ -76,8 +87,8 @@ TOML sections are tables. Recognized settings and fallback values:
   Publication consumes these optional display settings without changing sync.
 
 Tools are independent public CLIs. Skylark uses existing SSO and gateway settings;
-mdocr uses PADDLEOCR_TOKEN for new batch OCR, while its standalone ocr command
-requires the token at validation. Graphify retains its own provider configuration.
+mdocr uses the OpenAI Pi OAuth route for LLM or PADDLEOCR_TOKEN for explicit
+Paddle mode. Graphify retains its own provider configuration.
 Do not put credentials into saved plans, manifests or command examples.
 
 ## Run and result schemas
@@ -87,7 +98,7 @@ schema, run_id, command, book (key/name/sources), pid, lock (absolute corpus-loc
 path), status, stage, counts, started_at, updated_at, ended_at, exit_code, reason,
 artifacts (named absolute paths), failures and targets. targets holds source
 bindings and absolute corpus and graph paths. Loading a saved run checks all
-bindings and targets; resume does not accept a new --source selection.
+bindings and targets; resume accepts neither --source nor --dir.
 lock is the recorded corpus-lock path used by
 status for liveness observation; its presence does not itself prove a held lock.
 Optional stage/checkpoint fields are added as work progresses. Statuses include

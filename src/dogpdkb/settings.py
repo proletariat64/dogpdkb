@@ -19,6 +19,9 @@ else:
     import tomli as tomllib
 
 
+DEFAULT_DOWNLOAD_CONCURRENCY = 3
+
+
 class ConfigError(ValueError):
     """The selected instance cannot be configured."""
 
@@ -98,8 +101,25 @@ class Settings:
     tools: dict[str, tuple[str, ...]] = field(default_factory=dict)
     web_options: dict[str, Any] = field(default_factory=dict)
     body_recovery: Path | None = None
-    semantic_score_request_budget: int = 0
+    semantic_score_request_budget: int | None = None
     semantic_score_model: str | None = None
+    ocr_mode: str = "llm"
+    ocr_request_budget: int | None = None
+    graphify_model: str | None = None
+    graphify_token_budget: int | None = None
+
+    def ocr_policy(self) -> dict:
+        llm = self.ocr_mode == "llm"
+        return {
+            "mode": self.ocr_mode,
+            "model": "openai/gpt-6.1-terra" if llm else None,
+            "effort": "medium" if llm else None,
+            "concurrency": 3,
+            "request_budget": self.ocr_request_budget,
+            "max_seconds": self.ocr_budget_seconds,
+            "cache_dir": str(self.ocr_cache),
+            "command": self.command("mdocr"),
+        }
 
     def graph_for(self, book: Book) -> Path:
         return self.graph_dir or book.corpus / "graphify-out"
@@ -220,13 +240,34 @@ def load_config(path: Path | str | None = None) -> Settings:
     score = data.get("semantic_score", {})
     if not isinstance(score, dict):
         raise ConfigError("semantic_score: expected a TOML table")
-    score_requests, model = score.get("request_budget", 0), score.get("model")
-    if type(score_requests) is not int or score_requests < 0:
+    score_requests, model = score.get("request_budget"), score.get("model")
+    if score_requests is not None and (
+        type(score_requests) is not int or score_requests < 0
+    ):
         raise ConfigError(
             "semantic_score.request_budget: expected a nonnegative integer"
         )
     if model is not None and (not isinstance(model, str) or not model.strip()):
         raise ConfigError("semantic_score.model: expected provider/model")
+    ocr = data.get("ocr", {})
+    ocr_mode, ocr_requests = ocr.get("mode", "llm"), ocr.get("request_budget")
+    if ocr_mode not in ("llm", "paddle"):
+        raise ConfigError("ocr.mode: expected llm or paddle")
+    if ocr_requests is not None and (type(ocr_requests) is not int or ocr_requests < 0):
+        raise ConfigError("ocr.request_budget: expected a nonnegative integer")
+    graphify = data.get("graphify", {})
+    if not isinstance(graphify, dict):
+        raise ConfigError("graphify: expected a TOML table")
+    graphify_model = graphify.get("model")
+    if graphify_model is not None and (
+        not isinstance(graphify_model, str) or not graphify_model.strip()
+    ):
+        raise ConfigError("graphify.model: expected a nonempty model ID")
+    graphify_budget = graphify.get("token_budget")
+    if graphify_budget is not None and (
+        type(graphify_budget) is not int or graphify_budget <= 0
+    ):
+        raise ConfigError("graphify.token_budget: expected a positive integer")
     return Settings(
         file=selected,
         books_file=(selected.parent / Path(books).expanduser()).resolve(),
@@ -245,6 +286,10 @@ def load_config(path: Path | str | None = None) -> Settings:
         proxy_bin=proxy,
         timeout_seconds=number("skylark", "timeout_seconds", 60),
         ocr_budget_seconds=number("ocr", "budget_seconds", 1800),
+        ocr_mode=ocr_mode,
+        ocr_request_budget=ocr_requests,
+        graphify_model=graphify_model,
+        graphify_token_budget=graphify_budget,
         body_recovery=configured_path("body_recovery"),
         semantic_score_request_budget=score_requests,
         semantic_score_model=model,
@@ -364,3 +409,50 @@ def select_book(settings: Settings, key: str | None = None) -> Book:
     if len(matches) != 1:
         raise ConfigError("select exactly one enabled book with --book")
     return matches[0]
+
+
+def select_inputs(
+    settings: Settings, book: Book, keys: list[str] | None, directory: Path | None
+) -> tuple[Source, ...]:
+    if directory is None:
+        return book.select_sources(keys)
+    try:
+        root = directory.expanduser().resolve()
+    except RuntimeError as error:
+        raise ConfigError(f"invalid directory source {directory}: {error}") from error
+    validate_directory_source(settings, book, root)
+    matches = tuple(
+        source
+        for source in book.sources
+        if isinstance(source, DirectorySource) and source.path == root
+    )
+    if len(matches) > 1:
+        raise ConfigError(
+            f"directory matches multiple sources: {root}; choose --source KEY"
+        )
+    if matches:
+        return matches
+    key = "direct-" + document_identity(book.key, str(root)).removeprefix("doc-")
+    if key in book.source_bindings():
+        raise ConfigError(
+            f"generated directory source key conflicts with configured source: {key}"
+        )
+    return (DirectorySource(key, root),)
+
+
+def validate_directory_source(settings: Settings, book: Book, root: Path) -> None:
+    if not root.is_dir():
+        raise ConfigError(
+            f"directory source does not exist or is not a directory: {root}"
+        )
+    for target in (
+        book.corpus,
+        settings.graph_for(book),
+        settings.staging,
+        settings.state,
+        settings.ocr_cache,
+        settings.web,
+        settings.results,
+    ):
+        if root.is_relative_to(target) or target.is_relative_to(root):
+            raise ConfigError(f"directory source overlaps a managed path: {target}")

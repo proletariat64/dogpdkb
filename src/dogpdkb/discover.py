@@ -20,7 +20,13 @@ from dogpdkb.help import HelpParser
 from dogpdkb.planning import descriptor
 from dogpdkb.processes import diagnostic_argv, run_command
 from dogpdkb.records import UTC8, Run, Store, atomic_json, now_iso, read_json
-from dogpdkb.settings import YuqueSource, document_identity, load_config, select_book
+from dogpdkb.settings import (
+    YuqueSource,
+    document_identity,
+    load_config,
+    select_book,
+    validate_directory_source,
+)
 
 
 class DiscoverError(ValueError):
@@ -210,21 +216,7 @@ def _with_source(rows, source_key):
 
 def _directory_listing(settings, book, run, source):
     root = source.path
-    if not root.is_dir():
-        raise DiscoverError(
-            f"directory source does not exist or is not a directory: {root}"
-        )
-    for target in (
-        book.corpus,
-        settings.graph_for(book),
-        settings.staging,
-        settings.state,
-        settings.ocr_cache,
-        settings.web,
-        settings.results,
-    ):
-        if root.is_relative_to(target) or target.is_relative_to(root):
-            raise DiscoverError(f"directory source overlaps a managed path: {target}")
+    validate_directory_source(settings, book, root)
 
     def raise_scan_error(error):
         raise error
@@ -365,6 +357,13 @@ def _select(current, prior, documents, *, yuque):
             ignored.append(doc_id)
         else:
             reasons.append("new")
+        corpus = local.get("corpus", {})
+        if (
+            corpus.get("ocr_status") == "unattempted"
+            and corpus.get("version")
+            and _same(corpus["version"], row["version"])
+        ):
+            reasons.append("ocr_unattempted")
         pending = local.get("pending")
         if pending and _same(pending["version"], row["version"]):
             reasons = list(dict.fromkeys([*reasons, *pending["reasons"]]))
@@ -405,7 +404,9 @@ def discover(settings, book, store, run, listing=None, *, sources=None):
                 )
     run.stage("discover")
     seen, selected, absent, ignored, listings, cutoffs = {}, [], [], [], {}, {}
-    for source in sources:
+    for index, source in enumerate(sources):
+        run.data["collect_source"] = source.key
+        run.stage("discover", total=len(sources), completed=index)
         yuque = isinstance(source, YuqueSource)
         try:
             if yuque:
@@ -487,6 +488,7 @@ def discover(settings, book, store, run, listing=None, *, sources=None):
     store.save()
     atomic_json(path, differences)
     run.data["artifacts"]["differences"] = str(path)
+    run.data.pop("collect_source", None)
     run.stage(
         "discover",
         observed=sum(len(scan["documents"]) for scan in seen.values()),

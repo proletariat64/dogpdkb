@@ -9,15 +9,15 @@ import os
 import re
 import tempfile
 import time
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
 import requests
 
 from . import __version__
-from .llm import LlmClient, LlmError
+from .llm import IMAGE_SCHEMA, LlmClient, LlmError
 from .markdown import IMAGE_RE, parse_image_match
 from .paddle import _MODEL, OcrRequestOutcome, PaddleClient
 from .plan import read_plan
@@ -32,13 +32,6 @@ class NotCompleted(RuntimeError):
         self.reason = reason
         self.status = status
         self.unknown = unknown
-
-
-@dataclass(frozen=True)
-class Job:
-    key: str
-    images: tuple[dict, ...]
-    body: str | None = None
 
 
 def _sha(data: bytes) -> str:
@@ -120,6 +113,9 @@ def _validate(plan, plan_path, result_path, ledger, artifacts, lock_paths):
         3,
     }:
         raise ValueError("invalid plan settings")
+    if settings["mode"] == "llm" and settings.get("llm_schema") != IMAGE_SCHEMA:
+        # A legacy document-level admission cannot authorize per-image retries.
+        raise ValueError("unsupported LLM plan schema; legacy plans cannot be executed")
     for budget in (settings["token_budget"], settings["request_budget"]):
         if budget is not None and (type(budget) is not int or budget < 0):
             raise ValueError("invalid plan budget")
@@ -215,7 +211,7 @@ class Execution:
                 "model": self.settings["model"],
                 "effort": self.settings["effort"],
                 "prompt_sha256": _sha(self.settings["prompt"].encode()),
-                "schema": "mdocr-image-patches-1",
+                "schema": IMAGE_SCHEMA,
             }
         else:
             self.config |= {
@@ -280,60 +276,50 @@ class Execution:
         _atomic(self.ledger, data)
         _atomic(self.result, data)
 
-    def plan_jobs(self, texts):
-        jobs, layout = {}, []
-        for doc, text in zip(self.docs, texts):
-            selected = [im for im in doc["images"] if im["selected"]]
+    def plan_jobs(self):
+        jobs, layout, pipelines = {}, [], []
+        for doc in self.docs:
+            selected = [
+                im for im in doc["images"] if im["selected"] and not im["error"]
+            ]
             bindings = {}
+            for image in selected:
+                key = _sha(_json([self.config, image["sha256"]]))
+                jobs.setdefault(key, image)
+                bindings[image["id"]] = key
             context = None
-            if (
-                self.mode == "llm"
-                and selected
-                and not any(im["error"] for im in selected)
-            ):
+            if self.mode == "llm" and selected:
+                # Document evidence only: never sent to the engine or used as a cache key.
                 context = _sha(
                     _json(
-                        [doc["sha256"], [(im["id"], im["sha256"]) for im in selected]]
+                        [
+                            doc["sha256"],
+                            [(im["id"], im["sha256"]) for im in selected],
+                        ]
                     )
                 )
-                key = _sha(_json([self.config, context]))
-                body = text
-                for image in reversed(doc["images"]):
-                    body = (
-                        body[: image["start"]]
-                        + f"![Image occurrence]({image['id']})"
-                        + body[image["end"] :]
-                    )
-                jobs.setdefault(key, Job(key, tuple(selected), body))
-                bindings = {
-                    image["id"]: (key, offset) for offset, image in enumerate(selected)
-                }
+                pipelines.append(list(bindings.values()))
             elif self.mode == "paddle":
-                for image in selected:
-                    if image["error"]:
-                        continue
-                    key = _sha(_json([self.config, image["sha256"]]))
-                    jobs.setdefault(key, Job(key, (image,)))
-                    bindings[image["id"]] = (key, 0)
+                pipelines.extend([key] for key in bindings.values())
             layout.append((bindings, context))
-        return jobs.values(), layout
+        return jobs, pipelines, layout
 
-    def cached(self, job):
+    def cached(self, key):
         if self.cache is None:
             return None
-        path = self.cache / f"{job.key}.json"
+        path = self.cache / f"{key}.json"
         if not path.exists():
             return None
         try:
             record = json.loads(path.read_bytes())
             patches = record["patches"]
-            if record["key"] != job.key or record["sha256"] != _sha(_json(patches)):
+            if record["key"] != key or record["sha256"] != _sha(_json(patches)):
                 return None
-            return _patches(patches, len(job.images))
+            return _patches(patches, 1)
         except (KeyError, TypeError, ValueError, NotCompleted):
             return None
 
-    def reserve(self, job):
+    def reserve(self):
         if self.stop:
             return None
         if time.monotonic() >= self.deadline:
@@ -346,9 +332,10 @@ class Execution:
         token_limit = self.settings["token_budget"]
         if token_limit is None:
             return 0
-        bound = self.client.token_upper_bound(
-            job.body, job.images, self.settings["prompt"]
-        )
+        client = self.client
+        if not isinstance(client, LlmClient):
+            raise TypeError("only LLM supports token reservations")
+        bound = client.token_upper_bound()
         if type(bound) is not int or bound <= 0:
             self.stop = "OCR_TOKEN_BOUND_UNAVAILABLE"
         elif (
@@ -359,18 +346,25 @@ class Execution:
             return bound
         return None
 
-    def convert(self, job):
-        image = job.images[0]
+    def convert(self, image):
+        client = self.client
+        try:
+            data = _text(image["source_path"], image["sha256"], "IMAGE_DRIFT")
+        except (OSError, ValueError) as exc:
+            raise NotCompleted("IMAGE_DRIFT") from exc
         if self.mode == "llm":
-            images = [{"id": im["id"], "path": im["source_path"]} for im in job.images]
-            for im in job.images:
-                _text(im["source_path"], im["sha256"], "IMAGE_DRIFT")
-            result = self.client.convert(job.body, images, self.settings["prompt"])
-            patches = _patches(result["patches"], len(images))
-            if [p.get("id") for p in patches] != [im["id"] for im in images]:
-                raise NotCompleted("OCR_RESPONSE_INVALID")
-            return patches, result["usage_tokens"]
-        data = _text(image["source_path"], image["sha256"], "IMAGE_DRIFT")
+            if not isinstance(client, LlmClient):
+                raise TypeError("LLM job admitted before preflight")
+            result = client.convert(data, self.settings["prompt"])
+            usage = result["usage_tokens"]
+            try:
+                return _patches([result["image"]], 1), usage
+            except NotCompleted as exc:
+                raise LlmError(
+                    exc.reason, reason=exc.reason, usage_tokens=usage
+                ) from exc
+        if not isinstance(client, str):
+            raise TypeError("Paddle job admitted without a token")
         try:
             jpeg = normalize_image(data)
         except ImageError as exc:
@@ -381,20 +375,20 @@ class Execution:
         ):
             path = Path(tmp) / "prepared.jpg"
             path.write_bytes(jpeg)
-            client = PaddleClient(
-                self.client,
+            paddle = PaddleClient(
+                client,
                 session=session,
                 endpoint=self.settings["endpoint"],
                 adaptive=True,
             )
             try:
-                text = client.convert(path)
+                text = paddle.convert(path)
             except OcrRequestOutcome as exc:
                 reason = {
                     401: "OCR_AUTH_UNAVAILABLE",
                     403: "OCR_QUOTA_EXHAUSTED",
                     429: "OCR_RATE_LIMITED",
-                }.get(exc.status, "OCR_PROVIDER_FAILED")
+                }.get(exc.status or 0, "OCR_PROVIDER_FAILED")
                 raise NotCompleted(
                     reason, status=exc.status, unknown=exc.unknown
                 ) from exc
@@ -407,7 +401,7 @@ class Execution:
         for future in tuple(active):
             if future not in done:
                 continue
-            job, attempt, admitted = active.pop(future)
+            key, attempt, admitted = active.pop(future)
             reservation = attempt["reserved_tokens"]
             status, unknown, usage = None, False, None
             try:
@@ -427,10 +421,10 @@ class Execution:
                     p.get("kind") == "hold" for p in patches
                 ):
                     _atomic(
-                        self.cache / f"{job.key}.json",
+                        self.cache / f"{key}.json",
                         _json(
                             {
-                                "key": job.key,
+                                "key": key,
                                 "patches": patches,
                                 "sha256": _sha(_json(patches)),
                             }
@@ -461,69 +455,90 @@ class Execution:
                     )
             self.save()
 
-    def dispatch(self, jobs):
+    def admit(self, pool, active, key, image):
+        if self.client is None:
+            # Zero new requests is evaluated before checking credentials.
+            if self.settings["request_budget"] == 0:
+                self.stop = "OCR_REQUEST_BUDGET_EXHAUSTED"
+                return
+            if self.mode == "paddle":
+                self.client = os.environ.get("PADDLEOCR_TOKEN")
+                if not self.client:
+                    self.stop = "OCR_AUTH_UNAVAILABLE"
+                    return
+            else:
+                if self.settings["token_budget"] == 0:
+                    self.stop = "OCR_TOKEN_BUDGET_EXHAUSTED"
+                    return
+                self.client = LlmClient(self.settings["model"], self.settings["effort"])
+                try:
+                    self.client.preflight()
+                except LlmError as exc:
+                    self.stop = exc.reason
+                    return
+        reservation = self.reserve()
+        if reservation is None:
+            return
+        attempt = {"key": key, "status": "admitted", "reserved_tokens": reservation}
+        self.state["requests"].append(attempt)
+        self.latest[key] = attempt
+        self.budget["requests"] += 1
+        self.budget["reserved_tokens"] += reservation
+        self.save()
+        active[pool.submit(self.convert, image)] = (key, attempt, self.limit)
+
+    def dispatch(self, jobs, pipelines):
+        pending = {}
+        for key, image in jobs.items():
+            previous = self.latest.get(key)
+            if previous and (previous["status"] != "failed" or not self.retry):
+                continue
+            cached = self.cached(key)
+            if cached is None:
+                pending[key] = image
+            else:
+                self.reused[key] = self.latest[key] = {
+                    "key": key,
+                    "status": "reused",
+                    "patches": cached,
+                }
+        self.save()
+        waiting = deque(
+            deque(key for key in pipeline if key in pending) for pipeline in pipelines
+        )
+        slots = []
         with ThreadPoolExecutor(max_workers=self.limit) as pool:
             active = {}
-            for job in jobs:
-                previous = self.latest.get(job.key)
-                if previous and (previous["status"] != "failed" or not self.retry):
-                    continue
-                cached = self.cached(job)
-                if cached is not None:
-                    self.reused[job.key] = self.latest[job.key] = {
-                        "key": job.key,
-                        "status": "reused",
-                        "patches": cached,
-                    }
-                    self.save()
-                    continue
-                while active and (
-                    len(active) >= self.limit
-                    or any(w > self.limit for _, _, w in active.values())
+            while (waiting or slots) and not self.stop:
+                # After a 429, drain the prior tier. Park overflow pipelines and
+                # finish them before admitting more documents.
+                while active and any(
+                    tier > self.limit for _, _, tier in active.values()
                 ):
                     self.settle(active)
                 if self.stop:
-                    continue
-                if self.client is None:
-                    if self.mode == "paddle":
-                        self.client = os.environ.get("PADDLEOCR_TOKEN")
-                        if not self.client:
-                            self.stop = "OCR_AUTH_UNAVAILABLE"
-                            continue
-                    else:
-                        # Cheap terminal caps need no credentials or model runtime.
-                        if (
-                            self.settings["request_budget"] == 0
-                            or self.settings["token_budget"] == 0
-                        ):
-                            self.stop = (
-                                "OCR_REQUEST_BUDGET_EXHAUSTED"
-                                if self.settings["request_budget"] == 0
-                                else "OCR_TOKEN_BUDGET_EXHAUSTED"
-                            )
-                            continue
-                        self.client = LlmClient(
-                            self.settings["model"], self.settings["effort"]
-                        )
-                        try:
-                            self.client.preflight()
-                        except LlmError as exc:
-                            self.stop = exc.reason
-                            continue
-                reservation = self.reserve(job)
-                if reservation is None:
-                    continue
-                attempt = {
-                    "key": job.key,
-                    "status": "admitted",
-                    "reserved_tokens": reservation,
-                }
-                self.state["requests"].append(attempt)
-                self.latest[job.key] = attempt
-                self.budget["requests"] += 1
-                self.budget["reserved_tokens"] += reservation
-                self.save()
-                active[pool.submit(self.convert, job)] = (job, attempt, self.limit)
+                    break
+                in_flight = {key for key, _, _ in active.values()}
+                for slot in slots:
+                    while slot and slot[0] not in pending and slot[0] not in in_flight:
+                        slot.popleft()
+                slots = [slot for slot in slots if slot]
+                while waiting and len(slots) < self.limit:
+                    slot = waiting.popleft()
+                    while slot and slot[0] not in pending and slot[0] not in in_flight:
+                        slot.popleft()
+                    if slot:
+                        slots.append(slot)
+                for slot in slots[: self.limit]:
+                    key = slot[0]
+                    if key in in_flight:
+                        continue
+                    self.admit(pool, active, key, pending.pop(key))
+                    if self.stop:
+                        break
+                    in_flight.add(key)
+                if active:
+                    self.settle(active)
             while active:
                 self.settle(active)
 
@@ -543,8 +558,7 @@ class Execution:
                 records.append(record)
                 if not image["selected"]:
                     continue
-                key, offset = bindings.get(identifier, (None, None))
-                attempt = self.latest.get(key)
+                attempt = self.latest.get(bindings.get(identifier))
                 if (
                     image["error"]
                     or not attempt
@@ -558,13 +572,11 @@ class Execution:
                         else "unattempted"
                     )
                     reason = image["error"] or (
-                        attempt.get("reason")
-                        if attempt
-                        else self.stop or "OCR_GROUP_INPUT_HELD"
+                        attempt.get("reason") if attempt else self.stop
                     )
                     record.update(status=status, reason=reason)
                     continue
-                patch = attempt["patches"][offset]
+                (patch,) = attempt["patches"]
                 if patch.get("kind") == "hold":
                     record.update(
                         status="held",
@@ -655,6 +667,6 @@ def run_command(args) -> int:
         execution = Execution(
             plan, digest, ledger, result, artifacts, args.retry_failed
         )
-        jobs, layout = execution.plan_jobs(texts)
-        execution.dispatch(jobs)
+        jobs, pipelines, layout = execution.plan_jobs()
+        execution.dispatch(jobs, pipelines)
         return execution.publish(texts, layout)

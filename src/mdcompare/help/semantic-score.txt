@@ -9,16 +9,29 @@ and materiality claims are validated before a numeric score can be routed.
 Does not send source
 paths, image payloads or OCR. Scores bind the exact sidecar bytes.
 
+Repeat --document-id ID to score only those eligible, unambiguous document IDs
+in the report. Keep the same scope on resume. The report/index are unchanged.
+In the score result, only admitted rows have a status (scored or unscored);
+unscored entries without a status never entered the tool's request budget.
+
 --request-budget is required; 0 does not start a model. The limit counts
 admissions across resumes, including uncertain outcomes. A separate maximum
 byte size applies per prepared evidence packet; oversized packets are held
 whole, not clipped. This byte limit is not a hard token or invoice limit.
 
 Run with installed Pi and Node. Pi owns OAuth login/refresh; no API-key
-fallback. Default model openai/gpt-6.1-terra, medium. Keep the .execution.json
-journal beside the output; it contains provider replies and is private. Resume with the same immutable report, index,
-output, model, effort and budget; previously admitted jobs are never resent.
-401/403, rate limits and unknown submissions stop further admission. Valid
-scores from earlier requests remain; unscored entries never authorize a skip.
+fallback. Default model openai/gpt-6.1-terra, medium. --concurrency accepts
+1–3 (default 3) in a single run. An HTTP 429 lowers the persisted limit one
+tier after draining in-flight requests; at 1 it stops further admission.
+Rejected, failed and interrupted admissions still count against the budget.
+Authentication failures and observed unknown submissions also stop admission.
+
+Keep the private OUTPUT.execution.json journal and OUTPUT.lock beside the
+output. The journal contains raw replies; the lock prevents simultaneous
+writers and guards against recreating a missing journal. Rerun with the same
+report, index, output and settings to reuse valid scores and continue only
+work not previously admitted. Interrupted admissions become unknown; they
+are not resent. Scores and unscored entries are each in report order, not
+provider completion order. Unscored entries never authorize a skip.
 
 semantic-route consumes this output independently and applies the threshold.

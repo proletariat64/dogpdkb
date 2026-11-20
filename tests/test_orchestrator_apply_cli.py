@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.smoke_install import GRAPHIFY_PREFLIGHT, GRAPHIFY_PROOF
 from tests.ocr_fixture import write_ocr_fixture
 from tests.source_fixture import team_id, team_row, yuque_binding
 
@@ -313,8 +314,9 @@ if name == 'mdcompare' and args[0] == 'catalog' and 'incoming' in args[args.inde
     assert len(documents) == 2 and all(Path(d['path']).is_file() for d in documents)
 if name == 'mdocr' and args[0] == 'run':
     planned = Path(args[args.index('--plan')+1])
-    assert (planned.parent/'plan.json').is_file()
-    assert len(json.loads(planned.read_text())['documents']) == 1
+    [business_plan] = (root/'runs'/'funds').glob('run-*/plan.json')
+    assert len(json.loads(business_plan.read_bytes())['documents']) == 2
+    assert len(json.loads(planned.read_bytes())['documents']) == 2
 module = 'mdcompare' if name == 'mdcompare' else 'mdocr.cli'
 raise SystemExit(subprocess.call([sys.executable,'-m',module,*args]))
 """)
@@ -335,8 +337,6 @@ raise SystemExit(subprocess.call([sys.executable,'-m',module,*args]))
         "mdcompare semantic",
         "mdcompare knowledge",
         "mdcompare compare",
-        "mdocr plan",
-        "mdocr run",
         "mdocr plan",
         "mdocr run",
     ]
@@ -400,7 +400,7 @@ def test_interrupted_export_does_not_suppress_later_unstarted_source(tmp_path):
     assert (tmp_path / "events").read_text().splitlines() == ["export"]
 
 
-def test_shared_ocr_stop_preserves_unattempted_sources_for_later_run(tmp_path):
+def test_invalid_ocr_row_does_not_erase_a_verified_peer(tmp_path):
     config, differences = instance(tmp_path)
     two_sources(tmp_path, differences)
     original = config.read_text()
@@ -428,19 +428,11 @@ raise SystemExit(2)
     assert result.returncode == 2, result.stderr
     manifest = json.loads(Path(json.loads(result.stdout)["manifest"]).read_text())
     assert manifest["documents"][1]["pending_steps"] == []
-    assert any(
-        f["step"] == "ocr" and f["document_id"] == team_id("43")
-        for f in manifest["failures"]
-    )
+    assert {f["document_id"] for f in manifest["failures"] if f["step"] == "ocr"} == {
+        team_id("42")
+    }
     state = json.loads((tmp_path / "state" / "funds" / "state.json").read_text())
-    assert state["documents"][team_id("42")]["steps"]["ocr"]["status"] == "failed"
-    assert "ocr" not in state["documents"][team_id("43")]["steps"]
-    config.write_text(original)
-    next_run = cli("apply", "--config", config, "--input", differences)
-    assert next_run.returncode == 2, next_run.stderr
-    manifest = json.loads(Path(json.loads(next_run.stdout)["manifest"]).read_text())
-    assert manifest["documents"][1]["pending_steps"] == []
-    state = json.loads((tmp_path / "state" / "funds" / "state.json").read_text())
+    assert state["documents"][team_id("42")]["steps"]["ocr"]["status"] == "unknown"
     assert state["documents"][team_id("43")]["steps"]["ocr"]["status"] == "completed"
 
 
@@ -627,12 +619,11 @@ def test_missing_historical_ocr_input_does_not_abort_fresh_apply(tmp_path):
 
 @pytest.mark.parametrize("suffix", ["#width=600", ""])
 def test_image_selection_is_owned_by_mdocr(tmp_path, monkeypatch, suffix):
-    from PIL import Image
-
     monkeypatch.delenv("PADDLEOCR_TOKEN", raising=False)
     config, differences = instance(tmp_path)
+    config.write_text(config.read_text() + '\n[ocr]\nmode="paddle"\n')
     image = tmp_path / "image space.png"
-    Image.new("RGB", (8, 8), "red").save(image)
+    image.write_bytes(b"local image witness; no provider configured")
     remote = json.loads((tmp_path / "remote.json").read_text())
     remote["42"]["body"] += f"\n![image](../../../../image%20space.png{suffix})\n"
     (tmp_path / "remote.json").write_text(json.dumps(remote))
@@ -860,11 +851,6 @@ raise SystemExit(2)
 
 def test_resumed_run_status_clears_pause_end_time_and_elapsed_keeps_advancing(tmp_path):
     config, differences = instance(tmp_path)
-    paused = cli(
-        "apply", "--config", config, "--input", differences, "--stop-after", "plan"
-    )
-    assert paused.returncode == 0, paused.stderr
-    run_path = json.loads(paused.stdout)["run"]
     tool = tmp_path / "slow_ocr.py"
     tool.write_text(
         'import pathlib,time\npathlib.Path(__file__).with_suffix(".started").touch()\ntime.sleep(60)\n'
@@ -875,6 +861,11 @@ def test_resumed_run_status_clears_pause_end_time_and_elapsed_keeps_advancing(tm
             "mdocr=" + json.dumps([sys.executable, str(tool)]),
         )
     )
+    paused = cli(
+        "apply", "--config", config, "--input", differences, "--stop-after", "plan"
+    )
+    assert paused.returncode == 0, paused.stderr
+    run_path = json.loads(paused.stdout)["run"]
     with subprocess.Popen(
         [
             sys.executable,
@@ -1020,7 +1011,8 @@ def test_explicit_graph_replan_preserves_original_reports_and_published_bytes(tm
     seed_body_baseline(tmp_path, config, "# Title\n\nPrevious different knowledge.\n")
     graph = tmp_path / "graphify.py"
     graph.write_text(
-        "from pathlib import Path\nPath(__file__).with_suffix('.called').touch()\nraise SystemExit(2)\n"
+        GRAPHIFY_PREFLIGHT
+        + "from pathlib import Path\nPath(__file__).with_suffix('.called').touch()\nraise SystemExit(2)\n"
     )
     config.write_text(
         config.read_text()
@@ -1083,7 +1075,10 @@ def test_graph_replan_rejects_missing_original_baseline_before_tools(tmp_path):
         "--replan",
     )
     assert recovered.returncode == 1
-    assert "original baseline snapshot unavailable" in recovered.stderr
+    assert (
+        f"plan input missing or changed for {plan['documents'][0]['document_id']}"
+        in recovered.stderr
+    )
     assert not list(Path(output["run"]).parent.glob("replan-*"))
 
 
@@ -1162,13 +1157,13 @@ def test_retry_after_interrupted_replan_preserves_active_selection_and_inputs(tm
     seed_body_baseline(tmp_path, config, "# Title\n\nPrevious different knowledge.\n")
     graph = tmp_path / "graphify.py"
     graph.write_text(
-        "import json,sys\nfrom pathlib import Path\n"
+        GRAPHIFY_PREFLIGHT + "import json,sys\nfrom pathlib import Path\n"
         "flag=Path(__file__).with_suffix('.called')\n"
         "if not flag.exists():\n    flag.touch()\n    raise SystemExit(130)\n"
         "out=Path(sys.argv[sys.argv.index('--out')+1])/'graphify-out'\n"
         "out.mkdir(parents=True,exist_ok=True)\n"
         "(out/'graph.json').write_text(json.dumps({'nodes':[], 'links':[]}))\n"
-        "(out/'manifest.json').write_text('{}')\n"
+        "(out/'manifest.json').write_text('{}')\n" + GRAPHIFY_PROOF
     )
     config.write_text(
         config.read_text()

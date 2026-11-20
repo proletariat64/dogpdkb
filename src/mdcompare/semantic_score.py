@@ -7,6 +7,7 @@ import json
 import os
 import re
 import subprocess
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from .io import InputError, publish_reports, validate_outputs
@@ -25,7 +26,6 @@ _BRIDGE = Path(__file__).with_name("pi_score.mjs")
 _STOP = {
     "auth_error",
     "oauth_required",
-    "rate_limited",
     "sdk_unavailable",
     "proxy_unavailable",
     "bridge_error",
@@ -99,8 +99,15 @@ def _packet(data):
     return _json(dict(packet, schema="authored-model-diff-1")), None
 
 
+def _unique_fields(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("duplicate response field")
+    return result
+
+
 def _validate_reply(raw, count):
-    value = json.loads(raw)
+    value = json.loads(raw, object_pairs_hook=_unique_fields)
     if not isinstance(value, dict) or set(value) != {
         "evaluation_status",
         "change_score",
@@ -174,7 +181,7 @@ def _validate_reply(raw, count):
     return {"ok": True, "score": score, "ambiguous": ambiguous}
 
 
-def _bridge_request(request, *, timeout):
+def _bridge_request(request, *, timeout, pass_fds=()):
     diagnostic = request.get("op") == "doctor"
     try:
         proc = subprocess.run(
@@ -184,6 +191,7 @@ def _bridge_request(request, *, timeout):
             capture_output=True,
             check=False,
             timeout=timeout,
+            pass_fds=pass_fds,
             env={
                 k: v
                 for k, v in os.environ.items()
@@ -216,10 +224,12 @@ def _bridge_request(request, *, timeout):
         }
 
 
-def _assess(model, effort, evidence, prompt):
+def _assess(model, effort, evidence, prompt, lock_fd):
     result = _bridge_request(
         {"model": model, "effort": effort, "prompt": prompt, "evidence": evidence},
         timeout=180,
+        # An orphaned bridge keeps the run locked until it exits.
+        pass_fds=(lock_fd,),
     )
     if result.get("ok") is True:
         try:
@@ -245,6 +255,92 @@ def _save_journal(path, value):
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _record_outcome(state, attempt, reply):
+    if "reply" in reply:
+        attempt["reply"] = reply["reply"]
+    attempt["usage_tokens"] = reply.get("usage_tokens")
+    if reply.get("ok") is True:
+        attempt.update(
+            status="scored", score=reply["score"], ambiguous=reply["ambiguous"]
+        )
+        return
+    reason = reply["reason"]
+    status = reply.get("http_status")
+    attempt.update(status="unscored", reason=reason)
+    if status is not None:
+        attempt["http_status"] = status
+    # Only the first 429 at a tier lowers it. Other requests from that tier drain.
+    if status == 429 and attempt["concurrency"] == state["concurrency"]:
+        if state["concurrency"] > 1:
+            state["concurrency"] -= 1
+        else:
+            state["stop"] = state["stop"] or "rate_limited"
+    elif reason in _STOP:
+        state["stop"] = state["stop"] or reason
+
+
+def _score_pending(args, prompt, directory, journal, state, candidates, lock_fd):
+    attempts = state["attempts"]
+    held = state["held"]
+    known = {_identity(row) for row in attempts + held}
+    active = {}
+
+    def settle():
+        done, _ = wait(active, return_when=FIRST_COMPLETED)
+        for future in tuple(active):
+            if future in done:
+                _record_outcome(state, active.pop(future), future.result())
+                _save_journal(journal, state)
+
+    def await_capacity():
+        while active and (
+            state["stop"]
+            or next(iter(active.values()))["concurrency"] > state["concurrency"]
+            or len(active) >= state["concurrency"]
+            or any(f.done() for f in active)
+        ):
+            settle()
+
+    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+        for key, binding in candidates.items():
+            if key in known:
+                continue
+            if state["stop"] or len(attempts) >= args.request_budget:
+                break
+            data = (directory / binding["evidence"]).read_bytes()
+            if _digest(data) != binding["evidence_sha256"]:
+                raise InputError("SCORE_EVIDENCE_DRIFT")
+            packet, hold = _packet(json.loads(data))
+            if packet is None or len(packet.encode()) > args.max_evidence_bytes:
+                held.append(dict(binding, reason=hold or "OVERSIZED_EVIDENCE"))
+                continue
+            await_capacity()
+            if state["stop"]:
+                break
+            attempt = dict(
+                binding,
+                status="admitted",
+                packet_sha256=_digest(packet.encode()),
+                concurrency=state["concurrency"],
+            )
+            attempts.append(attempt)
+            _save_journal(journal, state)
+            future = pool.submit(
+                _assess, args.model, args.effort, packet, prompt, lock_fd
+            )
+            active[future] = attempt
+        while active:
+            settle()
+
+    recorded = {_identity(row): row for row in attempts + held}
+    return [
+        {k: v for k, v in recorded[key].items() if k != "reply"}
+        if key in recorded
+        else dict(binding, reason=state["stop"] or "REQUEST_BUDGET_EXHAUSTED")
+        for key, binding in candidates.items()
+    ]
 
 
 def publish_semantic_scores(args):
@@ -277,71 +373,66 @@ def publish_semantic_scores(args):
         "model": args.model,
         "effort": args.effort,
         "request_budget": args.request_budget,
+        "concurrency": args.concurrency,
         "max_evidence_bytes": args.max_evidence_bytes,
         "prompt_sha256": _digest(prompt.encode()),
         "format_sha256": _digest((_DIR / "semantic_score_format.json").read_bytes()),
     }
+    candidates = {}
+    for row in report["results"]:
+        if score_eligible(row):
+            key = _identity(row)
+            candidates[key] = {
+                "knowledge_base": key[0],
+                "document_id": key[1],
+                "evidence": bindings[key][0],
+                "evidence_sha256": bindings[key][1],
+            }
+    if args.document_id is not None:
+        selected = set(args.document_id)
+        candidates = {
+            key: binding for key, binding in candidates.items() if key[1] in selected
+        }
+        if (
+            len(selected) != len(args.document_id)
+            or len(candidates) != len(selected)
+            or {key[1] for key in candidates} != selected
+        ):
+            raise InputError("SCORE_DOCUMENT_SCOPE_INVALID")
+        config["document_ids"] = sorted(selected)
     with lock_path.open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if journal.exists():
             state = json.loads(journal.read_bytes())
             if state["configuration"] != config:
                 raise InputError("SCORE_EXECUTION_BINDING_INVALID")
-        elif output.exists():
-            raise InputError("SCORE_OUTPUT_UNOWNED")
         else:
-            state = {"configuration": config, "attempts": [], "stop": None}
+            if os.fstat(lock.fileno()).st_size:
+                raise InputError("SCORE_EXECUTION_JOURNAL_MISSING")
+            if output.exists():
+                raise InputError("SCORE_OUTPUT_UNOWNED")
+            state = {
+                "configuration": config,
+                "attempts": [],
+                "held": [],
+                "stop": None,
+                "concurrency": args.concurrency,
+            }
+        # Keep the lock inode as a durable witness against a lost journal.
+        # The first journal save syncs the directory before any request.
+        if not os.fstat(lock.fileno()).st_size:
+            lock.write(b"mdcompare-semantic-score\n")
+            lock.flush()
+            os.fsync(lock.fileno())
         attempts = state["attempts"]
         for previous in attempts:
             if previous["status"] == "admitted":
                 previous.update(status="unscored", reason="unknown_outcome")
-                state["stop"] = "unknown_outcome"
-        known = {_identity(attempt) for attempt in attempts}
-        skipped = []
-        for row in report["results"]:
-            if not score_eligible(row):
-                continue
-            key = _identity(row)
-            if key in known:
-                continue
-            binding = {
-                "knowledge_base": key[0],
-                "document_id": key[1],
-                "evidence": bindings[key][0],
-                "evidence_sha256": bindings[key][1],
-            }
-            if state["stop"] or len(attempts) >= args.request_budget:
-                skipped.append(
-                    dict(binding, reason=state["stop"] or "REQUEST_BUDGET_EXHAUSTED")
-                )
-                continue
-            data = (directory / binding["evidence"]).read_bytes()
-            if _digest(data) != binding["evidence_sha256"]:
-                raise InputError("SCORE_EVIDENCE_DRIFT")
-            packet, hold = _packet(json.loads(data))
-            if packet is None or len(packet.encode()) > args.max_evidence_bytes:
-                skipped.append(dict(binding, reason=hold or "OVERSIZED_EVIDENCE"))
-                continue
-            attempt = dict(
-                binding, status="admitted", packet_sha256=_digest(packet.encode())
-            )
-            attempts.append(attempt)
-            _save_journal(journal, state)
-            reply = _assess(args.model, args.effort, packet, prompt)
-            if "reply" in reply:
-                attempt["reply"] = reply["reply"]
-            attempt["usage_tokens"] = reply.get("usage_tokens")
-            if reply.get("ok") is True:
-                attempt.update(
-                    status="scored", score=reply["score"], ambiguous=reply["ambiguous"]
-                )
-            else:
-                attempt.update(status="unscored", reason=reply["reason"])
-                if reply["reason"] in _STOP:
-                    state["stop"] = reply["reason"]
-            _save_journal(journal, state)
-        public = [{k: v for k, v in a.items() if k != "reply"} for a in attempts]
-        scored = [a for a in public if a["status"] == "scored"]
+        public = _score_pending(
+            args, prompt, directory, journal, state, candidates, lock.fileno()
+        )
+        scored = [a for a in public if a.get("status") == "scored"]
+        unscored = [a for a in public if a.get("status") != "scored"]
         _save_journal(journal, state)
         _save(
             output,
@@ -349,12 +440,13 @@ def publish_semantic_scores(args):
                 "schema_version": "mdcompare-semantic-scores-1",
                 "diff_index": os.path.relpath(args.diff_index.resolve(), output.parent),
                 "scores": scored,
-                "unscored": [a for a in public if a["status"] != "scored"] + skipped,
+                "unscored": unscored,
                 "execution": {
                     "configuration": config,
                     "requests": len(attempts),
+                    "concurrency": state["concurrency"],
                     "stop": state["stop"],
                 },
             },
         )
-    return 2 if len(scored) != len(attempts) or skipped else 0
+    return 2 if unscored else 0

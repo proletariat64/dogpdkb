@@ -56,12 +56,16 @@ PLAN_FULL = """Plan controls:
   mdocr-plan-2 binds source bytes, image occurrences and witnesses, settings,
   and destinations. --selection is a JSON object mapping absolute input
   paths to lists of selected image targets; an empty list selects none.
+  With --download, --download-list restricts remote downloads to a JSON array
+  of absolute input paths. Other documents may still OCR local images.
   --mode llm defaults to openai/gpt-6.1-terra with medium effort. Use
   --model provider/model, --effort, and --prompt-file to override. The response
   schema stays code-owned. --token-budget and --request-budget are run-wide
   nonnegative ceilings; omit them for unlimited. A hard token budget refuses
   admission if a trustworthy upper bound is unavailable. Both modes start at
-  concurrency 3 by default. --max-seconds is an admission deadline (default 900).
+  concurrency 3 by default (active Markdown pipelines for LLM, active image
+  jobs for Paddle). The request budget counts image admissions, not documents.
+  --max-seconds is an admission deadline (default 900).
 """
 
 RUN = """Example:
@@ -81,6 +85,8 @@ RUN_FULL = """Execution and recovery:
   Reuse the same plan and result paths when resuming. The private plan-side
   journal is authoritative for prior submissions, even if the result mirror was
   not written. Do not delete or move it to restart an incomplete plan.
+  Legacy document-context LLM plans cannot be executed. In LLM mode images
+  run sequentially within each Markdown pipeline; only an image is sent.
   HTTP 429 reduces later admission 3 → 2 → 1, then stops. Known failed requests
   require --retry-failed; unknown outcomes are never automatically replayed.
   Total token accounting includes vision and provider-reported output. Each

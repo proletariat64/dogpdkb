@@ -5,16 +5,25 @@ import { createRequire } from 'node:module';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+const kinds = ['mermaid', 'table', 'ui', 'text', 'mixed', 'hold'];
+const fields = ['kind', 'markdown', 'uncertainty'];
 const schema = {
-  type: 'object', additionalProperties: false, required: ['images'],
-  properties: { images: { type: 'array', items: {
-    type: 'object', additionalProperties: false,
-    required: ['id', 'kind', 'markdown', 'uncertainty'],
-    properties: { id: { type: 'string' }, kind: { type: 'string', enum: ['mermaid', 'table', 'ui', 'text', 'mixed', 'hold'] }, markdown: { type: 'string' }, uncertainty: { type: 'string' } },
-  } } },
+  type: 'object', additionalProperties: false, required: fields,
+  properties: {
+    kind: { type: 'string', enum: kinds, description: 'Use table only for pipe tables without headings, captions, prose or code fences; use mixed for a faithful transcription with other blocks.' },
+    markdown: { type: 'string', description: 'For table, use one Markdown pipe table per block, with a header and dash separator, followed by rows. Use exactly the same column count on every line, keep empty cells, escape literal pipes as \\|, and do not use multiline cells or HTML tables. Preserve source values and cell associations.' },
+    uncertainty: { type: 'string' },
+  },
 };
-const format = { type: 'json_schema', name: 'mdocr_image_patches_1', strict: true, schema };
-const fail = (reason, message, status = null) => { const e = new Error(message); e.reason = reason; e.status = status; throw e; };
+const format = { type: 'json_schema', name: 'mdocr_image_content_1', strict: true, schema };
+class BridgeFailure extends Error {
+  constructor(reason, message, status) {
+    super(message);
+    this.reason = reason;
+    this.status = status;
+  }
+}
+const fail = (reason, message, status = null) => { throw new BridgeFailure(reason, message, status); };
 const selectParser = async () => {
   const root = process.env.MDOCR_NODE_DEPENDENCIES;
   if (!root) fail('mermaid_parser_unavailable', 'Set MDOCR_NODE_DEPENDENCIES to the npm prefix containing mermaid@12.3.0 and jsdom@26.1.0');
@@ -63,28 +72,28 @@ const cells = line => {
 const validateTables = patches => {
   for (const {kind, markdown} of patches) {
     if (!['mixed', 'table'].includes(kind)) continue;
-    if (/<\/?(?:table|thead|tbody|tfoot|tr|th|td|caption|colgroup|col)\b/i.test(markdown)) fail('invalid_response', 'Provider returned an HTML table');
+    if (/<\/?(?:table|thead|tbody|tfoot|tr|th|td|caption|colgroup|col)\b/i.test(markdown)) fail('response_table_invalid', 'Provider returned an HTML table');
     if (kind !== 'table') continue;
     const tables = markdown.trim().split(/\r?\n[ \t]*\r?\n/);
     for (const table of tables) {
       const lines = table.split(/\r?\n/);
-      if (lines.length < 2 || lines.some(line => !line.includes('|') || /^ {4}|^\t/.test(line))) fail('invalid_response', 'Provider did not return a Markdown table');
+      if (lines.length < 2 || lines.some(line => !line.includes('|') || /^ {4}|^\t/.test(line))) fail('response_table_invalid', 'Provider did not return a Markdown table');
       const [heading, separators, ...rows] = lines.map(cells);
-      if (!separators.every(cell => /^:?-+:?$/.test(cell.trim())) || [heading, ...rows].some(row => row.length !== separators.length)) fail('invalid_response', 'Provider returned inconsistent Markdown table columns');
+      if (!separators.every(cell => /^:?-+:?$/.test(cell.trim())) || [heading, ...rows].some(row => row.length !== separators.length)) fail('response_table_invalid', 'Provider returned inconsistent Markdown table columns');
     }
   }
 };
 const validateMermaid = async patches => {
   const blocks = patches.flatMap(p => {
     const diagrams = fences(p.markdown).filter(block => /^mermaid(?:\s|$)/i.test(block.info));
-    if ((p.kind === 'mermaid' && !diagrams.length) || diagrams.some(block => !block.closed)) fail('invalid_response', 'Provider returned an incomplete Mermaid block');
+    if ((p.kind === 'mermaid' && !diagrams.length) || diagrams.some(block => !block.closed)) fail('response_mermaid_fence_invalid', 'Provider returned an incomplete Mermaid block');
     return diagrams.map(block => block.lines.join('\n'));
   });
   if (!blocks.length) return;
   const parser = await selectParser();
   for (const block of blocks) {
     try { await parser.parse(block); }
-    catch { fail('invalid_response', 'Provider returned syntactically invalid Mermaid'); }
+    catch { fail('response_mermaid_syntax_invalid', 'Provider returned syntactically invalid Mermaid'); }
   }
 };
 const findSdk = () => {
@@ -132,6 +141,36 @@ const connection = entry => {
   } catch {
     fail('proxy_unavailable', 'Could not configure the installed Pi HTTPS proxy transport');
   }
+};
+const assertCompleted = (reply, attempted, status) => {
+  if (status >= 400) {
+    if (status === 429) fail('rate_limited', 'Provider rate limited the request', status);
+    if ([401, 403].includes(status)) fail('auth_error', 'Provider rejected authentication', status);
+    fail(status >= 500 ? 'unknown_outcome' : 'provider_error', 'Provider did not accept the request', status);
+  }
+  if (!attempted) fail('bridge_error', 'Pi returned a response without submitting a request');
+  if (!status || !reply || reply.stopReason === 'aborted') fail('unknown_outcome', 'Provider outcome is unknown');
+  // Pi maps terminal incomplete statuses other than the output cap to `error`.
+  // Never infer completion from a free-text error string or a refusal delta alone.
+  const raw = reply.rawStopReason;
+  if (reply.stopReason === 'length' || raw === 'incomplete.max_output_tokens') fail('response_output_limit', 'Provider reached its output token limit');
+  if (raw === 'incomplete.content_filter') fail('response_content_filter', 'Provider marked the response incomplete due to content filtering');
+  if (typeof raw === 'string' && (raw === 'incomplete' || raw.startsWith('incomplete.'))) fail('response_incomplete', 'Provider marked the response incomplete');
+  if (reply.stopReason === 'toolUse') fail('response_unexpected_stop', 'Provider returned unexpected tool output');
+  if (reply.stopReason !== 'stop') fail('unknown_outcome', 'Provider outcome is unknown');
+};
+const validateResponse = async (reply, attempted, status, refused) => {
+  assertCompleted(reply, attempted, status);
+  if (refused) fail('response_refusal', 'Provider returned a structured refusal');
+  const text = reply.content.filter(x => x.type === 'text').map(x => x.text).join('');
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { fail('response_json_invalid', 'Provider returned invalid JSON'); }
+  if (!parsed || Object.keys(parsed).length !== fields.length ||
+      !fields.every(field => Object.hasOwn(parsed, field) && typeof parsed[field] === 'string') ||
+      !kinds.includes(parsed.kind)) fail('response_schema_invalid', 'Provider returned invalid image content');
+  validateTables([parsed]);
+  await validateMermaid([parsed]);
+  return parsed;
 };
 const main = async () => {
   const request = JSON.parse(await new Promise((resolve, reject) => {
@@ -184,52 +223,54 @@ const main = async () => {
     if (!authStatus || authStatus.type !== 'oauth') fail('oauth_required', `Pi OAuth credentials are required for ${provider}`);
     if (request.op === 'preflight') return { ok: true, model: request.model, effort: request.effort };
     if (request.op !== 'convert') fail('bridge_error', 'Unknown bridge operation');
-    const content = [{ type: 'text', text: `${request.markdown}\n\nStable image occurrences are named in the source.` }];
-    for (const image of request.images) {
-      const bytes = await readFile(image.path);
-      const ext = image.path.toLowerCase().split('.').pop();
-      const mimeType = ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' })[ext];
-      if (!mimeType) fail('invalid_image', `Unsupported image format for ${image.id}`);
-      content.push({ type: 'text', text: `Original image occurrence: ${image.id}` }, { type: 'image', mimeType, data: bytes.toString('base64') });
-    }
+    const { path, mime_type: mimeType } = request.image;
+    if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(mimeType)) fail('invalid_image', 'Invalid vision transport encoding');
+    const bytes = await readFile(path);
+    const content = [{ type: 'image', mimeType, data: bytes.toString('base64') }];
     let attempted = false;
     let status = null;
-    const reply = await runtime.completeSimple(model, { systemPrompt: request.prompt, messages: [{ role: 'user', content, timestamp: Date.now() }] }, {
-      maxTokens: 8192, samplingParams: { max_output_tokens: 8192 }, reasoning: request.effort,
-      maxRetries: 0, timeoutMs: 230000, transport: 'sse', cacheRetention: 'none', env: {},
-      fetch: async (input, init) => {
-        const url = requestUrl(input);
-        if (url.href !== expected || attempted) fail('unsupported_transport', 'Pi attempted an unauthorized route or duplicate submission');
-        attempted = true;
-        const response = await transport.fetch(input, init);
-        status = response.status;
-        return response;
-      },
-      onPayload: payload => ({ ...payload, max_output_tokens: 8192, text: { ...payload.text, format } }),
-    });
-    const usage = reply?.usage;
-    const usageTokens = usage && [usage.input, usage.output, usage.cacheRead, usage.cacheWrite].every(n => Number.isSafeInteger(n) && n >= 0)
-      ? usage.input + usage.output + usage.cacheRead + usage.cacheWrite : null;
+    let refused = false;
+    let reply;
     try {
-      if (status && status >= 400) {
-        if (status === 429) fail('rate_limited', 'Provider rate limited the request', status);
-        if ([401, 403].includes(status)) fail('auth_error', 'Provider rejected authentication', status);
-        fail(status >= 500 ? 'unknown_outcome' : 'provider_error', 'Provider did not accept the request', status);
-      }
-      if (attempted && (!status || ['error', 'aborted'].includes(reply.stopReason))) fail('unknown_outcome', 'Provider outcome is unknown');
-      if (!attempted || reply.stopReason !== 'stop') fail('invalid_response', 'Provider did not complete the structured response');
-      const text = reply.content.filter(x => x.type === 'text').map(x => x.text).join('');
-      let parsed;
-      try { parsed = JSON.parse(text); } catch { fail('invalid_response', 'Provider returned invalid JSON'); }
-      const ids = request.images.map(x => x.id);
-      if (!Array.isArray(parsed?.images) || JSON.stringify(parsed.images.map(x => x?.id)) !== JSON.stringify(ids)) fail('invalid_response', 'Response IDs do not match image order');
-      for (const patch of parsed.images) {
-        if (typeof patch.markdown !== 'string' || typeof patch.uncertainty !== 'string' || !schema.properties.images.items.properties.kind.enum.includes(patch.kind)) fail('invalid_response', 'Provider returned an invalid image patch');
-      }
-      validateTables(parsed.images);
-      await validateMermaid(parsed.images);
-      return { ok: true, patches: parsed.images, usage_tokens: usageTokens };
+      reply = await runtime.completeSimple(model, { systemPrompt: request.prompt, messages: [{ role: 'user', content, timestamp: Date.now() }] }, {
+        maxTokens: 8192, samplingParams: { max_output_tokens: 8192 }, reasoning: request.effort,
+        maxRetries: 0, timeoutMs: 230000, transport: 'sse', cacheRetention: 'none', env: {},
+        fetch: async (input, init) => {
+          const url = requestUrl(input);
+          if (url.href !== expected || attempted) fail('unsupported_transport', 'Pi attempted an unauthorized route or duplicate submission');
+          attempted = true;
+          const response = await transport.fetch(input, init);
+          status = response.status;
+          return response;
+        },
+        onPayload: payload => ({ ...payload, max_output_tokens: 8192, text: { ...payload.text, format } }),
+        onProviderStreamEvent: event => {
+          // Pi flattens refusal parts into text. Record only the typed signal, never the text.
+          if (event.type === 'response.refusal.delta' || event.type === 'response.refusal.done') refused = true;
+          const items = event.type === 'response.output_item.done' ? [event.item] :
+            ['response.completed', 'response.done'].includes(event.type) ? event.response?.output : undefined;
+          if (Array.isArray(items) && items.some(item => item?.type === 'message' &&
+            Array.isArray(item.content) && item.content.some(part => part?.type === 'refusal'))) refused = true;
+        },
+      });
     } catch (error) {
+      if (!attempted) throw error;
+      // The SDK can throw instead of returning stopReason=error after transport.
+      reply = { stopReason: 'error' };
+    }
+    const usage = reply?.usage;
+    const tokens = usage && [usage.input, usage.output, usage.cacheRead, usage.cacheWrite];
+    const total = tokens?.every(n => Number.isSafeInteger(n) && n >= 0) ? tokens.reduce((a, b) => a + b, 0) : null;
+    const usageTokens = Number.isSafeInteger(total) ? total : null;
+    try {
+      const image = await validateResponse(reply, attempted, status, refused);
+      return { ok: true, image, usage_tokens: usageTokens };
+    } catch (error) {
+      if (!(error instanceof BridgeFailure)) {
+        if (!attempted) throw error;
+        // A malformed SDK response cannot establish a definitive failed job.
+        error = new BridgeFailure('unknown_outcome', 'Provider outcome is unknown', null);
+      }
       error.usageTokens = usageTokens;
       throw error;
     }
@@ -243,8 +284,12 @@ const main = async () => {
 };
 try { process.stdout.write(JSON.stringify(await main())); }
 catch (error) {
-const status = Number.isInteger(error.status) ? error.status : null;
-const reason = error.reason || (status === 429 ? 'rate_limited' : status === 401 || status === 403 ? 'auth_error' : 'provider_error');
-const message = status === 429 ? 'Provider rate limited the request' : status === 401 || status === 403 ? 'Provider rejected authentication' : reason === 'unknown_outcome' ? 'Provider request failed after possible submission; outcome is unknown' : reason === 'invalid_response' || reason.startsWith('unsupported_') || reason === 'oauth_required' || reason === 'sdk_unavailable' || reason === 'mermaid_parser_unavailable' || reason === 'invalid_image' || reason === 'proxy_unavailable' ? error.message : 'Pi provider request failed; details withheld';
-process.stdout.write(JSON.stringify({ ok: false, error: { reason, message, status, usage_tokens: error.usageTokens ?? null } })); process.exitCode = 1;
+  const known = error instanceof BridgeFailure;
+  process.stdout.write(JSON.stringify({ ok: false, error: {
+    reason: known ? error.reason : 'provider_error',
+    message: known ? error.message : 'Pi provider request failed; details withheld',
+    status: known ? error.status : null,
+    usage_tokens: known ? error.usageTokens ?? null : null,
+  } }));
+  process.exitCode = 1;
 }

@@ -16,14 +16,24 @@ ocr_cache = "ocr-cache"
 # Frozen once per run with byte witnesses; paths resolve relative to this config.
 # body_recovery = "body-recovery.json"
 
-[ocr]
-# Passed to mdocr's best-effort batch CLI; in-flight calls retain tool timeouts.
-budget_seconds = 1800
-
 [semantic_score]
-# Explicit maximum model requests per apply/sync run. 0 keeps comparison offline.
-request_budget = 0
-# model = "openai/gpt-6.1-terra"
+# Score eligible CHANGED evidence via Pi OAuth; omit the cap to score all eligible changes.
+model = "openai/gpt-6.1-terra"
+# request_budget = 0 # Disable model scoring for an offline run.
+
+[graphify]
+# Native Graphify OpenAI OAuth model ID.
+model = "gpt-6.1-terra"
+# Estimated input tokens per chunk, not a spending cap.
+token_budget = 5500
+
+[ocr]
+# Default LLM uses OpenAI Pi OAuth; set mode = "paddle" to opt in to Paddle.
+mode = "llm"
+# OCR request limit for the whole batch. Omit for unlimited; 0 sends nothing new.
+# request_budget = 20
+# Admission deadline. In-flight calls retain tool-owned timeouts.
+budget_seconds = 7200
 
 [skylark]
 mcp_url = "https://example.invalid/mcp"

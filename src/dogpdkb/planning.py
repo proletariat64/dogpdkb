@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 
 from dogpdkb.directory_snapshot import validate_snapshot
@@ -143,10 +144,17 @@ def make_plan(book, run, documents, knowledge, comparison, semantic, *, workspac
             "SCORE_ABOVE_THRESHOLD",
         }:
             reasons.append(body["routing_reason"])
+        previous = row.get("previous_corpus", {})
+        retry_ocr = (
+            status == "EQUIVALENT"
+            and previous.get("ocr_status") == "unattempted"
+            and same_version(previous["version"], row["version"])
+        )
         rows.append(
             {
                 **row,
                 "action": action,
+                "retry_ocr": retry_ocr,
                 "reason_codes": reasons,
                 "ocr_resources": None,
                 "semantic_status": status,
@@ -156,6 +164,7 @@ def make_plan(book, run, documents, knowledge, comparison, semantic, *, workspac
         )
     plan = {
         "schema": "dogpdkb-plan-1",
+        "ocr_policy": run.store.settings.ocr_policy(),
         "book": book.key,
         "run_id": run.id,
         "sources": run.data.get("sources", []),
@@ -196,17 +205,21 @@ def validate_inputs(documents, *, check_baseline=False):
     for row in documents:
         try:
             body = Path(row["raw_path"]).read_bytes()
-            if body != Path(row["input_copy"]).read_bytes():
+            if body != Path(row["input_copy"]).read_bytes() or (
+                row.get("raw_sha256") and sha256(body).hexdigest() != row["raw_sha256"]
+            ):
                 raise ValueError("changed")
             if "directory_snapshot" in row:
                 validate_snapshot(Path(row["directory_snapshot"]), row, body)
-            if (
-                check_baseline
-                and row.get("baseline_input_copy")
-                and Path(row["baseline"]["path"]).read_bytes()
-                != Path(row["baseline_input_copy"]).read_bytes()
-            ):
-                raise ValueError("baseline changed")
+            if row.get("baseline_input_copy"):
+                before = Path(row["baseline_input_copy"]).read_bytes()
+                if (
+                    row.get("baseline_input_sha256")
+                    and sha256(before).hexdigest() != row["baseline_input_sha256"]
+                    or check_baseline
+                    and Path(row["baseline"]["path"]).read_bytes() != before
+                ):
+                    raise ValueError("baseline changed")
         except (OSError, ValueError) as error:
             raise ValueError(
                 f"plan input missing or changed for {row['document_id']}; generate a new plan"

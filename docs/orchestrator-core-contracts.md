@@ -17,6 +17,12 @@ when the key is omitted.
   the subscriptions JSON. Source keys are unique within the subscription.
   `Book.select_sources` defaults to all enabled sources and rejects unknown,
   disabled or duplicate explicit keys. Old top-level URL/scope is rejected.
+- For sync and doctor, `--dir PATH` selects only a Markdown directory, excludes
+  `--source`, and resolves PATH from the caller's cwd. A unique configured
+  directory binding at this canonical root is reused; otherwise a new identity
+  binds the canonical root to the selected book without changing subscriptions.
+  Multiple matching bindings require an explicit registered source selection.
+  Resume accepts neither `--source` nor `--dir`.
 - `Settings`: `file`, `books_file`, `corpus`, `staging`, `state`, `web`,
   `graph_dir` (optional), `mcp_url`, `proxy_bin`, `timeout_seconds`,
   `ocr_budget_seconds`, `ocr_cache`, `results`, optional `body_recovery`.
@@ -32,7 +38,7 @@ when the key is omitted.
 ## Download scheduling
 
 `sync` and `apply` accept the runtime option `--concurrency` with integer choices
-1, 2 and 3, default 2. It is not a Settings/TOML field and does not participate in
+1, 2 and 3, default 3. It is not a Settings/TOML field and does not participate in
 source identity or version checks. Invalid values fail before operational writes
 or subprocess dispatch. Each in-flight document retains a separate public Skylark
 request/report and raw destination. The coordinator alone updates Store/Run and
@@ -101,8 +107,10 @@ registered. Ambiguous ownership or duplicate IDs fail before registration.
 
 ## Run record
 
-`Run.create(store, command) -> Run` creates a new `run-*` directory under
-`settings.staging / book.key`, regardless of old interrupted records.
+`Run.create(store, command, *, sources=None) -> Run` creates a new `run-*`
+directory under `settings.staging / book.key`, regardless of old interrupted
+records. Sync supplies the selected sources; ad hoc bindings are registered
+under the write lock without recording observations or acquired inputs.
 `Run.load(store, reference)` accepts a run ID, run directory or run JSON path.
 
 - `run.directory`, `run.path`, `run.id`, `run.data`; `run.save()`.
@@ -124,12 +132,46 @@ registered. Ambiguous ownership or duplicate IDs fail before registration.
 - `run.data['artifacts']` maps public artifact names to paths. Other product
   metadata such as selected inputs, stop-after and plan paths stays in this record.
 
-Run JSON is schema `dogpdkb-run-1`, containing run_id, command, book, pid, status,
+Run JSON is schema `dogpdkb-run-2`, containing run_id, command, book, pid, status,
 stage, counts, started_at, updated_at, ended_at, exit_code, reason, artifacts and
 failures. Status is observationally interrupted when `running` has no live owner.
-`targets` freezes the source book URL and absolute corpus/graph targets. Loading
+`targets` freezes source bindings and absolute corpus/graph targets. A new sync
+freezes only selected sources and checks them against durable bindings. Loading
 a run for execution rejects changed targets before any tool call or publication;
 use a newly generated plan for a different source or target.
+
+### Sync phase handoffs
+
+`sync --stop-after {collect,plan,ocr,corpus,graph}` runs through the named
+boundary. The first four stop with `paused`/exit 0 and retain their wash;
+`graph` uses the ordinary final result and cleanup. `sync --resume RUN`
+continues the same run and cannot take a new source or directory. A repeated
+stop at the same phase does not re-enter the phase. The download concurrency
+option remains a scheduler limit rather than part of the frozen plan.
+
+`run.json` records `completed_phase`, SHA-256 `checkpoints` keyed by phase and
+artifact, and `sync_policy`. The policy captures the selected tools, OCR and
+score limits, explicit body-recovery inputs, and Graphify input mode before
+collection. It does not include provider credentials. The handoffs are:
+
+| Phase | Frozen output |
+| --- | --- |
+| collect | Complete `differences` scope and `prepared_inputs` (only verified acquired inputs), with separate export failures |
+| plan | `plan` and frozen per-document routing; no OCR or public writes |
+| ocr | Native OCR request/plan/result/journal and a `publication` handoff of verified OCR or readable fallback bytes; no corpus replacement |
+| corpus | Final `manifest`, containing only published documents, and the pre-extraction public graph generation |
+| graph | Settled graph exit; native result proof and atomic publication remain the Graphify adapter's responsibility |
+
+Compare, OCR and corpus publication exclude documents whose frozen state has
+been superseded (`STALE_DOCUMENT`), while nonconflicting peers continue. A
+paused corpus handoff whose published inputs or previous graph generation have
+changed reports `STALE_GRAPH_HANDOFF` without dispatching a new directory
+extraction. If graph state already records this batch's exact successful inputs,
+reconciliation does not re-extract. Ordinary resume does not change the scope of
+an already admitted native OCR batch; if its scope went stale, settled children
+can be verified, but the batch cannot admit further work as a whole.
+Explicit graph-only retry still uses the existing Graphify recovery contract.
+
 Corpus publication saves `publication.json` (`dogpdkb-publication-1`) before
 replacing any corpus file. It freezes the complete compile rows, retained output
 witnesses and optional `before_copy` snapshots; book/run identity and plan
@@ -140,7 +182,15 @@ listing, download, comparison or OCR. Short same-directory temporary names avoid
 lengthening valid final filenames; corpus facts are saved once per batch (also
 on a caught partial publication error). A replacement that precedes the state
 save is reconciled from the handoff. The final `dogpdkb-compile-1` manifest is
-written only after complete publication and excludes `before_copy`.
+written only after publication settles and excludes `before_copy` and its hash.
+
+A later run may select a same-version document whose OCR was provably not sent.
+Before admission it revalidates the settled checkpoint, the request/result
+witnesses, and the document/resource bytes. It does not resubmit verified or
+failed/unknown peers. If no OCR enrichment was
+added, it keeps the previous readable corpus bytes and witness. New verified
+OCR bytes override authored-body reuse for that row (`OCR_ENRICHMENT_ADDED`),
+so the regular graph stage picks them up in one directory batch.
 
 A saved final compile manifest is reused without renewing its bounded OCR budget.
 OCR is advisory: new manifests emit no required pending OCR steps. Historical
@@ -151,17 +201,24 @@ no automatic historical migration or retry layer.
 Cleaned completed/partial runs are not ordinarily resumable. Explicit
 `sync --resume RUN --retry-graph` uses only a retained final compile manifest,
 including after cleanup, and revalidates it through the graph stage. It never
-re-enters discovery, download, comparison, OCR or corpus publication. Missing or
-changed witnesses still require a new plan. Historical failures stay recorded;
-the final result can remain partial even after successful graph recovery.
+re-enters discovery, download, comparison, OCR or corpus publication. New sync
+runs bind the manifest SHA-256 and input mode at the corpus checkpoint, and the
+actual mirror tree digest before extraction. Recovery rejects changed witnesses,
+mode, input tree or a superseding graph generation. If a new run never froze
+its mirror, there is no graph batch to retry; resume the unfinished phase or
+make a new plan. `--replan` is the separate,
+explicit reselection of the same published inputs, not a way to add documents.
+Historical failures stay recorded; unresolved non-graph work still yields exit 2
+when graph recovery succeeds. Preexisting manifests without a binding keep the
+legacy validation path; no missing witnesses are invented.
 Recovery snapshots the already-cleaned run's retained file paths before the new
 attempt, so cleanup preserves its failure bundles even when the old plan was
 pruned. Newly created disposable graph workspace files can still be reclaimed.
 Manual `purge` deletes only
 selected wash; force permits discarding unfinished runs but never bypasses locks
 or clears durable facts, corpus, graphs, persistent inputs or tool caches.
-Purge validates saved schema, book key/source URL and run ID against the selected
-wash; it does not require the saved corpus/graph execution targets to match the
+Purge validates the saved schema, book key, source bindings and run ID against
+the selected wash; it does not require the saved corpus/graph execution targets to match the
 current configuration. Protected-path and live-owner checks still apply.
 Saved corpus/graph targets must be absolute and cannot overlap selected wash.
 Purge acquires their locks in addition to current target locks before deleting
@@ -184,8 +241,45 @@ tool environment; it is never persisted or printed. `settings.skylark_environmen
 supplies configured gateway/proxy/timeout variables for listing and export.
 
 `dogpdkb.observe.main(argv=None)` implements `dogpdkb status`: config/book/run,
-json/watch. `view_run(path)` returns a read-only snapshot, with process/lock
-liveness and elapsed seconds. Watch emits JSONL when combined with JSON.
+json/watch. `view_run(path)` derives process/lock liveness and elapsed seconds.
+Watch samples the same atomically saved run and book state each second (JSONL
+with `--json`). The two records are independently atomic, not a cross-file
+transaction. No business tool, provider, target write lock or state write is
+used. Ctrl-C stops only the observer. `status` exits 0 for a readable snapshot
+(including no runs and failed runs), not the observed run's exit code.
+
+Status retains `dogpdkb-status-1` and adds:
+
+- `progress`: phase, last completed phase, stage `total`, `completed`,
+  `in_flight`, `pending`, `failed`, and last progress time. Units depend on the
+  stage. Export in-flight is the scheduler's recorded admissions, not a remote
+  request counter. Opaque tools may leave counts null; an upper limit is not a
+  measurement. Watch does not interpret tool logs as live progress.
+- `publication`: corpus and graph outcomes for this run. `retained` means this
+  attempt did not replace the graph; `unknown` includes an interrupted or
+  unconfirmed publication boundary. `next_action` explains how to proceed.
+- `facts`: current recorded document facts for this run's selected sources,
+  not a historical snapshot of the selected run. Observed version, acquired raw,
+  published corpus, and graph input are separate. `sha256` is a saved byte
+  witness, not a live checksum; old facts can have no digest. `corpus_vs_graph`
+  compares recorded digests regardless of source-version equality.
+- `handoff` (`dogpdkb-handoff-1`) is saved in terminal sync `run.json` before
+  automatic wash cleanup, including a requested pause. It lists phase, run,
+  source, document, version, input digest, send state, failure and evidence
+  paths when known. Batch-level errors may not identify a document. Missing or
+  interrupted results do not attest transmission; abrupt owner loss can show
+  a provisional read-only interrupted view. Manual `purge` removes that run's
+  handoff and wash evidence but not durable version suppression or native OCR
+  artifacts under state.
+
+Handoff `retry_scope` is the recorded upper bound: `none`,
+`document_next_batch` (verified unsent OCR only), or `graph_batch` (the bound
+manifest and its input mode, never a document-only Graphify extraction).
+`status` adds current `eligibility`: `revalidate`, `stale`, `superseded` or
+`none`. It is advisory, not authorizing a call; writers check the current
+witnesses before dispatch. A retry never applies one version's evidence to
+another. Unknown export/OCR work remains suppressed; no tool fallback or
+force-send command is implied.
 
 ## Automatic body routing and explicit reselection
 

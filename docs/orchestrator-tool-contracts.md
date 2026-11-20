@@ -9,19 +9,32 @@ The active interface is `mdocr plan --mode paddle|llm --input FILE --output FILE
 then `mdocr run --plan PLAN --result RESULT`. For batch inputs, use `--list` (JSON array
 of Markdown paths resolved from the list) or `--directory` (recursive Markdown paths)
 with `--output-dir`. See `mdocr plan --help --full` and [OCR runtime prerequisites](mdocr-runtime.md).
-The orchestrator explicitly chooses Paddle and uses a single input plan per document. It binds the
-result to the plan SHA-256, the planned source and destination, and the SHA-256 of output/evidence.
-It does not import the OCR implementation. `--selection` is a separate optional map keyed by
-absolute input path; selected image hashes are bound to each occurrence. Planning may download
-selected remote images only with `--download`; it performs no OCR.
+The orchestrator submits one batch plan using `--list`, with LLM as the default and Paddle
+only when configured. It binds the result to the plan SHA-256, the planned source and
+destination, and the SHA-256 of output/evidence. It does not import the OCR implementation.
+`--selection` is a separate optional map keyed by absolute input path; selected image hashes
+are bound to each occurrence. Planning performs no OCR. `--download` allows selected
+remote images to be downloaded; `--download-list` optionally limits that permission to a
+JSON array of absolute inputs, so a mixed batch does not fetch live directory-source images.
 
 `mdocr-result-2` contains `plan_sha256`, `status`, request/reservation state,
 concurrency transitions and ordered document rows. Complete rows have `output`,
 `output_sha256`, and `mdocr-ocr-2` evidence containing effective mode configuration,
 resource IDs, and original image and OCR-block paths/byte digests. LLM evidence also
-has a context digest. Failed/held/unknown rows cannot claim a completed Markdown
-output. The internal plan-side journal prevents resubmission if result mirroring was
-interrupted. Exit 0 means complete, 2 incomplete, and 1 fatal invocation or artifact error.
+binds the **document evidence**, not provider context, with the SHA-256 of
+`[document_sha256, [[occurrence_id, image_sha256], ...]]`, using plan occurrence order
+and selected images only. The serialization is UTF-8 JSON with two-space indentation,
+no ASCII escaping, and a trailing LF. New LLM plans declare
+`settings.llm_schema: "mdocr-image-content-1"`, which must match evidence configuration.
+Legacy document-context plans cannot be executed; existing terminal reports remain
+verifiable against their legacy plan and schema. Do not create replacement plans to
+replay previously unknown admissions.
+
+Failed, held or unknown rows cannot claim a completed Markdown output. The plan-side
+journal prevents resubmission if result mirroring was interrupted. LLM admissions and
+the global request budget are per image; concurrency limits active Markdown pipelines,
+with one image at a time per document. Exit 0 means complete, 2 incomplete, and 1 fatal
+invocation or artifact error.
 
 ## mdcompare catalog
 
@@ -95,14 +108,28 @@ reports are staged together; caught ordinary failures roll back replacements.
 A failed invocation must not make an old report appear newly complete. Full
 schema/example is installed in `mdcompare semantic --help --full`.
 
-With a positive `[semantic_score].request_budget`, `apply`/`sync` calls public
+By default `apply`/`sync` scores eligible `CHANGED` documents. The optional
+`[semantic_score].request_budget` caps admissions; `0` disables scoring. With
+no cap, the admission bound is the number of eligible, reserved documents.
+For this work, the orchestrator calls public
 `mdcompare semantic-score --report … --diff-index … --output … --request-budget N`
 (default `openai/gpt-6.1-terra`, Pi OAuth only), then public `mdcompare
-semantic-route`. Exit 2 from the scorer is a published partial result, not a
-reason to skip unscored changes. Neither scorer nor router rewrites the input
+semantic-route`. A single scorer invocation owns concurrency (default 3);
+its separate request budget counts durable admissions across resumes. A 429
+drains the active tier, persists a lower limit, or stops sending at limit 1.
+Keep the score output with its private `.execution.json` journal and `.lock`
+file. Exit 2 from the scorer is a published partial result, not a reason to
+skip unscored changes. Neither scorer nor router rewrites the input
 comparison. The plan binds the report, index, scores and route by SHA-256.
-A resume with a frozen plan does not make more scoring calls. An interruption
-before the plan suppresses a second scoring pass in that same dogpdkb run.
+A resume with a frozen plan does not make more scoring calls. Before invoking
+the scorer, dogpdkb durably reserves each candidate version in book state and
+limits admission to those IDs with repeatable `--document-id` options. A bound
+score result distinguishes admitted rows (with a status) from proven unsent
+ones (without one). Completed, failed or uncertain admissions do not get a new
+score request on a later run for that version; unscored evidence leaves the
+deterministic route intact. An interruption before the plan suppresses a second
+scoring pass in that same run. Without a verified result, reserved versions
+remain suppressed rather than assuming work was unsent.
 See `mdcompare semantic-score --help --full` for admission limits and privacy.
 
 

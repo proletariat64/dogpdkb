@@ -66,6 +66,29 @@ def test_completed_sync_cleans_bulk_and_keeps_status_and_next_sync(tmp_path):
     ]
 
 
+def test_unsupported_native_graphify_does_not_prevent_corpus_publication(tmp_path):
+    config, _ = instance(tmp_path)
+    (tmp_path / "mode").write_text("unsupported")
+
+    result = cli("sync", "--config", config)
+    assert result.returncode == 2, result.stderr
+    run = json.loads(Path(json.loads(result.stdout)["run"]).read_text())
+    assert run["status"] == "partial"
+    assert any(
+        row["reason"] == "GRAPHIFY_NATIVE_PROOF_UNSUPPORTED" for row in run["failures"]
+    )
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    docs = state["documents"].values()
+    assert len(docs) == 2
+    assert all(
+        Path(doc["corpus"]["path"]).is_file() and "graph" not in doc for doc in docs
+    )
+    assert not any(
+        json.loads(line)[:2] == ["graphify", "extract"]
+        for line in (tmp_path / "commands.jsonl").read_text().splitlines()
+    )
+
+
 def test_partial_ocr_keeps_failed_markdown_image_report_but_cleans_success(tmp_path):
     from PIL import Image
 
@@ -108,10 +131,11 @@ if tool in ('mdcompare', 'mdocr'):""",
     assert Path(failure["input"]).is_file()
     assert Path(failure["report"]).is_file()
     assert not list(run.parent.glob("graphify-*"))
-    assert (
-        json.loads((tmp_path / "corpus/graphify-out/graph.json").read_text())["nodes"]
-        == []
-    )
+    corpus = tmp_path / "corpus"
+    graph = json.loads((corpus / "graphify-out/graph.json").read_text())
+    published = {p.name for p in corpus.glob("*.md")}
+    assert len(published) == 2
+    assert {node["source_file"] for node in graph["nodes"]} == published
 
 
 def test_paused_run_is_preserved_and_cleaned_run_cannot_resume(tmp_path):
@@ -159,11 +183,30 @@ def test_failed_graph_keeps_input_and_report_without_candidate_graph(tmp_path):
             "--out",
             str(Path(failure["report"]).parent),
             "--no-cluster",
+            "--backend",
+            "openai-oauth",
+            "--max-concurrency",
+            "3",
         ]
         assert failure["argv"] == expected
         assert report["graphify_inputs"] == "text"
         assert report["argv"] == expected
+        assert Path(report["native_log"]).is_file()
     assert not list(run.parent.glob("graphify-*/graphify-out"))
+
+    second = cli("sync", "--config", config)
+    assert second.returncode == 2, second.stderr
+    next_run = Path(json.loads(second.stdout)["run"])
+    assert next_run != run
+    assert any(
+        row["reason"] == "SAME_VERSION_NOT_RETRIED"
+        for row in json.loads(next_run.read_text())["failures"]
+    )
+    calls = [
+        json.loads(line)
+        for line in (tmp_path / "commands.jsonl").read_text().splitlines()
+    ]
+    assert sum(row[:2] == ["graphify", "extract"] for row in calls) == 1
 
 
 @pytest.mark.parametrize("tool_exit,expected", [(1, 2), (130, 130)])
@@ -225,7 +268,7 @@ def test_graph_recovery_preserves_cleaned_unknown_ocr_failure_bundle(tmp_path):
         )
         .replace(
             "if tool in ('mdcompare', 'mdocr'):",
-            "if tool == 'mdocr': raise SystemExit(1)\nif tool in ('mdcompare', 'mdocr'):",
+            "if tool == 'mdocr' and args[0] == 'run': raise SystemExit(1)\nif tool in ('mdcompare', 'mdocr'):",
         )
         .replace(
             "    graph=flag('--out')",
@@ -243,7 +286,20 @@ def test_graph_recovery_preserves_cleaned_unknown_ocr_failure_bundle(tmp_path):
         if path.is_file() and path.name not in {"run.json", "manifest.json"}
     }
     assert (run.parent / "raw/2.png") in retained
-    assert any(path.name.endswith("-request.json") for path in retained)
+    snapshot = json.loads(
+        cli("status", "--config", config, "--run", run, "--json").stdout
+    )
+    [failure] = [
+        item
+        for item in snapshot["handoff"]["items"]
+        if item["phase"] == "ocr" and item["source_document_id"] == "2"
+    ]
+    assert failure["send_state"] == "unknown" and failure["retry_scope"] == "none"
+    [request] = [
+        Path(path) for path in failure["evidence"] if Path(path).name == "request.json"
+    ]
+    assert request.is_relative_to(tmp_path / "state/funds/ocr")
+    retained[request] = request.read_bytes()
     tool.write_text(original)
 
     result = cli("sync", "--config", config, "--resume", run, "--retry-graph")
@@ -281,8 +337,8 @@ def test_cleanup_failure_reports_stderr_without_changing_sync_result(tmp_path, f
             directory.chmod(0o755)
 
 
-@pytest.mark.parametrize("mode,expected", [("invalid", 1), ("interrupt", 130)])
-def test_whole_batch_failure_or_interruption_keeps_run_untouched(
+@pytest.mark.parametrize("mode,expected", [("invalid", 2), ("interrupt", 130)])
+def test_invalid_or_interrupted_graph_retains_failure_evidence(
     tmp_path, mode, expected
 ):
     config, tool = instance(tmp_path)
@@ -304,9 +360,16 @@ def test_whole_batch_failure_or_interruption_keeps_run_untouched(
         else next((tmp_path / "runs/funds").glob("run-*/run.json"))
     )
     record = json.loads(run.read_text())
-    assert "cleanup" not in record
-    assert (run.parent / "raw/0.md").is_file()
-    assert list(run.parent.glob("graphify-*"))
+    assert not (tmp_path / "corpus/graphify-out/graph.json").exists()
+    if mode == "interrupt":
+        assert "cleanup" not in record
+        assert (run.parent / "raw/0.md").is_file()
+    else:
+        assert (
+            record["status"] == "partial" and record["cleanup"]["status"] == "completed"
+        )
+    [report] = {row["report"] for row in record["failures"] if row["step"] == "graph"}
+    assert json.loads(Path(report).read_bytes())["status"] == "unknown"
 
 
 @pytest.mark.parametrize("image_target", ["2.png", "../images/2.png"])

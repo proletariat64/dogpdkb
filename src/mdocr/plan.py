@@ -12,8 +12,9 @@ from urllib.parse import urlsplit
 
 import requests
 from markdown_it import MarkdownIt
+from markdown_it.common.html_re import HTML_TAG_RE
 
-from .llm import DEFAULT_EFFORT, DEFAULT_MODEL
+from .llm import DEFAULT_EFFORT, DEFAULT_MODEL, IMAGE_SCHEMA
 from .markdown import IMAGE_RE, parse_image_match
 from .prepare import (
     DEFAULT_ENABLED_EXTENSIONS,
@@ -82,10 +83,15 @@ def _masked_ranges(markdown: str) -> list[tuple[int, int]]:
         if not token.map:
             continue
         start, end = (line_offsets[line] for line in token.map)
-        if token.type in {"fence", "code_block"}:
+        if token.type in {"fence", "code_block", "html_block"}:
             ranges.append((start, end))
         elif token.type == "inline":
-            ranges.extend(_inline_code_ranges(markdown[start:end], start))
+            text = markdown[start:end]
+            ranges.extend(_inline_code_ranges(text, start))
+            for marker in re.finditer("<", text):
+                left = marker.start()
+                if tag := HTML_TAG_RE.match(text[left:]):
+                    ranges.append((start + left, start + left + tag.end()))
     return sorted(ranges)
 
 
@@ -191,6 +197,20 @@ def _read_inputs(args) -> tuple[list[tuple[str, Path]], str]:
 
 def plan_command(args) -> int:
     files, output_root = _read_inputs(args)
+    download_sources = None
+    if args.download_list:
+        if not args.download:
+            raise ValueError("--download-list requires --download")
+        listed = json.loads(Path(args.download_list).read_bytes())
+        if not isinstance(listed, list) or any(
+            not isinstance(path, str) for path in listed
+        ):
+            raise ValueError(
+                "--download-list must contain a JSON array of absolute input paths"
+            )
+        download_sources = set(listed)
+        if download_sources - {str(path) for _, path in files}:
+            raise ValueError("--download-list names an unknown input document")
     if args.mode not in {"paddle", "llm"}:
         raise ValueError("--mode must be paddle or llm")
     if args.mode == "paddle" and any(
@@ -200,11 +220,10 @@ def plan_command(args) -> int:
             args.effort,
             args.prompt_file,
             args.token_budget,
-            args.request_budget,
         )
     ):
         raise ValueError(
-            "model, effort, prompt and LLM budgets are only valid in llm mode"
+            "model, effort, prompt and token budget are only valid in llm mode"
         )
     if args.mode == "llm" and args.endpoint is not None:
         raise ValueError("--endpoint is only valid in paddle mode")
@@ -284,7 +303,7 @@ def plan_command(args) -> int:
     }
     extra_inputs = {
         str(Path(value).resolve())
-        for value in (args.prompt_file, args.selection, args.list)
+        for value in (args.prompt_file, args.selection, args.list, args.download_list)
         if value
     }
     protected_inputs = source_paths | image_paths | extra_inputs
@@ -303,6 +322,7 @@ def plan_command(args) -> int:
         remote_images = [
             image
             for doc in docs
+            if download_sources is None or doc["path"] in download_sources
             for image in doc["images"]
             if image["selected"] and image["error"] == "REMOTE_IMAGE_NOT_DOWNLOADED"
         ]
@@ -316,7 +336,7 @@ def plan_command(args) -> int:
                     "image staging directory overlaps a planned input or output"
                 )
             assets.mkdir(parents=True, exist_ok=False)
-            _bind_remote_images(remote_images, assets)
+            _bind_remote_images(remote_images, assets, args.mode)
     settings = {
         "mode": args.mode,
         "model": model,
@@ -329,19 +349,21 @@ def plan_command(args) -> int:
         "max_seconds": args.max_seconds,
         "cache_dir": str(Path(args.cache_dir).resolve()) if args.cache_dir else None,
     }
+    if args.mode == "llm":
+        settings["llm_schema"] = IMAGE_SCHEMA
     result = {"schema_version": "mdocr-plan-2", "settings": settings, "documents": docs}
     _atomic_json(plan_path, result)
     return 0
 
 
-def _bind_remote_images(images, assets):
+def _bind_remote_images(images, assets, mode):
     seen = {}
     with requests.Session() as session:
         for image in images:
             url = image["resource_id"]
             if url not in seen:
                 ext = Path(urlsplit(url).path).suffix.lower()
-                if ext not in DEFAULT_ENABLED_EXTENSIONS:
+                if mode == "paddle" and ext not in DEFAULT_ENABLED_EXTENSIONS:
                     seen[url] = {"error": "REMOTE_IMAGE_FORMAT_UNSUPPORTED"}
                 else:
                     try:
@@ -350,7 +372,8 @@ def _bind_remote_images(images, assets):
                         seen[url] = {"error": "REMOTE_IMAGE_DOWNLOAD_FAILED"}
                     else:
                         digest = _digest(data)
-                        path = assets / f"{_digest(url.encode())}{ext}"
+                        suffix = ext if mode == "paddle" else ""
+                        path = assets / f"{_digest(url.encode())}{suffix}"
                         with path.open("xb") as stream:
                             stream.write(data)
                         seen[url] = {

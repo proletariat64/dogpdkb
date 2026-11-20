@@ -10,6 +10,7 @@ import shutil
 import sys
 import tarfile
 import tempfile
+import textwrap
 import zipfile
 from pathlib import Path
 from subprocess import PIPE
@@ -49,9 +50,44 @@ def observe(event, args):
 sys.addaudithook(observe)
 """
 
+# This prefix exits before synthetic capability checks can reach a fake's extraction body.
+GRAPHIFY_PREFLIGHT = """import os,sys
+from pathlib import Path
+if '--version' in sys.argv and sys.argv[1:2] != ['skylark']:
+    print('graphify 0.9.110' if Path(__file__).with_name('mode').is_file() and Path(__file__).with_name('mode').read_text() == 'unsupported' else 'graphify 0.9.111')
+    raise SystemExit(0)
+if os.environ.get('GRAPHIFY_OPENAI_OAUTH_AUTH_FILE','').endswith('/no-oauth.json'):
+    assert 'openai-oauth' in sys.argv
+    print("error: backend 'openai-oauth' requires a ChatGPT subscription OAuth login.")
+    raise SystemExit(1)
+"""
+
+GRAPHIFY_PROOF = """
+import hashlib,json,sys,unicodedata
+from pathlib import Path
+scan=Path(sys.argv[sys.argv.index('extract')+1])
+out=Path(sys.argv[sys.argv.index('--out')+1])/'graphify-out'
+manifest={}
+graph=json.loads((out/'graph.json').read_text())
+for path in scan.rglob('*'):
+    if path.is_file() and not path.name.startswith('.'):
+        name=unicodedata.normalize('NFC', path.relative_to(scan).as_posix())
+        stamp=hashlib.new('md5',path.read_bytes(),usedforsecurity=False).hexdigest()
+        manifest[name]={'ast_hash':stamp,'semantic_hash':stamp}
+        graph['nodes'].append({'id':name,'source_file':name})
+(out/'manifest.json').write_text(json.dumps(manifest))
+(out/'graph.json').write_text(json.dumps(graph))
+if manifest:
+    print(f'[graphify extract] semantic extraction on {len(manifest)} files via openai-oauth...')
+    print('[graphify extract] chunk 1/1 done')
+print(f'[graphify extract] wrote {out / "graph.json"} — {len(graph["nodes"])} nodes (no clustering)')
+"""
+
 # Fake only external remote/graph processes. Comparison and image-less OCR use
 # the installed public CLIs, with no replacement packages or tool runtime imports.
-REMOTE_CLI = r"""
+REMOTE_CLI = (
+    GRAPHIFY_PREFLIGHT
+    + r"""
 import json, pathlib, subprocess, sys
 tool, *args = sys.argv[1:]
 root = pathlib.Path(__file__).parent
@@ -88,6 +124,9 @@ elif tool == 'graphify' and args[0] == 'extract':
 else:
     raise SystemExit('unexpected public command')
 """
+    + "\nif tool == 'graphify':\n"
+    + textwrap.indent(GRAPHIFY_PROOF, "    ")
+)
 
 
 def inspect_artifacts(wheel: Path, sdist: Path) -> None:
@@ -120,6 +159,10 @@ def inspect_artifacts(wheel: Path, sdist: Path) -> None:
     }
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
+        sample = tomllib.loads(archive.read("dogpdkb/resources/dogpdkb.toml").decode())
+        assert sample["semantic_score"] == {"model": "openai/gpt-6.1-terra"}
+        assert sample["graphify"] == {"model": "gpt-6.1-terra", "token_budget": 5500}
+        assert sample["ocr"] == {"mode": "llm", "budget_seconds": 7200}
     with tarfile.open(sdist) as archive:
         source_names = {name.split("/", 1)[-1] for name in archive.getnames()}
     if (
@@ -235,9 +278,9 @@ def smoke(dist: Path) -> None:
         before_help = {path.relative_to(work) for path in work.rglob("*")}
         for tool in ("dogpdkb", "mdcompare", "mdocr"):
             executable = environment / "bin" / tool
-            root_help = run([executable, "--help"], extra_env=help_env)
-            # Commands are discovered from the public root help, so a new leaf
-            # cannot silently remain outside the installed acceptance matrix.
+            root_help = run([executable, "--help", "--full"], extra_env=help_env)
+            # The full public help lists all commands even when quick help is
+            # intentionally terse. Still exercise both help forms below.
             commands = re.findall(
                 r"^    ([a-z][a-z0-9-]*)\s{2,}",
                 root_help.split("options:", 1)[0],
@@ -319,6 +362,7 @@ def smoke(dist: Path) -> None:
         config.write_text(
             '[source]\nbooks_file="books.json"\n'
             '[paths]\nstate="state"\nstaging="runs"\nocr_cache="ocr-cache"\n'
+            "[semantic_score]\nrequest_budget=0\n"
             "[tools]\n" + commands + "\n"
         )
         status = json.loads(run([command, "status", "--config", config, "--json"]))

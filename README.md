@@ -8,8 +8,8 @@ and software lifecycle remain separate.
 ## Local help
 
 All installed CLI help is in English and works offline without configuration or
-authentication. Use root help to choose a command, command help for a first
-invocation, and `--help --full` for the complete local contract:
+authentication. Root help shows run, watch and resume. Use command help for
+common options and `--help --full` for advanced options and the local contract:
 
 ```bash
 dogpdkb --help
@@ -61,6 +61,8 @@ dogpdkb init-state --config ./instance/dogpdkb.toml --book funds
 dogpdkb sync --config ./instance/dogpdkb.toml --book funds
 # 只扫描指定来源；仍发布到同一个知识库，可重复传 --source
 dogpdkb sync --config ./instance/dogpdkb.toml --book funds --source inbox
+# 只读本地目录，不改订阅配置，不需要 Skylark；路径相对调用时的工作目录
+dogpdkb sync --config ./instance/dogpdkb.toml --book funds --dir ./inbox/2026-11-19
 # 全批获取输入、比较和计划；不会 OCR、写本批语料或编译
 dogpdkb sync --config ./instance/dogpdkb.toml --book funds --stop-after plan
 # RUN 为输出中的 run ID 或目录；只推进未完成步骤
@@ -80,7 +82,7 @@ Markdown 语料；`update-graph --input MANIFEST` 编译。`sync` 共用这套�
 ### Download concurrency
 
 `sync` and `apply` accept `--concurrency N` for document exports only. The default
-is **2**; allowed values are **1, 2 or 3**, with a hard maximum of three. Use one
+is **3**; allowed values are **1, 2 or 3**, with a hard maximum of three. Use one
 for serial downloads. Invalid values fail before run creation or tool calls.
 
 ```bash
@@ -102,7 +104,7 @@ process groups, starts no queued exports and preserves truthful checkpoints.
 This is a per-invocation option, not a TOML setting or a Skylark argument. Graph-only
 recovery with `--retry-graph` does not restart downloads.
 
-返回码：0 完成、无工作或停在计划；2 可用集合完成但有部分失败；1 整批失败；
+返回码：0 完成（含有依据的策略跳过）、无工作或按要求暂停；2 有待处理项；1 致命配置、身份或状态错误；
 64 参数错误；130/143 中断。stdout 是结果，stderr 实时输出进度与工具诊断，
 可直接由 shell 重定向和系统 logrotate 管理。没有工具公开计数时不推算百分比。
 
@@ -114,13 +116,23 @@ recovery with `--retry-graph` does not restart downloads.
 相关图片、报告和简要运行记录。计划暂停、整批失败和中断不自动清理；清理错误
 进入 stderr，不改变同步退出码。普通 resume 不恢复已清理批次。
 
-For a diagnosed graph failure, fix the provider/environment first, then run
-`dogpdkb sync --config ./instance/dogpdkb.toml --book funds --resume RUN --retry-graph`.
-This explicit recovery revalidates the retained final compile manifest, including
-after cleanup, and repeats only Graphify. It preserves earlier failure reports;
-target locks, source/version checks and frozen byte witnesses still apply.
-Unrelated failed batches remain blocked. Historical failures may keep exit 2
-even after graph recovery; inspect the current graph stage and its report.
+`status` separates corpus and graph publication, shows the last completed phase,
+and points to the next action. `status --run RUN --json` exposes observed, raw,
+corpus and graph facts with available SHA-256 witnesses; even equal source
+versions can have different corpus and graph bytes. `--watch` is read-only.
+Ctrl-C in the observer does not stop a separately running sync.
+
+Use `handoff.items` in the JSON to locate a document, version, phase, transmission
+state and evidence. `unknown` does not authorize replay. A proven-unsent OCR
+item can join a later eligible batch only after its evidence and bytes are
+revalidated. There is no document-level force retry.
+
+After diagnosing a graph failure, use
+`dogpdkb sync --config ./instance/dogpdkb.toml --book funds --resume RUN --retry-graph`
+only for the exact saved batch. Recovery checks the manifest, input mode, prior
+graph generation, versions and byte witnesses. Earlier failures remain visible;
+resolved graph failures alone do not keep a new sync run partial. See the
+[operator contract](docs/orchestrator-core-contracts.md#processes-and-observation).
 
 ```bash
 dogpdkb purge --config ./instance/dogpdkb.toml --book funds --run RUN
@@ -137,11 +149,19 @@ purge 只删除所选 book 的 wash，包括失败材料和运行记录；正式
 `apply`/`sync` consume the independent offline `mdcompare semantic` CLI as the
 body-routing authority: **NEW / CHANGED / UNCERTAIN → compile; demonstrated
 EQUIVALENT → reuse/metadata; UNAVAILABLE → defer**. Authored deletions compile.
-Image changes and OCR failures/results are advisory and never promote equivalent
-body text to compilation. Equivalent documents do not start fresh OCR. Usable
-uncertainty compiles without a model, manual approval or hidden network call.
+Image changes and OCR failures do not change authored-text classification. A
+later OCR success for previously unattempted work can make an equivalent body
+eligible for compilation. Usable uncertainty routes to compile without scoring,
+manual approval or a hidden network call.
 Missing or malformed authoritative reports stop explicitly rather than falling
 back to legacy knowledge advice. Baseline-only IDs never imply remote deletion.
+
+OCR uses one `mdocr` plan for each batch, defaulting to OpenAI Pi OAuth
+(`openai/gpt-6.1-terra`, medium, concurrency 3). Set `[ocr].mode = "paddle"`
+to use Paddle explicitly. `[ocr].request_budget` is independent of scoring:
+omit it for unlimited requests or set it to 0 to prohibit new requests.
+Incomplete OCR publishes the usable raw body without claiming OCR success.
+Original v2 evidence is retained under `state/<book>/ocr/<run>/` outside wash.
 
 Complete `mdcompare-semantic-diff-1` evidence is streamed per document and indexed
 outside wash under `state/<book>/semantic/<run>/`. Preserve the index and its
@@ -180,10 +200,14 @@ threshold 3 means strictly greater scores compile, lower/equal scores skip;
 compile. Missing scores never enable skips. See
 `mdcompare semantic-route --help --full` for the complete schema and path rules.
 
-Enable bounded scoring in `dogpdkb apply/sync` with `[semantic_score]` and
-`request_budget = N` (default `0`, offline). Optional `model = "provider/model"`
-overrides the scorer default. Plans freeze the exact score and route artifacts;
-a resume does not call the scorer again. Ambiguity is advisory.
+In `dogpdkb apply/sync`, semantic scoring is on by default for `CHANGED`
+documents with eligible evidence. Omit `[semantic_score].request_budget` to
+admit every eligible document, set a positive cap to limit requests, or set
+`0` to stay offline. Optional `model = "provider/model"` overrides the scorer default. One scorer handles up to three concurrent
+requests and drains before lowering concurrency on HTTP 429. The scoring
+budget counts admissions, not concurrent slots. Plans freeze the exact
+score and route artifacts; a resume does not call the scorer again.
+Ambiguity is advisory.
 
 ## 多源订阅
 
@@ -205,7 +229,10 @@ a resume does not call the scorer again. Ambiguity is advisory.
 `_inventory` 和符号链接；不移动或删除原件。非 Markdown 文件不作为独立文档输入；
 Markdown 引用的目录内资源随正文冻结，资源变更也计入版本。
 默认扫描所有启用来源；可重复传 `--source KEY` 选子集，未选来源不访问也不判为缺失。
-任何选中来源扫描失败则不生成计划。`--resume` 不接受 `--source`，只使用冻结输入。
+`sync --dir PATH` 只扫描指定目录，与 `--source` 互斥。规范化路径若匹配唯一登记目录，
+则沿用其身份；否则使用绑定到目标知识库和该路径的独立身份，不修改订阅配置。
+`doctor` 可用相同选择参数离线检查；仅在选中语雀来源时检查 Skylark。
+任何选中来源扫描失败则不生成计划。`--resume` 不接受 `--source` 或 `--dir`，只使用冻结输入。
 
 语雀来源可省略 `document_ids` 订阅整本；列表仍完整读取并验证，再按 ID 筛选。
 来源 key 在订阅内唯一，已记录状态后不允许换绑 URL、订阅范围或目录。

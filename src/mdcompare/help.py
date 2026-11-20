@@ -86,7 +86,8 @@ SEMANTIC_SCORE = """Example:
 Requires installed Pi and Node, and Pi OAuth. Default: openai/gpt-6.1-terra, medium.
 Sends changed authored evidence only, with at most two nearby units per side.
 Oversized evidence is not clipped or sent. Output is consumed by semantic-route.
-Reuse the same bindings and output on resume; admitted requests are not replayed.
+Default concurrency: 3. HTTP 429 drains the current tier and lowers the limit.
+Keep the journal and lock; use the same bindings and output to resume without replay.
 Exit 0: complete; 2: some eligible documents unscored; 1: invalid input or failure.
 Use mdcompare semantic-score --help --full for the full contract.
 """

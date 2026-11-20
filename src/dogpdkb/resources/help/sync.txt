@@ -2,15 +2,21 @@
 
 sync scans all enabled sources of the selected subscription and runs one shared
 comparison, planning, OCR, corpus publication and Graphify compilation pipeline.
-Repeat --source KEY to scan only specified sources; the corpus and graph remain
-shared. An unsuccessful selected scan aborts planning and publication. Local
-Markdown is frozen from disk and does not call Skylark export. Sync never
-publishes the Web.
+Repeat --source KEY to scan only specified sources, or use --dir PATH to scan
+only that directory without editing the subscription. PATH resolves from the
+caller's working directory. The target stays the selected book; if more than
+one book is enabled, use --book. The same canonical root reuses a registered
+directory source's identity; ambiguous matches require --source. An unregistered
+root gets a stable, book-specific identity. Source identity is not inferred from
+file or directory names. An unsuccessful selected scan aborts planning and
+publication. A directory-only run does not call Skylark. Sync never publishes
+the Web.
 
---resume continues the saved run without rediscovery or a new --source selection;
-source bindings, corpus and graph targets must still match. --stop-after plan
-pauses after preparing raw inputs and comparisons, before OCR, corpus and graph
-writes. Remove that option on resume to continue.
+--resume continues the saved run without rediscovery, --source or --dir;
+frozen source bindings, corpus and graph targets must still match. --stop-after
+accepts collect, plan, ocr, corpus, or graph. The first four pause after the
+named checkpoint; graph settles normally. --stop-after plan freezes routing
+before OCR and public writes. Remove that option on resume to continue.
 
 Authored-body routing uses the offline public mdcompare semantic CLI:
 NEW/CHANGED/UNCERTAIN -> COMPILE; demonstrated EQUIVALENT -> reuse/metadata;
@@ -25,7 +31,7 @@ See apply --help --full for schemas, source versions and successful-baseline rul
 This routing does not change Graphify's text-input projection below.
 
 --concurrency N applies only to document exports. It accepts 1, 2 or 3, defaults
-to 2 and never permits more than 3 in-flight exports; 1 selects serial downloads.
+to 3 and never permits more than 3 in-flight exports; 1 selects serial downloads.
 Invalid values fail before run creation or tool calls. Exports remain independent
 Skylark CLI processes. Only the main coordinator records settled results and
 checkpoints. One export failure does not stop other eligible downloads; identity,
@@ -44,9 +50,10 @@ Graphify inputs
 containing only Markdown (.md, case-insensitive). OCR text in Markdown is kept;
 images and other non-Markdown files stay in the public corpus but are not sent
 for extraction. Existing scan controls are preserved. all restores the previous
-complete-tree scan, including images and other resources. The option also applies
-to --resume RUN --retry-graph. Native Graphify may prune old non-Markdown graph
-records when switching to text; graph/cache artifacts are not manually rewritten.
+complete-tree scan, including images and other resources. A newly sealed run's
+explicit graph retry inherits its saved input mode and rejects changes. Native
+Graphify may prune old non-Markdown graph records when switching to text on a
+new run; graph/cache artifacts are not manually rewritten.
 
 ```text
 dogpdkb sync --config instance/dogpdkb.toml --book funds --stop-after plan --concurrency 3
@@ -54,17 +61,21 @@ dogpdkb status --config instance/dogpdkb.toml --book funds --run RUN --json
 dogpdkb sync --config instance/dogpdkb.toml --book funds --resume RUN
 ```
 
-stdout JSON has exit_code (0/1/2/130/143), paused (boolean), manifest (absolute
+stdout JSON has exit_code, status, paused (boolean), manifest (absolute
 dogpdkb-compile-1 JSON path or null), and run (absolute run.json path). Reports
-are reached through run.artifacts. Inputs and full-source witnesses required
-after cleanup live outside wash. A failure before a result can emit stderr only.
+are reached through run.artifacts and run.handoff (dogpdkb-handoff-1 schema).
+Inputs and full-source witnesses required after cleanup live outside wash. A
+failure before a result can emit stderr only. Exit codes: 0 complete, no work,
+evidence-backed policy skip or requested pause; 2 unresolved work; 1 fatal
+configuration, identity or state error; 64 usage; 130/143 interruption.
 --help --full on discover, apply and update-graph describes their stage schemas.
 
 Only successful OCR is reused by its tool. Downloaded raw versions, published
 corpus and successful graph versions remain separate facts. Source export and
 OCR failures are isolated where possible; usable bodies may still compile and
-produce exit 2. A shared graph failure can make the entire batch exit 1. Inspect
-failures and per-document reports; numeric exits alone do not grant retry.
+produce exit 2, as can unproven Graphify extraction with usable corpus. Inspect
+status --json for the publication facts and handoff. Numeric exits alone do not
+grant retry. Unknown export or OCR sends are not automatically replayed.
 
 Stopped plans and interrupted/failed runs retain evidence. Saved input copies
 are checked before and after OCR and again before publication. Missing/changed
@@ -84,10 +95,12 @@ final compile manifest, even after cleanup, without repeating discovery,
 downloads, comparison, OCR or corpus writes. Only this run's failed/unknown or
 abandoned in-flight graph versions in that manifest are authorized. Other
 blocked sources still stop compilation. Original target locks, version/metadata
-checks and byte witnesses remain mandatory. No block is cleared before a real
-successful result. Each attempt keeps a separate report; earlier failures stay
-recorded and can keep the run partial. This is explicit operator recovery,
-not an automatic daily retry or a way to recover missing/changed inputs.
+checks and byte witnesses remain mandatory. A newly sealed run also binds the
+manifest, prior graph generation and frozen tree digest. If the run never froze
+a tree, use ordinary resume (if unfinished) or make a new plan. No block
+is cleared before a real successful result. Each attempt keeps a separate report;
+unresolved non-graph failures can keep the run partial after graph recovery.
+This is not an automatic daily retry or a way to recover missing/changed inputs.
 
 After a comparison/routing fix, recompute the saved published batch explicitly:
 

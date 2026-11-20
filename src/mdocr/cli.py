@@ -99,6 +99,7 @@ def build_parser(*, full: bool = False) -> argparse.ArgumentParser:
     plan.add_argument("--max-seconds", type=float, default=900)
     plan.add_argument("--endpoint")
     plan.add_argument("--download", action="store_true")
+    plan.add_argument("--download-list", help="restrict --download to listed inputs")
     plan.add_argument("--selection")
     plan.add_argument("--cache-dir")
 

@@ -3,7 +3,9 @@
 `dogpdkb.discover.discover(settings, book, store, run, listing=None, *, sources=None)`
 runs inside the caller's store lock and uses the caller's Run. `sync` calls the
 same function. Both CLI commands accept repeatable `--source KEY`; omission scans
-all enabled sources of the selected subscription.
+all enabled sources of the selected subscription. Sync can instead take `--dir
+PATH`; it passes the resolved directory as the only source to this same scanner.
+Registering an ad hoc binding alone implies neither a listing nor acquired bytes.
 
 ## Selected source scans
 

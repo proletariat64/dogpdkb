@@ -6,11 +6,17 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 DEFAULT_MODEL = "openai/gpt-6.1-terra"
 DEFAULT_EFFORT = "medium"
+IMAGE_SCHEMA = "mdocr-image-content-1"
 _PI_BRIDGE = Path(__file__).with_name("pi_bridge.mjs")
+
+
+def _valid_usage(value: Any) -> bool:
+    return value is None or (type(value) is int and value >= 0)
 
 
 class LlmError(RuntimeError):
@@ -37,6 +43,14 @@ class LlmClient:
         self.env = os.environ.copy()
 
     def _invoke(self, request: dict[str, Any], *, timeout: int = 240) -> dict[str, Any]:
+        def invalid_protocol() -> LlmError:
+            return LlmError(
+                "Pi bridge returned invalid protocol data",
+                reason="unknown_outcome"
+                if request["op"] == "convert"
+                else "bridge_error",
+            )
+
         try:
             process = subprocess.run(
                 ["node", str(_PI_BRIDGE)],
@@ -64,25 +78,30 @@ class LlmClient:
         try:
             result = json.loads(process.stdout)
         except json.JSONDecodeError as exc:
-            raise LlmError(
-                "Pi bridge returned invalid protocol data",
-                reason="unknown_outcome"
-                if request["op"] == "convert"
-                else "invalid_response",
-            ) from exc
+            raise invalid_protocol() from exc
         if not isinstance(result, dict):
-            raise LlmError(
-                "Pi bridge returned invalid protocol data", reason="invalid_response"
-            )
-        if process.returncode or not result.get("ok"):
-            err = result.get("error", {})
-            raise LlmError(
-                err.get("message", "Pi bridge failed"),
-                status=err.get("status"),
-                reason=err.get("reason", "bridge_error"),
-                usage_tokens=err.get("usage_tokens"),
-            )
-        return result
+            raise invalid_protocol()
+        if process.returncode == 0 and result.get("ok") is True:
+            if request["op"] == "convert" and (
+                not isinstance(result.get("image"), dict)
+                or not _valid_usage(result.get("usage_tokens"))
+            ):
+                raise invalid_protocol()
+            return result
+        if process.returncode != 1 or result.get("ok") is not False:
+            raise invalid_protocol()
+        err = result.get("error")
+        if not isinstance(err, dict) or not all(
+            isinstance(err.get(field), str) and err[field]
+            for field in ("reason", "message")
+        ):
+            raise invalid_protocol()
+        status, usage = err.get("status"), err.get("usage_tokens")
+        if (status is not None and type(status) is not int) or not _valid_usage(usage):
+            raise invalid_protocol()
+        raise LlmError(
+            err["message"], status=status, reason=err["reason"], usage_tokens=usage
+        )
 
     def doctor(self) -> dict[str, Any]:
         return self._invoke(
@@ -94,41 +113,30 @@ class LlmClient:
             {"op": "preflight", "model": self.model, "effort": self.effort}
         )
 
-    def convert(
-        self, markdown: str, images: list[dict[str, str]], prompt: str
-    ) -> dict[str, Any]:
-        result = self._invoke(
-            {
-                "op": "convert",
-                "model": self.model,
-                "effort": self.effort,
-                "markdown": markdown,
-                "images": images,
-                "prompt": prompt,
-            }
-        )
-        expected = [item["id"] for item in images]
-        patches = result.get("patches")
-        if not isinstance(patches, list) or [p.get("id") for p in patches] != expected:
+    def convert(self, original: bytes, prompt: str) -> dict[str, Any]:
+        # Image dependencies belong to conversion; doctor probes them separately.
+        from .llm_image import vision_image
+        from .prepare import ImageError
+
+        try:
+            data, mime = vision_image(original)
+        except ImageError as exc:
             raise LlmError(
-                "Response image IDs do not exactly match planned occurrence order",
-                reason="invalid_response",
+                "Cannot prepare vision image", reason="invalid_image"
+            ) from exc
+        with TemporaryDirectory(prefix="mdocr-vision-") as tmp:
+            path = Path(tmp) / "attachment"
+            path.write_bytes(data)
+            result = self._invoke(
+                {
+                    "op": "convert",
+                    "model": self.model,
+                    "effort": self.effort,
+                    "image": {"path": str(path), "mime_type": mime},
+                    "prompt": prompt,
+                }
             )
-        if any(
-            p.get("kind") not in {"mermaid", "table", "ui", "text", "mixed", "hold"}
-            or not isinstance(p.get("markdown"), str)
-            or not isinstance(p.get("uncertainty"), str)
-            or "<!-- mdocr:" in p["markdown"].lower()
-            for p in patches
-        ):
-            raise LlmError(
-                "Response contains an invalid or reserved patch payload",
-                reason="invalid_response",
-            )
-        usage = result.get("usage_tokens")
-        if usage is not None and (not isinstance(usage, int) or usage < 0):
-            raise LlmError("Response token usage is invalid", reason="invalid_response")
-        return {"patches": patches, "usage_tokens": usage}
+        return {"image": result["image"], "usage_tokens": result.get("usage_tokens")}
 
     def token_upper_bound(self, *_: Any, **__: Any) -> None:
         # No trustworthy provider/model bound for vision input is exposed here.
