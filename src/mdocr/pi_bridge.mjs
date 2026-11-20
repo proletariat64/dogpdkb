@@ -44,12 +44,12 @@ const fences = markdown => {
   const blocks = [];
   let open;
   for (const line of markdown.split(/\r?\n/)) {
-    const fence = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    const fence = /^ {0,3}(`{3,}|~{3,})([^\r\n]*)$/.exec(line);
     if (!open) {
       if (fence && (fence[1][0] !== '`' || !fence[2].includes('`'))) {
         open = { marker: fence[1][0], width: fence[1].length, info: fence[2].trim(), lines: [] };
       }
-    } else if (fence && fence[1][0] === open.marker && fence[1].length >= open.width && !fence[2].trim()) {
+    } else if (fence && fence[1][0] === open.marker && fence[1].length >= open.width && !/[^ \t]/.test(fence[2])) {
       blocks.push({ ...open, closed: true });
       open = undefined;
     } else open.lines.push(line);
@@ -91,12 +91,24 @@ const mermaidWarnings = async patches => {
   });
   if (!blocks.length) return [];
   const parser = await selectParser();
+  let syntaxInvalid = false;
   for (const block of blocks) {
-    if (await parser.parse(block, { suppressErrors: true }) === false) {
-      return ['response_mermaid_syntax_invalid'];
+    try {
+      await parser.parse(block);
+    } catch (error) {
+      // Mermaid 12.3 uses Jison error hashes, Langium parse results, and
+      // typed detector/front-matter errors. Unrecognized errors fail closed.
+      if ((error?.hash && typeof error.hash.token === 'string') ||
+          (error?.constructor?.name === 'MermaidParseError' && error.result) ||
+          error?.name === 'YAMLException' ||
+          (error?.name === 'UnknownDiagramError' && error.message?.startsWith('No diagram type detected'))) {
+        syntaxInvalid = true;
+      } else {
+        fail('mermaid_parser_unavailable', 'Mermaid parser could not validate the diagram');
+      }
     }
   }
-  return [];
+  return syntaxInvalid ? ['response_mermaid_syntax_invalid'] : [];
 };
 const findSdk = () => {
   const starts = [];

@@ -471,6 +471,60 @@ def test_missing_parser_is_explicit_for_mixed_patch(model, tmp_path, monkeypatch
     assert exc.value.reason == "mermaid_parser_unavailable"
 
 
+@pytest.mark.parametrize("suffix", ["\u00a0", "\u2028"])
+def test_mermaid_closer_rejects_non_commonmark_whitespace(
+    model, tmp_path, monkeypatch, suffix
+):
+    monkeypatch.setenv(
+        "FAKE_PATCH",
+        json.dumps(
+            {
+                "kind": "mermaid",
+                "markdown": f"```mermaid\nflowchart TD\n A -->\n```{suffix}\nProse",
+            }
+        ),
+    )
+    with pytest.raises(LlmError) as exc:
+        convert(model, tmp_path)
+    assert exc.value.reason == "response_mermaid_fence_invalid"
+
+
+def test_mermaid_lazy_import_failure_overrides_earlier_syntax_warning(
+    model, tmp_path, monkeypatch
+):
+    packages = tmp_path / "parser" / "node_modules"
+    for name, script in (
+        ("jsdom", "exports.JSDOM = class { window = { document: {} }; };"),
+        (
+            "mermaid",
+            """module.exports = {
+              initialize() {},
+              async parse(text, options) {
+                try {
+                  if (text.startsWith('sequenceDiagram')) await import('./missing.mjs');
+                  throw Object.assign(new Error('Syntax error'), {hash: {token: 'EOF'}});
+                } catch (error) {
+                  if (options?.suppressErrors) return false;
+                  throw error;
+                }
+              }
+            };""",
+        ),
+    ):
+        package = packages / name
+        package.mkdir(parents=True)
+        (package / "index.js").write_text(script)
+    monkeypatch.setenv("MDOCR_NODE_DEPENDENCIES", str(packages.parent))
+    markdown = "```mermaid\nflowchart TD\n A -->\n```\n\n```mermaid\nsequenceDiagram\n A->>B: Ping\n```"
+    monkeypatch.setenv(
+        "FAKE_PATCH", json.dumps({"kind": "mixed", "markdown": markdown})
+    )
+    with pytest.raises(LlmError) as exc:
+        convert(model, tmp_path)
+    assert exc.value.reason == "mermaid_parser_unavailable"
+    assert "missing.mjs" not in str(exc.value)
+
+
 @pytest.mark.skipif(
     not os.environ.get("MDOCR_NODE_DEPENDENCIES"), reason="requires real parser"
 )

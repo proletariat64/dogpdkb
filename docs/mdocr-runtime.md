@@ -54,8 +54,9 @@ Older `invalid_response` journal entries do not record which check failed.
 ## Mermaid and inference limits
 
 Install the local Mermaid parser once with `npm install --prefix "$HOME/.local/share/mdocr/node" --ignore-scripts mermaid@12.3.0 jsdom@26.1.0`. Set `MDOCR_NODE_DEPENDENCIES` to that prefix. The parser loads locally, can run offline, and receives no OAuth credential. The bridge still refuses missing/unclosed Mermaid fences or Mermaid output when
-the parser is unavailable. If a closed Mermaid diagram fails syntax parsing,
-the otherwise valid OCR text is preserved unchanged. The `mdocr-result-2`
+the parser is unavailable, including when an individual diagram parser cannot
+load. If a closed Mermaid diagram has a recognized syntax error, the otherwise
+valid OCR text is preserved unchanged. The `mdocr-result-2`
 document resource entry records `warnings: ["response_mermaid_syntax_invalid"]`
 alongside that image’s ID and resource ID, including on cache reuse. The warning
 does not change completion status, the original-byte witness, or graph
