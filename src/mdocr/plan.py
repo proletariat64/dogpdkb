@@ -242,6 +242,8 @@ def plan_command(args) -> int:
         for value in (args.token_budget, args.request_budget)
     ):
         raise ValueError("budgets must be nonnegative")
+    if args.fix < 0:
+        raise ValueError("--fix must be nonnegative")
     if not 0 <= args.max_seconds < float("inf"):
         raise ValueError("deadline must be finite and nonnegative")
     model = args.model or (DEFAULT_MODEL if args.mode == "llm" else None)
@@ -355,6 +357,7 @@ def plan_command(args) -> int:
         "token_budget": args.token_budget,
         "request_budget": args.request_budget,
         "concurrency": args.concurrency,
+        "fix": args.fix,
         "endpoint": args.endpoint,
         "max_seconds": args.max_seconds,
         "cache_dir": str(Path(args.cache_dir).resolve()) if args.cache_dir else None,

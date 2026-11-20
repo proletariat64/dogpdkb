@@ -34,6 +34,8 @@ concurrency = 3
 mode = "llm"
 # Concurrent OCR workers, 1–10 (default 3).
 concurrency = 3
+# Extra attempts per eligible failed image after the first pass.
+fix = 1
 # OCR request limit for the whole batch. Omit for unlimited; 0 sends nothing new.
 # request_budget = 20
 # Admission deadline. In-flight calls retain tool-owned timeouts.

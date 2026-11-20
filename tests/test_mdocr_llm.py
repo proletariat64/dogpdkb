@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -91,13 +92,22 @@ export class ModelRuntime {
    }
    globalThis.fetch = async () => {
      const outcome = (repairMode && process.env.FAKE_REPAIR_OUTCOME) || record?.outcome || process.env.FAKE_PROVIDER_OUTCOME || 200;
-     if (outcome === 'unknown') throw new TypeError('socket closed');
-     return new Response('{}', {status: Number(outcome)});
+     const number = Array.isArray(outcome)
+       ? readFileSync(trace, 'utf8').split('\n').filter(x => x === `begin ${record.name}`).length
+       : 0;
+     const current = number ? outcome[Math.min(number - 1, outcome.length - 1)] : outcome;
+     if (current === 'connection') throw new TypeError('fetch failed', {cause: {code: 'ECONNREFUSED'}});
+     if (current === 'unknown') throw new TypeError('socket closed');
+     return new Response('{}', {status: Number(current)});
    };
    let status;
    try { status = (await options.fetch('https://api.openai.com/v1/responses')).status; }
    catch { return {stopReason: 'error'}; }
    finally { if (record) appendFileSync(trace, `end ${record.name}\n`); }
+   if (repairMode && process.env.FAKE_INTERRUPT_REPAIR) {
+     process.kill(process.ppid, 'SIGKILL');
+     return {stopReason: 'error'};
+   }
    if (status !== 200) return {stopReason: 'error'};
    if (process.env.FAKE_WIRE) {
      const wire = process.env.FAKE_WIRE;
@@ -254,7 +264,7 @@ def fixture_images(tmp_path, monkeypatch, outcomes, barrier=False):
     return trace
 
 
-def plan_batch(tmp_path, name, sources, budget):
+def plan_batch(tmp_path, name, sources, budget, *extra):
     (tmp_path / f"{name}-inputs.json").write_text(json.dumps(sources))
     plan = batch_cli(
         tmp_path,
@@ -271,6 +281,7 @@ def plan_batch(tmp_path, name, sources, budget):
         "cache",
         "--request-budget",
         str(budget),
+        *extra,
     )
     assert plan.returncode == 0, plan.stderr
 
@@ -287,6 +298,61 @@ def run_batch(tmp_path, name, expected, *options):
     )
     assert run.returncode == expected, (run.stdout, run.stderr)
     return json.loads((tmp_path / f"{name}-result.json").read_bytes())
+
+
+@pytest.mark.parametrize(
+    ("fix", "budget", "extra", "rounds"),
+    [
+        (0, 10, [], []),
+        (2, 10, ["recover", "exhaust", "exhaust"], [1, 1, 2]),
+        (2, 5, ["recover"], [1]),
+    ],
+)
+def test_batch_fix_retries_only_eligible_failed_images(
+    model, tmp_path, monkeypatch, fix, budget, extra, rounds
+):
+    initial = ["recover", "exhaust", "lost", "ok"]
+    trace = fixture_images(
+        tmp_path,
+        monkeypatch,
+        {"recover": [429, 200], "exhaust": 429, "lost": "unknown", "ok": 200},
+    )
+    (tmp_path / "a.md").write_text("\n\n".join(f"![x]({name}.png)" for name in initial))
+    plan_batch(
+        tmp_path, "fixed", ["a.md"], budget, "--fix", str(fix), "--concurrency", "10"
+    )
+    result = run_batch(tmp_path, "fixed", 2)
+    assert result["budget"]["requests"] == 4 + len(rounds)
+    assert [a["fix_round"] for a in result["requests"][4:]] == rounds
+    assert result["requests"][2]["status"] == "unknown"
+    assert trace.read_text().splitlines()[::2] == [
+        "begin " + name for name in initial + extra
+    ]
+    assert run_batch(tmp_path, "fixed", 2) == result
+    assert len(trace.read_text().splitlines()) == 2 * (4 + len(rounds))
+
+
+@pytest.mark.parametrize("fix", [0, 1, 2])
+def test_batch_fix_retries_observed_connection_interruptions(
+    model, tmp_path, monkeypatch, fix
+):
+    trace = fixture_images(
+        tmp_path, monkeypatch, {"diagram": ["connection", "connection", 200]}
+    )
+    (tmp_path / "a.md").write_text("![flow](diagram.png)\n")
+    plan_batch(tmp_path, "connection", ["a.md"], 4, "--fix", str(fix))
+    result = run_batch(tmp_path, "connection", 0 if fix == 2 else 2)
+    assert result["budget"]["requests"] == fix + 1
+    assert [a.get("fix_round", 0) for a in result["requests"]] == list(range(fix + 1))
+    assert all(
+        (a["status"], a["reason"]) == ("unknown", "connection_outcome_unknown")
+        for a in result["requests"][: min(fix + 1, 2)]
+    )
+    if fix == 2:
+        assert result["requests"][-1]["status"] == "success"
+    assert trace.read_text().splitlines() == ["begin diagram", "end diagram"] * (
+        fix + 1
+    )
 
 
 def test_each_image_is_private_and_success_survives_unknown_peer(
@@ -460,6 +526,7 @@ def test_rejects_non_oauth_provider_route_before_request(model):
         ("429", 429, "rate_limited"),
         ("403", 403, "auth_error"),
         ("unknown", None, "unknown_outcome"),
+        ("connection", None, "connection_outcome_unknown"),
     ],
 )
 def test_preserves_http_status_or_unknown_after_sdk_return(
@@ -574,6 +641,31 @@ def test_managed_mermaid_parser_warns_without_changing_content(
 @pytest.mark.skipif(
     not os.environ.get("MDOCR_NODE_DEPENDENCIES"), reason="requires real parser"
 )
+@pytest.mark.parametrize(
+    "diagram",
+    [
+        "flowchart TD\n A@{shape: invalidshape} --> B",
+        "flowchart TD\n A --> B\n linkStyle 2 stroke:red",
+        "sequenceDiagram\n participant A\n create participant A\n B->>A: start",
+        "sequenceDiagram\n create participant B\n A->>C: start",
+        "sequenceDiagram\n participant A\n destroy A\n B->>C: finish",
+    ],
+)
+def test_mermaid_reports_known_invalid_diagram_not_parser_outage(
+    model, tmp_path, monkeypatch, diagram
+):
+    markdown = f"```mermaid\n{diagram}\n```"
+    monkeypatch.setenv(
+        "FAKE_PATCH", json.dumps({"kind": "mermaid", "markdown": markdown})
+    )
+    patch = convert(model, tmp_path)["image"]
+    assert patch["markdown"] == markdown
+    assert patch["warnings"] == ["response_mermaid_syntax_invalid"]
+
+
+@pytest.mark.skipif(
+    not os.environ.get("MDOCR_NODE_DEPENDENCIES"), reason="requires real parser"
+)
 def test_mermaid_warning_publishes_and_survives_cache_reuse(
     model, tmp_path, monkeypatch
 ):
@@ -657,6 +749,48 @@ def test_mermaid_repair_uses_durable_requests_and_keeps_fallback(
     assert "Parse error on line" not in json.dumps(result)
     assert run_batch(tmp_path, "repair", 0, "--retry-failed") == result
     assert trace.read_text().splitlines() == ["begin diagram", "end diagram"] * calls
+
+
+@pytest.mark.skipif(
+    not os.environ.get("MDOCR_NODE_DEPENDENCIES"), reason="requires real parser"
+)
+def test_interrupted_mermaid_repair_resumes_without_resending(
+    model, tmp_path, monkeypatch
+):
+    trace = fixture_images(tmp_path, monkeypatch, {"diagram": 200})
+    (tmp_path / "a.md").write_text("# Body\n\n![flow](diagram.png)\n")
+    initial = "```mermaid\nflowchart TD\n A -->\n```"
+    monkeypatch.setenv(
+        "FAKE_PATCH", json.dumps({"kind": "mermaid", "markdown": initial})
+    )
+    monkeypatch.setenv("MDOCR_MERMAID_REPAIR_ROUNDS", "3")
+    monkeypatch.setenv("FAKE_INTERRUPT_REPAIR", "1")
+    plan_batch(tmp_path, "interrupted", ["a.md"], 4)
+
+    interrupted = run_batch(tmp_path, "interrupted", -signal.SIGKILL)
+    assert interrupted == json.loads(
+        (tmp_path / "interrupted.json.execution.json").read_bytes()
+    )
+    assert interrupted["status"] == "running"
+    first, repair = interrupted["requests"]
+    assert first["status"] == "success"
+    assert repair["status"] == "admitted" and repair["repair_round"] == 1
+    assert interrupted["budget"]["requests"] == 2
+    assert trace.read_text().splitlines() == ["begin diagram", "end diagram"] * 2
+
+    monkeypatch.delenv("FAKE_INTERRUPT_REPAIR")
+    result = run_batch(tmp_path, "interrupted", 0, "--retry-failed")
+    assert result["status"] == "completed"
+    assert result["budget"] == interrupted["budget"]
+    assert result["requests"] == [
+        first,
+        dict(repair, status="unknown", reason="OCR_OUTCOME_UNKNOWN"),
+    ]
+    (doc,) = result["documents"]
+    (resource,) = doc["resources"]
+    assert resource["warnings"] == ["response_mermaid_syntax_invalid"]
+    assert initial in Path(doc["output"]).read_text()
+    assert trace.read_text().splitlines() == ["begin diagram", "end diagram"] * 2
 
 
 def test_bridge_honors_https_proxy_without_direct_fallback(

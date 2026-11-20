@@ -119,6 +119,8 @@ def _load_plan(root, request):
     ):
         if plan["settings"][key] != policy[key]:
             raise ValueError(f"OCR plan did not preserve {key}")
+    if settings.get("fix", 0) != policy.get("fix", 0):
+        raise ValueError("OCR plan did not preserve fix")
     for key, entry in expected.items():
         doc = docs[key]
         if any(doc[field] != entry[field] for field in ("path", "output", "sha256")):
@@ -383,6 +385,8 @@ def _start_args(root, request):
         "--max-seconds",
         policy["max_seconds"],
     ]
+    if policy.get("fix", 0):
+        args += ["--fix", str(policy["fix"])]
     if policy["mode"] == "llm":
         args += ["--model", policy["model"], "--effort", policy["effort"]]
     if policy["request_budget"] is not None:
@@ -406,7 +410,7 @@ def _start_args(root, request):
     return args
 
 
-def _verify_running_journal(state, budget, mirror=None):
+def _verify_running_journal(state, budget, mirror=None, *, fix=0, repair=0):
     attempts = state["requests"]
     count = state["budget"]["requests"]
     if (
@@ -415,17 +419,49 @@ def _verify_running_journal(state, budget, mirror=None):
         or type(count) is not int
         or count != len(attempts)
         or (budget is not None and count > budget)
-        or len(_index(attempts, "key")) != count
         or any(
             item["status"] not in {"admitted", "success", "failed", "unknown"}
             for item in attempts
         )
     ):
         raise ValueError("OCR journal cannot prove prior admissions")
+    # The same key can occur again only in a bounded fix or repair round.
+    previous = {}
+    for attempt in attempts:
+        key = attempt["key"]
+        last = previous.get(key)
+        tag = "fix_round" if "fix_round" in attempt else "repair_round"
+        if tag in attempt:
+            number = attempt[tag]
+            other = "repair_round" if tag == "fix_round" else "fix_round"
+            if (
+                last is None
+                or other in attempt
+                or type(number) is not int
+                or not 1 <= number <= (fix if tag == "fix_round" else repair)
+                or number != last.get(tag, 0) + 1
+                or (
+                    tag == "fix_round"
+                    and (
+                        "repair_round" in last
+                        or not (
+                            last["status"] == "failed"
+                            or last["status"] == "unknown"
+                            and last.get("reason") == "connection_outcome_unknown"
+                        )
+                    )
+                )
+                or (tag == "repair_round" and last["status"] != "success")
+            ):
+                raise ValueError("OCR journal has an invalid retry round")
+        elif last is not None:
+            raise ValueError("OCR journal duplicates an initial admission")
+        previous[key] = attempt
     if mirror is not None:
         prior = mirror["requests"]
         if len(prior) > count or any(
-            old["key"] != new["key"] or (old["status"] != "admitted" and old != new)
+            any(old.get(k) != new.get(k) for k in ("key", "fix_round", "repair_round"))
+            or (old["status"] != "admitted" and old != new)
             for old, new in zip(prior, attempts)
         ):
             raise ValueError("OCR journal lost observed admissions or outcomes")
@@ -475,7 +511,11 @@ def _execute(root, request, store, run, call_tool, *, allow_dispatch=True):
                             else None
                         )
                         _verify_running_journal(
-                            state, request["policy"]["request_budget"], mirror
+                            state,
+                            request["policy"]["request_budget"],
+                            mirror,
+                            fix=plan["settings"].get("fix", 0),
+                            repair=plan["settings"].get("mermaid_repair_rounds", 0),
                         )
                 elif report_path.exists():
                     # A terminal result is sufficient to inspect completed rows,
@@ -588,7 +628,7 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
     if existing is not None and (
         existing["schema"] != "dogpdkb-ocr-request-3"
         or existing["run_id"] != run.id
-        or existing["policy"] != policy
+        or ({"fix": 0} | existing["policy"]) != ({"fix": 0} | policy)
     ):
         raise ValueError("Saved OCR batch does not match the frozen run policy")
     superseded = set()

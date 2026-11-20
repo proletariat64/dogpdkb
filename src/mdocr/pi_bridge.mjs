@@ -85,6 +85,22 @@ const validateTables = patches => {
   }
 };
 const mermaidBlocks = markdown => fences(markdown).filter(block => /^mermaid(?:\s|$)/i.test(block.info));
+// Mermaid 12.3 also raises plain errors for several invalid diagram constructs.
+// Match the upstream diagnostics narrowly; unrelated runtime faults still stop validation.
+const isMermaidContentError = error => {
+  if ((error?.hash && typeof error.hash.token === 'string') ||
+      (error?.constructor?.name === 'MermaidParseError' && error.result) ||
+      error?.name === 'YAMLException' ||
+      (error?.name === 'UnknownDiagramError' && error.message?.startsWith('No diagram type detected'))) return true;
+  if (error?.name === 'Error') {
+    return /^No such shape: [^\n]+\.$/.test(error.message) ||
+      error.message === "It is not possible to have actors with the same id, even if one is destroyed before the next is created. Use 'AS' aliases to simulate the behavior" ||
+      /^The (?:created participant [^\n]+ does not have an associated creating|destroyed participant [^\n]+ does not have an associated destroying) message after its declaration\. Please check the sequence diagram\.$/.test(error.message);
+  }
+  // The 12.3 flowchart parser dereferences an absent edge for out-of-range linkStyle.
+  return error?.name === 'TypeError' && error.message === "Cannot set properties of undefined (setting 'style')" &&
+    /\bat FlowDB\.updateLink \(/.test(error.stack);
+};
 const mermaidErrors = async ({ kind, markdown }) => {
   const blocks = mermaidBlocks(markdown);
   if ((kind === 'mermaid' && !blocks.length) || blocks.some(block => !block.closed)) fail('response_mermaid_fence_invalid', 'Provider returned an incomplete Mermaid block');
@@ -95,12 +111,7 @@ const mermaidErrors = async ({ kind, markdown }) => {
     try {
       await parser.parse(block.lines.join('\n'));
     } catch (error) {
-      // Mermaid 12.3 uses Jison error hashes, Langium parse results, and
-      // typed detector/front-matter errors. Unrecognized errors fail closed.
-      if ((error?.hash && typeof error.hash.token === 'string') ||
-          (error?.constructor?.name === 'MermaidParseError' && error.result) ||
-          error?.name === 'YAMLException' ||
-          (error?.name === 'UnknownDiagramError' && error.message?.startsWith('No diagram type detected'))) {
+      if (isMermaidContentError(error)) {
         errors.push({ block: index + 1, message: error.message });
       } else {
         fail('mermaid_parser_unavailable', 'Mermaid parser could not validate the diagram');
@@ -119,7 +130,8 @@ const outsideRepairTargets = (markdown, targets) => {
   return JSON.stringify(lines);
 };
 const verifyMermaid = async () => {
-  const errors = await mermaidErrors({ kind: 'mermaid', markdown: '```mermaid\nflowchart LR\n  A --> B\n```' });
+  const checks = ['flowchart LR\n  A --> B', 'sequenceDiagram\n  A->>B: Ping'];
+  const errors = await mermaidErrors({ kind: 'mermaid', markdown: checks.map(body => '```mermaid\n' + body + '\n```').join('\n\n') });
   if (errors.length) fail('mermaid_parser_unavailable', 'Mermaid parser rejected its local diagnostic diagram');
 };
 const findSdk = () => {
@@ -168,6 +180,11 @@ const connection = entry => {
     fail('proxy_unavailable', 'Could not configure the installed Pi HTTPS proxy transport');
   }
 };
+// Fetch exposes these socket/connect failures as an error or its cause.
+const interruptedConnectionCodes = new Set([
+  'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ETIMEDOUT',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET', 'UND_ERR_HEADERS_TIMEOUT',
+]);
 const assertCompleted = (reply, attempted, status) => {
   if (status >= 400) {
     if (status === 429) fail('rate_limited', 'Provider rate limited the request', status);
@@ -274,6 +291,7 @@ labels, directions, participants and relationships. Do not change the number or 
 fence lines, non-Mermaid text, kind or uncertainty. Return the full corrected JSON image patch.` : request.prompt;
     if (repair) content.push({ type: 'text', text: JSON.stringify(repair) });
     let attempted = false;
+    let connectionInterrupted = false;
     let status = null;
     let refused = false;
     let reply;
@@ -285,9 +303,15 @@ fence lines, non-Mermaid text, kind or uncertainty. Return the full corrected JS
           const url = requestUrl(input);
           if (url.href !== expected || attempted) fail('unsupported_transport', 'Pi attempted an unauthorized route or duplicate submission');
           attempted = true;
-          const response = await transport.fetch(input, init);
-          status = response.status;
-          return response;
+          try {
+            const response = await transport.fetch(input, init);
+            status = response.status;
+            return response;
+          } catch (error) {
+            connectionInterrupted = interruptedConnectionCodes.has(error?.code) ||
+              interruptedConnectionCodes.has(error?.cause?.code);
+            throw error;
+          }
         },
         onPayload: payload => ({ ...payload, max_output_tokens: 8192, text: { ...payload.text, format } }),
         onProviderStreamEvent: event => {
@@ -309,6 +333,7 @@ fence lines, non-Mermaid text, kind or uncertainty. Return the full corrected JS
     const total = tokens?.every(n => Number.isSafeInteger(n) && n >= 0) ? tokens.reduce((a, b) => a + b, 0) : null;
     const usageTokens = Number.isSafeInteger(total) ? total : null;
     try {
+      if (connectionInterrupted) fail('connection_outcome_unknown', 'Provider connection was interrupted; outcome is unknown');
       const { image, mermaid_errors } = await validateResponse(reply, attempted, status, refused, repair);
       return { ok: true, image, usage_tokens: usageTokens,
         ...(request.mermaid_diagnostics ? { mermaid_errors } : {}) };

@@ -120,6 +120,9 @@ def _validate(plan, plan_path, result_path, ledger, artifacts, lock_paths):
     if settings["mode"] == "llm" and settings.get("llm_schema") != IMAGE_SCHEMA:
         # A legacy document-level admission cannot authorize per-image retries.
         raise ValueError("unsupported LLM plan schema; legacy plans cannot be executed")
+    fix = settings.get("fix", 0)
+    if type(fix) is not int or fix < 0:
+        raise ValueError("invalid batch fix limit")
     rounds = settings.get("mermaid_repair_rounds", 0)
     if type(rounds) is not int or rounds < 0 or (rounds and settings["mode"] != "llm"):
         raise ValueError("invalid Mermaid repair rounds")
@@ -203,6 +206,22 @@ def _validate(plan, plan_path, result_path, ledger, artifacts, lock_paths):
     return texts
 
 
+# Only known unsuccessful provider attempts where submitting the same image
+# can help. A typed connection interruption is retried separately below.
+_FIXABLE_FAILURES = {
+    "OCR_PROVIDER_FAILED",
+    "OCR_RATE_LIMITED",
+    "rate_limited",
+    "response_incomplete",
+    "response_json_invalid",
+    "response_mermaid_fence_invalid",
+    "response_output_limit",
+    "response_schema_invalid",
+    "response_table_invalid",
+    "response_unexpected_stop",
+}
+
+
 class Execution:
     def __init__(self, plan, digest, ledger, result, artifacts, retry):
         self.docs = plan["documents"]
@@ -210,6 +229,8 @@ class Execution:
         self.mode = self.settings["mode"]
         self.repair_rounds = self.settings.get("mermaid_repair_rounds", 0)
         self.repairs = {}
+        self.fix_limit = self.settings.get("fix", 0)
+        self.fixes = {}
         self.result, self.ledger, self.artifacts = result, ledger, artifacts
         self.retry = retry
         self.deadline = time.monotonic() + self.settings["max_seconds"]
@@ -276,6 +297,8 @@ class Execution:
         self.limit = self.state["concurrency"]["final"]
         self.latest = {}
         for previous in self.state["requests"]:
+            if "fix_round" in previous:
+                self.fixes[previous["key"]] = previous["fix_round"]
             if previous["status"] == "admitted":
                 previous.update(status="unknown", reason="OCR_OUTCOME_UNKNOWN")
             if "repair_round" not in previous or "patches" in previous:
@@ -434,9 +457,10 @@ class Execution:
                 patches, usage, errors = future.result()
             except (LlmError, NotCompleted) as exc:
                 status = exc.status
-                unknown = (
-                    getattr(exc, "unknown", False) or exc.reason == "unknown_outcome"
-                )
+                unknown = getattr(exc, "unknown", False) or exc.reason in {
+                    "unknown_outcome",
+                    "connection_outcome_unknown",
+                }
                 usage = getattr(exc, "usage_tokens", None)
                 attempt.update(
                     status="unknown" if unknown else "failed", reason=exc.reason
@@ -491,7 +515,9 @@ class Execution:
                     )
             self.save()
 
-    def admit(self, pool, active, key, image, *, repair=None, repair_round=0):
+    def admit(
+        self, pool, active, key, image, *, repair=None, repair_round=0, fix=False
+    ):
         if self.client is None:
             # Zero new requests is evaluated before checking credentials.
             if self.settings["request_budget"] == 0:
@@ -518,6 +544,8 @@ class Execution:
         attempt = {"key": key, "status": "admitted", "reserved_tokens": reservation}
         if repair is None:
             self.latest[key] = attempt
+            if fix:
+                self.fixes[key] = attempt["fix_round"] = self.fixes.get(key, 0) + 1
         else:
             attempt["repair_round"] = repair_round
         self.state["requests"].append(attempt)
@@ -543,6 +571,26 @@ class Execution:
                 }
         self.save()
         self.dispatch_pending(pending, pipelines)
+        while self.fix_limit and not self.stop:
+            pending = {
+                key: image
+                for key, image in jobs.items()
+                if self.fixes.get(key, 0) < self.fix_limit
+                and (last := self.latest.get(key)) is not None
+                and (
+                    (
+                        last["status"] == "failed"
+                        and last.get("reason") in _FIXABLE_FAILURES
+                    )
+                    or (
+                        last["status"] == "unknown"
+                        and last.get("reason") == "connection_outcome_unknown"
+                    )
+                )
+            }
+            if not pending:
+                break
+            self.dispatch_pending(pending, pipelines, fix=True)
         for round_number in range(1, self.repair_rounds + 1):
             if not self.repairs or self.stop:
                 break
@@ -552,7 +600,9 @@ class Execution:
             )
         self.repairs.clear()
 
-    def dispatch_pending(self, pending, pipelines, repairs=None, round_number=0):
+    def dispatch_pending(
+        self, pending, pipelines, repairs=None, round_number=0, *, fix=False
+    ):
         repairs = {} if repairs is None else repairs
         waiting = deque(
             deque(key for key in pipeline if key in pending) for pipeline in pipelines
@@ -591,6 +641,7 @@ class Execution:
                         pending.pop(key),
                         repair=repairs.get(key),
                         repair_round=round_number,
+                        fix=fix,
                     )
                     if self.stop:
                         break

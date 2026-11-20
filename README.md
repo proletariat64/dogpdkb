@@ -162,6 +162,11 @@ OCR uses one `mdocr` plan for each batch, defaulting to OpenAI Pi OAuth
 lower the effective limit after throttling. Set `[ocr].mode = "paddle"` to use
 Paddle explicitly. `[ocr].request_budget` is independent of scoring:
 omit it for unlimited requests or set it to 0 to prohibit new requests.
+`[ocr].fix = N` allows up to N batch-end retries per eligible failed image
+including observed connection failures (which may incur duplicate usage).
+Other unknown outcomes are not replayed. The installed TOML sets `fix = 1`; an
+omitted key or `0` disables retries. Standalone OCR uses `mdocr plan --fix N`.
+The original request and time limits still apply.
 Incomplete OCR publishes the usable raw body without claiming OCR success.
 Original v2 evidence is retained under `state/<book>/ocr/<run>/` outside wash.
 

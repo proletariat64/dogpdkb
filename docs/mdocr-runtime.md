@@ -33,7 +33,7 @@ caps concurrent Markdown pipelines; each document processes selected images
 sequentially. A 429 drains active requests before
 admission continues at the lower concurrency, finishing already-started pipelines
 before admitting more documents. A 429 at one stops further admission. Paddle
-keeps its per-image concurrency. The optional request budget counts each initial or repair admission across
+keeps its per-image concurrency. The optional request budget counts each initial, batch fix or repair admission across
 resumes, not cache hits. Initial OCR requests are scheduled before optional
 repairs. If configured, the image cache persists valid
 results even when a sibling image is unknown, keyed by original image SHA-256

@@ -381,6 +381,51 @@ def test_native_resume_keeps_original_admission_after_result_loss(tmp_path):
     }
 
 
+@pytest.mark.parametrize(
+    "reason", ["response_schema_invalid", "connection_outcome_unknown"]
+)
+def test_interrupted_batch_fix_stays_unknown_on_orchestrator_resume(tmp_path, reason):
+    config, differences = _native_instance(tmp_path)
+    config.write_text(
+        config.read_text().replace("request_budget=1", "request_budget=4\nfix=2")
+    )
+    driver = tmp_path / "offline_mdocr.py"
+    driver.write_text(
+        driver.read_text().replace(
+            "        if (root / 'crash').exists():",
+            f"""        if image == b'synthetic image bytes':
+            marker = root / 'once'
+            if not marker.exists():
+                marker.touch()
+                raise runner.LlmError('synthetic failure', reason={reason!r})
+            os._exit(143)
+        if (root / 'crash').exists():""",
+        )
+    )
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 143, first.stderr
+    (run,) = (tmp_path / "runs/funds").glob("run-*/run.json")
+    (journal,) = (tmp_path / "state/funds/ocr").glob("*/plan.json.execution.json")
+    initial = json.loads(journal.read_bytes())
+    assert initial["budget"]["requests"] == 3
+    fix = initial["requests"][-1]
+    assert fix["status"] == "admitted" and fix["fix_round"] == 1
+    resumed = cli("apply", "--config", config, "--resume", run)
+    assert resumed.returncode == 2, resumed.stderr
+    assert (tmp_path / "commands").read_text().splitlines() == ["plan", "run", "run"]
+    assert len((tmp_path / "requests").read_text().splitlines()) == 3
+    final = json.loads(journal.read_bytes())
+    assert final["budget"] == initial["budget"]
+    assert final["requests"][-1] == dict(
+        fix, status="unknown", reason="OCR_OUTCOME_UNKNOWN"
+    )
+    manifest = json.loads(Path(json.loads(resumed.stdout)["manifest"]).read_bytes())
+    assert {row["ocr_status"] for row in manifest["documents"]} == {
+        "completed",
+        "unknown",
+    }
+
+
 def test_legacy_unsettled_admission_cannot_resume_as_single_image_jobs(tmp_path):
     import hashlib
 

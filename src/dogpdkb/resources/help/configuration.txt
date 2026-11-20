@@ -82,6 +82,8 @@ TOML sections are tables. Recognized settings and fallback values:
 - ocr.budget_seconds: positive finite number, default 1800 seconds; mdocr owns
   the admission deadline. The installed sample uses 7200 seconds.
 - ocr.concurrency: OCR worker limit, integer 1-10; default 3.
+- ocr.fix: batch-end retries per eligible failed image, nonnegative integer.
+  Installed sample sets 1; if omitted or 0, no retries.
   mdocr can lower the effective limit after provider throttling.
 - tools.skylark/mdcompare/mdocr/graphify: nonempty executable string or nonempty
   string argv array, default the tool name. This is not shell command text.

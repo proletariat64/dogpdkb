@@ -65,7 +65,8 @@ PLAN_FULL = """Plan controls:
   admission if a trustworthy upper bound is unavailable. --concurrency accepts
   1 through 10 (default 3): active Markdown pipelines for LLM, active image
   jobs for Paddle. The request budget counts image admissions, not documents.
-  --max-seconds is an admission deadline (default 900).
+  --max-seconds is an admission deadline (default 900). --fix N sets at most
+  N extra batch-end requests per eligible failed image (default 0).
   MDOCR_MERMAID_REPAIR_ROUNDS sets the maximum repair attempts per image in LLM
   mode (default 3, 0 disables). The plan freezes this environment setting.
   Repairs count as requests. Unrepaired syntax keeps the original OCR warning.
@@ -91,8 +92,10 @@ RUN_FULL = """Execution and recovery:
   Legacy document-context LLM plans cannot be executed. In LLM mode images
   run sequentially within each Markdown pipeline; only an image is sent.
   HTTP 429 lowers the active concurrency limit by one; at 1 it stops new
-  admissions. Known failed requests require --retry-failed; unknown outcomes
-  are never automatically replayed.
+  admissions. --fix in the plan allows bounded retries of eligible known
+  failures after the initial pass. --retry-failed explicitly retries known
+  failures on rerun. Only an observed connection interruption may be retried
+  despite an unknown result, within --fix; this may incur duplicate usage.
   Total token accounting includes vision and provider-reported output. Each
   mdocr-result-2 document row records output digest and mdocr-ocr-2 evidence
   only if complete. Local original image paths in OCR blocks stay traceable.

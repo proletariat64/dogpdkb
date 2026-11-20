@@ -170,6 +170,7 @@ def inspect_artifacts(wheel: Path, sdist: Path) -> None:
             "mode": "llm",
             "budget_seconds": 7200,
             "concurrency": 3,
+            "fix": 1,
         }
     with tarfile.open(sdist) as archive:
         source_names = {name.split("/", 1)[-1] for name in archive.getnames()}
