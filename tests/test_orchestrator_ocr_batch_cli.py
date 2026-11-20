@@ -219,7 +219,7 @@ class SyntheticLLM:
         assert (model, effort) == ('openai/gpt-6.1-terra', 'medium')
     def preflight(self):
         return {}
-    def convert(self, image, prompt):
+    def convert(self, image, prompt, *, mermaid_diagnostics, repair):
         assert isinstance(image, bytes)
         with (root / 'requests').open('a') as log:
             log.write(repr(image) + '\\n')

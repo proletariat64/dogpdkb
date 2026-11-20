@@ -344,7 +344,7 @@ def test_paddle_and_llm_publish_same_v2_block_shape(tmp_path, monkeypatch):
         def preflight(self):
             return {"ok": True}
 
-        def convert(self, image, _prompt):
+        def convert(self, image, _prompt, *, mermaid_diagnostics, repair):
             assert image == Path("source/0.png").read_bytes()
             return {
                 "image": {

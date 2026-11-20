@@ -16,7 +16,7 @@ _HINTS = {
     "unsupported_effort": "Select a reasoning effort supported by the model.",
     "oauth_required": "Use Pi /login for the selected provider. API keys are not used.",
     "proxy_unavailable": "Check HTTPS_PROXY and Pi's undici dependency.",
-    "mermaid_parser_unavailable": "Set MDOCR_NODE_DEPENDENCIES to the npm prefix containing Mermaid and jsdom.",
+    "mermaid_parser_unavailable": "Reinstall the managed release or set MDOCR_NODE_DEPENDENCIES to a working Mermaid/jsdom npm prefix.",
     "bridge_timeout": "The local Pi diagnostic did not finish within 15 seconds.",
 }
 

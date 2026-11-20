@@ -215,6 +215,14 @@ def plan_command(args) -> int:
         raise ValueError("--mode must be paddle or llm")
     if type(args.concurrency) is not int or not 1 <= args.concurrency <= 10:
         raise ValueError("--concurrency must be between 1 and 10")
+    repair_rounds = 0
+    if args.mode == "llm":
+        configured = os.environ.get("MDOCR_MERMAID_REPAIR_ROUNDS", "3")
+        if not re.fullmatch(r"[0-9]+", configured):
+            raise ValueError(
+                "MDOCR_MERMAID_REPAIR_ROUNDS must be a nonnegative integer"
+            )
+        repair_rounds = int(configured)
     if args.mode == "paddle" and any(
         value is not None
         for value in (
@@ -353,6 +361,7 @@ def plan_command(args) -> int:
     }
     if args.mode == "llm":
         settings["llm_schema"] = IMAGE_SCHEMA
+        settings["mermaid_repair_rounds"] = repair_rounds
     result = {"schema_version": "mdocr-plan-2", "settings": settings, "documents": docs}
     _atomic_json(plan_path, result)
     return 0

@@ -35,8 +35,8 @@ Use mdocr doctor --help --full for the complete contract.
 DOCTOR_FULL = """Local readiness details:
   A usable stored OAuth entry is not proof of account access or quota. Doctor
   never refreshes it. Run `pi` and use /login if no credential is stored.
-  For LLM mode set MDOCR_PI_SDK_DIR if Pi cannot be located and set
-  MDOCR_NODE_DEPENDENCIES to the Mermaid/jsdom npm prefix.
+  For LLM mode set MDOCR_PI_SDK_DIR if Pi cannot be located. Managed releases
+  include Mermaid and jsdom. MDOCR_NODE_DEPENDENCIES overrides their npm prefix.
   For Paddle mode a present token is not proof of remote acceptance.
 """
 
@@ -66,6 +66,9 @@ PLAN_FULL = """Plan controls:
   1 through 10 (default 3): active Markdown pipelines for LLM, active image
   jobs for Paddle. The request budget counts image admissions, not documents.
   --max-seconds is an admission deadline (default 900).
+  MDOCR_MERMAID_REPAIR_ROUNDS sets the maximum repair attempts per image in LLM
+  mode (default 3, 0 disables). The plan freezes this environment setting.
+  Repairs count as requests. Unrepaired syntax keeps the original OCR warning.
 """
 
 RUN = """Example:

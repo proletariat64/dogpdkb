@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from mdocr import llm
 from mdocr.llm import LlmClient, LlmError
 
 pytestmark = pytest.mark.skipif(
@@ -51,8 +52,16 @@ export class ModelRuntime {
    assert.equal(payload.text.format.type, 'json_schema');
    const [message] = context.messages;
    assert.equal(context.messages.length, 1);
-   const [image] = message.content;
-   assert.equal(message.content.length, 1);
+   const [image, repairPart] = message.content;
+   const repairMode = repairPart !== undefined;
+   assert.equal(message.content.length, repairMode ? 2 : 1);
+   if (repairMode) {
+     assert.equal(repairPart.type, 'text');
+     assert.ok(context.systemPrompt.includes('Mermaid repair only'));
+     const prior = JSON.parse(repairPart.text);
+     assert.ok(prior.markdown.includes('A -->'));
+     assert.ok(prior.errors.some(e => e.block === 1 && /parse error on line/i.test(e.message)));
+   }
    assert.equal(image.type, 'image');
    assert.equal(image.mimeType, 'image/png');
    assert.equal(payload.text.format.schema.additionalProperties, false);
@@ -81,7 +90,7 @@ export class ModelRuntime {
      assert.deepEqual(bytes, Buffer.from(process.env.FAKE_PNG_HEX, 'hex'));
    }
    globalThis.fetch = async () => {
-     const outcome = record?.outcome || process.env.FAKE_PROVIDER_OUTCOME || 200;
+     const outcome = (repairMode && process.env.FAKE_REPAIR_OUTCOME) || record?.outcome || process.env.FAKE_PROVIDER_OUTCOME || 200;
      if (outcome === 'unknown') throw new TypeError('socket closed');
      return new Response('{}', {status: Number(outcome)});
    };
@@ -101,13 +110,15 @@ export class ModelRuntime {
      for (const event of events || []) await options.onProviderStreamEvent?.(event);
      return {usage, ...reply};
    }
-   const patch = process.env.FAKE_PATCH ? JSON.parse(process.env.FAKE_PATCH) : {kind:'text', markdown:record?.name || 'Faithful'};
+   const patchText = (repairMode && process.env.FAKE_REPAIR_PATCH) || process.env.FAKE_PATCH;
+   const patch = patchText ? JSON.parse(patchText) : {kind:'text', markdown:record?.name || 'Faithful'};
    return {stopReason:'stop', content:[{type:'text',text:JSON.stringify({uncertainty:'', ...patch})}], usage:{input:4,output:3,cacheRead:0,cacheWrite:0}};
  }
  async settleCredentialWrites() {}
 }
 """)
     monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("MDOCR_MERMAID_REPAIR_ROUNDS", raising=False)
     monkeypatch.delenv("https_proxy", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-forwarded")
     monkeypatch.setenv("MDOCR_PI_SDK_DIR", str(sdk))
@@ -529,10 +540,17 @@ def test_mermaid_lazy_import_failure_overrides_earlier_syntax_warning(
     not os.environ.get("MDOCR_NODE_DEPENDENCIES"), reason="requires real parser"
 )
 @pytest.mark.parametrize("fence", ["```", "````", "~~~"])
-def test_real_mermaid_parser_warns_without_changing_content(
+def test_managed_mermaid_parser_warns_without_changing_content(
     model, tmp_path, monkeypatch, fence
 ):
-    import json
+    installed = tmp_path / "managed environment"
+    bridge = installed / "lib/python/site-packages/mdocr/pi_bridge.mjs"
+    bridge.parent.mkdir(parents=True)
+    shutil.copyfile(llm._PI_BRIDGE, bridge)
+    packages = Path(os.environ["MDOCR_NODE_DEPENDENCIES"]).resolve() / "node_modules"
+    (installed / "node_modules").symlink_to(packages, target_is_directory=True)
+    monkeypatch.setattr(llm, "_PI_BRIDGE", bridge)
+    monkeypatch.delenv("MDOCR_NODE_DEPENDENCIES")
 
     monkeypatch.setenv(
         "FAKE_PATCH",
@@ -559,6 +577,7 @@ def test_real_mermaid_parser_warns_without_changing_content(
 def test_mermaid_warning_publishes_and_survives_cache_reuse(
     model, tmp_path, monkeypatch
 ):
+    monkeypatch.setenv("MDOCR_MERMAID_REPAIR_ROUNDS", "0")
     malformed = "```mermaid\nflowchart TD\n A -->\n```"
     monkeypatch.setenv(
         "FAKE_PATCH", json.dumps({"kind": "mermaid", "markdown": malformed})
@@ -584,6 +603,60 @@ def test_mermaid_warning_publishes_and_survives_cache_reuse(
         assert malformed in Path(evidence["artifact"]).read_text()
         assert malformed in Path(doc["output"]).read_text()
     assert trace.read_text().splitlines() == ["begin diagram", "end diagram"]
+
+
+@pytest.mark.skipif(
+    not os.environ.get("MDOCR_NODE_DEPENDENCIES"), reason="requires real parser"
+)
+@pytest.mark.parametrize(
+    ("repair", "budget", "calls", "last_reason"),
+    [
+        ("valid", 4, 2, None),
+        ("still_invalid", 4, 4, None),
+        ("scope_changed", 4, 2, "response_mermaid_repair_scope_changed"),
+        ("other_diagram_changed", 4, 2, "response_mermaid_repair_scope_changed"),
+        ("unknown", 4, 2, "unknown_outcome"),
+        ("valid", 1, 1, None),
+    ],
+)
+def test_mermaid_repair_uses_durable_requests_and_keeps_fallback(
+    model, tmp_path, monkeypatch, repair, budget, calls, last_reason
+):
+    trace = fixture_images(tmp_path, monkeypatch, {"diagram": 200})
+    (tmp_path / "a.md").write_text("# Body\n\n![flow](diagram.png)\n")
+    initial = (
+        "Kept prose.\n\n```mermaid\nflowchart TD\n A -->\n```\n\n"
+        "```mermaid\nflowchart LR\n C --> D\n```"
+    )
+    repaired = initial.replace("A -->", "A --> B")
+    if repair == "scope_changed":
+        repaired = repaired.replace("Kept prose.", "Invented prose.")
+    elif repair == "other_diagram_changed":
+        repaired = repaired.replace("C --> D", "C --> E")
+    elif repair == "still_invalid":
+        repaired = initial
+    elif repair == "unknown":
+        monkeypatch.setenv("FAKE_REPAIR_OUTCOME", "unknown")
+    monkeypatch.setenv("FAKE_PATCH", json.dumps({"kind": "mixed", "markdown": initial}))
+    monkeypatch.setenv(
+        "FAKE_REPAIR_PATCH", json.dumps({"kind": "mixed", "markdown": repaired})
+    )
+    plan_batch(tmp_path, "repair", ["a.md"], budget)
+    plan = json.loads((tmp_path / "repair.json").read_bytes())
+    assert plan["settings"]["mermaid_repair_rounds"] == 3
+    monkeypatch.setenv("MDOCR_MERMAID_REPAIR_ROUNDS", "0")  # plan policy is frozen
+    result = run_batch(tmp_path, "repair", 0)
+    assert result["budget"]["requests"] == calls
+    assert [x.get("repair_round", 0) for x in result["requests"]] == list(range(calls))
+    assert result["requests"][-1].get("reason") == last_reason
+    (doc,) = result["documents"]
+    (resource,) = doc["resources"]
+    improved = repair == "valid" and budget > 1
+    assert ("warnings" in resource) is not improved
+    assert (repaired if improved else initial) in Path(doc["output"]).read_text()
+    assert "Parse error on line" not in json.dumps(result)
+    assert run_batch(tmp_path, "repair", 0, "--retry-failed") == result
+    assert trace.read_text().splitlines() == ["begin diagram", "end diagram"] * calls
 
 
 def test_bridge_honors_https_proxy_without_direct_fallback(

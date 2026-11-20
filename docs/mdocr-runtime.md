@@ -22,7 +22,9 @@ screenshot. Raster-only LLM runs and all Paddle runs do not start Chrome.
 ## Requests, caching and resume
 
 A provider request includes exactly one image and the configured OCR instructions.
-It does not include authored Markdown, paths, occurrence IDs or peer images. The
+Only a Mermaid repair request also includes the previous OCR patch and local
+parser diagnostics. Requests do not include authored Markdown, paths, occurrence
+IDs or peer images. The
 strict JSON response contains `kind`, `markdown` and `uncertainty`. The runner builds
 the v2 wrapper and document evidence from the original plan.
 
@@ -31,11 +33,13 @@ caps concurrent Markdown pipelines; each document processes selected images
 sequentially. A 429 drains active requests before
 admission continues at the lower concurrency, finishing already-started pipelines
 before admitting more documents. A 429 at one stops further admission. Paddle
-keeps its per-image concurrency. The global request budget counts image admissions
-across resumes, not cache hits. If configured, the image cache persists valid
+keeps its per-image concurrency. The optional request budget counts each initial or repair admission across
+resumes, not cache hits. Initial OCR requests are scheduled before optional
+repairs. If configured, the image cache persists valid
 results even when a sibling image is unknown, keyed by original image SHA-256
-and mode/model/effort/prompt/schema; the prior document-context cache is not
-reused. Markdown is assembled locally after OCR work settles, and an unresolved
+and mode/model/effort/prompt/schema and repair policy; the prior
+document-context cache is not reused. With repair enabled, results that still
+have a Mermaid syntax warning are not cached. Markdown is assembled locally after OCR work settles, and an unresolved
 image prevents publication of its document, not of other completed documents.
 Resume with the same plan, journal and result; unknown image jobs are never
 replayed on that plan. An unrelated new standalone plan has no knowledge of
@@ -54,13 +58,28 @@ Older `invalid_response` journal entries do not record which check failed.
 
 ## Mermaid and inference limits
 
-Install the local Mermaid parser once with `npm install --prefix "$HOME/.local/share/mdocr/node" --ignore-scripts mermaid@12.3.0 jsdom@26.1.0`. Set `MDOCR_NODE_DEPENDENCIES` to that prefix. The parser loads locally, can run offline, and receives no OAuth credential. The bridge still refuses missing/unclosed Mermaid fences or Mermaid output when
+The release installer installs and verifies the local Mermaid parser in the
+managed environment. For a standalone wheel or source checkout, install it with
+`npm install --prefix "$HOME/.local/share/mdocr/node" --ignore-scripts mermaid@12.3.0 jsdom@26.1.0`
+and set `MDOCR_NODE_DEPENDENCIES` to that prefix. An explicit value overrides the
+managed dependencies. The parser runs locally without network or OAuth
+credentials. The bridge refuses missing/unclosed Mermaid fences or Mermaid output when
 the parser is unavailable, including when an individual diagram parser cannot
-load. If a closed Mermaid diagram has a recognized syntax error, the otherwise
-valid OCR text is preserved unchanged. The `mdocr-result-2`
-document resource entry records `warnings: ["response_mermaid_syntax_invalid"]`
-alongside that image’s ID and resource ID, including on cache reuse. The warning
+load. Only recognized syntax errors in closed Mermaid fences are repair candidates.
+`MDOCR_MERMAID_REPAIR_ROUNDS` is read by `mdocr plan`: unset means at most 3 repair
+requests per image, `0` disables repairs, and older plans without the field stay
+at `0`. Each repair receives the original image, previous patch and parser block
+number/message. Parser messages are not persisted. Repairs must pass the regular
+response checks, and changes to already-valid diagrams, fence lines, non-Mermaid text, kind or uncertainty
+are rejected.
+
+The initial otherwise valid OCR patch stays available if repair fails, rounds are
+exhausted, or the existing admission limits prevent repair. Its document resource
+still carries `warnings: ["response_mermaid_syntax_invalid"]`. If a repair is
+interrupted or its outcome is unknown, resume keeps the accepted OCR and does not
+resend the repair. Repairs are recorded separately with `repair_round` and consume
+existing request accounting; no spend cap is introduced by this feature. The warning
 does not change completion status, the original-byte witness, or graph
 publication requirements.
 
-The bridge exposes no live vision input token ceiling from the installed provider descriptors. A hard total-token limit must fail closed unless the runner has a justified upper bound. Request-count limits are independent and unaffected. Do not interpret a successful local runtime preflight as real inference acceptance for either provider.
+The bridge exposes no live vision input token ceiling from the installed provider descriptors. A hard total-token limit must fail closed unless the runner has a justified upper bound. Request-count limits are independent. Do not interpret a successful local runtime preflight as real inference acceptance for either provider.

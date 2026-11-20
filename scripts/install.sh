@@ -128,6 +128,9 @@ ENV_DIR=$(mktemp -d "$PREFIX/versions/$VERSION.XXXXXX")
 npm install --prefix "$ENV_DIR/skylark" --omit=dev --ignore-scripts --no-audit --no-fund pi-skylark@latest
 ln -s ../skylark/node_modules/.bin/skylark "$ENV_DIR/bin/skylark"
 "$ENV_DIR/bin/skylark" --help
+npm install --prefix "$ENV_DIR" --omit=dev --ignore-scripts --no-audit --no-fund mermaid@12.3.0 jsdom@26.1.0
+MDOCR_BRIDGE=$("$ENV_DIR/bin/python" -I -c 'from mdocr.llm import _PI_BRIDGE; print(_PI_BRIDGE)')
+env -u MDOCR_NODE_DEPENDENCIES node "$MDOCR_BRIDGE" <<<'{"op":"verify_mermaid"}'
 "$ENV_DIR/bin/dogpdkb" doctor --package
 # This marker records paths, not authority to remove arbitrary directories.
 printf '1\n%s\n%s\n%s\n' "$PREFIX" "$BIN_DIR" "$CONFIG_DIR" > "$ENV_DIR/.dogpdkb-managed"

@@ -45,6 +45,7 @@ class Installer:
             "mv",
             "sh",
             "bash",
+            "env",
             "flock",
         ):
             (self.tools / name).symlink_to(shutil.which(name))
@@ -91,7 +92,11 @@ with open(os.environ['FAKE_LOG'], 'a') as stream:
 if args[0] == 'venv':
     directory = pathlib.Path(args[-1]) / 'bin'
     directory.mkdir(parents=True)
-    (directory / 'python').symlink_to(sys.executable)
+    python = directory / 'python'
+    python.write_text(f'#!{sys.executable}\\nfrom pathlib import Path\\nimport sys\\n'
+                      'assert sys.argv[1:3] == ["-I", "-c"]\\n'
+                      'print(Path(sys.argv[0]).parent.parent / "lib/mdocr/pi_bridge.mjs")\\n')
+    python.chmod(0o755)
     (directory.parent / 'pyvenv.cfg').write_text('home = test fixture\\n')
     body = pathlib.Path(os.environ['FAKE_CLI_SOURCE']).read_text().replace('@TEST_VERSION@', os.environ['TEST_VERSION'])
     for name in ('dogpdkb', 'mdocr', 'mdcompare'):
@@ -107,17 +112,33 @@ else:
 """,
         )
         (self.tools / "uv").symlink_to(root / "uv-source")
-        self.python_script(self.tools / "node", "print('v22.0.0')\n")
+        self.python_script(
+            self.tools / "node",
+            """
+import json, os, pathlib, sys
+assert 'MDOCR_NODE_DEPENDENCIES' not in os.environ
+assert json.load(sys.stdin) == {'op': 'verify_mermaid'}
+prefix = pathlib.Path(sys.argv[1]).parents[2]
+assert (prefix / 'node_modules/mermaid').is_dir()
+assert (prefix / 'node_modules/jsdom').is_dir()
+if os.environ.get('FAIL_MERMAID_VERIFY'): sys.exit(1)
+""",
+        )
         self.python_script(
             self.tools / "npm",
             """
 import json, os, pathlib, sys
 args = sys.argv[1:]
-assert args[0] == 'install' and args[-1] == 'pi-skylark@latest'
+assert args[0] == 'install'
 with open(os.environ['FAKE_LOG'], 'a') as stream:
     stream.write(json.dumps(['npm', *args]) + '\\n')
 if os.environ.get('FAIL_NPM'): sys.exit(1)
 prefix = pathlib.Path(args[args.index('--prefix') + 1])
+if args[-2:] == ['mermaid@12.3.0', 'jsdom@26.1.0']:
+    for package in ('mermaid', 'jsdom'):
+        (prefix / 'node_modules' / package).mkdir(parents=True)
+    sys.exit(0)
+assert args[-1] == 'pi-skylark@latest'
 binary = prefix / 'node_modules/.bin/skylark'
 binary.parent.mkdir(parents=True)
 binary.write_text(pathlib.Path(os.environ['FAKE_CLI_SOURCE']).read_text().replace('@TEST_VERSION@', os.environ.get('SKYLARK_LATEST', '1.0.0')))
@@ -215,7 +236,8 @@ def test_install_and_upgrade_preserve_config_and_data(installer):
 
 
 @pytest.mark.parametrize(
-    "failure", ["DOWNLOAD", "CHECKSUM", "INSTALL", "DOCTOR", "MDCOMPARE", "NPM"]
+    "failure",
+    ["DOWNLOAD", "CHECKSUM", "INSTALL", "DOCTOR", "MDCOMPARE", "NPM", "MERMAID_VERIFY"],
 )
 def test_failed_upgrade_keeps_working_install(installer, failure):
     assert installer.run().returncode == 0
@@ -331,6 +353,7 @@ def test_override_paths_and_mirror(installer):
         DOGPDKB_BIN_DIR=str(installer.root / "custom-bin"),
         DOGPDKB_CONFIG_DIR=str(installer.root / "custom-config"),
         DOGPDKB_PYPI_INDEX="https://pypi.org/simple",
+        MDOCR_NODE_DEPENDENCIES=str(installer.root / "unused-override"),
     )
     assert installer.run().returncode == 0
     assert (installer.root / "custom-bin/dogpdkb").is_symlink()

@@ -45,6 +45,9 @@ Each install, upgrade or same-version reinstall runs `npm install pi-skylark@lat
 inside the candidate managed environment. npm uses its configured registry; no
 Skylark version is pinned. The command is checked before activation. A download,
 installation or startup failure preserves the previous active environment.
+The installer also installs `mermaid@12.3.0` and `jsdom@26.1.0` in the candidate
+environment and verifies Mermaid parsing before activation. Managed `mdocr`
+works without setting `MDOCR_NODE_DEPENDENCIES`.
 Uninstall removes this managed Skylark copy and its owned link; Node.js, npm and
 unrelated global npm installations remain untouched. Gateway/SSO setup is separate.
 Source examples are disabled. Edit the gateway, source selection and data paths

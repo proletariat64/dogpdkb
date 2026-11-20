@@ -113,7 +113,9 @@ class LlmClient:
             {"op": "preflight", "model": self.model, "effort": self.effort}
         )
 
-    def convert(self, original: bytes, prompt: str) -> dict[str, Any]:
+    def convert(
+        self, original: bytes, prompt: str, *, mermaid_diagnostics=False, repair=None
+    ) -> dict[str, Any]:
         # Image dependencies belong to conversion; doctor probes them separately.
         from .llm_image import vision_image
         from .prepare import ImageError
@@ -134,9 +136,26 @@ class LlmClient:
                     "effort": self.effort,
                     "image": {"path": str(path), "mime_type": mime},
                     "prompt": prompt,
+                    "mermaid_diagnostics": mermaid_diagnostics,
+                    "repair": repair,
                 }
             )
-        return {"image": result["image"], "usage_tokens": result.get("usage_tokens")}
+        output = {"image": result["image"], "usage_tokens": result["usage_tokens"]}
+        if mermaid_diagnostics:
+            errors = result.get("mermaid_errors")
+            if not isinstance(errors, list) or not all(
+                isinstance(e, dict)
+                and set(e) == {"block", "message"}
+                and type(e["block"]) is int
+                and e["block"] > 0
+                and isinstance(e["message"], str)
+                for e in errors
+            ):
+                raise LlmError(
+                    "Pi bridge returned invalid diagnostics", reason="unknown_outcome"
+                )
+            output["mermaid_errors"] = errors
+        return output
 
     def token_upper_bound(self, *_: Any, **__: Any) -> None:
         # No trustworthy provider/model bound for vision input is exposed here.
