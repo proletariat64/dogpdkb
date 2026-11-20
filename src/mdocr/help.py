@@ -90,7 +90,10 @@ RUN_FULL = """Execution and recovery:
   journal is authoritative for prior submissions, even if the result mirror was
   not written. Do not delete or move it to restart an incomplete plan.
   Legacy document-context LLM plans cannot be executed. In LLM mode images
-  run sequentially within each Markdown pipeline; only an image is sent.
+  run sequentially within each Markdown pipeline. Initial OCR sends the configured
+  instructions and one image, not source Markdown. Mermaid repair also sends the
+  image-derived patch and parser diagnostics; set repair rounds to 0 at planning
+  time to disable those extra requests.
   HTTP 429 lowers the active concurrency limit by one; at 1 it stops new
   admissions. --fix in the plan allows bounded retries of eligible known
   failures after the initial pass. --retry-failed explicitly retries known

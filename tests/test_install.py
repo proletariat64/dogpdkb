@@ -106,6 +106,7 @@ if args[0] == 'venv':
     if os.environ.get('FAIL_MDCOMPARE'): (directory / 'mdcompare').unlink()
 elif args[:2] == ['pip', 'install']:
     assert '--default-index' in args
+    assert args[args.index('--link-mode') + 1] == 'copy'
     if os.environ.get('FAIL_INSTALL'): sys.exit(1)
 else:
     raise AssertionError(args)
@@ -354,6 +355,7 @@ def test_override_paths_and_mirror(installer):
         DOGPDKB_CONFIG_DIR=str(installer.root / "custom-config"),
         DOGPDKB_PYPI_INDEX="https://pypi.org/simple",
         MDOCR_NODE_DEPENDENCIES=str(installer.root / "unused-override"),
+        UV_LINK_MODE="symlink",
     )
     assert installer.run().returncode == 0
     assert (installer.root / "custom-bin/dogpdkb").is_symlink()

@@ -140,22 +140,31 @@ class LlmClient:
                     "repair": repair,
                 }
             )
-        output = {"image": result["image"], "usage_tokens": result["usage_tokens"]}
+        output = {"image": result["image"], "usage_tokens": result.get("usage_tokens")}
         if mermaid_diagnostics:
-            errors = result.get("mermaid_errors")
-            if not isinstance(errors, list) or not all(
-                isinstance(e, dict)
-                and set(e) == {"block", "message"}
-                and type(e["block"]) is int
-                and e["block"] > 0
-                and isinstance(e["message"], str)
-                for e in errors
-            ):
-                raise LlmError(
-                    "Pi bridge returned invalid diagnostics", reason="unknown_outcome"
-                )
-            output["mermaid_errors"] = errors
+            output["mermaid_errors"] = self._mermaid_errors(result)
         return output
+
+    @staticmethod
+    def _mermaid_errors(result):
+        errors = result.get("mermaid_errors")
+        if not isinstance(errors, list) or not all(
+            isinstance(e, dict)
+            and set(e) == {"block", "message"}
+            and type(e["block"]) is int
+            and e["block"] > 0
+            and isinstance(e["message"], str)
+            for e in errors
+        ):
+            raise LlmError(
+                "Pi bridge returned invalid diagnostics", reason="unknown_outcome"
+            )
+        return errors
+
+    def mermaid_diagnostics(self, patch):
+        return self._mermaid_errors(
+            self._invoke({"op": "mermaid_diagnostics", "patch": patch})
+        )
 
     def token_upper_bound(self, *_: Any, **__: Any) -> None:
         # No trustworthy provider/model bound for vision input is exposed here.

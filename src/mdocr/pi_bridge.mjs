@@ -261,6 +261,9 @@ const main = async () => {
     await verifyMermaid();
     return { ok: true };
   }
+  if (request.op === 'mermaid_diagnostics') {
+    return { ok: true, mermaid_errors: await mermaidErrors(request.patch) };
+  }
   const [provider, modelId, ...extra] = request.model.split('/');
   if (extra.length || !['openai', 'openai-codex'].includes(provider) || !modelId) fail('unsupported_model', 'Model must use an allowlisted provider/model route');
   if (!['low', 'medium', 'high', 'xhigh'].includes(request.effort)) fail('unsupported_effort', 'Unsupported reasoning effort');

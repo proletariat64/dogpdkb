@@ -410,6 +410,20 @@ def _start_args(root, request):
     return args
 
 
+# Public mdocr result-contract reasons that may precede a fix_round.
+_FIXABLE_FAILURES = {
+    "OCR_RATE_LIMITED",
+    "rate_limited",
+    "response_incomplete",
+    "response_json_invalid",
+    "response_mermaid_fence_invalid",
+    "response_output_limit",
+    "response_schema_invalid",
+    "response_table_invalid",
+    "response_unexpected_stop",
+}
+
+
 def _verify_running_journal(state, budget, mirror=None, *, fix=0, repair=0):
     attempts = state["requests"]
     count = state["budget"]["requests"]
@@ -446,6 +460,7 @@ def _verify_running_journal(state, budget, mirror=None, *, fix=0, repair=0):
                         "repair_round" in last
                         or not (
                             last["status"] == "failed"
+                            and last.get("reason") in _FIXABLE_FAILURES
                             or last["status"] == "unknown"
                             and last.get("reason") == "connection_outcome_unknown"
                         )

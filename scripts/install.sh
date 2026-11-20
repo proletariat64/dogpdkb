@@ -122,7 +122,7 @@ export UV_HTTP_RETRIES="${UV_HTTP_RETRIES:-2}"
 mkdir -p "$PREFIX/versions"
 ENV_DIR=$(mktemp -d "$PREFIX/versions/$VERSION.XXXXXX")
 "$UV" venv --no-config --no-project --no-python-downloads --python "${DOGPDKB_PYTHON:-3.12}" "$ENV_DIR"
-"$UV" pip install --no-config --python "$ENV_DIR/bin/python" --default-index "$INDEX" "$TMP/$WHEEL"
+"$UV" pip install --no-config --link-mode copy --python "$ENV_DIR/bin/python" --default-index "$INDEX" "$TMP/$WHEEL"
 [[ "$("$ENV_DIR/bin/dogpdkb" --version)" == "dogpdkb $VERSION" ]] || fail 'Installed version does not match the Release.'
 "$ENV_DIR/bin/mdcompare" --version
 npm install --prefix "$ENV_DIR/skylark" --omit=dev --ignore-scripts --no-audit --no-fund pi-skylark@latest

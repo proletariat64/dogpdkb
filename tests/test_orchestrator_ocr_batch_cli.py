@@ -381,6 +381,56 @@ def test_native_resume_keeps_original_admission_after_result_loss(tmp_path):
     }
 
 
+def test_changed_mdocr_version_refuses_to_resend_unknown_old_admissions(tmp_path):
+    config, differences = _native_instance(tmp_path, crash=True)
+    config.write_text(
+        config.read_text().replace("request_budget=1", "request_budget=3")
+    )
+    driver = tmp_path / "offline_mdocr.py"
+    initial_driver = driver.read_text()
+    driver.write_text(
+        initial_driver.replace(
+            "runner.LlmClient = SyntheticLLM",
+            "runner.__version__ = '0.3.2'\nrunner.LlmClient = SyntheticLLM",
+        )
+    )
+    assert cli("apply", "--config", config, "--input", differences).returncode == 143
+    (run,) = (tmp_path / "runs/funds").glob("run-*/run.json")
+    (journal,) = (tmp_path / "state/funds/ocr").glob("*/plan.json.execution.json")
+    before = journal.read_bytes()
+    driver.write_text(
+        initial_driver.replace(
+            "runner.LlmClient = SyntheticLLM",
+            "runner.__version__ = '0.3.3'\nrunner.LlmClient = SyntheticLLM",
+        )
+    )
+    resumed = cli("apply", "--config", config, "--resume", run)
+    assert resumed.returncode == 2, resumed.stderr
+    assert "saved OCR request identities do not match" in resumed.stderr
+    assert journal.read_bytes() == before
+    assert len((tmp_path / "requests").read_text().splitlines()) == 1
+
+
+def test_batch_resume_rejects_retry_of_definitive_refusal():
+    from dogpdkb.ocr_batch import _verify_running_journal
+
+    state = {
+        "status": "running",
+        "budget": {"requests": 2},
+        "requests": [
+            {"key": "k", "status": "failed", "reason": "response_refusal"},
+            {
+                "key": "k",
+                "status": "failed",
+                "reason": "response_json_invalid",
+                "fix_round": 1,
+            },
+        ],
+    }
+    with pytest.raises(ValueError, match="invalid retry round"):
+        _verify_running_journal(state, 3, fix=2)
+
+
 @pytest.mark.parametrize(
     "reason", ["response_schema_invalid", "connection_outcome_unknown"]
 )

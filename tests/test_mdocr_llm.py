@@ -820,6 +820,80 @@ def test_interrupted_mermaid_repair_resumes_without_resending(
     assert trace.read_text().splitlines() == ["begin diagram", "end diagram"] * 2
 
 
+@pytest.mark.skipif(
+    not os.environ.get("MDOCR_NODE_DEPENDENCIES"), reason="requires real parser"
+)
+@pytest.mark.parametrize("settled_repairs", [0, 1])
+def test_resume_rebuilds_unsent_mermaid_repair(
+    model, tmp_path, monkeypatch, settled_repairs
+):
+    trace = fixture_images(tmp_path, monkeypatch, {"diagram": 200})
+    (tmp_path / "a.md").write_text("![flow](diagram.png)\n")
+    initial = "```mermaid\nflowchart TD\n A -->\n```"
+    monkeypatch.setenv("MDOCR_MERMAID_REPAIR_ROUNDS", "2")
+    monkeypatch.setenv(
+        "FAKE_PATCH", json.dumps({"kind": "mermaid", "markdown": initial})
+    )
+    monkeypatch.setenv(
+        "FAKE_REPAIR_PATCH", json.dumps({"kind": "mermaid", "markdown": initial})
+    )
+    plan_batch(tmp_path, "resume", ["a.md"], 3)
+    interrupted = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"""
+import os
+from mdocr import cli, runner
+original = runner.Execution.dispatch_pending
+calls = 0
+def interrupted(*args, **kwargs):
+    global calls
+    original(*args, **kwargs)
+    calls += 1
+    if calls == {settled_repairs + 1}:
+        os._exit(75)
+runner.Execution.dispatch_pending = interrupted
+cli.main(['run','--plan','resume.json','--result','resume-result.json'])
+""",
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        timeout=25,
+    )
+    assert interrupted.returncode == 75, interrupted.stderr
+    before = json.loads((tmp_path / "resume.json.execution.json").read_bytes())
+    assert [a.get("repair_round", 0) for a in before["requests"]] == list(
+        range(settled_repairs + 1)
+    )
+    assert before["requests"][-1]["status"] == "success"
+    fixed = initial.replace("A -->", "A --> B")
+    monkeypatch.setenv(
+        "FAKE_REPAIR_PATCH", json.dumps({"kind": "mermaid", "markdown": fixed})
+    )
+    result = run_batch(tmp_path, "resume", 0)
+    assert result["requests"][:-1] == before["requests"]
+    assert result["requests"][-1]["repair_round"] == settled_repairs + 1
+    assert fixed in Path(result["documents"][0]["output"]).read_text()
+    assert trace.read_text().splitlines() == ["begin diagram", "end diagram"] * (
+        settled_repairs + 2
+    )
+
+
+def test_optional_bridge_usage_may_be_omitted(model, tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "FAKE_WIRE",
+        json.dumps(
+            {
+                "ok": True,
+                "image": {"kind": "text", "markdown": "Recognized.", "uncertainty": ""},
+            }
+        ),
+    )
+    assert convert(model, tmp_path)["usage_tokens"] is None
+
+
 def test_bridge_honors_https_proxy_without_direct_fallback(
     model, tmp_path, monkeypatch
 ):

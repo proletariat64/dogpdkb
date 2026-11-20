@@ -209,7 +209,6 @@ def _validate(plan, plan_path, result_path, ledger, artifacts, lock_paths):
 # Only known unsuccessful provider attempts where submitting the same image
 # can help. A typed connection interruption is retried separately below.
 _FIXABLE_FAILURES = {
-    "OCR_PROVIDER_FAILED",
     "OCR_RATE_LIMITED",
     "rate_limited",
     "response_incomplete",
@@ -229,6 +228,7 @@ class Execution:
         self.mode = self.settings["mode"]
         self.repair_rounds = self.settings.get("mermaid_repair_rounds", 0)
         self.repairs = {}
+        self.repair_attempts = {}
         self.fix_limit = self.settings.get("fix", 0)
         self.fixes = {}
         self.result, self.ledger, self.artifacts = result, ledger, artifacts
@@ -301,13 +301,15 @@ class Execution:
                 self.fixes[previous["key"]] = previous["fix_round"]
             if previous["status"] == "admitted":
                 previous.update(status="unknown", reason="OCR_OUTCOME_UNKNOWN")
-            if "repair_round" not in previous or "patches" in previous:
-                self.latest[previous["key"]] = previous
+            if "repair_round" in previous:
+                self.repair_attempts[previous["key"]] = previous
+                if "patches" not in previous or previous.get("warnings"):
+                    continue
+            self.latest[previous["key"]] = previous
         self.reused = self.state.setdefault("reused", {})
         self.latest.update(self.reused)
         self.budget = self.state["budget"]
         self.state["status"] = "running"
-        self.save()
 
     def save(self):
         data = _json(self.state)
@@ -340,6 +342,13 @@ class Execution:
             elif self.mode == "paddle":
                 pipelines.extend([key] for key in bindings.values())
             layout.append((bindings, context))
+        if (
+            not self.latest.keys() <= jobs.keys()
+            or not self.repair_attempts.keys() <= jobs.keys()
+        ):
+            raise ValueError(
+                "saved OCR request identities do not match this runtime; no requests sent"
+            )
         return jobs, pipelines, layout
 
     def cached(self, key):
@@ -466,9 +475,8 @@ class Execution:
                     status="unknown" if unknown else "failed", reason=exc.reason
                 )
             else:
-                attempt.update(status="success")
+                attempt.update(status="success", patches=patches)
                 if "repair_round" not in attempt or not errors:
-                    attempt["patches"] = patches
                     self.latest[key] = attempt
                 if errors:
                     attempt["warnings"] = ["response_mermaid_syntax_invalid"]
@@ -515,9 +523,7 @@ class Execution:
                     )
             self.save()
 
-    def admit(
-        self, pool, active, key, image, *, repair=None, repair_round=0, fix=False
-    ):
+    def admit(self, pool, active, key, image, *, repair=None, fix=False):
         if self.client is None:
             # Zero new requests is evaluated before checking credentials.
             if self.settings["request_budget"] == 0:
@@ -547,14 +553,44 @@ class Execution:
             if fix:
                 self.fixes[key] = attempt["fix_round"] = self.fixes.get(key, 0) + 1
         else:
-            attempt["repair_round"] = repair_round
+            attempt["repair_round"] = (
+                self.repair_attempts.get(key, {}).get("repair_round", 0) + 1
+            )
+            self.repair_attempts[key] = attempt
         self.state["requests"].append(attempt)
         self.budget["requests"] += 1
         self.budget["reserved_tokens"] += reservation
         self.save()
         active[pool.submit(self.convert, image, repair)] = (key, attempt, self.limit)
 
+    def restore_repairs(self):
+        if not self.repair_rounds:
+            return
+        pending = {
+            key: attempt["patches"][0]
+            for key, latest in self.latest.items()
+            if (attempt := self.repair_attempts.get(key, latest))["status"] == "success"
+            and attempt.get("repair_round", 0) < self.repair_rounds
+            and attempt.get("warnings")
+            and attempt.get("patches")
+        }
+        if not pending:
+            return
+        parser = LlmClient(self.settings["model"], self.settings["effort"])
+        for key, patch in pending.items():
+            try:
+                errors = parser.mermaid_diagnostics(patch)
+            except LlmError as exc:
+                raise ValueError(
+                    f"cannot restore Mermaid diagnostics: {exc.reason}"
+                ) from exc
+            if errors:
+                self.repairs[key] = {
+                    k: patch[k] for k in ("kind", "markdown", "uncertainty")
+                } | {"errors": errors}
+
     def dispatch(self, jobs, pipelines):
+        self.restore_repairs()
         pending = {}
         for key, image in jobs.items():
             previous = self.latest.get(key)
@@ -591,18 +627,20 @@ class Execution:
             if not pending:
                 break
             self.dispatch_pending(pending, pipelines, fix=True)
-        for round_number in range(1, self.repair_rounds + 1):
-            if not self.repairs or self.stop:
-                break
-            repairs, self.repairs = self.repairs, {}
+        while self.repairs and not self.stop:
+            repairs = {
+                key: repair
+                for key, repair in self.repairs.items()
+                if self.repair_attempts.get(key, {}).get("repair_round", 0)
+                < self.repair_rounds
+            }
+            self.repairs = {}
             self.dispatch_pending(
-                {key: jobs[key] for key in repairs}, pipelines, repairs, round_number
+                {key: jobs[key] for key in repairs}, pipelines, repairs
             )
         self.repairs.clear()
 
-    def dispatch_pending(
-        self, pending, pipelines, repairs=None, round_number=0, *, fix=False
-    ):
+    def dispatch_pending(self, pending, pipelines, repairs=None, *, fix=False):
         repairs = {} if repairs is None else repairs
         waiting = deque(
             deque(key for key in pipeline if key in pending) for pipeline in pipelines
@@ -640,7 +678,6 @@ class Execution:
                         key,
                         pending.pop(key),
                         repair=repairs.get(key),
-                        repair_round=round_number,
                         fix=fix,
                     )
                     if self.stop:

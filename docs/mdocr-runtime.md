@@ -77,7 +77,9 @@ The initial otherwise valid OCR patch stays available if repair fails, rounds ar
 exhausted, or the existing admission limits prevent repair. Its document resource
 still carries `warnings: ["response_mermaid_syntax_invalid"]`. If a repair is
 interrupted or its outcome is unknown, resume keeps the accepted OCR and does not
-resend the repair. Repairs are recorded separately with `repair_round` and consume
+resend the repair. When the journal proves that the next repair was never
+admitted, resume regenerates its diagnostics locally. An older runtime's request
+identities that no longer match the current plan are rejected before any send. Repairs are recorded separately with `repair_round` and consume
 existing request accounting; no spend cap is introduced by this feature. The warning
 does not change completion status, the original-byte witness, or graph
 publication requirements.
