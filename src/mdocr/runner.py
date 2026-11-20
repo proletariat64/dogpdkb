@@ -360,6 +360,15 @@ class Execution:
             raise ValueError(
                 "saved OCR request identities do not match this runtime; no requests sent"
             )
+        # Keep historic attempt records unchanged. Expose their resolved
+        # source bindings separately, after validating the frozen job keys.
+        legacy = {
+            attempt["key"]: jobs[attempt["key"]]["sha256"]
+            for attempt in self.state["requests"]
+            if "source_sha256" not in attempt
+        }
+        if legacy:
+            self.state["legacy_request_sources"] = legacy
         return jobs, pipelines, layout
 
     def cached(self, key):

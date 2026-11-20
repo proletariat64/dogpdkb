@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import tempfile
+from functools import cache
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -170,8 +171,9 @@ def _request_history(report):
     if not attempts or report["budget"]["requests"] != len(attempts):
         return None
     history, keys = {}, {}
+    legacy = report.get("legacy_request_sources", {})
     for attempt in attempts:
-        source = attempt.get("source_sha256", "")
+        source = attempt.get("source_sha256", legacy.get(attempt["key"], ""))
         if not re.fullmatch(r"[0-9a-f]{64}", source):
             return None  # Older admissions cannot prove the new pre-send claim.
         if keys.setdefault(attempt["key"], source) != source:
@@ -180,7 +182,7 @@ def _request_history(report):
     return history
 
 
-def _verified_result(root, plan, doc, entry, row, history=None):
+def _verified_result(root, plan, doc, entry, row, request_history=None):
     _verify_input(root, entry, doc)
     if row["path"] != doc["path"]:
         raise ValueError("OCR row source path is not its planned source")
@@ -199,10 +201,12 @@ def _verified_result(root, plan, doc, entry, row, history=None):
             for key, item in resources.items()
             if occurrences[key]["selected"]
         ]
-        pre_send = set()
+        pre_send, history = set(), None
         for item, im in selected:
             if "send_state" not in item:
                 continue
+            if history is None and request_history is not None:
+                history = request_history()
             attempts = history.get(im["sha256"]) if history is not None else None
             if (
                 item["send_state"] != "not_sent"
@@ -358,16 +362,14 @@ def _settled_report(root, seal):
 
 
 def _settled_request_history(report, seal):
-    if not any(
-        "send_state" in item for row in report["documents"] for item in row["resources"]
-    ):
-        return None
-    witnesses = seal["witnesses"]
-    if witnesses.get("plan.json.execution.json") != witnesses[seal["report"]]:
-        return (
-            None  # A result without a matching sealed native journal is insufficient.
-        )
-    return _request_history(report)
+    @cache
+    def history():
+        witnesses = seal["witnesses"]
+        if witnesses.get("plan.json.execution.json") != witnesses[seal["report"]]:
+            return None  # An unmirrored result cannot prove a pre-send claim.
+        return _request_history(report)
+
+    return history
 
 
 def _previous_ocr_evidence(previous, row):
