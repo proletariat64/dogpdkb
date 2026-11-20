@@ -87,8 +87,9 @@ RUN_FULL = """Execution and recovery:
   not written. Do not delete or move it to restart an incomplete plan.
   Legacy document-context LLM plans cannot be executed. In LLM mode images
   run sequentially within each Markdown pipeline; only an image is sent.
-  HTTP 429 reduces later admission 3 → 2 → 1, then stops. Known failed requests
-  require --retry-failed; unknown outcomes are never automatically replayed.
+  HTTP 429 lowers the active concurrency limit by one; at 1 it stops new
+  admissions. Known failed requests require --retry-failed; unknown outcomes
+  are never automatically replayed.
   Total token accounting includes vision and provider-reported output. Each
   mdocr-result-2 document row records output digest and mdocr-ocr-2 evidence
   only if complete. Local original image paths in OCR blocks stay traceable.
