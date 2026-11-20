@@ -120,7 +120,7 @@ def test_plan_downloads_remote_reference_once_only_when_selected(tmp_path):
     seen = []
 
     class Server(BaseHTTPRequestHandler):
-        def log_message(self, *_args):
+        def log_message(self, format, *args):
             pass
 
         def do_GET(self):
@@ -330,3 +330,58 @@ def test_nested_list_siblings_are_separate_blocks_with_exact_crlf_spans(tmp_path
         "images"
     ]
     assert text[image["start"] : image["end"]] == "![real](same.png)"
+
+
+def test_only_llm_downloads_svg_and_extensionless_remote_images(tmp_path):
+    seen = []
+    svg = b'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>'
+
+    class Server(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+        def do_GET(self):
+            seen.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(svg)
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Server) as server:
+        base = f"http://127.0.0.1:{server.server_port}"
+        (tmp_path / "source.md").write_text(
+            f"![diagram]({base}/diagram.svg)\n![second]({base}/opaque)"
+        )
+        worker = Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            for mode in ("paddle", "llm"):
+                result = cli(
+                    tmp_path,
+                    "plan",
+                    "--mode",
+                    mode,
+                    "--input",
+                    "source.md",
+                    "--output",
+                    f"{mode}.md",
+                    "--plan",
+                    f"{mode}.json",
+                    "--download",
+                )
+                assert result.returncode == 0, result.stderr
+                images = json.loads((tmp_path / f"{mode}.json").read_text())[
+                    "documents"
+                ][0]["images"]
+                if mode == "paddle":
+                    assert not seen and all(
+                        x["error"] == "REMOTE_IMAGE_FORMAT_UNSUPPORTED" for x in images
+                    )
+                else:
+                    assert seen == ["/diagram.svg", "/opaque"]
+                    assert all(
+                        not x["error"] and Path(x["source_path"]).read_bytes() == svg
+                        for x in images
+                    )
+        finally:
+            server.shutdown()
+            worker.join()

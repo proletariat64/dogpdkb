@@ -336,7 +336,7 @@ def plan_command(args) -> int:
                     "image staging directory overlaps a planned input or output"
                 )
             assets.mkdir(parents=True, exist_ok=False)
-            _bind_remote_images(remote_images, assets)
+            _bind_remote_images(remote_images, assets, args.mode)
     settings = {
         "mode": args.mode,
         "model": model,
@@ -354,14 +354,14 @@ def plan_command(args) -> int:
     return 0
 
 
-def _bind_remote_images(images, assets):
+def _bind_remote_images(images, assets, mode):
     seen = {}
     with requests.Session() as session:
         for image in images:
             url = image["resource_id"]
             if url not in seen:
                 ext = Path(urlsplit(url).path).suffix.lower()
-                if ext not in DEFAULT_ENABLED_EXTENSIONS:
+                if mode == "paddle" and ext not in DEFAULT_ENABLED_EXTENSIONS:
                     seen[url] = {"error": "REMOTE_IMAGE_FORMAT_UNSUPPORTED"}
                 else:
                     try:
@@ -370,7 +370,8 @@ def _bind_remote_images(images, assets):
                         seen[url] = {"error": "REMOTE_IMAGE_DOWNLOAD_FAILED"}
                     else:
                         digest = _digest(data)
-                        path = assets / f"{_digest(url.encode())}{ext}"
+                        suffix = ext if mode == "paddle" else ""
+                        path = assets / f"{_digest(url.encode())}{suffix}"
                         with path.open("xb") as stream:
                             stream.write(data)
                         seen[url] = {

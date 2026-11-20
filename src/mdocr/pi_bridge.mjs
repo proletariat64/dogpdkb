@@ -187,9 +187,8 @@ const main = async () => {
     const content = [{ type: 'text', text: `${request.markdown}\n\nStable image occurrences are named in the source.` }];
     for (const image of request.images) {
       const bytes = await readFile(image.path);
-      const ext = image.path.toLowerCase().split('.').pop();
-      const mimeType = ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' })[ext];
-      if (!mimeType) fail('invalid_image', `Unsupported image format for ${image.id}`);
+      const mimeType = image.mime_type;
+      if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(mimeType)) fail('invalid_image', `Invalid transport encoding for ${image.id}`);
       content.push({ type: 'text', text: `Original image occurrence: ${image.id}` }, { type: 'image', mimeType, data: bytes.toString('base64') });
     }
     let attempted = false;

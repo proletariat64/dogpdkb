@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
+
+from .llm_image import vision_image
+from .prepare import ImageError
 
 DEFAULT_MODEL = "openai/gpt-6.1-terra"
 DEFAULT_EFFORT = "medium"
@@ -97,16 +102,49 @@ class LlmClient:
     def convert(
         self, markdown: str, images: list[dict[str, str]], prompt: str
     ) -> dict[str, Any]:
-        result = self._invoke(
-            {
-                "op": "convert",
-                "model": self.model,
-                "effort": self.effort,
-                "markdown": markdown,
-                "images": images,
-                "prompt": prompt,
-            }
-        )
+        with TemporaryDirectory(prefix="mdocr-vision-") as tmp:
+            attachments = []
+            for i, image in enumerate(images):
+                try:
+                    original = Path(image["path"]).read_bytes()
+                except OSError as exc:
+                    raise LlmError(
+                        f"Cannot read vision image {image['id']}",
+                        reason="IMAGE_DRIFT" if "sha256" in image else "invalid_image",
+                    ) from exc
+                if (
+                    "sha256" in image
+                    and hashlib.sha256(original).hexdigest() != image["sha256"]
+                ):
+                    raise LlmError(
+                        "Planned image bytes changed before vision preparation",
+                        reason="IMAGE_DRIFT",
+                    )
+                try:
+                    data, mime = vision_image(original)
+                except ImageError as exc:
+                    raise LlmError(
+                        f"Cannot prepare vision image {image['id']}: {exc}",
+                        reason="invalid_image",
+                    ) from exc
+                # Keep a private copy even for native images: the bridge must
+                # read exactly the bytes just validated, not a mutable source.
+                path = Path(tmp) / str(i)
+                path.write_bytes(data)
+                attachments.append(
+                    {"id": image["id"], "path": str(path), "mime_type": mime}
+                )
+                del original, data
+            result = self._invoke(
+                {
+                    "op": "convert",
+                    "model": self.model,
+                    "effort": self.effort,
+                    "markdown": markdown,
+                    "images": attachments,
+                    "prompt": prompt,
+                }
+            )
         expected = [item["id"] for item in images]
         patches = result.get("patches")
         if not isinstance(patches, list) or [p.get("id") for p in patches] != expected:

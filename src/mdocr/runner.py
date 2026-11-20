@@ -366,9 +366,10 @@ class Execution:
         if self.mode == "llm":
             if not isinstance(client, LlmClient):
                 raise TypeError("LLM job admitted before preflight")
-            images = [{"id": im["id"], "path": im["source_path"]} for im in job.images]
-            for im in job.images:
-                _text(im["source_path"], im["sha256"], "IMAGE_DRIFT")
+            images = [
+                {"id": im["id"], "path": im["source_path"], "sha256": im["sha256"]}
+                for im in job.images
+            ]
             result = client.convert(job.body, images, self.settings["prompt"])
             patches = _patches(result["patches"], len(images))
             if [p.get("id") for p in patches] != [im["id"] for im in images]:
