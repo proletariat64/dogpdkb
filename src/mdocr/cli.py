@@ -119,8 +119,13 @@ def build_parser(*, full: bool = False) -> argparse.ArgumentParser:
     assemble = sub.add_parser(
         "assemble",
         help="assemble a sealed running journal offline",
-        epilog=contracts.ASSEMBLE + ("\\n" + contracts.ASSEMBLE_FULL if full else ""),
+        epilog=contracts.ASSEMBLE + ("\n" + contracts.ASSEMBLE_FULL if full else ""),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    assemble.add_argument(
+        "--full",
+        action="store_true",
+        help="with -h/--help, show the full local contract",
     )
     assemble.add_argument("--plan", required=True)
     assemble.add_argument("--journal", required=True)

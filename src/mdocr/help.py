@@ -90,7 +90,8 @@ ASSEMBLE = """Example:
 
 Offline assembly verifies the immutable plan and native running journal, then
 writes a new result and completed documents without dispatching OCR.
-Exit codes: 0 complete; 2 partial; 1 invalid inputs or write failure.
+Exit codes: 0 complete; 2 partial or invalid arguments; 1 invalid inputs or write failure.
+Use mdocr assemble --help --full for the complete contract.
 """
 
 ASSEMBLE_FULL = """Assembly never writes to the original plan, journal, result mirror,
