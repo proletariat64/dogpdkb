@@ -90,6 +90,17 @@ export class ModelRuntime {
    catch { return {stopReason: 'error'}; }
    finally { if (record) appendFileSync(trace, `end ${record.name}\n`); }
    if (status !== 200) return {stopReason: 'error'};
+   if (process.env.FAKE_WIRE) {
+     const wire = process.env.FAKE_WIRE;
+     process.stdout.write(wire, () => process.exit(JSON.parse(wire)?.ok === false ? 1 : 0));
+     await new Promise(() => {});
+   }
+   const usage = {input:4,output:3,cacheRead:2,cacheWrite:1};
+   if (process.env.FAKE_REPLY) {
+     const {events, ...reply} = JSON.parse(process.env.FAKE_REPLY);
+     for (const event of events || []) await options.onProviderStreamEvent?.(event);
+     return {usage, ...reply};
+   }
    const patch = process.env.FAKE_PATCH ? JSON.parse(process.env.FAKE_PATCH) : {kind:'text', markdown:record?.name || 'Faithful'};
    return {stopReason:'stop', content:[{type:'text',text:JSON.stringify({uncertainty:'', ...patch})}], usage:{input:4,output:3,cacheRead:0,cacheWrite:0}};
  }
@@ -357,6 +368,75 @@ def test_rate_limit_drains_pipeline_tiers_and_preserves_budget_on_resume(
     assert trace.read_text().splitlines() == [*events, "begin d1", "end d1"]
 
 
+def test_structured_refusal_is_not_ocr_even_if_text_matches_schema(
+    model, tmp_path, monkeypatch
+):
+    fixture_images(tmp_path, monkeypatch, {"a1": 200})
+    (tmp_path / "a.md").write_text("![image](a1.png)\n")
+    refusal = json.dumps({"kind": "text", "markdown": "PRIVATE", "uncertainty": ""})
+    # The SDK flattens refusal parts into text in its AssistantMessage.
+    monkeypatch.setenv(
+        "FAKE_REPLY",
+        json.dumps(
+            {
+                "stopReason": "stop",
+                "content": [{"type": "text", "text": refusal}],
+                "events": [
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "status": "completed",
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "content": [
+                                        {"type": "refusal", "refusal": refusal}
+                                    ],
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        ),
+    )
+    plan_batch(tmp_path, "refusal", ["a.md"], 1)
+    result = run_batch(tmp_path, "refusal", 2)
+    (attempt,) = result["requests"]
+    (doc,) = result["documents"]
+    assert (attempt["status"], attempt["reason"], attempt["usage_tokens"]) == (
+        "failed",
+        "response_refusal",
+        10,
+    )
+    assert doc["resources"][0]["reason"] == "response_refusal"
+    assert doc["output"] is None and "ocr" not in doc
+    assert "PRIVATE" not in json.dumps(result)
+    assert result["budget"]["tokens"] == 10
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        "[]",
+        '{"ok": false, "error": null}',
+        '{"ok": true, "image": {}, "usage_tokens": "invalid"}',
+    ],
+)
+def test_malformed_bridge_protocol_after_submission_is_not_retried(
+    model, tmp_path, monkeypatch, wire
+):
+    trace = fixture_images(tmp_path, monkeypatch, {"a1": 200})
+    (tmp_path / "a.md").write_text("![image](a1.png)\n")
+    monkeypatch.setenv("FAKE_WIRE", wire)
+    plan_batch(tmp_path, "wire", ["a.md"], 2)
+    result = run_batch(tmp_path, "wire", 2)
+    (attempt,) = result["requests"]
+    assert (attempt["status"], attempt["reason"]) == ("unknown", "unknown_outcome")
+    assert run_batch(tmp_path, "wire", 2, "--retry-failed") == result
+    assert trace.read_text().splitlines() == ["begin a1", "end a1"]
+
+
 def test_rejects_non_oauth_provider_route_before_request(model):
     model.model = "anthropic/claude"
     with pytest.raises(LlmError, match="allowlisted"):
@@ -448,20 +528,63 @@ exports.fetch = async (url, options) => {
 
 
 @pytest.mark.parametrize(
-    "patch",
+    ("reply", "reason"),
     [
-        {"id": "wrong", "kind": "text", "markdown": "X"},
-        {"kind": "table", "markdown": "<table><tr><td>X</td></tr></table>"},
-        {"kind": "table", "markdown": "| A | B |\n| --- | --- |\n| X |"},
+        ({"stopReason": "length"}, "response_output_limit"),
+        (
+            {"stopReason": "error", "rawStopReason": "incomplete.content_filter"},
+            "response_content_filter",
+        ),
+        (
+            {"stopReason": "error", "rawStopReason": "incomplete.PRIVATE"},
+            "response_incomplete",
+        ),
+        (
+            {"stopReason": "error", "errorMessage": "incomplete: PRIVATE"},
+            "unknown_outcome",
+        ),
+        (
+            {"stopReason": "stop", "content": [{"type": "text", "text": "PRIVATE"}]},
+            "response_json_invalid",
+        ),
     ],
 )
-def test_rejected_patches_preserve_reported_usage(model, tmp_path, monkeypatch, patch):
-    import json
+def test_provider_stop_and_json_failures_preserve_safe_usage(
+    model, tmp_path, monkeypatch, reply, reason
+):
+    monkeypatch.setenv("FAKE_REPLY", json.dumps(reply))
+    with pytest.raises(LlmError) as exc:
+        convert(model, tmp_path)
+    assert exc.value.reason == reason
+    assert exc.value.usage_tokens == 10
+    assert "PRIVATE" not in str(exc.value)
 
+
+@pytest.mark.parametrize(
+    ("patch", "reason"),
+    [
+        ({"id": "wrong", "kind": "text", "markdown": "X"}, "response_schema_invalid"),
+        (
+            {"kind": "table", "markdown": "<table><tr><td>X</td></tr></table>"},
+            "response_table_invalid",
+        ),
+        (
+            {"kind": "table", "markdown": "| A | B |\n| --- | --- |\n| X |"},
+            "response_table_invalid",
+        ),
+        (
+            {"kind": "mermaid", "markdown": "```mermaid\nA"},
+            "response_mermaid_fence_invalid",
+        ),
+    ],
+)
+def test_rejected_patches_preserve_reported_usage(
+    model, tmp_path, monkeypatch, patch, reason
+):
     monkeypatch.setenv("FAKE_PATCH", json.dumps(patch))
     with pytest.raises(LlmError) as exc:
         convert(model, tmp_path)
-    assert exc.value.reason == "invalid_response"
+    assert exc.value.reason == reason
     assert exc.value.usage_tokens == 7
 
 

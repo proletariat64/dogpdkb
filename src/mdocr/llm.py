@@ -15,6 +15,10 @@ IMAGE_SCHEMA = "mdocr-image-content-1"
 _PI_BRIDGE = Path(__file__).with_name("pi_bridge.mjs")
 
 
+def _valid_usage(value: Any) -> bool:
+    return value is None or (type(value) is int and value >= 0)
+
+
 class LlmError(RuntimeError):
     """A public, machine-readable Pi bridge failure."""
 
@@ -39,6 +43,14 @@ class LlmClient:
         self.env = os.environ.copy()
 
     def _invoke(self, request: dict[str, Any], *, timeout: int = 240) -> dict[str, Any]:
+        def invalid_protocol() -> LlmError:
+            return LlmError(
+                "Pi bridge returned invalid protocol data",
+                reason="unknown_outcome"
+                if request["op"] == "convert"
+                else "bridge_error",
+            )
+
         try:
             process = subprocess.run(
                 ["node", str(_PI_BRIDGE)],
@@ -66,25 +78,30 @@ class LlmClient:
         try:
             result = json.loads(process.stdout)
         except json.JSONDecodeError as exc:
-            raise LlmError(
-                "Pi bridge returned invalid protocol data",
-                reason="unknown_outcome"
-                if request["op"] == "convert"
-                else "invalid_response",
-            ) from exc
+            raise invalid_protocol() from exc
         if not isinstance(result, dict):
-            raise LlmError(
-                "Pi bridge returned invalid protocol data", reason="invalid_response"
-            )
-        if process.returncode or not result.get("ok"):
-            err = result.get("error", {})
-            raise LlmError(
-                err.get("message", "Pi bridge failed"),
-                status=err.get("status"),
-                reason=err.get("reason", "bridge_error"),
-                usage_tokens=err.get("usage_tokens"),
-            )
-        return result
+            raise invalid_protocol()
+        if process.returncode == 0 and result.get("ok") is True:
+            if request["op"] == "convert" and (
+                not isinstance(result.get("image"), dict)
+                or not _valid_usage(result.get("usage_tokens"))
+            ):
+                raise invalid_protocol()
+            return result
+        if process.returncode != 1 or result.get("ok") is not False:
+            raise invalid_protocol()
+        err = result.get("error")
+        if not isinstance(err, dict) or not all(
+            isinstance(err.get(field), str) and err[field]
+            for field in ("reason", "message")
+        ):
+            raise invalid_protocol()
+        status, usage = err.get("status"), err.get("usage_tokens")
+        if (status is not None and type(status) is not int) or not _valid_usage(usage):
+            raise invalid_protocol()
+        raise LlmError(
+            err["message"], status=status, reason=err["reason"], usage_tokens=usage
+        )
 
     def doctor(self) -> dict[str, Any]:
         return self._invoke(
@@ -119,10 +136,7 @@ class LlmClient:
                     "prompt": prompt,
                 }
             )
-        usage = result.get("usage_tokens")
-        if usage is not None and (type(usage) is not int or usage < 0):
-            raise LlmError("Response token usage is invalid", reason="invalid_response")
-        return {"image": result["image"], "usage_tokens": usage}
+        return {"image": result["image"], "usage_tokens": result.get("usage_tokens")}
 
     def token_upper_bound(self, *_: Any, **__: Any) -> None:
         # No trustworthy provider/model bound for vision input is exposed here.

@@ -41,6 +41,16 @@ replayed on that plan. An unrelated new standalone plan has no knowledge of
 unknown attempts from other journals. Legacy LLM plans are read-only historical
 evidence; do not replan previously unknown OCR work.
 
+The LLM journal records fixed reason codes and aggregate token usage when
+available. `response_refusal` is a typed provider refusal, not inferred from text.
+`response_output_limit`, `response_content_filter`, and `response_incomplete`
+identify terminal incomplete responses. Other `response_*` codes distinguish JSON,
+schema, table and Mermaid validation; `mermaid_parser_unavailable` indicates
+local configuration. No refusal message, raw provider reason, or rejected output
+is included in these diagnostics. Missing terminal evidence or invalid bridge
+protocol after possible submission is `unknown_outcome`, not a retryable failure.
+Older `invalid_response` journal entries do not record which check failed.
+
 ## Mermaid and inference limits
 
 Install the local Mermaid parser once with `npm install --prefix "$HOME/.local/share/mdocr/node" --ignore-scripts mermaid@12.3.0 jsdom@26.1.0`. Set `MDOCR_NODE_DEPENDENCIES` to that prefix. The parser loads locally, can run offline, and receives no OAuth credential. The bridge refuses malformed diagrams or explicit Mermaid output when the parser is unavailable; it does not pretend a regex validates Mermaid syntax.
