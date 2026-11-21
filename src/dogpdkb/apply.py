@@ -545,6 +545,9 @@ def prepare_admitted_inputs(settings, book, store, run, admitted, body):
     prepared_path = run.directory / "prepared-inputs.json"
     prepared = read_json(prepared_path) if prepared_path.exists() else {}
     validate_inputs(prepared.values(), check_baseline=True)
+    # Persist the frozen scope before writing prepared witnesses so an
+    # interruption between the two never leaves a resume without scope.
+    run.save(durable=True)
     for index, admitted_row in enumerate(payload["documents"]):
         identifier = admitted_row["document_id"]
         document = store.data["documents"][identifier]

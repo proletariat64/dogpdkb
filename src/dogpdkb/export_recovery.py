@@ -371,6 +371,7 @@ def verify_admission(store, data, body):
         if (
             current.get("raw") != raw
             or step.get("run_id") != run.id
+            or step.get("source_run_id") != json.loads(receipt_bytes)["original_run"]
             or not same_version(step.get("version"), raw.get("version"))
             or not same_version(raw.get("version"), selected["version"])
             or step.get("path") != raw["path"]
@@ -399,6 +400,10 @@ def verify_admission(store, data, body):
 def resume(store, reference):
     match = re.fullmatch(r"run-\d{8}-\d{6}-[0-9a-f]{8}", reference)
     candidate = store.runs / reference if match else Path(reference)
+    if not match and (
+        not candidate.is_absolute() or candidate.resolve() != candidate
+    ):
+        raise ValueError("resume requires a run ID or canonical absolute path")
     resolved_runs = store.runs.resolve()
     if not candidate.resolve().is_relative_to(resolved_runs) or not (
         candidate / "run.json"
