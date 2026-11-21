@@ -34,6 +34,12 @@ previous failure evidence remains. Only actual success clears its graph block.
 dogpdkb update-graph --config instance/dogpdkb.toml --book funds --input manifest.json --retry-graph
 ```
 
+--graph-scope SCOPE --scope-sha256 SHA256 binds an explicitly approved
+text-only cross-run hold scope to the original compile manifest, public graph
+and manifest, frozen input mirror, and semantic cache. It never retries or
+acknowledges held rows and cannot be combined with --retry-graph.
+See docs/orchestrator-graphify-contract.md for the dogpdkb-graph-scope-1 schema.
+
 --graphify-inputs {all,text} defaults to text. Graphify receives a run-owned
 Markdown-only (.md, case-insensitive) mirror with original scan controls. Images,
 PDF, code and other non-Markdown files are excluded from extraction, while original

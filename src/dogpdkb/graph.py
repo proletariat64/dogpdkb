@@ -18,7 +18,7 @@ from dogpdkb.phases import check_graph_manifest, graph_generation
 from dogpdkb.planning import reject_rollback
 from dogpdkb.processes import diagnostic_argv, run_command
 from dogpdkb.records import Run, Store, atomic_json, read_json, version_key
-from dogpdkb.settings import load_config, select_book
+from dogpdkb.settings import document_identity, load_config, select_book
 
 
 def _manifest(settings, book, store, run, reference):
@@ -472,6 +472,15 @@ def _unowned_deferred_sources(settings, book, store, data, *, initial_recovery=F
         return set(candidates)  # No published generation can own these deferred paths.
     if not all(files):
         return set()
+    owned = _native_source_paths(book, native)
+    return {
+        doc_id
+        for doc_id, path in candidates.items()
+        if unicodedata.normalize("NFC", str(path)) not in owned
+    }
+
+
+def _native_source_paths(book, native):
     manifest = read_json(native / "manifest.json")
     if not isinstance(manifest, dict):
         raise TypeError("Graphify baseline manifest must be an object")
@@ -495,12 +504,105 @@ def _unowned_deferred_sources(settings, book, store, data, *, initial_recovery=F
             path = book.corpus / path
         return unicodedata.normalize("NFC", str(path.resolve()))
 
-    owned = {identity(source) for source in sources}
-    return {
-        doc_id
-        for doc_id, path in candidates.items()
-        if identity(str(path)) not in owned
+    return {identity(source) for source in sources}
+
+
+def _load_graph_scope(path, approved_sha, manifest_bytes, book, run):
+    if "graph_retry" in run.data:
+        raise ValueError("frozen graph scope requires an unsealed compile handoff")
+    content = path.read_bytes()
+    if hashlib.sha256(content).hexdigest() != approved_sha:
+        raise ValueError("frozen graph scope SHA-256 mismatch")
+    scope = json.loads(content)
+    if (
+        not isinstance(scope, dict)
+        or scope.get("schema") != "dogpdkb-graph-scope-1"
+        or scope.get("book") != book.key
+        or scope.get("run_id") != run.id
+        or scope.get("compile_sha256") != hashlib.sha256(manifest_bytes).hexdigest()
+        or not all(
+            isinstance(scope.get(name), dict)
+            for name in ("holds", "baseline", "inputs", "semantic_cache", "misses")
+        )
+        or not scope["holds"]
+    ):
+        raise ValueError("invalid frozen graph scope or compile binding")
+    return {**scope, "approval_sha256": approved_sha}
+
+
+def _historical_holds(book, store, run, data, native, scope):
+    """Prove that omission preserves existing suppression; never authorize a retry."""
+    baseline = {
+        name: _digest(native / name) for name in ("graph.json", "manifest.json")
     }
+    if scope["baseline"] != baseline:
+        raise ValueError("frozen graph baseline changed")
+    owned = _native_source_paths(book, native)
+    selected = {row["document_id"] for row in data["documents"]}
+    documents = store.data["documents"]
+    corpus_paths = [doc.get("corpus", {}).get("path") for doc in documents.values()]
+    for doc_id, hold in scope["holds"].items():
+        doc = documents.get(doc_id, {})
+        corpus = doc.get("corpus", {})
+        source_key, remote_id = doc.get("source_key"), doc.get("source_document_id")
+        path = book.corpus / f"source-[{doc_id}].md"
+        step = store.step(doc_id, "graph") or {}
+        if (
+            not isinstance(hold, dict)
+            or doc_id in selected
+            or not isinstance(source_key, str)
+            or not source_key
+            or not isinstance(remote_id, str)
+            or not remote_id
+            or doc_id != document_identity(source_key, remote_id)
+            or corpus.get("path") != str(path)
+            or corpus_paths.count(str(path)) != 1
+            or not path.is_file()
+            or path.resolve() != path
+            or unicodedata.normalize("NFC", str(path)) in owned
+            or any(doc.get(key) for key in ("baseline", "graph_baseline", "graph"))
+            or not isinstance(hold.get("run_id"), str)
+            or not hold["run_id"]
+            or hold["run_id"] == run.id
+            or hold["run_id"] != step.get("run_id")
+            or step.get("status") not in {"failed", "unknown"}
+            or version_key(hold.get("version")) != version_key(corpus.get("version"))
+            or version_key(hold["version"]) != version_key(step.get("version"))
+        ):
+            raise ValueError(f"unproven historical graph hold: {doc_id}")
+        block = store.blocked_attempt(doc_id, "graph", corpus["version"])
+        if not block or (block.get("run_id"), block.get("status")) != (
+            hold["run_id"],
+            step["status"],
+        ):
+            raise ValueError(f"unproven historical graph suppression: {doc_id}")
+    return set(scope["holds"])
+
+
+def _check_frozen_graph_scope(scope, book, pending, snapshot, baseline, candidate):
+    selected = {
+        _input_name(Path(row["path"]).relative_to(book.corpus)) for row in pending
+    }
+    markdown = {name for name in snapshot if Path(name).suffix.lower() == ".md"}
+    if (
+        snapshot != scope["inputs"]
+        or not selected
+        or selected & baseline.keys()
+        or markdown != selected | baseline.keys()
+        or {name: snapshot[name] for name in selected} != scope["misses"]
+    ):
+        raise ValueError("frozen graph mirror or approved misses changed")
+    if scope["baseline"] != {
+        name: _digest(candidate / name) for name in scope["baseline"]
+    }:
+        raise ValueError("frozen Graphify candidate baseline changed")
+    cache = candidate / "cache/semantic"
+    if (
+        not cache.is_dir()
+        or not scope["semantic_cache"]
+        or _snapshot(cache) != scope["semantic_cache"]
+    ):
+        raise ValueError("frozen Graphify semantic cache changed")
 
 
 def _retained_corpus(
@@ -616,6 +718,7 @@ def run_graph(
     retry_graph=False,
     graphify_inputs=None,
     replan=False,
+    graph_scope=None,
 ) -> int:
     """Run native directory extraction; publish only a complete batch."""
     manifest = manifest or run.data["artifacts"].get("manifest")
@@ -687,9 +790,17 @@ def run_graph(
     omitted = _unowned_deferred_sources(
         settings, book, store, data, initial_recovery=recovery
     )
+    graph_dir = settings.graph_for(book)
+    historical_holds = (
+        _historical_holds(book, store, run, data, graph_dir, graph_scope)
+        if graph_scope is not None
+        else set()
+    )
     # A directory scan could otherwise silently retry a blocked source from an
     # earlier batch, even when the new plan selected different documents.
     for doc_id, document in store.data["documents"].items():
+        if doc_id in historical_holds:
+            continue
         version = document.get("corpus", {}).get("version")
         retained_input = False
         if doc_id not in selected:
@@ -733,7 +844,6 @@ def run_graph(
                 reason="SAME_VERSION_NOT_RETRIED",
             )
             return 2
-    graph_dir = settings.graph_for(book)
     graph_path = graph_dir / "graph.json"
     native_manifest = graph_dir / "manifest.json"
     if graph_path.exists() != native_manifest.is_file():
@@ -788,7 +898,15 @@ def run_graph(
     workspace = Path(tempfile.mkdtemp(prefix="graphify-", dir=run.directory))
     public_snapshot = _snapshot(graph_dir)
     corpus, witnesses = _retained_corpus(
-        settings, book, store, run, data, pending, workspace, omitted, graphify_inputs
+        settings,
+        book,
+        store,
+        run,
+        data,
+        pending,
+        workspace,
+        omitted | historical_holds,
+        graphify_inputs,
     )
     if corpus is None:
         return 2
@@ -846,6 +964,10 @@ def run_graph(
         if name != ".dogpdkb.lock"
     }:
         raise ValueError("public Graphify generation changed while freezing baseline")
+    if graph_scope is not None:
+        _check_frozen_graph_scope(
+            graph_scope, book, pending, _snapshot(corpus), baseline_manifest, candidate
+        )
     report = workspace / "result.json"
     run.data["artifacts"].update(
         graph_report=str(report), graph_candidate=str(candidate)
@@ -929,6 +1051,11 @@ def run_graph(
         "omitted_deferred_sources": sorted(omitted),
         "reason": reason,
     }
+    if graph_scope is not None:
+        evidence.update(
+            graph_scope_sha256=graph_scope["approval_sha256"],
+            omitted_historical_sources=sorted(historical_holds),
+        )
     atomic_json(report, evidence, durable=True)
     retained_report = report
     if status == "completed":
@@ -1047,6 +1174,10 @@ def main(argv=None) -> int:
     parser.add_argument("--config", type=Path)
     parser.add_argument("--book")
     parser.add_argument("--retry-graph", action="store_true")
+    parser.add_argument(
+        "--graph-scope", type=Path, help="approved frozen historical-hold scope"
+    )
+    parser.add_argument("--scope-sha256", help="approved SHA-256 of --graph-scope")
     parser.add_argument("--graphify-inputs", choices=["all", "text"])
     parser.add_argument(
         "-i",
@@ -1061,16 +1192,28 @@ def main(argv=None) -> int:
         return 64 if error.code == 2 else int(error.code or 0)
     run = None
     try:
+        if bool(args.graph_scope) != bool(args.scope_sha256):
+            raise ValueError("--graph-scope and --scope-sha256 are required together")
+        if args.graph_scope and (args.retry_graph or args.graphify_inputs == "all"):
+            raise ValueError("frozen graph scope requires text inputs without retry")
         settings = load_config(args.config)
         book = select_book(settings, args.book)
         store = Store(settings, book)
         with store.lock():
-            manifest = read_json(args.input)
+            manifest_bytes = args.input.read_bytes()
+            manifest = json.loads(manifest_bytes)
             if not isinstance(manifest, dict) or not isinstance(
                 manifest.get("run_id"), str
             ):
                 raise TypeError("invalid complete-source manifest")
             run = Run.load(store, manifest.get("run_id", ""))
+            scope = (
+                _load_graph_scope(
+                    args.graph_scope, args.scope_sha256, manifest_bytes, book, run
+                )
+                if args.graph_scope
+                else None
+            )
             run.data.update(status="running", pid=os.getpid(), ended_at=None)
             run.save()
             code = run_graph(
@@ -1078,8 +1221,9 @@ def main(argv=None) -> int:
                 book,
                 store,
                 run,
-                args.input,
+                manifest if scope is not None else args.input,
                 retry_graph=args.retry_graph,
+                graph_scope=scope,
                 graphify_inputs=args.graphify_inputs,
             )
             run.finish(
