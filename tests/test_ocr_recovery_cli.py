@@ -296,7 +296,8 @@ def test_global_invalid_binding_keeps_sync_graph_and_corpus_unchanged(tmp_path):
     assert (tmp_path / "commands.jsonl").read_bytes() == calls
 
 
-def test_saved_ocr_handoff_rechecks_binding_before_corpus(tmp_path):
+@pytest.mark.parametrize("stale", [False, True])
+def test_saved_ocr_handoff_rechecks_publishable_binding(tmp_path, stale):
     from dogpdkb.records import Store, atomic_json
     from dogpdkb.settings import load_config, select_book
 
@@ -314,7 +315,28 @@ def test_saved_ocr_handoff_rechecks_binding_before_corpus(tmp_path):
     atomic_json(
         request.with_name("settled.json"), {"reason": "OCR_RESULT_BINDING_INVALID"}
     )
-    resumed = cli("sync", "--config", config, "--resume", data["run_id"])
-    assert resumed.returncode == 1 and "OCR_RESULT_BINDING_INVALID" in resumed.stderr
-    assert not list((tmp_path / "corpus").glob("*.md"))
+    if stale:
+        store.document(row["document_id"])["raw"]["version"] = "2026-11-14T01:00:00Z"
+        store.save()
+        resumed = cli(
+            "sync",
+            "--config",
+            config,
+            "--resume",
+            data["run_id"],
+            "--stop-after",
+            "corpus",
+        )
+        assert resumed.returncode == 0, resumed.stderr
+        manifest = read(json.loads(resumed.stdout)["manifest"])
+        assert [r["document_id"] for r in manifest["documents"]] == [
+            publication["documents"][1]["document_id"]
+        ]
+        assert not Path(row["path"]).exists()
+    else:
+        resumed = cli("sync", "--config", config, "--resume", data["run_id"])
+        assert (
+            resumed.returncode == 1 and "OCR_RESULT_BINDING_INVALID" in resumed.stderr
+        )
+        assert not list((tmp_path / "corpus").glob("*.md"))
     assert "graphify" not in (tmp_path / "commands.jsonl").read_text()

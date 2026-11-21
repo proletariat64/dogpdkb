@@ -1119,6 +1119,9 @@ def publish_corpus(book, store, run, plan, publication, *, verify_ocr=False):
     if run.data["command"] == "sync":
         rows = current_rows(book, store, run, rows, "corpus", expected=published)
         documents = [published[row["document_id"]] for row in rows]
+    if run.data["command"] in {"apply", "sync"}:
+        # Only rows that can actually publish participate in the OCR gate.
+        require_prior_ocr_binding(store, rows)
     validate_plan({**plan, "documents": rows}, book, store)
     for row, document in zip(rows, documents):
         expected = corpus_destination(book, row["document_id"], row["previous_corpus"])
@@ -1324,8 +1327,6 @@ def apply_run(
         publication = prepare_publication(book, store, run, rows, results)
     if sync and "ocr" not in checkpoints:
         seal_phase(run, "ocr", "publication")
-    # A saved handoff may predate a same-version globally invalid OCR attempt.
-    require_prior_ocr_binding(store, publication["documents"])
     if result := pause(run, "ocr", stop_after):
         return result
     if sync and "graph_generation" not in run.data:
