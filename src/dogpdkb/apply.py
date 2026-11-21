@@ -1134,6 +1134,9 @@ def publish_corpus(book, store, run, plan, publication, *, verify_ocr=False):
         validate_publication_target(document)
         if verify_ocr and document.get("ocr_status") == "completed":
             verify_completed_ocr(store, row, document.get("ocr"))
+    if run.data["command"] == "sync" and "graph_generation" not in run.data:
+        run.data["graph_generation"] = graph_generation(store, book)
+        run.save(durable=True)
     run.stage("corpus", total=len(documents))
     dirty = False
     try:
@@ -1329,9 +1332,6 @@ def apply_run(
         seal_phase(run, "ocr", "publication")
     if result := pause(run, "ocr", stop_after):
         return result
-    if sync and "graph_generation" not in run.data:
-        run.data["graph_generation"] = graph_generation(store, book)
-        run.save(durable=True)
     manifest = publish_corpus(
         book, store, run, plan, publication, verify_ocr=has_publication
     )
