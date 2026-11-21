@@ -718,38 +718,21 @@ def test_candidate_needs_native_work_and_real_source_ownership(tmp_path, with_ch
 
 
 @pytest.mark.parametrize("edge_key", ["edges", "links"])
-@pytest.mark.parametrize("orphan", [True, False])
-def test_native_candidate_requires_bound_declared_edge_source(
-    tmp_path, edge_key, orphan
-):
+def test_candidate_passes_through_native_edge_source_metadata(tmp_path, edge_key):
     config, manifest, source = fixture(tmp_path)
-    graph = source.parent / "graphify-out/graph.json"
-    native_manifest = graph.with_name("manifest.json")
-    write(graph, {"nodes": [{"id": "old"}], "links": []})
-    write(native_manifest, {})
-    before = (graph.read_bytes(), native_manifest.read_bytes())
     tool = tmp_path / "graphify.py"
-    source_name = source.name.replace("42", "442") if orphan else source.name
+    edge = {"source": source.name, "target": source.name, "source_file": "native-label"}
     write_graph = "(out/'graph.json').write_text(json.dumps(graph))"
     proof = GRAPHIFY_PROOF.replace(
         write_graph,
-        f"graph[{edge_key!r}] = [{{'source': {source.name!r}, 'target': {source.name!r}, 'source_file': {source_name!r}}}]\n"
-        + write_graph,
+        f"graph[{edge_key!r}] = [{edge!r}]\n" + write_graph,
     )
     tool.write_text(tool.read_text().removesuffix(GRAPHIFY_PROOF) + proof)
+
     result = cli(config, manifest)
-    run = json.loads((manifest.parent / "run.json").read_text())
-    if orphan:
-        assert result.returncode == 2, result.stdout + result.stderr
-        assert (graph.read_bytes(), native_manifest.read_bytes()) == before
-        report = json.loads(Path(run["artifacts"]["graph_report"]).read_text())
-        assert f"unbound provenance in {edge_key}[0]" in report["reason"]
-        assert Path(report["candidate"]).is_dir()
-        assert cli(config, manifest).returncode == 2
-        assert len((tmp_path / "calls.jsonl").read_text().splitlines()) == 1
-    else:
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert json.loads(graph.read_bytes())[edge_key][0]["source_file"] == source.name
+    assert result.returncode == 0, result.stdout + result.stderr
+    graph = source.parent / "graphify-out/graph.json"
+    assert json.loads(graph.read_bytes())[edge_key] == [edge]
 
 
 @pytest.mark.parametrize("native_cache", [False, True])
