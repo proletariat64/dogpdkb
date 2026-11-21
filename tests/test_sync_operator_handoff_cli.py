@@ -283,3 +283,31 @@ def test_interrupting_live_watch_does_not_signal_sync(tmp_path):
         stdout, stderr = sync.communicate(timeout=10)
         assert sync.returncode == 0, stderr
         assert json.loads(stdout)["status"] == "completed"
+
+
+def test_retry_owns_interrupted_native_writes(tmp_path):
+    config, source = setup_local(tmp_path)
+    (source / "note.md").write_text("# Interrupted native write\n")
+    tool = tmp_path / "tools.py"
+    original = tool.read_text()
+    tool.write_text(
+        original.replace(
+            "    graph=flag('--out')",
+            "    import os, signal\n"
+            "    out=Path(os.environ['GRAPHIFY_OUT'])\n"
+            "    (out/'graph.json').write_text('{}')\n"
+            "    os.kill(os.getppid(), signal.SIGKILL)\n"
+            "    raise SystemExit(0)\n"
+            "    graph=flag('--out')",
+        )
+    )
+    first = cli(tmp_path, "sync", "--config", config, "--dir", source)
+    assert first.returncode == -9, first.stderr
+    (run,) = (tmp_path / "runs/funds").glob("run-*/run.json")
+    assert (tmp_path / "corpus/funds/graphify-out/graph.json").read_text() == "{}"
+    tool.write_text(original)
+    retried = cli(
+        tmp_path, "sync", "--config", config, "--resume", run, "--retry-graph"
+    )
+    assert retried.returncode == 0, retried.stderr
+    assert status(tmp_path, config, run)["publication"]["graph"] == "published"

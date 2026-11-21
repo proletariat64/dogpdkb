@@ -21,8 +21,10 @@ uses its workflow state to suppress a new directory dispatch when it would
 silently resend a known failed or unknown input at the same version. This does
 not inspect graph internals or query native cache to construct a historical hold
 inventory. When there is no pending compilation work (including an unchanged
-run), Graphify is not invoked. Graphify and the orchestrator retain their writer
-locks; Corpus publication remains ordered before graph dispatch.
+run), Graphify is not invoked. Before dispatch, dogpdkb records the directory attempt
+and the unacknowledged current Corpus it could send, including documents
+outside this compile plan. Only selected documents receive new graph facts.
+The writer locks remain in force; Corpus publication precedes graph dispatch.
 
 The configured Graphify CLI and its own authentication/runtime remain external
 prerequisites. The orchestrator does not add Pi, API-key fallback, or provider
@@ -30,8 +32,10 @@ routing. Configuration may pass Graphify's supported model, concurrency and
 token-budget options. These are execution settings, not document-scope controls.
 Normal resume uses the saved run's settings. `--retry-graph` explicitly retries
 graph work for that same run after revalidating its saved batch and current
-inputs; it is not an automatic retry or a way for a later run to resend a known
-failed/unknown version. Existing ordinary run resume, same-run retry and writer
+inputs. An interrupted run may have written native output; retry recognizes
+that run’s last recorded dispatch without treating its own writes as a newer
+run’s result. This is not automatic retry or permission for a later run to
+resend a known failed/unknown version. Existing ordinary run resume, same-run retry and writer
 locks remain supported.
 
 ## Results and failure behavior

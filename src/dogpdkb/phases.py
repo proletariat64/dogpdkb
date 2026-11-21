@@ -62,6 +62,7 @@ def graph_generation(store, book):
     # Keep the saved handoff identity as well as current native output bytes.
     generation = graph.stat() if graph.is_dir() else None
     return {
+        "writer": store.data.get("graph_writer"),
         "directory": [generation.st_dev, generation.st_ino] if generation else None,
         **{
             name: file_digest(graph / name) if (graph / name).is_file() else None

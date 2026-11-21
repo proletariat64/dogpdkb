@@ -984,3 +984,47 @@ def test_only_retained_sources_do_not_call_graphify(tmp_path, action, code):
     assert not (tmp_path / "calls.jsonl").exists()
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
     assert "graph" not in state["documents"]["42"]["steps"]
+
+
+def test_unselected_corpus_exposure_blocks_next_run_and_is_not_acknowledged(tmp_path):
+    config, manifest, selected = fixture(tmp_path)
+    state_path = tmp_path / "state/funds/state.json"
+    state = json.loads(state_path.read_bytes())
+    unselected = selected.parent / "unselected.md"
+    unselected.write_text("# Published by another Corpus batch\n")
+    state["documents"]["43"] = {"corpus": {"version": VERSION, "path": str(unselected)}}
+    write(state_path, state)
+    mode = tmp_path / "mode"
+    mode.write_text("interrupt")
+    assert cli(config, manifest).returncode == 130
+    state = json.loads(state_path.read_bytes())
+    doc = state["documents"]["43"]
+    assert doc["steps"]["graph"]["status"] == "unknown"
+    assert doc["steps"]["graph"]["scan_only"]
+    assert "graph" not in doc
+
+    # A new version of the selected source does not authorize resending 43.
+    next_manifest = manifest.parent.with_name("run-next") / "manifest.json"
+    request = json.loads(manifest.read_bytes())
+    new_version = {**VERSION, "utc": "2026-11-13T10:00:00+00:00"}
+    request["run_id"] = "run-next"
+    request["documents"][0]["version"] = new_version
+    write(next_manifest, request)
+    run = json.loads((manifest.parent / "run.json").read_bytes())
+    run.update(
+        run_id="run-next", artifacts={"manifest": str(next_manifest)}, failures=[]
+    )
+    write(next_manifest.parent / "run.json", run)
+    state["documents"]["42"]["corpus"]["version"] = new_version
+    write(state_path, state)
+    mode.write_text("success")
+    assert cli(config, next_manifest).returncode == 2
+    assert len((tmp_path / "calls.jsonl").read_text().splitlines()) == 1
+
+    state["documents"]["42"]["corpus"]["version"] = VERSION
+    write(state_path, state)
+    assert cli(config, manifest, retry_graph=True).returncode == 0
+    doc = json.loads(state_path.read_bytes())["documents"]["43"]
+    assert "graph" not in doc
+    assert doc["steps"]["graph"]["status"] == "completed"
+    assert not doc["blocked_versions"]["graph"]

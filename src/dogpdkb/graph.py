@@ -224,46 +224,73 @@ def run_graph(
         run.data["graph_publication"] = "published" if reconciled else "no_work"
         run.stage("graphify", total=reconciled, completed=reconciled, failed=0)
         return 2 if partial else 0
+    interrupted_here = store.data.get("graph_writer") == run.id and any(
+        (step := store.step(row["document_id"], "graph"))
+        and step["run_id"] == run.id
+        and step["status"] == "running"
+        for row in pending
+    )
     if (
         retry_graph
         and "graph_generation" in run.data
+        and not interrupted_here
         and graph_generation(store, book) != run.data["graph_generation"]
     ):
         run.failure(step="graph", reason="STALE_GRAPH_HANDOFF", send_state="not_sent")
         return 2
     selected = {row["document_id"] for row in pending}
+    attempted = list(pending)
     retrying = False
-    # The native scan sees the fixed Corpus, including files this plan did not
-    # select. A same-version hold is not permission to send those bytes again.
+    # The fixed scan can send newly published Corpus beyond this compile plan.
+    # Track possible sends without advancing graph facts for unselected inputs.
     for doc_id, document in store.data["documents"].items():
-        corpus_fact = document.get("corpus", {})
-        version = corpus_fact.get("version")
-        path = corpus_fact.get("path")
-        if not (
-            version
-            and path
-            and Path(path).is_file()
-            and Path(path).resolve().is_relative_to(book.corpus)
-            and store.suppressed(doc_id, "graph", version)
-        ):
+        entry = document.get("corpus", {})
+        version, path = entry.get("version"), entry.get("path")
+        if not (version and path):
             continue
         attempt = store.blocked_attempt(doc_id, "graph", version)
-        if (
-            retry_graph
-            and doc_id in selected
-            and attempt
-            and attempt.get("run_id") == run.id
+        previous = store.step(doc_id, "graph") or {}
+        known = document.get("graph", {})
+        digest = entry.get("input_copy_sha256")
+        if not attempt and (
+            doc_id in selected
+            or (
+                digest
+                and (
+                    digest == known.get("sha256")
+                    or (
+                        previous.get("status") == "completed"
+                        and previous.get("scan_only")
+                        and previous.get("input_sha256") == digest
+                    )
+                )
+            )
         ):
-            retrying = True
             continue
-        run.failure(
-            document_id=doc_id,
-            version=version,
-            step="graph",
-            reason="SAME_VERSION_NOT_RETRIED",
-            send_state="not_sent",
-        )
-        return 2
+        if not (
+            Path(path).is_file() and Path(path).resolve().is_relative_to(book.corpus)
+        ):
+            continue
+        if attempt:
+            if not (
+                retry_graph
+                and attempt.get("run_id") == run.id
+                and (
+                    doc_id in selected
+                    or (previous.get("scan_only") and previous["run_id"] == run.id)
+                )
+            ):
+                run.failure(
+                    document_id=doc_id,
+                    version=version,
+                    step="graph",
+                    reason="SAME_VERSION_NOT_RETRIED",
+                    send_state="not_sent",
+                )
+                return 2
+            retrying = True
+        if doc_id not in selected:
+            attempted.append({"document_id": doc_id, "version": version, "path": path})
 
     if retry_graph and "graph_retry" in run.data and not (retrying or replan):
         raise ValueError(
@@ -274,7 +301,9 @@ def run_graph(
     graph_dir = settings.graph_for(book)
     graph_path = graph_dir / "graph.json"
     native_manifest = graph_dir / "manifest.json"
-    input_digests = {row["document_id"]: _digest(Path(row["path"])) for row in pending}
+    input_digests = {
+        row["document_id"]: _digest(Path(row["path"])) for row in attempted
+    }
     run.stage("graphify", total=len(pending), completed=0, failed=0, phase="prepare")
     evidence_root = store.path.parent / "graph-evidence"
     evidence_root.mkdir(parents=True, exist_ok=True)
@@ -282,6 +311,7 @@ def run_graph(
     report = evidence_dir / "result.json"
     log = evidence_dir / "extract.log"
     run.data["artifacts"]["graph_report"] = str(report)
+    store.data["graph_writer"] = run.id
     store.complete_batch(
         (
             {
@@ -293,8 +323,9 @@ def run_graph(
                 "input": row["path"],
                 "report": str(report),
                 "input_sha256": input_digests[row["document_id"]],
+                "scan_only": row["document_id"] not in selected,
             }
-            for row in pending
+            for row in attempted
         ),
         durable=True,
     )
@@ -322,9 +353,9 @@ def run_graph(
             _manifest(book, store, run, data)
             if any(
                 _digest(Path(row["path"])) != input_digests[row["document_id"]]
-                for row in pending
+                for row in attempted
             ):
-                raise ValueError("selected Corpus changed while Graphify was running")
+                raise ValueError("Corpus input changed while Graphify was running")
             status = "completed"
         except IncompleteExtraction as error:
             reason = f"GRAPHIFY_INCOMPLETE_EXTRACTION: {error}"
@@ -349,10 +380,11 @@ def run_graph(
         "graphify", total=len(pending), completed=0, failed=0, phase="record-results"
     )
     outcomes = []
-    for row in pending:
+    for row in attempted:
         doc_id = row["document_id"]
+        scan_only = doc_id not in selected
         acknowledgement = {}
-        if status == "completed":
+        if status == "completed" and not scan_only:
             document = store.document(doc_id)
             witness = row.get("input_copy") or document["corpus"]["input_copy"]
             source_file = Path(row["path"]).relative_to(book.corpus)
@@ -361,7 +393,6 @@ def run_graph(
                 "action": row["action"],
                 "metadata": row.get("metadata", {}),
             }
-            document = store.document(doc_id)
             document["graph"] = {
                 "status": "completed",
                 "version": row["version"],
@@ -397,6 +428,7 @@ def run_graph(
                 "report": str(report),
                 "reason": reason,
                 "input_sha256": input_digests[doc_id],
+                "scan_only": scan_only,
                 **acknowledgement,
             }
         )
@@ -416,6 +448,7 @@ def run_graph(
                 exit_code=code,
                 argv=diagnostic_argv(argv),
                 input_sha256=input_digests[doc_id],
+                scan_only=scan_only,
             )
     store.complete_batch(outcomes, durable=True)
     complete = len(pending) if status == "completed" else 0
