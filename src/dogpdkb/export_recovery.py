@@ -29,14 +29,13 @@ def _bytes(value, root=None):
 def _single(data, schema, remote):
     payload = json.loads(data)
     rows = payload["documents"]
-    if (
-        payload["schema"] != schema
-        or len(rows) != 1
-        or rows[0]["document_id"] != remote
-    ):
-        raise ValueError(
-            "export request/report must bind exactly one expected remote ID"
-        )
+    if payload["schema"] != schema or len(rows) != 1:
+        raise ValueError("export request/report must contain one documented row")
+    identifier = rows[0]["document_id"]
+    if schema == "skylark-export-request-1" and type(identifier) is int:
+        identifier = str(identifier)
+    if identifier != remote:
+        raise ValueError("export request/report must bind the expected remote ID")
     return payload, rows[0]
 
 
@@ -85,6 +84,7 @@ def _snapshot(store, source_id, scope):
                 current.get(fact)
                 for fact in ("raw", "corpus", "graph", "baseline", "graph_baseline")
             )
+            or current.get("absence")
             or not same_version(current["observed"]["version"], version)
             or step["run_id"] != source_id
             or step["status"] != "failed"
@@ -125,12 +125,13 @@ def _snapshot(store, source_id, scope):
         _, requested = _single(request, "skylark-export-request-1", remote)
         ok, result = _single(report, "skylark-export-result-1", remote)
         metadata = result["metadata"]
+        timestamp = metadata.get("content_updated_at") or metadata.get("updated_at")
         if (
             failed["status"] != "failed"
             or failed["path"] != prior["path"]
             or prior["path"] != failure["input"]
-            or requested["format"] != prior["format"]
-            or requested["format"] != selected.get("format", "md")
+            or requested.get("format", "md") != prior.get("format", "md")
+            or requested.get("format", "md") != selected.get("format", "md")
             or requested["path"] != result["path"]
             or result["path"] != spec["markdown"]
             or result["status"] != "completed"
@@ -138,9 +139,7 @@ def _snapshot(store, source_id, scope):
             or ok["counts"] != {"total": 1, "completed": 1, "failed": 0}
             or str(metadata["id"]) != remote
             or not same_version(result["version"], version)
-            or not same_version(
-                metadata.get("content_updated_at") or metadata["updated_at"], version
-            )
+            or (timestamp is not None and not same_version(timestamp, version))
             or type(result["bytes"]) is not int
             or result["bytes"] != len(body)
             or not body.decode("utf-8").strip()
@@ -187,7 +186,7 @@ def prepare(store, source_id, staged, output):
     receipt, _ = _snapshot(store, source_id, data["documents"])
     output = output.absolute()
     if output.resolve() != output or any(
-        output.is_relative_to(path)
+        output.is_relative_to(path.resolve())
         for path in (
             store.path.parent,
             store.runs,

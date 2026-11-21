@@ -151,6 +151,14 @@ def test_generic_raw_only_set_rejects_bad_scope_version_and_hash(tmp_path):
     atomic_json(report, bad_version)
     assert prep(specs[:2], "wrong-version").returncode == 1
     report.write_bytes(correct)
+    state = json.loads(initial)
+    state["documents"][document_identity("team", "beta")]["absence"] = {
+        "run_id": "later-scan"
+    }
+    atomic_json(store.path, state)
+    absent = prep(specs[:2], "absent")
+    assert absent.returncode == 1 and "no longer active" in absent.stderr
+    store.path.write_bytes(initial)
     ready = prep(specs[:2], "prepared")
     assert ready.returncode == 0, ready.stderr
     result = json.loads(ready.stdout)
@@ -203,3 +211,83 @@ def test_generic_raw_only_set_rejects_bad_scope_version_and_hash(tmp_path):
     assert json.loads(resumed.stdout) == receipt
     assert json.loads(record_path.read_bytes())["status"] == "completed"
     assert store.path.read_bytes() == committed
+
+
+def test_partial_sync_cleanup_keeps_recoverable_export_witnesses(tmp_path):
+    config, tool = instance(tmp_path)
+    tool.write_text(
+        tool.read_text().replace(
+            "        path=pathlib.Path(doc['path']);",
+            """        if doc['document_id'] == '2':
+            write(flag('--output'), {'schema':'skylark-export-result-1', 'status':'partial',
+                'documents':[{**doc, 'status':'failed', 'error':'fixture timeout'}],
+                'counts':{'total':1,'completed':0,'failed':1}})
+            raise SystemExit(2)
+        path=pathlib.Path(doc['path']);""",
+        )
+    )
+    old = cli("sync", "--config", config)
+    assert old.returncode == 2, old.stderr
+    original = json.loads(Path(json.loads(old.stdout)["run"]).read_bytes())
+    assert original["cleanup"]["status"] == "completed"
+    assert Path(original["artifacts"]["differences"]).is_file()
+    (failure,) = [entry for entry in original["failures"] if entry["step"] == "export"]
+    assert Path(failure["inputs"][0]).is_file()
+    md = tmp_path / "recovered.md"
+    md.write_text("# Staged body\n")
+    request, report = tmp_path / "staged-request.json", tmp_path / "staged-report.json"
+    atomic_json(
+        request,
+        {
+            "schema": "skylark-export-request-1",
+            "documents": [{"document_id": 2, "path": str(md)}],
+        },
+    )
+    atomic_json(
+        report,
+        {
+            "schema": "skylark-export-result-1",
+            "status": "completed",
+            "counts": {"total": 1, "completed": 1, "failed": 0},
+            "documents": [
+                {
+                    "document_id": "2",
+                    "path": str(md),
+                    "status": "completed",
+                    "version": "2026-11-12T01:00:00Z",
+                    "bytes": md.stat().st_size,
+                    "metadata": {"id": 2},
+                }
+            ],
+        },
+    )
+    staged = tmp_path / "staged.json"
+    atomic_json(
+        staged,
+        {
+            "schema": "dogpdkb-staged-export-1",
+            "documents": [
+                {
+                    "source_key": "team",
+                    "remote_id": "2",
+                    "request": str(request),
+                    "report": str(report),
+                    "markdown": str(md),
+                }
+            ],
+        },
+    )
+    before = (tmp_path / "commands.jsonl").read_bytes()
+    prepared = cli(
+        "recover-export",
+        "--config",
+        config,
+        "--run",
+        original["run_id"],
+        "--input",
+        staged,
+        "--output-dir",
+        tmp_path / "prepared",
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    assert (tmp_path / "commands.jsonl").read_bytes() == before
