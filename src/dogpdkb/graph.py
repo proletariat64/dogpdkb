@@ -356,6 +356,18 @@ def _prove_coverage(
                 or prior.get("semantic_hash") != expected
             ):
                 changed += 1
+    for kind in ("nodes", "edges", "links", "hyperedges"):
+        for index, record in enumerate(graph.get(kind, [])):
+            if "source_file" not in record:
+                continue  # Native records may have no declared source.
+            source = record["source_file"]
+            if (
+                not isinstance(source, str)
+                or unicodedata.normalize("NFC", source) not in tool_manifest
+            ):
+                raise IncompleteExtraction(
+                    f"Graphify has unbound provenance in {kind}[{index}]"
+                )
     if changed > native_work:
         raise IncompleteExtraction(
             "native extraction or cache evidence omitted changed sources"

@@ -155,6 +155,10 @@ previous public generation must be accounted for by native dispatch or cache
 hit counts; a terminal write alone cannot prove new work. Validate other present
 manifest stamps against their frozen bytes. The native manifest
 uses MD5 as a change stamp; dogpdkb records SHA-256 input witnesses separately.
+Every declared `source_file` in a candidate node, edge/link or hyperedge must
+bind to a validated native manifest path. Valid edge endpoints do not prove
+edge provenance. An unbound claim blocks the whole candidate; the orchestrator
+never guesses or rewrites source paths.
 No size growth or shrink threshold substitutes for these checks.
 
 Recheck the full frozen input tree, source witnesses and prior public generation.
