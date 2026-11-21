@@ -152,6 +152,19 @@ class Store:
             "graph": str(self.settings.graph_for(self.book).resolve()),
         }
 
+    @property
+    def graph_writer_path(self) -> Path:
+        return self.settings.graph_for(self.book) / ".dogpdkb-graph-writer"
+
+    def graph_writer(self) -> str | None:
+        try:
+            return json.loads(self.graph_writer_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+
+    def record_graph_writer(self, run_id: str) -> None:
+        atomic_json(self.graph_writer_path, run_id, durable=True)
+
     def input_directory(self, doc_id: str) -> Path:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", doc_id):
             raise ValueError("source ID cannot be represented as a local filename")

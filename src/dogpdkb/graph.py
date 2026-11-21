@@ -320,7 +320,6 @@ def run_graph(
     report = evidence_dir / "result.json"
     log = evidence_dir / "extract.log"
     run.data["artifacts"]["graph_report"] = str(report)
-    store.data["graph_writer"] = run.id
     store.complete_batch(
         (
             {
@@ -338,6 +337,7 @@ def run_graph(
         ),
         durable=True,
     )
+    store.record_graph_writer(run.id)
     run.stage("graphify", total=len(pending), completed=0, failed=0, phase="tools")
     argv = _native_extract(
         settings.command("graphify"),

@@ -62,7 +62,7 @@ def graph_generation(store, book):
     # Keep the saved handoff identity as well as current native output bytes.
     generation = graph.stat() if graph.is_dir() else None
     return {
-        "writer": store.data.get("graph_writer"),
+        "writer": store.graph_writer(),
         "directory": [generation.st_dev, generation.st_ino] if generation else None,
         **{
             name: file_digest(graph / name) if (graph / name).is_file() else None
@@ -74,7 +74,7 @@ def graph_generation(store, book):
 def graph_handoff_matches(store, book, run):
     # A different run's dispatch makes this handoff stale, even if final
     # native bytes are identical. Own writes do not invalidate an explicit retry.
-    return store.data.get("graph_writer") == run.id or run.data[
+    return store.graph_writer() == run.id or run.data[
         "graph_generation"
     ] == graph_generation(store, book)
 

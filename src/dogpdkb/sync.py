@@ -136,7 +136,7 @@ def _settle_graph(settings, book, store, run, manifest, retry_graph, *, replan=F
     )
     if run.data["graph_publication"] == "pending":
         run.data["graph_publication"] = (
-            "unknown" if store.data.get("graph_writer") == run.id else "retained"
+            "unknown" if store.graph_writer() == run.id else "retained"
         )
     if run.data.get("graph_result") == "unknown" and graph_code == 1:
         # An unproven tool result leaves unresolved work, not a fatal instance error.

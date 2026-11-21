@@ -357,3 +357,40 @@ def test_retry_after_failed_outcome_saved_before_run_metadata(tmp_path, monkeypa
     tool.write_text(original)
     result = cli(tmp_path, "sync", "--config", config, "--resume", run, "--retry-graph")
     assert result.returncode == 0, result.stderr
+
+
+def test_another_instance_writing_same_graph_target_supersedes_retry(tmp_path):
+    graph = tmp_path / "shared-native-output"
+    a, b = tmp_path / "instance-a", tmp_path / "instance-b"
+    for root in (a, b):
+        root.mkdir()
+        config, source = setup_local(root)
+        config.write_text(
+            config.read_text() + f"\n[paths]\ngraph_dir={json.dumps(str(graph))}\n"
+        )
+        (source / "note.md").write_text(f"# Corpus from {root.name}\n")
+    tool = a / "tools.py"
+    original = tool.read_text()
+    tool.write_text(
+        original.replace(
+            "    graph=flag('--out')",
+            "    raise SystemExit(1)\n    graph=flag('--out')",
+        )
+    )
+    config_a = a / "instance.toml"
+    config_b = b / "instance.toml"
+    first = cli(a, "sync", "--config", config_a, "--dir", a / "inbox")
+    assert first.returncode == 2, first.stderr
+    run_a = Path(json.loads(first.stdout)["run"])
+    second = cli(b, "sync", "--config", config_b, "--dir", b / "inbox")
+    assert second.returncode == 0, second.stderr
+    before = (graph / "graph.json").read_bytes()
+    tool.write_text(original)
+    retry = cli(a, "sync", "--config", config_a, "--resume", run_a, "--retry-graph")
+    assert retry.returncode == 2, retry.stderr
+    assert (graph / "graph.json").read_bytes() == before
+    assert (a / "commands.jsonl").read_text().count('["graphify", "extract"') == 1
+    assert any(
+        f["reason"] == "STALE_GRAPH_HANDOFF"
+        for f in json.loads(run_a.read_text())["failures"]
+    )

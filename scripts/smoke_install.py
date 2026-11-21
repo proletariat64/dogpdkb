@@ -118,7 +118,7 @@ elif tool == 'skylark' and args[0] == 'export':
     write(flag('--output'), {'schema':'skylark-export-result-1','status':'completed',
         'documents':rows,'counts':{'total':len(rows),'completed':len(rows),'failed':0}})
 elif tool == 'graphify' and args[0] == 'extract':
-    graph=flag('--out')/'graphify-out/graph.json'
+    graph=flag('--out')/os.environ['GRAPHIFY_OUT']/'graph.json'
     write(graph, {'nodes':[], 'links':[], 'graph':{}})
     write(graph.with_name('manifest.json'), {})
 else:
