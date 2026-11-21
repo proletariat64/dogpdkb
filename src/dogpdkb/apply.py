@@ -779,11 +779,20 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
             }
             for row in active:
                 row["resources"] = resources.get(row["document_id"], [])
+            if not replan and run.data.get("artifacts", {}).get("admitted_run"):
                 # Comparison-derived resources must not rewrite an admitted raw
                 # fact; the admission record stays byte-exact for revalidation.
-                if not replan and not run.data.get("artifacts", {}).get(
-                    "admitted_run"
-                ):
+                # Persist them on the prepared rows so a later resume keeps
+                # the catalog instead of re-deriving it.
+                prepared = Path(run.data["artifacts"]["prepared_inputs"])
+                cataloged = read_json(prepared)
+                for prepared_row in active:
+                    cataloged[prepared_row["document_id"]]["resources"] = (
+                        prepared_row["resources"]
+                    )
+                atomic_json(prepared, cataloged)
+            elif not replan:
+                for row in active:
                     store.document(row["document_id"])["raw"]["resources"] = row[
                         "resources"
                     ]
