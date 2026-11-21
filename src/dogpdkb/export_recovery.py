@@ -399,7 +399,10 @@ def verify_admission(store, data, body):
 
 def resume(store, reference):
     match = re.fullmatch(r"run-\d{8}-\d{6}-[0-9a-f]{8}", reference)
-    candidate = (store.runs / reference if match else Path(reference)).resolve()
+    candidate = store.runs / reference if match else Path(reference)
+    if candidate.name == "run.json":
+        candidate = candidate.parent
+    candidate = candidate.resolve()
     resolved_runs = store.runs.resolve()
     if not candidate.is_relative_to(resolved_runs) or not (
         candidate / "run.json"
