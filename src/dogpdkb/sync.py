@@ -14,7 +14,7 @@ from dogpdkb.ocr_batch import file_digest
 from dogpdkb.phases import (
     SYNC_PHASES,
     check_graph_manifest,
-    graph_generation,
+    graph_handoff_matches,
     read_checkpoint,
     seal_phase,
 )
@@ -106,7 +106,7 @@ def graph_handoff_current(book, store, run):
                 and file_digest(witness) == row["input_copy_sha256"]
             ):
                 pending = True
-    return not pending or run.data["graph_generation"] == graph_generation(store, book)
+    return not pending or graph_handoff_matches(store, book, run)
 
 
 def _settle_graph(settings, book, store, run, manifest, retry_graph, *, replan=False):
@@ -135,7 +135,9 @@ def _settle_graph(settings, book, store, run, manifest, retry_graph, *, replan=F
         replan=replan,
     )
     if run.data["graph_publication"] == "pending":
-        run.data["graph_publication"] = "retained"
+        run.data["graph_publication"] = (
+            "unknown" if store.data.get("graph_writer") == run.id else "retained"
+        )
     if run.data.get("graph_result") == "unknown" and graph_code == 1:
         # An unproven tool result leaves unresolved work, not a fatal instance error.
         return 2

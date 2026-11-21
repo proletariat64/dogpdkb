@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 from dogpdkb.help import HelpParser
-from dogpdkb.phases import check_graph_manifest, graph_generation
+from dogpdkb.phases import check_graph_manifest, graph_handoff_matches
 from dogpdkb.planning import reject_rollback
 from dogpdkb.processes import diagnostic_argv, run_command
 from dogpdkb.records import Run, Store, atomic_json, read_json, version_key
@@ -224,61 +224,52 @@ def run_graph(
         run.data["graph_publication"] = "published" if reconciled else "no_work"
         run.stage("graphify", total=reconciled, completed=reconciled, failed=0)
         return 2 if partial else 0
-    interrupted_here = store.data.get("graph_writer") == run.id and any(
-        (step := store.step(row["document_id"], "graph"))
-        and step["run_id"] == run.id
-        and step["status"] == "running"
-        for row in pending
-    )
     if (
         retry_graph
         and "graph_generation" in run.data
-        and not interrupted_here
-        and graph_generation(store, book) != run.data["graph_generation"]
+        and not graph_handoff_matches(store, book, run)
     ):
         run.failure(step="graph", reason="STALE_GRAPH_HANDOFF", send_state="not_sent")
         return 2
-    selected = {row["document_id"] for row in pending}
-    attempted = list(pending)
+    attempted = {row["document_id"]: row for row in pending}
+    selected = set(attempted)
+    input_digests = {
+        doc_id: _digest(Path(row["path"])) for doc_id, row in attempted.items()
+    }
     retrying = False
-    # The fixed scan can send newly published Corpus beyond this compile plan.
-    # Track possible sends without advancing graph facts for unselected inputs.
+    # Record possible sends in the fixed directory, not just selected facts.
     for doc_id, document in store.data["documents"].items():
         entry = document.get("corpus", {})
         version, path = entry.get("version"), entry.get("path")
-        if not (version and path):
+        if not (
+            version
+            and path
+            and Path(path).is_file()
+            and Path(path).resolve().is_relative_to(book.corpus)
+        ):
             continue
+        digest = input_digests[doc_id] if doc_id in selected else _digest(Path(path))
+        if entry.get("input_copy_sha256", digest) != digest:
+            run.failure(
+                document_id=doc_id,
+                version=version,
+                step="graph",
+                reason="CORPUS_PUBLICATION_UNSETTLED",
+                send_state="not_sent",
+            )
+            return 2
         attempt = store.blocked_attempt(doc_id, "graph", version)
         previous = store.step(doc_id, "graph") or {}
-        known = document.get("graph", {})
-        digest = entry.get("input_copy_sha256")
-        if not attempt and (
-            doc_id in selected
-            or (
-                digest
-                and (
-                    digest == known.get("sha256")
-                    or (
-                        previous.get("status") == "completed"
-                        and previous.get("scan_only")
-                        and previous.get("input_sha256") == digest
-                    )
-                )
-            )
-        ):
-            continue
-        if not (
-            Path(path).is_file() and Path(path).resolve().is_relative_to(book.corpus)
-        ):
-            continue
         if attempt:
+            own_scan = (
+                previous.get("scan_only")
+                and previous["run_id"] == run.id
+                and version_key(previous["version"]) == version_key(version)
+            )
             if not (
                 retry_graph
-                and attempt.get("run_id") == run.id
-                and (
-                    doc_id in selected
-                    or (previous.get("scan_only") and previous["run_id"] == run.id)
-                )
+                and attempt["run_id"] == run.id
+                and (doc_id in selected or own_scan)
             ):
                 run.failure(
                     document_id=doc_id,
@@ -288,9 +279,30 @@ def run_graph(
                     send_state="not_sent",
                 )
                 return 2
+            if doc_id not in selected and (
+                previous.get("input") != path or previous.get("input_sha256") != digest
+            ):
+                raise ValueError(
+                    "a source exposed by the saved Graphify attempt changed"
+                )
             retrying = True
+        elif (
+            doc_id in selected
+            or digest == document.get("graph", {}).get("sha256")
+            or (
+                previous.get("status") == "completed"
+                and previous.get("scan_only")
+                and previous.get("input_sha256") == digest
+            )
+        ):
+            continue
         if doc_id not in selected:
-            attempted.append({"document_id": doc_id, "version": version, "path": path})
+            attempted[doc_id] = {
+                "document_id": doc_id,
+                "version": version,
+                "path": path,
+            }
+            input_digests[doc_id] = digest
 
     if retry_graph and "graph_retry" in run.data and not (retrying or replan):
         raise ValueError(
@@ -301,9 +313,6 @@ def run_graph(
     graph_dir = settings.graph_for(book)
     graph_path = graph_dir / "graph.json"
     native_manifest = graph_dir / "manifest.json"
-    input_digests = {
-        row["document_id"]: _digest(Path(row["path"])) for row in attempted
-    }
     run.stage("graphify", total=len(pending), completed=0, failed=0, phase="prepare")
     evidence_root = store.path.parent / "graph-evidence"
     evidence_root.mkdir(parents=True, exist_ok=True)
@@ -325,7 +334,7 @@ def run_graph(
                 "input_sha256": input_digests[row["document_id"]],
                 "scan_only": row["document_id"] not in selected,
             }
-            for row in attempted
+            for row in attempted.values()
         ),
         durable=True,
     )
@@ -353,7 +362,7 @@ def run_graph(
             _manifest(book, store, run, data)
             if any(
                 _digest(Path(row["path"])) != input_digests[row["document_id"]]
-                for row in attempted
+                for row in attempted.values()
             ):
                 raise ValueError("Corpus input changed while Graphify was running")
             status = "completed"
@@ -380,7 +389,7 @@ def run_graph(
         "graphify", total=len(pending), completed=0, failed=0, phase="record-results"
     )
     outcomes = []
-    for row in attempted:
+    for row in attempted.values():
         doc_id = row["document_id"]
         scan_only = doc_id not in selected
         acknowledgement = {}
@@ -427,6 +436,7 @@ def run_graph(
                 "run_id": run.id,
                 "report": str(report),
                 "reason": reason,
+                "input": row["path"],
                 "input_sha256": input_digests[doc_id],
                 "scan_only": scan_only,
                 **acknowledgement,
@@ -454,10 +464,6 @@ def run_graph(
     complete = len(pending) if status == "completed" else 0
     run.data["graph_result"] = status
     run.data["graph_publication"] = "published" if complete else "unknown"
-    # Explicit retry is bound to the state left by this attempt, not to the
-    # pre-extract bytes that native Graphify may already have changed.
-    if "graph_generation" in run.data:
-        run.data["graph_generation"] = graph_generation(store, book)
     run.stage(
         "graphify",
         total=len(pending),

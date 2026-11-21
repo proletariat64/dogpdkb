@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from scripts.smoke_install import REMOTE_CLI
 from tests.test_orchestrator_ocr_batch_cli import _native_instance
 from tests.test_orchestrator_operations_cli import line, running
@@ -306,8 +308,52 @@ def test_retry_owns_interrupted_native_writes(tmp_path):
     (run,) = (tmp_path / "runs/funds").glob("run-*/run.json")
     assert (tmp_path / "corpus/funds/graphify-out/graph.json").read_text() == "{}"
     tool.write_text(original)
+    resumed = cli(tmp_path, "sync", "--config", config, "--resume", run)
+    assert resumed.returncode == 2, resumed.stderr
+    paused = status(tmp_path, config, run)
+    assert paused["publication"]["graph"] == "unknown"
+    assert any(
+        item["retry_scope"] == "graph_batch" for item in paused["handoff"]["items"]
+    )
+    assert (tmp_path / "commands.jsonl").read_text().count(
+        '["graphify", "extract"'
+    ) == 1
     retried = cli(
         tmp_path, "sync", "--config", config, "--resume", run, "--retry-graph"
     )
     assert retried.returncode == 0, retried.stderr
     assert status(tmp_path, config, run)["publication"]["graph"] == "published"
+
+
+def test_retry_after_failed_outcome_saved_before_run_metadata(tmp_path, monkeypatch):
+    from dogpdkb import records, sync
+
+    config, source = setup_local(tmp_path)
+    (source / "note.md").write_text("# Native failure\n")
+    tool = tmp_path / "tools.py"
+    original = tool.read_text()
+    tool.write_text(
+        original.replace(
+            "    graph=flag('--out')",
+            "    raise SystemExit(1)\n    graph=flag('--out')",
+        )
+    )
+    complete_batch = records.Store.complete_batch
+
+    def lose_owner(store, outcomes, **kwargs):
+        rows = list(outcomes)
+        complete_batch(store, rows, **kwargs)
+        if rows and rows[0]["name"] == "graph" and rows[0]["status"] == "failed":
+            raise RuntimeError("owner lost after durable graph outcome")
+
+    with monkeypatch.context() as patch:
+        patch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1] / "src"))
+        patch.setattr(records.Store, "complete_batch", lose_owner)
+        with pytest.raises(
+            RuntimeError, match="owner lost after durable graph outcome"
+        ):
+            sync.main(["--config", str(config), "--dir", str(source)])
+    (run,) = (tmp_path / "runs/funds").glob("run-*/run.json")
+    tool.write_text(original)
+    result = cli(tmp_path, "sync", "--config", config, "--resume", run, "--retry-graph")
+    assert result.returncode == 0, result.stderr

@@ -1023,8 +1023,34 @@ def test_unselected_corpus_exposure_blocks_next_run_and_is_not_acknowledged(tmp_
 
     state["documents"]["42"]["corpus"]["version"] = VERSION
     write(state_path, state)
+    original = unselected.read_bytes()
+    unselected.write_text("# Same-version enrichment from another batch\n")
+    changed = cli(config, manifest, retry_graph=True)
+    assert (
+        changed.returncode == 1 and "saved Graphify attempt changed" in changed.stderr
+    )
+    assert len((tmp_path / "calls.jsonl").read_text().splitlines()) == 1
+    unselected.write_bytes(original)
     assert cli(config, manifest, retry_graph=True).returncode == 0
     doc = json.loads(state_path.read_bytes())["documents"]["43"]
     assert "graph" not in doc
     assert doc["steps"]["graph"]["status"] == "completed"
     assert not doc["blocked_versions"]["graph"]
+
+
+def test_unselected_unsettled_corpus_publication_stops_native_send(tmp_path):
+    config, manifest, selected = fixture(tmp_path)
+    state_path = tmp_path / "state/funds/state.json"
+    state = json.loads(state_path.read_bytes())
+    source = selected.parent / "unsettled.md"
+    source.write_text("# Replaced before Corpus facts were saved\n")
+    prior = hashlib.sha256(b"# Older published body\n").hexdigest()
+    state["documents"]["43"] = {
+        "corpus": {"version": VERSION, "path": str(source), "input_copy_sha256": prior},
+        "graph": {"status": "completed", "version": VERSION, "sha256": prior},
+    }
+    write(state_path, state)
+    assert cli(config, manifest).returncode == 2
+    run = json.loads((manifest.parent / "run.json").read_bytes())
+    assert run["failures"][-1]["reason"] == "CORPUS_PUBLICATION_UNSETTLED"
+    assert not (tmp_path / "calls.jsonl").exists()

@@ -71,6 +71,14 @@ def graph_generation(store, book):
     }
 
 
+def graph_handoff_matches(store, book, run):
+    # A different run's dispatch makes this handoff stale, even if final
+    # native bytes are identical. Own writes do not invalidate an explicit retry.
+    return store.data.get("graph_writer") == run.id or run.data[
+        "graph_generation"
+    ] == graph_generation(store, book)
+
+
 def pause(run, phase, stop_after, *, manifest=None):
     if phase != stop_after:
         return None
