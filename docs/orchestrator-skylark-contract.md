@@ -91,3 +91,23 @@ save. The command neither starts external tools nor touches Corpus or Graph.
 run record if interrupted after the state save. If the state was not committed,
 re-validate and publish the original approved receipt instead. The resulting
 `dogpdkb-admitted-export-1` is raw evidence, not an `apply` or Graphify manifest.
+
+## Consuming a committed admission in apply
+
+`dogpdkb apply --input ADMITTED --stop-after plan` also accepts the
+`dogpdkb-admitted-export-1` handoff; the handoff remains raw evidence, not an
+`apply` difference selection or a Graphify manifest. The receive path
+revalidates the admission read-only through the shared `verify_admission`
+checks: exactly one `recover-export` run, input bytes identical to the
+run-recorded admitted SHA-256, an intact receipt chain, committed raw facts,
+frozen versions and raw file digests. Verified rows become witnessed plan
+inputs and enter the existing compare/plan/OCR/Corpus flow unchanged; the
+independent OCR decision stays inside the plan (`ocr_policy` and per-row
+`action`/`retry_ocr`). The initial receive and preparation validate the whole
+set before the run writes any state, so scope, identity, version, membership,
+metadata or SHA drift refuses there. Drift detected later — the admission is
+revalidated before resumed OCR or Corpus publication — refuses the run
+without rolling back facts the run already persisted (comparison records,
+prepared witnesses); start a new run instead. This path never constructs an
+export request or invokes Skylark. Plain `dogpdkb-differences-2` inputs are
+unaffected.
