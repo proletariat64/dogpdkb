@@ -63,14 +63,14 @@ if os.environ.get('GRAPHIFY_OPENAI_OAUTH_AUTH_FILE','').endswith('/no-oauth.json
 """
 
 GRAPHIFY_PROOF = """
-import hashlib,json,sys,unicodedata
+import hashlib,json,os,sys,unicodedata
 from pathlib import Path
 scan=Path(sys.argv[sys.argv.index('extract')+1])
-out=Path(sys.argv[sys.argv.index('--out')+1])/'graphify-out'
+out=Path(os.environ['GRAPHIFY_OUT'])
 manifest={}
 graph=json.loads((out/'graph.json').read_text())
 for path in scan.rglob('*'):
-    if path.is_file() and not path.name.startswith('.'):
+    if path.is_file() and not path.is_relative_to(out) and not path.name.startswith('.'):
         name=unicodedata.normalize('NFC', path.relative_to(scan).as_posix())
         stamp=hashlib.new('md5',path.read_bytes(),usedforsecurity=False).hexdigest()
         manifest[name]={'ast_hash':stamp,'semantic_hash':stamp}
@@ -118,7 +118,7 @@ elif tool == 'skylark' and args[0] == 'export':
     write(flag('--output'), {'schema':'skylark-export-result-1','status':'completed',
         'documents':rows,'counts':{'total':len(rows),'completed':len(rows),'failed':0}})
 elif tool == 'graphify' and args[0] == 'extract':
-    graph=flag('--out')/'graphify-out/graph.json'
+    graph=flag('--out')/os.environ['GRAPHIFY_OUT']/'graph.json'
     write(graph, {'nodes':[], 'links':[], 'graph':{}})
     write(graph.with_name('manifest.json'), {})
 else:

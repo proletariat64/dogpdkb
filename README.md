@@ -110,7 +110,8 @@ recovery with `--retry-graph` does not restart downloads.
 
 同版本同一步骤的失败或不明结果不会在日常运行自动重试，由定时清理 agent 排查。
 新版本仍正常处理；OCR 失败不阻断可用正文编译。缺席只记录，不自动删除既有语料
-或图谱。失败图谱不回滚已更新语料；Graphify 编译按目录整批成功后发布；失败保留旧图。
+或图谱。Graphify 原生输出可能在失败或中断时已发生变化；编排器不回滚原生文件，
+也不会对不完整结果确认新的图谱版本。
 
 成功或 partial 的 sync 自动清理本次 wash 的成功临时副本，保留失败文档 Markdown、
 相关图片、报告和简要运行记录。计划暂停、整批失败和中断不自动清理；清理错误
@@ -271,14 +272,14 @@ skylark = ["node", "/opt/pi-skylark/dist/cli.mjs"]
 - [Graphify 原版 CLI](docs/orchestrator-graphify-contract.md)：目录级增量、原生 manifest/cache 和整批发布。
 - [Skylark listing/export](docs/orchestrator-skylark-contract.md)：已恢复的独立 CLI 与构建方法。
 
-`sync` and `update-graph` default to `--graphify-inputs text`: only Markdown
-(`.md`, case-insensitive) is passed to Graphify. OCR text remains in Markdown;
-images and other resources remain in the corpus without being sent for extraction.
-Use `--graphify-inputs all` for the previous complete-tree scan. Switching to text
-can natively remove non-Markdown sources from the graph; source files are retained.
-
-Graphify 直接使用未修改的已发布 CLI；已有图缺少其原生 manifest 时停止，
-不自动回填历史。Skylark 使用已恢复的独立 CLI，配置它的真实可执行路径。
+`sync` 和 `update-graph` 将每本书固定的 Corpus 目录直接交给 Graphify，输出写入
+该书固定的原生输出目录（默认 `corpus/graphify-out`）。计划选择控制哪些文档进入
+Corpus，不构成 Graphify 扫描范围；扫描、排除规则、缓存和合并由 Graphify 管理。
+没有镜像目录、输出交换、手工范围文件或校验和要求。正常新 run 支持 resume，
+且可显式重试同一 run 的图谱工作；不会自动重试其他 run 已知失败或结果未知的同版本。
+失败或中断时 Graphify 原生文件可能已改变；Corpus 保留，但不确认新的图谱版本。
+详见[Graphify 合同](docs/orchestrator-graphify-contract.md)。Skylark 使用已恢复的独立
+CLI，配置它的真实可执行路径。
 
 ## 安装与独立功能
 

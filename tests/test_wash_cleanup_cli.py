@@ -55,6 +55,13 @@ def test_completed_sync_cleans_bulk_and_keeps_status_and_next_sync(tmp_path):
     assert not (run.parent / "raw").exists()
     assert not list(run.parent.glob("graphify-*"))
     assert record["status"] == "completed"
+    documents = json.loads((tmp_path / "state/funds/state.json").read_text())[
+        "documents"
+    ]
+    for document in documents.values():
+        witness = document["corpus"]["input_copy"]
+        assert document["steps"]["graph"]["input_copy"] == witness
+        assert Path(witness).is_file()
     status = cli("status", "--config", config, "--json")
     assert json.loads(status.stdout)["status"] == "completed"
     before = (tmp_path / "commands.jsonl").read_text().splitlines()
@@ -64,29 +71,6 @@ def test_completed_sync_cleans_bulk_and_keeps_status_and_next_sync(tmp_path):
     assert [json.loads(line)[:2] for line in after[len(before) :]] == [
         ["skylark", "listing"]
     ]
-
-
-def test_unsupported_native_graphify_does_not_prevent_corpus_publication(tmp_path):
-    config, _ = instance(tmp_path)
-    (tmp_path / "mode").write_text("unsupported")
-
-    result = cli("sync", "--config", config)
-    assert result.returncode == 2, result.stderr
-    run = json.loads(Path(json.loads(result.stdout)["run"]).read_text())
-    assert run["status"] == "partial"
-    assert any(
-        row["reason"] == "GRAPHIFY_NATIVE_PROOF_UNSUPPORTED" for row in run["failures"]
-    )
-    state = json.loads((tmp_path / "state/funds/state.json").read_text())
-    docs = state["documents"].values()
-    assert len(docs) == 2
-    assert all(
-        Path(doc["corpus"]["path"]).is_file() and "graph" not in doc for doc in docs
-    )
-    assert not any(
-        json.loads(line)[:2] == ["graphify", "extract"]
-        for line in (tmp_path / "commands.jsonl").read_text().splitlines()
-    )
 
 
 def test_partial_ocr_keeps_failed_markdown_image_report_but_cleans_success(tmp_path):
@@ -173,7 +157,7 @@ def test_failed_graph_keeps_input_and_report_without_candidate_graph(tmp_path):
     for failure in failures:
         assert Path(failure["input"]).is_file()
         report = json.loads(Path(failure["report"]).read_text())
-        assert report["candidate"] is None
+        assert "candidate" not in report
         expected = [
             sys.executable,
             str(tool),
@@ -181,7 +165,7 @@ def test_failed_graph_keeps_input_and_report_without_candidate_graph(tmp_path):
             "extract",
             report["corpus"],
             "--out",
-            str(Path(failure["report"]).parent),
+            report["corpus"],
             "--no-cluster",
             "--backend",
             "openai-oauth",
@@ -189,7 +173,6 @@ def test_failed_graph_keeps_input_and_report_without_candidate_graph(tmp_path):
             "3",
         ]
         assert failure["argv"] == expected
-        assert report["graphify_inputs"] == "text"
         assert report["argv"] == expected
         assert Path(report["native_log"]).is_file()
     assert not list(run.parent.glob("graphify-*/graphify-out"))
@@ -315,9 +298,9 @@ def test_graph_recovery_preserves_cleaned_unknown_ocr_failure_bundle(tmp_path):
 def test_cleanup_failure_reports_stderr_without_changing_sync_result(tmp_path, fault):
     config, tool = instance(tmp_path)
     injection = (
-        "    blocked=flag('--out').parent/'blocked';blocked.mkdir();(blocked/'file').write_text('keep');blocked.chmod(0o555)\n"
+        "    blocked=next((root/'runs/funds').glob('run-*'))/'blocked';blocked.mkdir();(blocked/'file').write_text('keep');blocked.chmod(0o555)\n"
         if fault == "blocked-directory"
-        else "    (flag('--out').parent/'plan.json').write_text('invalid')\n"
+        else "    (next((root/'runs/funds').glob('run-*'))/'plan.json').write_text('invalid')\n"
     )
     tool.write_text(
         tool.read_text().replace(
@@ -360,7 +343,7 @@ def test_invalid_or_interrupted_graph_retains_failure_evidence(
         else next((tmp_path / "runs/funds").glob("run-*/run.json"))
     )
     record = json.loads(run.read_text())
-    assert not (tmp_path / "corpus/graphify-out/graph.json").exists()
+    assert (tmp_path / "corpus/graphify-out/graph.json").exists() == (mode == "invalid")
     if mode == "interrupt":
         assert "cleanup" not in record
         assert (run.parent / "raw/0.md").is_file()

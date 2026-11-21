@@ -28,7 +28,6 @@ Optional [paths].body_recovery names explicit mdcompare-body-recovery-1 repairs,
 resolved from config and frozen with byte witnesses per run. Resume validates
 saved repair inputs; it never silently replaces them with live config changes.
 See apply --help --full for schemas, source versions and successful-baseline rules.
-This routing does not change Graphify's text-input projection below.
 
 --concurrency N applies only to document exports. It accepts 1, 2 or 3, defaults
 to 3 and never permits more than 3 in-flight exports; 1 selects serial downloads.
@@ -45,15 +44,11 @@ groups, starts no queued exports and preserves truthful checkpoints. The option
 is per invocation, not a TOML setting or a Skylark argument. --retry-graph skips
 downloads entirely, regardless of --concurrency.
 
-Graphify inputs
---graphify-inputs {all,text} defaults to text: Graphify scans a run-owned mirror
-containing only Markdown (.md, case-insensitive). OCR text in Markdown is kept;
-images and other non-Markdown files stay in the public corpus but are not sent
-for extraction. Existing scan controls are preserved. all restores the previous
-complete-tree scan, including images and other resources. A newly sealed run's
-explicit graph retry inherits its saved input mode and rejects changes. Native
-Graphify may prune old non-Markdown graph records when switching to text on a
-new run; graph/cache artifacts are not manually rewritten.
+Graphify handoff
+Graphify scans the fixed Corpus and writes directly to the configured native
+graph directory. The ingestion list is not a native scan exclusion list.
+Graphify owns incremental extraction and its cache. A failed or interrupted
+attempt does not advance graph facts; native output may already have changed.
 
 ```text
 dogpdkb sync --config instance/dogpdkb.toml --book funds --stop-after plan --concurrency 3

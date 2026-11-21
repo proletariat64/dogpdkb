@@ -158,12 +158,19 @@ def test_successful_graph_witness_and_report_survive_wash_deletion(tmp_path):
     result = graph_cli(config, manifest)
     assert result.returncode == 0, result.stderr
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
-    step = state["documents"]["42"]["steps"]["graph"]
+    document = state["documents"]["42"]
+    step = document["steps"]["graph"]
+    original = source.read_bytes()
     shutil.rmtree(manifest.parent)
-    assert Path(step["input_copy"]).read_bytes() == source.read_bytes()
+    witness = Path(step["input_copy"])
+    assert witness.read_bytes() == original
+    assert witness == Path(document["graph_baseline"]["path"])
+    source.write_bytes(b"# Newer Corpus bytes\n")
+    assert witness.read_bytes() == original
     report = json.loads(Path(step["report"]).read_text())
     assert report["status"] == "completed"
-    assert report["candidate"] is None
+    assert Path(report["native_log"]).is_file()
+    assert "candidate" not in report
 
 
 def test_declared_v2_ocr_images_are_retained_before_corpus_publication(tmp_path):

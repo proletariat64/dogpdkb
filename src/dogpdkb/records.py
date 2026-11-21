@@ -152,6 +152,19 @@ class Store:
             "graph": str(self.settings.graph_for(self.book).resolve()),
         }
 
+    @property
+    def graph_writer_path(self) -> Path:
+        return self.settings.graph_for(self.book) / ".dogpdkb-graph-writer"
+
+    def graph_writer(self) -> str | None:
+        try:
+            return json.loads(self.graph_writer_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+
+    def record_graph_writer(self, run_id: str) -> None:
+        atomic_json(self.graph_writer_path, run_id, durable=True)
+
     def input_directory(self, doc_id: str) -> Path:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", doc_id):
             raise ValueError("source ID cannot be represented as a local filename")
@@ -381,7 +394,7 @@ def _failure_items(store, run, *, interrupted=False):
             and (key, name) not in recorded
         )
     binding = run.get("graph_retry", {})
-    graph_retriable = bool(binding.get("input_tree_sha256")) and not any(
+    graph_retriable = bool(binding.get("manifest")) and not any(
         f.get("reason") == "STALE_GRAPH_HANDOFF" for f in failures
     )
     items = []
@@ -415,14 +428,18 @@ def _failure_items(store, run, *, interrupted=False):
                 and step.get("input_sha256") == input_sha
             ):
                 retry = "document_next_batch"
-        if name == "graph" and frozen and matching_step:
-            resolved = (
-                step["status"] == "completed"
-                and doc.get("graph", {}).get("sha256") == input_sha
+        scan_only = failure.get("scan_only") and name == "graph"
+        if name == "graph" and (frozen or scan_only) and matching_step:
+            digest = (
+                step.get("input_sha256")
+                if scan_only
+                else doc.get("graph", {}).get("sha256")
             )
+            resolved = step["status"] == "completed" and digest == input_sha
             if (
                 not resolved
                 and graph_retriable
+                and (scan_only or frozen.get("action") == "compile")
                 and step["status"] in {"failed", "unknown", "running"}
             ):
                 retry = "graph_batch"

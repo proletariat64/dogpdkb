@@ -14,7 +14,7 @@ from dogpdkb.ocr_batch import file_digest
 from dogpdkb.phases import (
     SYNC_PHASES,
     check_graph_manifest,
-    graph_generation,
+    graph_handoff_matches,
     read_checkpoint,
     seal_phase,
 )
@@ -28,7 +28,7 @@ from dogpdkb.settings import (
 )
 
 
-def freeze_policy(settings, store, run, graphify_inputs):
+def freeze_policy(settings, store, run):
     """Persist the selected runtime choices, not provider credentials."""
     policy = run.data.get("sync_policy")
     if policy is None:
@@ -57,7 +57,6 @@ def freeze_policy(settings, store, run, graphify_inputs):
             },
             "ocr_cache": str(settings.ocr_cache),
             "body_recovery": str(source) if source else None,
-            "graphify_inputs": graphify_inputs,
         }
         policy["graphify_model"] = settings.graphify_model
         policy["graphify_token_budget"] = settings.graphify_token_budget
@@ -79,7 +78,7 @@ def freeze_policy(settings, store, run, graphify_inputs):
         else None,
     )
     store.settings = frozen
-    return frozen, policy["graphify_inputs"]
+    return frozen
 
 
 def graph_handoff_current(book, store, run):
@@ -107,12 +106,10 @@ def graph_handoff_current(book, store, run):
                 and file_digest(witness) == row["input_copy_sha256"]
             ):
                 pending = True
-    return not pending or run.data["graph_generation"] == graph_generation(store, book)
+    return not pending or graph_handoff_matches(store, book, run)
 
 
-def _settle_graph(
-    settings, book, store, run, manifest, retry_graph, graphify_inputs, *, replan=False
-):
+def _settle_graph(settings, book, store, run, manifest, retry_graph, *, replan=False):
     from dogpdkb.graph import run_graph
 
     if not retry_graph and "graph_exit_code" in run.data:
@@ -135,11 +132,12 @@ def _settle_graph(
         run,
         manifest=manifest,
         retry_graph=retry_graph,
-        graphify_inputs=graphify_inputs,
         replan=replan,
     )
     if run.data["graph_publication"] == "pending":
-        run.data["graph_publication"] = "retained"
+        run.data["graph_publication"] = (
+            "unknown" if store.graph_writer() == run.id else "retained"
+        )
     if run.data.get("graph_result") == "unknown" and graph_code == 1:
         # An unproven tool result leaves unresolved work, not a fatal instance error.
         return 2
@@ -157,7 +155,6 @@ def sync_run(
     retry_graph=False,
     replan=False,
     concurrency=DEFAULT_DOWNLOAD_CONCURRENCY,
-    graphify_inputs=None,
     sources=None,
 ):
     from dogpdkb.discover import discover
@@ -171,7 +168,7 @@ def sync_run(
         manifest = run.data["artifacts"].get("manifest")
         if not manifest:
             raise ValueError("graph recovery requires a saved final compile manifest")
-        graphify_inputs = check_graph_manifest(run, manifest, graphify_inputs)
+        check_graph_manifest(run, manifest)
         if replan:
             from dogpdkb.apply import replan_published
 
@@ -192,9 +189,7 @@ def sync_run(
             and SYNC_PHASES.index(stop_after) < SYNC_PHASES.index(completed)
         ):
             raise ValueError("cannot stop before the last completed phase")
-        settings, graphify_inputs = freeze_policy(
-            settings, store, run, graphify_inputs or "text"
-        )
+        settings = freeze_policy(settings, store, run)
         differences = (
             None if resume else discover(settings, book, store, run, sources=sources)
         )
@@ -217,7 +212,6 @@ def sync_run(
         run,
         Path(result["manifest"]),
         retry_graph,
-        graphify_inputs,
         replan=replan,
     )
     if graph_code in {130, 143}:
@@ -247,7 +241,7 @@ def _select_run(store, args, sources):
         manifest = run.data["artifacts"].get("manifest")
         if not manifest:
             raise ValueError("graph recovery requires a saved final compile manifest")
-        args.graphify_inputs = check_graph_manifest(run, manifest, args.graphify_inputs)
+        check_graph_manifest(run, manifest)
     return run
 
 
@@ -271,7 +265,6 @@ def _execute_sync(settings, book, store, run, args, sources):
             retry_graph=args.retry_graph,
             replan=args.replan,
             concurrency=args.concurrency,
-            graphify_inputs=args.graphify_inputs,
             sources=sources,
         )
     except InterruptedError as error:

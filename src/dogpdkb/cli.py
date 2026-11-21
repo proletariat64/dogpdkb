@@ -62,10 +62,6 @@ def _dispatch(argv: list[str] | None = None):
         from dogpdkb.export_recovery import main as recover_export_main
 
         return recover_export_main(arguments[1:])
-    if arguments and arguments[0] == "recover-ocr":
-        from dogpdkb.ocr_recovery import main as recover_main
-
-        return recover_main(arguments[1:])
     if arguments and arguments[0] == "publish-web":
         from dogpdkb.workflows.publish_web import main as web_main
 
@@ -91,7 +87,6 @@ def _dispatch(argv: list[str] | None = None):
         "apply",
         "update-graph",
         "sync",
-        "recover-ocr",
         "recover-export",
         "publish-web",
     ):

@@ -11,7 +11,6 @@ _NamespaceT = TypeVar("_NamespaceT")
 
 SUMMARIES = {
     "recover-export": "Admit verified staged Skylark exports as raw facts only.",
-    "recover-ocr": "Recover complete Markdown offline from a sealed interrupted OCR batch.",
     "": "Sync selected sources into a knowledge book, watch progress, or resume a saved run.",
     "discover": "Validate a complete source listing and select recent changes; no body export.",
     "apply": "Route authored-text changes, retain complete diffs, optionally OCR, then publish usable corpus Markdown.",
@@ -29,7 +28,6 @@ SUMMARIES = {
 
 ARGUMENTS = {
     "concurrency": "maximum simultaneous Skylark document exports: 1–3; default: 3; download stage only; may change when resuming",
-    "graphify_inputs": "Graphify scan inputs: text (default) passes only Markdown (.md); all includes images and other corpus files; original corpus resources are preserved",
     "config": "TOML instance file: explicit option > DOGPDKB_CONFIG > source default.toml or installed cwd/dogpdkb.toml",
     "book": "enabled book key in books.json; optional only when exactly one book is enabled",
     "source": "select one enabled registered source; repeat for more",
@@ -50,7 +48,6 @@ ARGUMENTS = {
 
 EXAMPLES = {
     "recover-export": "dogpdkb recover-export --run ORIGINAL --input staged.json --output-dir /tmp/private-export",
-    "recover-ocr": "dogpdkb recover-ocr --run ORIGINAL --execution-version 0.3.4 --output-dir /tmp/private-recovery",
     "discover": "dogpdkb discover --config instance/dogpdkb.toml --book funds",
     "apply": "dogpdkb apply --config instance/dogpdkb.toml --book funds --input differences.json --stop-after plan\n  dogpdkb apply --config instance/dogpdkb.toml --book funds --resume RUN",
     "update-graph": "dogpdkb update-graph --config instance/dogpdkb.toml --book funds --input manifest.json",
@@ -67,7 +64,6 @@ EXAMPLES = {
 
 DETAILS = {
     "recover-export": "Prepare an offline raw-only receipt for explicitly selected known export failures. Approve with --publish RECEIPT --receipt-sha256 SHA. No Corpus, OCR or Graphify action.",
-    "recover-ocr": "Prepare a SHA-bound receipt without sending requests. Use --publish RECEIPT --receipt-sha256 SHA to publish complete changed corpus bodies under the write lock; --resume RUN resumes frozen corpus publication only. Graphify is a separate action.",
     "discover": "Inputs: complete Skylark listing JSON, not Markdown. Writes a new wash run, listing, differences.json and durable observations, never corpus/graph. Missing baseline: use init-state first. stdout: JSON pointer with run/differences/counts; stderr: diagnostics. Exit codes: 0 selected/no changes; 1 failure; 64 usage; 130/143 interruption. Repeating creates a new listing observation; absent IDs never delete local data.",
     "apply": "Inputs: dogpdkb-differences-1 JSON from discover, or --resume (exclusive). Offline mdcompare semantic routes NEW/CHANGED/UNCERTAIN to COMPILE, EQUIVALENT to reuse/metadata, UNAVAILABLE to DEFER; images/OCR are advisory. Complete semantic diffs survive wash cleanup; optional [paths].body_recovery freezes explicit marker repair witnesses. Uses configured Skylark/mdcompare/mdocr and their existing authentication; may download and call OCR. Writes run reports, persistent inputs, state and corpus; emits dogpdkb-compile-1 manifest, not a graph update. stdout: exit_code/paused/manifest/run JSON; stderr: live tool diagnostics. Exit codes: 0 complete/plan pause; 2 usable set with failures; 1 batch failure; 64 usage; 130/143 interruption. Inspect reports before recovery: same-version failed/unknown steps remain suppressed. Resume validates saved inputs; it does not repair missing frozen inputs.",
     "sync": "Runs all phases unattended unless you request a stop. Use status --watch to observe. stdout: result JSON; stderr: tool progress and diagnostics. Exit codes: 0 complete/no work/paused; 2 unresolved work; 1 fatal error; 64 usage; 130/143 interruption.",
@@ -140,7 +136,7 @@ class HelpParser(argparse.ArgumentParser):
             if isinstance(action, argparse._SubParsersAction):
                 for choice in action._choices_actions:
                     choice.help = SUMMARIES.get(choice.dest, choice.help)
-            elif self.scope in {"recover-ocr", "recover-export"} and action.dest in {
+            elif self.scope == "recover-export" and action.dest in {
                 "run",
                 "resume",
             }:
@@ -176,7 +172,6 @@ class HelpParser(argparse.ArgumentParser):
                     action.help = argparse.SUPPRESS
                 if self.scope == "sync" and action.dest in {
                     "concurrency",
-                    "graphify_inputs",
                     "retry_graph",
                     "replan",
                 }:

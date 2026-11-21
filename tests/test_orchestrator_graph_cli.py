@@ -137,8 +137,9 @@ assert '--no-cluster' in args
 assert value('--backend')=='openai-oauth'
 assert value('--max-concurrency')=='3'
 assert os.environ['GRAPHIFY_OPENAI_OAUTH_PARALLEL']=='1'
-assert os.environ['GRAPHIFY_OUT']=='graphify-out'
-output=Path(value('--out'))/'graphify-out'; output.mkdir(parents=True,exist_ok=True)
+output=Path(os.environ['GRAPHIFY_OUT']); output.mkdir(parents=True,exist_ok=True)
+assert Path(args[0])==Path(value('--out'))==root/'corpus'
+assert output==root/'corpus/graphify-out'
 mode=(root/'mode').read_text() if (root/'mode').exists() else 'success'
 if mode=='interrupt': sys.exit(130)
 if mode in ('failed','partial'):
@@ -170,7 +171,7 @@ else:
     return config, manifest, source
 
 
-def cli(config, manifest, environment=None, *, retry_graph=False, graphify_inputs=None):
+def cli(config, manifest, environment=None, *, retry_graph=False):
     return subprocess.run(
         [
             sys.executable,
@@ -182,7 +183,6 @@ def cli(config, manifest, environment=None, *, retry_graph=False, graphify_input
             "--input",
             str(manifest),
             *(["--retry-graph"] if retry_graph else []),
-            *(["--graphify-inputs", graphify_inputs] if graphify_inputs else []),
         ],
         env=environment or {**os.environ, "PYTHONPATH": str(ROOT / "src")},
         check=False,
@@ -200,7 +200,7 @@ def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):
         "42"
     ]["graph"]
     report = json.loads(Path(graph["report"]).read_bytes())
-    assert graph["sha256"] == report["input_sha256"]["Café-2026-11-12-[42].md"]
+    assert graph["sha256"] == report["input_sha256"]["42"]
     assert graph["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
 
 
@@ -218,7 +218,10 @@ def test_complete_source_calls_only_public_graphify_and_records_success(
         json.loads(line) for line in (tmp_path / "calls.jsonl").read_text().splitlines()
     ]
     assert [row[0] for row in calls] == ["extract"]
-    assert Path(calls[0][1]) != source.parent
+    assert Path(calls[0][1]) == source.parent
+    assert Path(calls[0][calls[0].index("--out") + 1]) == source.parent
+    report = json.loads(Path(json.loads(result.stdout)["report"]).read_text())
+    assert "candidate" not in report
     assert (Path(calls[0][1]) / source.name).read_bytes() == source.read_bytes()
     assert "--no-cluster" in calls[0]
     if budget is None:
@@ -307,7 +310,9 @@ def test_graph_retry_refuses_another_runs_failure(tmp_path):
     assert cli(config, manifest).returncode == 2
     state_path = tmp_path / "state/funds/state.json"
     state = json.loads(state_path.read_text())
-    state["documents"]["42"]["steps"]["graph"]["run_id"] = "another-run"
+    doc = state["documents"]["42"]
+    doc["steps"]["graph"]["run_id"] = "another-run"
+    doc["blocked_versions"]["graph"][VERSION["utc"]]["run_id"] = "another-run"
     write(state_path, state)
     before = (tmp_path / "calls.jsonl").read_bytes()
     assert cli(config, manifest, retry_graph=True).returncode == 2
@@ -330,8 +335,10 @@ def test_graph_retry_does_not_authorize_unselected_blocked_sources(tmp_path):
     assert cli(config, manifest).returncode == 2
     state_path = tmp_path / "state/funds/state.json"
     state = json.loads(state_path.read_text())
+    held = tmp_path / "corpus/held.md"
+    held.write_text("# Held Corpus body\n")
     state["documents"]["43"] = {
-        "corpus": {"version": VERSION},
+        "corpus": {"version": VERSION, "path": str(held)},
         "steps": {
             "graph": {
                 "status": "failed",
@@ -598,42 +605,26 @@ def test_superseded_metadata_manifest_is_refused(tmp_path):
     assert not (tmp_path / "calls.jsonl").exists()
 
 
-def test_existing_graph_without_manifest_stops_before_extraction(tmp_path):
+def test_failed_native_write_leaves_corpus_and_does_not_acknowledge(tmp_path):
     config, manifest, source = fixture(tmp_path)
+    before = source.read_bytes()
     graph = source.parent / "graphify-out/graph.json"
-    write(graph, {"nodes": [], "links": []})
-    before = graph.read_bytes()
-    result = cli(config, manifest)
-    assert result.returncode == 1, result.stderr
-    assert graph.read_bytes() == before
-    assert not (tmp_path / "calls.jsonl").exists()
-
-
-def test_failed_candidate_keeps_public_graph_and_manifest_bytes(tmp_path):
-    config, manifest, source = fixture(tmp_path)
-    graph = source.parent / "graphify-out/graph.json"
-    native_manifest = graph.with_name("manifest.json")
     write(graph, {"nodes": [{"id": "old"}], "links": []})
-    write(native_manifest, {"preserved": True})
-    before = graph.read_bytes(), native_manifest.read_bytes()
     (tmp_path / "mode").write_text("failed")
-    assert cli(config, manifest).returncode == 2
-    assert (graph.read_bytes(), native_manifest.read_bytes()) == before
-
-
-def test_unsupported_graphify_is_stopped_before_extracting_corpus(tmp_path):
-    config, manifest, source = fixture(tmp_path)
-    (tmp_path / "mode").write_text("unsupported")
-
     result = cli(config, manifest)
-    assert result.returncode == 2, result.stdout + result.stderr
-    assert not (tmp_path / "calls.jsonl").exists()
-    assert not (source.parent / "graphify-out/graph.json").exists()
+    assert result.returncode == 2
+    assert json.loads(graph.read_bytes())["nodes"][0]["id"] == "unpublished"
+    assert source.read_bytes() == before
     run = json.loads((manifest.parent / "run.json").read_text())
-    assert run["failures"][-1]["reason"] == "GRAPHIFY_NATIVE_PROOF_UNSUPPORTED"
+    assert run["graph_publication"] == "unknown"
+    assert run["graph_result"] == "failed"
+    document = json.loads((tmp_path / "state/funds/state.json").read_text())[
+        "documents"
+    ]["42"]
+    assert "graph" not in document
 
 
-def test_growing_partial_candidate_keeps_entire_generation_and_suppresses(tmp_path):
+def test_native_partial_result_does_not_acknowledge_and_suppresses(tmp_path):
     config, manifest, source = fixture(tmp_path)
     graph = source.parent / "graphify-out/graph.json"
     native_manifest = graph.with_name("manifest.json")
@@ -648,7 +639,14 @@ def test_growing_partial_candidate_keeps_entire_generation_and_suppresses(tmp_pa
 
     first = cli(config, manifest)
     assert first.returncode == 2, first.stdout + first.stderr
-    assert [path.read_bytes() for path in generation] == before
+    assert graph.read_bytes() != before[0]
+    assert cache.read_bytes() == b"unpublishable"
+    assert (
+        "graph"
+        not in json.loads((tmp_path / "state/funds/state.json").read_text())[
+            "documents"
+        ]["42"]
+    )
     assert cli(config, manifest).returncode == 2
     assert len((tmp_path / "calls.jsonl").read_text().splitlines()) == 1
 
@@ -657,19 +655,6 @@ def test_growing_partial_candidate_keeps_entire_generation_and_suppresses(tmp_pa
     assert result.returncode == 0, result.stdout + result.stderr
     assert all(path.read_bytes() != old for path, old in zip(generation, before))
     assert cache.read_bytes() == b"trusted replacement"
-
-
-def test_successful_exit_without_native_current_byte_coverage_is_partial(tmp_path):
-    config, manifest, source = fixture(tmp_path)
-    tool = tmp_path / "graphify.py"
-    tool.write_text(
-        tool.read_text().removesuffix(GRAPHIFY_PROOF)
-        + "print('[graphify extract] chunk 1/1 done')\n"
-    )
-
-    result = cli(config, manifest)
-    assert result.returncode == 2, result.stdout + result.stderr
-    assert not (source.parent / "graphify-out/graph.json").exists()
 
 
 def test_missing_chunk_completion_is_not_proof_even_with_current_stamps(tmp_path):
@@ -684,41 +669,13 @@ def test_missing_chunk_completion_is_not_proof_even_with_current_stamps(tmp_path
 
     first = cli(config, manifest)
     assert first.returncode == 2, first.stdout + first.stderr
-    assert not (source.parent / "graphify-out/graph.json").exists()
-    assert cli(config, manifest).returncode == 2
-    assert len((tmp_path / "calls.jsonl").read_text().splitlines()) == 1
-
-
-@pytest.mark.parametrize("with_chunks", [False, True])
-def test_candidate_needs_native_work_and_real_source_ownership(tmp_path, with_chunks):
-    config, manifest, source = fixture(tmp_path)
-    graph = source.parent / "graphify-out/graph.json"
-    write(graph, {"nodes": [{"id": "old"}], "links": []})
-    write(graph.with_name("manifest.json"), {})
-    before = graph.read_bytes()
-    tool = tmp_path / "graphify.py"
-    proof = GRAPHIFY_PROOF
-    if not with_chunks:
-        # Good source ownership does not prove the new stamp came from extraction.
-        proof = proof[: proof.index("if manifest:")] + (
-            "print(f'[graphify extract] wrote {out / \"graph.json\"} — complete')\n"
-        )
-    else:
-        # Complete chunks do not turn an empty hyperedge into source ownership.
-        proof = proof.replace(
-            "graph['nodes'].append({'id':name,'source_file':name})",
-            "graph.setdefault('hyperedges',[]).append({'source_file':name,'nodes':[]})",
-        )
-    tool.write_text(tool.read_text().removesuffix(GRAPHIFY_PROOF) + proof)
-
-    assert cli(config, manifest).returncode == 2
-    assert graph.read_bytes() == before
+    assert (source.parent / "graphify-out/graph.json").exists()
     assert cli(config, manifest).returncode == 2
     assert len((tmp_path / "calls.jsonl").read_text().splitlines()) == 1
 
 
 @pytest.mark.parametrize("edge_key", ["edges", "links"])
-def test_candidate_passes_through_native_edge_source_metadata(tmp_path, edge_key):
+def test_native_edge_source_metadata_is_left_untouched(tmp_path, edge_key):
     config, manifest, source = fixture(tmp_path)
     tool = tmp_path / "graphify.py"
     edge = {"source": source.name, "target": source.name, "source_file": "native-label"}
@@ -758,34 +715,16 @@ def test_no_dispatch_accepts_proven_baseline_or_cache_coverage(tmp_path, native_
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_existing_baseline_cannot_authorize_unstamped_historical_backfill(tmp_path):
-    config, manifest, source = fixture(tmp_path)
-    native = source.parent / "graphify-out"
-    write(native / "graph.json", {"nodes": [], "links": []})
-    write(native / "manifest.json", {})
-    (source.parent / "historical.md").write_text("# Historical corpus\n")
-
-    result = cli(config, manifest)
-    assert result.returncode == 2, result.stdout + result.stderr
-    assert not (tmp_path / "calls.jsonl").exists()
-
-
-def test_changed_input_during_extraction_does_not_publish(tmp_path):
+def test_changed_input_during_extract_does_not_acknowledge(tmp_path):
     config, manifest, source = fixture(tmp_path)
     (tmp_path / "mode").write_text("mutate")
-    assert cli(config, manifest).returncode == 1
-    assert not (source.parent / "graphify-out/graph.json").exists()
-
-
-@pytest.mark.parametrize("folder", ["", "archive"])
-def test_unregistered_historical_sources_are_not_backfilled(tmp_path, folder):
-    config, manifest, source = fixture(tmp_path)
-    historical = source.parent / folder / "Historical-2020-01-01-[99].md"
-    historical.parent.mkdir(parents=True, exist_ok=True)
-    historical.write_text("Historical")
     result = cli(config, manifest)
-    assert result.returncode == 1
-    assert not (tmp_path / "calls.jsonl").exists()
+    assert result.returncode == 1, result.stderr
+    assert (source.parent / "graphify-out/graph.json").is_file()
+    document = json.loads((tmp_path / "state/funds/state.json").read_text())[
+        "documents"
+    ]["42"]
+    assert "graph" not in document
 
 
 def test_original_graphify_incremental_directory_preserves_other_sources(tmp_path):
@@ -1032,17 +971,86 @@ def test_usable_corpus_compiles_despite_separate_apply_failures(tmp_path):
     assert state["documents"]["42"]["graph"]["version"] == VERSION
 
 
-def test_graph_digests_work_without_python311_hashlib_helper(tmp_path, monkeypatch):
-    import hashlib
+@pytest.mark.parametrize("action,code", [("retain", 0), ("defer", 2)])
+def test_only_retained_sources_do_not_call_graphify(tmp_path, action, code):
+    config, manifest, _ = fixture(tmp_path)
+    data = json.loads(manifest.read_text())
+    data["documents"][0]["action"] = action
+    write(manifest, data)
 
-    from dogpdkb.graph import _digest
+    result = cli(config, manifest)
 
-    monkeypatch.delattr(hashlib, "file_digest", raising=False)
-    source = tmp_path / "large.md"
-    content = b"evidence\n" * 250_000
-    source.write_bytes(content)
-    assert _digest(source) == hashlib.sha256(content).hexdigest()
-    assert (
-        _digest(source, "md5")
-        == hashlib.md5(content, usedforsecurity=False).hexdigest()
+    assert result.returncode == code, result.stdout + result.stderr
+    assert not (tmp_path / "calls.jsonl").exists()
+    state = json.loads((tmp_path / "state/funds/state.json").read_text())
+    assert "graph" not in state["documents"]["42"]["steps"]
+
+
+def test_unselected_corpus_exposure_blocks_next_run_and_is_not_acknowledged(tmp_path):
+    config, manifest, selected = fixture(tmp_path)
+    state_path = tmp_path / "state/funds/state.json"
+    state = json.loads(state_path.read_bytes())
+    unselected = selected.parent / "unselected.md"
+    unselected.write_text("# Published by another Corpus batch\n")
+    state["documents"]["43"] = {"corpus": {"version": VERSION, "path": str(unselected)}}
+    write(state_path, state)
+    mode = tmp_path / "mode"
+    mode.write_text("interrupt")
+    assert cli(config, manifest).returncode == 130
+    state = json.loads(state_path.read_bytes())
+    doc = state["documents"]["43"]
+    assert doc["steps"]["graph"]["status"] == "unknown"
+    assert doc["steps"]["graph"]["scan_only"]
+    assert "graph" not in doc
+
+    # A new version of the selected source does not authorize resending 43.
+    next_manifest = manifest.parent.with_name("run-next") / "manifest.json"
+    request = json.loads(manifest.read_bytes())
+    new_version = {**VERSION, "utc": "2026-11-13T10:00:00+00:00"}
+    request["run_id"] = "run-next"
+    request["documents"][0]["version"] = new_version
+    write(next_manifest, request)
+    run = json.loads((manifest.parent / "run.json").read_bytes())
+    run.update(
+        run_id="run-next", artifacts={"manifest": str(next_manifest)}, failures=[]
     )
+    write(next_manifest.parent / "run.json", run)
+    state["documents"]["42"]["corpus"]["version"] = new_version
+    write(state_path, state)
+    mode.write_text("success")
+    assert cli(config, next_manifest).returncode == 2
+    assert len((tmp_path / "calls.jsonl").read_text().splitlines()) == 1
+
+    state["documents"]["42"]["corpus"]["version"] = VERSION
+    write(state_path, state)
+    original = unselected.read_bytes()
+    unselected.write_text("# Same-version enrichment from another batch\n")
+    changed = cli(config, manifest, retry_graph=True)
+    assert (
+        changed.returncode == 1 and "saved Graphify attempt changed" in changed.stderr
+    )
+    assert len((tmp_path / "calls.jsonl").read_text().splitlines()) == 1
+    unselected.write_bytes(original)
+    assert cli(config, manifest, retry_graph=True).returncode == 0
+    doc = json.loads(state_path.read_bytes())["documents"]["43"]
+    assert "graph" not in doc
+    assert doc["steps"]["graph"]["status"] == "completed"
+    assert not doc["blocked_versions"]["graph"]
+
+
+def test_unselected_unsettled_corpus_publication_stops_native_send(tmp_path):
+    config, manifest, selected = fixture(tmp_path)
+    state_path = tmp_path / "state/funds/state.json"
+    state = json.loads(state_path.read_bytes())
+    source = selected.parent / "unsettled.md"
+    source.write_text("# Replaced before Corpus facts were saved\n")
+    prior = hashlib.sha256(b"# Older published body\n").hexdigest()
+    state["documents"]["43"] = {
+        "corpus": {"version": VERSION, "path": str(source), "input_copy_sha256": prior},
+        "graph": {"status": "completed", "version": VERSION, "sha256": prior},
+    }
+    write(state_path, state)
+    assert cli(config, manifest).returncode == 2
+    run = json.loads((manifest.parent / "run.json").read_bytes())
+    assert run["failures"][-1]["reason"] == "CORPUS_PUBLICATION_UNSETTLED"
+    assert not (tmp_path / "calls.jsonl").exists()

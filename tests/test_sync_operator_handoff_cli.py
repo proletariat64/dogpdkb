@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from scripts.smoke_install import REMOTE_CLI
 from tests.test_orchestrator_ocr_batch_cli import _native_instance
 from tests.test_orchestrator_operations_cli import line, running
@@ -65,7 +67,10 @@ def test_status_shows_phase_and_separate_publication_facts(tmp_path):
     rejected = cli(
         tmp_path, "sync", "--config", config, "--resume", run, "--retry-graph"
     )
-    assert rejected.returncode == 1 and "no frozen graph input tree" in rejected.stderr
+    assert (
+        rejected.returncode == 1
+        and "no prior graph attempt to retry" in rejected.stderr
+    )
     assert (tmp_path / "commands.jsonl").read_bytes() == commands
 
     run_data(cli(tmp_path, "sync", "--config", config, "--resume", run))
@@ -99,7 +104,7 @@ def test_cleanup_handoff_binds_graph_retry_to_original_scope(tmp_path):
     assert result.returncode == 2, result.stderr
     run = Path(json.loads(result.stdout)["run"])
     snapshot = status(tmp_path, config, run)
-    assert snapshot["publication"] == {"corpus": "published", "graph": "retained"}
+    assert snapshot["publication"] == {"corpus": "published", "graph": "unknown"}
     handoff = snapshot["handoff"]
     [failure] = handoff["items"]
     assert failure["run_id"] == snapshot["run_id"]
@@ -121,8 +126,8 @@ def test_cleanup_handoff_binds_graph_retry_to_original_scope(tmp_path):
     calls = (tmp_path / "commands.jsonl").read_bytes()
     recovery = (*sync, "--resume", run, "--retry-graph")
     widened = cli(tmp_path, *recovery, "--graphify-inputs", "all")
-    assert widened.returncode == 1, widened.stderr
-    assert "saved Graphify input mode" in widened.stderr
+    assert widened.returncode == 64, widened.stderr
+    assert "unrecognized arguments: --graphify-inputs" in widened.stderr
     altered = json.loads(before)
     altered["documents"][0]["action"] = "defer"
     manifest.write_text(json.dumps(altered))
@@ -132,13 +137,6 @@ def test_cleanup_handoff_binds_graph_retry_to_original_scope(tmp_path):
     assert (tmp_path / "commands.jsonl").read_bytes() == calls
 
     manifest.write_bytes(before)
-    scan_control = tmp_path / "corpus/funds/.graphifyignore"
-    scan_control.write_text("# A changed scan scope\n")
-    rejected = cli(tmp_path, *recovery)
-    assert rejected.returncode == 1, rejected.stderr
-    assert "graph input tree changed" in rejected.stderr
-    assert (tmp_path / "commands.jsonl").read_bytes() == calls
-    scan_control.unlink()
     recovered = cli(tmp_path, *recovery)
     assert recovered.returncode == 0, recovered.stderr
     after = status(tmp_path, config, run)
@@ -287,3 +285,112 @@ def test_interrupting_live_watch_does_not_signal_sync(tmp_path):
         stdout, stderr = sync.communicate(timeout=10)
         assert sync.returncode == 0, stderr
         assert json.loads(stdout)["status"] == "completed"
+
+
+def test_retry_owns_interrupted_native_writes(tmp_path):
+    config, source = setup_local(tmp_path)
+    (source / "note.md").write_text("# Interrupted native write\n")
+    tool = tmp_path / "tools.py"
+    original = tool.read_text()
+    tool.write_text(
+        original.replace(
+            "    graph=flag('--out')",
+            "    import os, signal\n"
+            "    out=Path(os.environ['GRAPHIFY_OUT'])\n"
+            "    (out/'graph.json').write_text('{}')\n"
+            "    os.kill(os.getppid(), signal.SIGKILL)\n"
+            "    raise SystemExit(0)\n"
+            "    graph=flag('--out')",
+        )
+    )
+    first = cli(tmp_path, "sync", "--config", config, "--dir", source)
+    assert first.returncode == -9, first.stderr
+    (run,) = (tmp_path / "runs/funds").glob("run-*/run.json")
+    assert (tmp_path / "corpus/funds/graphify-out/graph.json").read_text() == "{}"
+    tool.write_text(original)
+    resumed = cli(tmp_path, "sync", "--config", config, "--resume", run)
+    assert resumed.returncode == 2, resumed.stderr
+    paused = status(tmp_path, config, run)
+    assert paused["publication"]["graph"] == "unknown"
+    assert any(
+        item["retry_scope"] == "graph_batch" for item in paused["handoff"]["items"]
+    )
+    assert (tmp_path / "commands.jsonl").read_text().count(
+        '["graphify", "extract"'
+    ) == 1
+    retried = cli(
+        tmp_path, "sync", "--config", config, "--resume", run, "--retry-graph"
+    )
+    assert retried.returncode == 0, retried.stderr
+    assert status(tmp_path, config, run)["publication"]["graph"] == "published"
+
+
+def test_retry_after_failed_outcome_saved_before_run_metadata(tmp_path, monkeypatch):
+    from dogpdkb import records, sync
+
+    config, source = setup_local(tmp_path)
+    (source / "note.md").write_text("# Native failure\n")
+    tool = tmp_path / "tools.py"
+    original = tool.read_text()
+    tool.write_text(
+        original.replace(
+            "    graph=flag('--out')",
+            "    raise SystemExit(1)\n    graph=flag('--out')",
+        )
+    )
+    complete_batch = records.Store.complete_batch
+
+    def lose_owner(store, outcomes, **kwargs):
+        rows = list(outcomes)
+        complete_batch(store, rows, **kwargs)
+        if rows and rows[0]["name"] == "graph" and rows[0]["status"] == "failed":
+            raise RuntimeError("owner lost after durable graph outcome")
+
+    with monkeypatch.context() as patch:
+        patch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1] / "src"))
+        patch.setattr(records.Store, "complete_batch", lose_owner)
+        with pytest.raises(
+            RuntimeError, match="owner lost after durable graph outcome"
+        ):
+            sync.main(["--config", str(config), "--dir", str(source)])
+    (run,) = (tmp_path / "runs/funds").glob("run-*/run.json")
+    tool.write_text(original)
+    result = cli(tmp_path, "sync", "--config", config, "--resume", run, "--retry-graph")
+    assert result.returncode == 0, result.stderr
+
+
+def test_another_instance_writing_same_graph_target_supersedes_retry(tmp_path):
+    graph = tmp_path / "shared-native-output"
+    a, b = tmp_path / "instance-a", tmp_path / "instance-b"
+    for root in (a, b):
+        root.mkdir()
+        config, source = setup_local(root)
+        config.write_text(
+            config.read_text() + f"\n[paths]\ngraph_dir={json.dumps(str(graph))}\n"
+        )
+        (source / "note.md").write_text(f"# Corpus from {root.name}\n")
+    tool = a / "tools.py"
+    original = tool.read_text()
+    tool.write_text(
+        original.replace(
+            "    graph=flag('--out')",
+            "    raise SystemExit(1)\n    graph=flag('--out')",
+        )
+    )
+    config_a = a / "instance.toml"
+    config_b = b / "instance.toml"
+    first = cli(a, "sync", "--config", config_a, "--dir", a / "inbox")
+    assert first.returncode == 2, first.stderr
+    run_a = Path(json.loads(first.stdout)["run"])
+    second = cli(b, "sync", "--config", config_b, "--dir", b / "inbox")
+    assert second.returncode == 0, second.stderr
+    before = (graph / "graph.json").read_bytes()
+    tool.write_text(original)
+    retry = cli(a, "sync", "--config", config_a, "--resume", run_a, "--retry-graph")
+    assert retry.returncode == 2, retry.stderr
+    assert (graph / "graph.json").read_bytes() == before
+    assert (a / "commands.jsonl").read_text().count('["graphify", "extract"') == 1
+    assert any(
+        f["reason"] == "STALE_GRAPH_HANDOFF"
+        for f in json.loads(run_a.read_text())["failures"]
+    )
