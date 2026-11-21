@@ -95,13 +95,17 @@ def retain_inputs(store, run, rows, results):
         raw = store.document(identifier)["raw"]
         result = results.setdefault(identifier, {})
         if admitted:
-            # Admitted raw bytes already live in durable admission evidence;
-            # retaining copies would rewrite the byte-exact raw record and
-            # invalidate revalidation. Catalog resources stay on the row.
-            target = Path(raw["path"])
-            resources = row.get("resources") or []
-            output = Path(run.directory) / "corpus-inputs" / f"{row['slot']}.md"
-            output.parent.mkdir(parents=True, exist_ok=True)
+            # Retain catalogued files for durable publication, but keep the
+            # admitted raw record byte-exact: no raw.update here.
+            parent = store.input_directory(identifier)
+            parent.mkdir(parents=True, exist_ok=True)
+            directory = Path(tempfile.mkdtemp(prefix="retained-", dir=parent))
+            target, resources = retain_raw(
+                directory,
+                Path(row["raw_path"]),
+                [dict(r) for r in (row.get("resources") or [])],
+            )
+            row["resources"] = resources
         else:
             parent = store.input_directory(identifier)
             parent.mkdir(parents=True, exist_ok=True)
@@ -118,7 +122,7 @@ def retain_inputs(store, run, rows, results):
                 sha256=hashlib.sha256(target.read_bytes()).hexdigest(),
             )
             row["resources"] = resources
-            output = directory / "corpus-input.md"
+        output = directory / "corpus-input.md"
         enriched = result.get("status") == "completed"
         source = Path(result["output"]) if enriched else target
         output.write_bytes(

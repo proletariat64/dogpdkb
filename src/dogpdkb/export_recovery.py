@@ -318,6 +318,8 @@ def verify_admission(store, data, body):
     run = Run.load(store, store.runs / run_ids.pop())
     if run.data["command"] != "recover-export":
         raise ValueError("resume requires a staged export recovery run")
+    if not run.path.resolve().is_relative_to(store.runs.resolve()):
+        raise ValueError("recovery run is outside the committed staging root")
     durable = store.path.parent / "export-recovery" / run.id
     handoff = Path(run.data["artifacts"]["admitted"])
     if _bytes(handoff, durable) != body:
@@ -359,11 +361,14 @@ def verify_admission(store, data, body):
             raise ValueError(f"frozen version no longer observed for {identifier}")
         raw = {key: value for key, value in row.items() if key != "document_id"}
         step = store.step(identifier, "export") or {}
+        staged_report = str(durable / identifier / "staged-report.json")
         if (
             current.get("raw") != raw
             or step.get("run_id") != run.id
             or not same_version(step.get("version"), raw.get("version"))
+            or not same_version(raw.get("version"), selected["version"])
             or step.get("path") != raw["path"]
+            or step.get("report") != staged_report
             or step.get("recovery_receipt") != str(receipt)
             or digest(_bytes(raw["path"], durable)) != raw["sha256"]
         ):
@@ -386,13 +391,15 @@ def verify_admission(store, data, body):
 
 
 def resume(store, reference):
-    run = Run.load(store, store.runs / reference)
+    match = re.fullmatch(r"run-\d{8}-\d{6}-[0-9a-f]{8}", reference)
+    run = Run.load(store, store.runs / reference if match else Path(reference))
     handoff = Path(run.data["artifacts"]["admitted"])
     body = _bytes(handoff, store.path.parent / "export-recovery" / run.id)
     data = json.loads(body)
     verified = verify_admission(store, data, body)
     if verified.id != run.id:
         raise ValueError("admission was committed by a different recovery run")
+    run = verified
     if run.data["status"] != "completed":
         run.stage(
             "download", total=len(data["documents"]), completed=len(data["documents"])

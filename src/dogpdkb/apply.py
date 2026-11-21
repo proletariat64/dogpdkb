@@ -482,6 +482,13 @@ def prepare_inputs(
     return rows
 
 
+def enabled_bindings(book):
+    """Current enabled source subscriptions, not a run's frozen targets."""
+    from dogpdkb.settings import source_binding
+
+    return {source.key: source_binding(source) for source in book.sources if source.enabled}
+
+
 def admitted_membership(bindings, document, identifier):
     """Refuse admitted identities outside the given source subscription."""
     binding = bindings.get(document.get("source_key"))
@@ -511,7 +518,7 @@ def prepare_admitted_inputs(settings, book, store, run, admitted, body):
     if run.data["command"] == "sync":
         raise ValueError("admitted exports enter through apply, not sync")
     payload = json.loads(body)
-    if payload != admitted:
+    if payload != admitted or payload.get("schema") != "dogpdkb-admitted-export-1":
         raise ValueError("admitted input must be the exact recorded bytes")
     source_run = verify_admission(store, payload, body)
     frozen = run.directory / "admitted.json"
@@ -532,8 +539,14 @@ def prepare_admitted_inputs(settings, book, store, run, admitted, body):
             owners.setdefault(Path(path), set()).add(identity)
 
     rows = []
+    prepared_path = run.directory / "prepared-inputs.json"
+    prepared = read_json(prepared_path) if prepared_path.exists() else {}
+    validate_inputs(prepared.values(), check_baseline=True)
     for index, admitted_row in enumerate(payload["documents"]):
         identifier = admitted_row["document_id"]
+        if identifier in prepared:
+            rows.append(prepared[identifier])
+            continue
         document = store.data["documents"][identifier]
         raw = {
             key: value for key, value in admitted_row.items() if key != "document_id"
@@ -542,7 +555,7 @@ def prepare_admitted_inputs(settings, book, store, run, admitted, body):
         source_document_id = document.get("source_document_id")
         if not source_key or not source_document_id:
             raise ValueError(f"admitted identity missing for {identifier}")
-        admitted_membership(run.data["targets"]["sources"], document, identifier)
+        admitted_membership(enabled_bindings(book), document, identifier)
         row = {
             "document_id": identifier,
             "source_key": source_key,
@@ -603,7 +616,6 @@ def prepare_admitted_inputs(settings, book, store, run, admitted, body):
         row["raw_path"] = str(raw_path)
         rows.append(row)
     run.data["sources"] = sorted({row["source_key"] for row in rows})
-    prepared_path = run.directory / "prepared-inputs.json"
     atomic_json(prepared_path, {row["document_id"]: row for row in rows})
     run.data["artifacts"]["prepared_inputs"] = str(prepared_path)
     run.save()
@@ -1385,7 +1397,9 @@ def apply_run(
                 differences = json.loads(input_bytes)
             if not isinstance(differences, dict):
                 raise ValueError("a difference scope is required")
-            if differences.get("schema") == "dogpdkb-admitted-export-1":
+            if differences.get("schema") == "dogpdkb-admitted-export-1" or run.data.get(
+                "admitted_sha256"
+            ):
                 if input_bytes is None:
                     raise ValueError("admitted exports must be resumed from a run")
                 rows = prepare_admitted_inputs(
@@ -1449,10 +1463,9 @@ def apply_run(
                 owners.setdefault(Path(path), set()).add(identity)
         for row in plan["documents"]:
             identifier = row["document_id"]
-            output = corpus_destination(
-                book, identifier, store.data["documents"][identifier].get("corpus", {})
-            )
-            if (output.exists() or output.is_symlink()) and output not in owners:
+            output = corpus_destination(book, identifier, row.get("previous_corpus", {}))
+            owners.setdefault(output, set()).add(identifier)
+            if owners[output] != {identifier} or output.is_symlink():
                 raise ValueError(f"corpus destination conflict for {identifier}")
     if stop_after == "plan":
         validate_inputs(plan["documents"])
