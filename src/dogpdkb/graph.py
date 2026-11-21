@@ -384,7 +384,6 @@ def run_graph(
         "graphify_concurrency": settings.graphify_concurrency,
         "reason": reason,
     }
-    atomic_json(report, evidence, durable=True)
     run.stage(
         "graphify", total=len(pending), completed=0, failed=0, phase="record-results"
     )
@@ -395,7 +394,16 @@ def run_graph(
         acknowledgement = {}
         if status == "completed" and not scan_only:
             document = store.document(doc_id)
-            witness = row.get("input_copy") or document["corpus"]["input_copy"]
+            witness = Path(row.get("input_copy") or document["corpus"]["input_copy"])
+            # Corpus normally provides a durable witness. A compile handoff can
+            # still carry its own wash copy; never pin that path as a baseline.
+            if not witness.resolve().is_relative_to(store.input_directory(doc_id)):
+                body = witness.read_bytes()
+                witness = evidence_dir / f"{doc_id}.md"
+                with witness.open("xb") as stream:
+                    stream.write(body)
+                    stream.flush()
+                    os.fsync(stream.fileno())
             source_file = Path(row["path"]).relative_to(book.corpus)
             acknowledgement = {
                 "input_copy": str(witness),
@@ -460,6 +468,7 @@ def run_graph(
                 input_sha256=input_digests[doc_id],
                 scan_only=scan_only,
             )
+    atomic_json(report, evidence, durable=True)
     store.complete_batch(outcomes, durable=True)
     complete = len(pending) if status == "completed" else 0
     run.data["graph_result"] = status

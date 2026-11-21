@@ -55,6 +55,13 @@ def test_completed_sync_cleans_bulk_and_keeps_status_and_next_sync(tmp_path):
     assert not (run.parent / "raw").exists()
     assert not list(run.parent.glob("graphify-*"))
     assert record["status"] == "completed"
+    documents = json.loads((tmp_path / "state/funds/state.json").read_text())[
+        "documents"
+    ]
+    for document in documents.values():
+        witness = document["corpus"]["input_copy"]
+        assert document["steps"]["graph"]["input_copy"] == witness
+        assert Path(witness).is_file()
     status = cli("status", "--config", config, "--json")
     assert json.loads(status.stdout)["status"] == "completed"
     before = (tmp_path / "commands.jsonl").read_text().splitlines()
