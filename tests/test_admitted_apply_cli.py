@@ -361,9 +361,7 @@ def test_admitted_local_image_compiles_with_ocr_decision_and_no_refetch(tmp_path
         assert published.parent == tmp_path / "corpus"
         assert row["ocr_status"] == "completed"
         bodies[row["document_id"]] = published.read_text()
-    (image_doc,) = [
-        key for key, body in bodies.items() if "mdocr:ocr-begin" in body
-    ]
+    (image_doc,) = [key for key, body in bodies.items() if "mdocr:ocr-begin" in body]
     assert image_doc in admitted
     (text_doc,) = [key for key in admitted if key != image_doc]
     assert bodies[text_doc] == "# alpha\n\nStaged body.\n"

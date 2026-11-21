@@ -486,7 +486,9 @@ def enabled_bindings(book):
     """Current enabled source subscriptions, not a run's frozen targets."""
     from dogpdkb.settings import source_binding
 
-    return {source.key: source_binding(source) for source in book.sources if source.enabled}
+    return {
+        source.key: source_binding(source) for source in book.sources if source.enabled
+    }
 
 
 def admitted_membership(bindings, document, identifier):
@@ -787,9 +789,9 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
                 prepared = Path(run.data["artifacts"]["prepared_inputs"])
                 cataloged = read_json(prepared)
                 for prepared_row in active:
-                    cataloged[prepared_row["document_id"]]["resources"] = (
-                        prepared_row["resources"]
-                    )
+                    cataloged[prepared_row["document_id"]]["resources"] = prepared_row[
+                        "resources"
+                    ]
                 atomic_json(prepared, cataloged)
             elif not replan:
                 for row in active:
@@ -1462,7 +1464,9 @@ def apply_run(
             and hashlib.sha256(admitted_bytes).hexdigest()
             != run.data["admitted_sha256"]
         ):
-            raise ValueError("admitted input changed after planning; generate a new plan")
+            raise ValueError(
+                "admitted input changed after planning; generate a new plan"
+            )
         admitted_payload = json.loads(admitted_bytes)
         verify_admission(store, admitted_payload, admitted_bytes)
         for admitted_row in admitted_payload["documents"]:
@@ -1476,7 +1480,8 @@ def apply_run(
             (row["document_id"], row.get("raw_sha256")) for row in plan["documents"]
         }
         admitted_scope = {
-            (row["document_id"], row.get("sha256")) for row in admitted_payload["documents"]
+            (row["document_id"], row.get("sha256"))
+            for row in admitted_payload["documents"]
         }
         if plan_rows != admitted_scope:
             raise ValueError("plan does not match the verified admission")
@@ -1486,7 +1491,9 @@ def apply_run(
                 owners.setdefault(Path(path), set()).add(identity)
         for row in plan["documents"]:
             identifier = row["document_id"]
-            output = corpus_destination(book, identifier, row.get("previous_corpus", {}))
+            output = corpus_destination(
+                book, identifier, row.get("previous_corpus", {})
+            )
             if (output.exists() or output.is_symlink()) and output not in owners:
                 owners[output] = {None}
             owners.setdefault(output, set()).add(identifier)
