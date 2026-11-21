@@ -89,28 +89,42 @@ def retain_blocked_raw(store, rows):
 
 
 def retain_inputs(store, run, rows, results):
+    admitted = bool(run.data.get("artifacts", {}).get("admitted_run"))
     for row in rows:
         identifier = row["document_id"]
-        parent = store.input_directory(identifier)
-        parent.mkdir(parents=True, exist_ok=True)
-        # Published Markdown can still refer to earlier retained generations.
-        directory = Path(tempfile.mkdtemp(prefix="retained-", dir=parent))
         raw = store.document(identifier)["raw"]
-        target, resources = retain_raw(
-            directory,
-            Path(row["raw_path"]),
-            [dict(r) for r in raw.get("resources") or []],
-        )
-        raw.update(
-            path=str(target),
-            resources=resources,
-            sha256=hashlib.sha256(target.read_bytes()).hexdigest(),
-        )
-        row["resources"] = resources
         result = results.setdefault(identifier, {})
+        if admitted:
+            # Retain catalogued files for durable publication, but keep the
+            # admitted raw record byte-exact: no raw.update here.
+            parent = store.input_directory(identifier)
+            parent.mkdir(parents=True, exist_ok=True)
+            directory = Path(tempfile.mkdtemp(prefix="retained-", dir=parent))
+            target, resources = retain_raw(
+                directory,
+                Path(row["raw_path"]),
+                [dict(r) for r in (row.get("resources") or [])],
+            )
+            row["resources"] = resources
+        else:
+            parent = store.input_directory(identifier)
+            parent.mkdir(parents=True, exist_ok=True)
+            # Published Markdown can still refer to earlier retained generations.
+            directory = Path(tempfile.mkdtemp(prefix="retained-", dir=parent))
+            target, resources = retain_raw(
+                directory,
+                Path(row["raw_path"]),
+                [dict(r) for r in raw.get("resources") or []],
+            )
+            raw.update(
+                path=str(target),
+                resources=resources,
+                sha256=hashlib.sha256(target.read_bytes()).hexdigest(),
+            )
+            row["resources"] = resources
+        output = directory / "corpus-input.md"
         enriched = result.get("status") == "completed"
         source = Path(result["output"]) if enriched else target
-        output = directory / "corpus-input.md"
         output.write_bytes(
             publication_body(source, resources, result if enriched else {})
         )

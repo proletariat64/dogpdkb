@@ -482,6 +482,154 @@ def prepare_inputs(
     return rows
 
 
+def enabled_bindings(book):
+    """Current enabled source subscriptions, not a run's frozen targets."""
+    from dogpdkb.settings import source_binding
+
+    return {
+        source.key: source_binding(source) for source in book.sources if source.enabled
+    }
+
+
+def admitted_membership(bindings, document, identifier):
+    """Refuse admitted identities outside the given source subscription."""
+    binding = bindings.get(document.get("source_key"))
+    include = binding.get("document_ids") if binding else None
+    remote = document.get("source_document_id")
+    if (
+        binding is None
+        or (include is not None and remote not in include)
+        or remote in binding.get("exclude_document_ids", ())
+    ):
+        raise ValueError(
+            f"admitted identity outside the current subscription: {identifier}"
+        )
+
+
+def prepare_admitted_inputs(settings, book, store, run, admitted, body):
+    """Adopt a committed export admission as plan inputs without any export fetch.
+
+    The admitted handoff is verified read-only against the recover-export run,
+    its receipt and the committed raw facts. Every document must still be
+    reusable exactly as admitted: any scope, identity, version, metadata or
+    SHA drift refuses the whole set before any state update, and this path
+    never constructs an export request or enters the Skylark flow.
+    """
+    from dogpdkb.export_recovery import verify_admission
+
+    if run.data["command"] == "sync":
+        raise ValueError("admitted exports enter through apply, not sync")
+    recorded = run.data.get("admitted_sha256")
+    if recorded and recorded != hashlib.sha256(body).hexdigest():
+        raise ValueError("admitted input changed; start a new run")
+    payload = json.loads(body)
+    if payload != admitted or payload.get("schema") != "dogpdkb-admitted-export-1":
+        raise ValueError("admitted input must be the exact recorded bytes")
+    source_run = verify_admission(store, payload, body)
+    frozen = run.directory / "admitted.json"
+    if frozen.exists():
+        # Resume reuses the exact frozen bytes instead of recreating them.
+        if frozen.read_bytes() != body:
+            raise ValueError("frozen admitted input changed; start a new run")
+    else:
+        with frozen.open("xb") as stream:
+            stream.write(body)
+    run.data["artifacts"]["differences"] = str(frozen)
+    run.data["artifacts"]["admitted_run"] = source_run.id
+    run.data["admitted_sha256"] = hashlib.sha256(body).hexdigest()
+
+    owners = {}
+    for identity, document in store.data["documents"].items():
+        if path := document.get("corpus", {}).get("path"):
+            owners.setdefault(Path(path), set()).add(identity)
+
+    rows = []
+    prepared_path = run.directory / "prepared-inputs.json"
+    prepared = read_json(prepared_path) if prepared_path.exists() else {}
+    validate_inputs(prepared.values(), check_baseline=True)
+    # Persist the frozen scope before writing prepared witnesses so an
+    # interruption between the two never leaves a resume without scope.
+    run.save(durable=True)
+    for index, admitted_row in enumerate(payload["documents"]):
+        identifier = admitted_row["document_id"]
+        document = store.data["documents"][identifier]
+        admitted_membership(enabled_bindings(book), document, identifier)
+        output = corpus_destination(book, identifier, document.get("corpus", {}))
+        if (output.exists() or output.is_symlink()) and output not in owners:
+            owners[output] = {None}
+        owners.setdefault(output, set()).add(identifier)
+        if owners[output] != {identifier} or output.is_symlink():
+            raise ValueError(f"corpus destination conflict for {identifier}")
+        if identifier in prepared:
+            rows.append(prepared[identifier])
+            continue
+        raw = {
+            key: value for key, value in admitted_row.items() if key != "document_id"
+        }
+        source_key = document.get("source_key")
+        source_document_id = document.get("source_document_id")
+        if not source_key or not source_document_id:
+            raise ValueError(f"admitted identity missing for {identifier}")
+        row = {
+            "document_id": identifier,
+            "source_key": source_key,
+            "source_document_id": source_document_id,
+            "version": raw["version"],
+            "slot": index,
+            "metadata": raw["metadata"],
+        }
+        version_key(row["version"])
+        reject_rollback(store, [row])
+        graph_step = store.step(identifier, "graph") or {}
+        graph_witness = graph_step.get("input_copy")
+        if graph_step.get("status") == "completed" and graph_witness:
+            baseline = {
+                **document.get("graph_baseline", {}),
+                "path": graph_witness,
+                "version": graph_step["version"],
+                "metadata": graph_step.get("metadata", {}),
+            }
+        elif document.get("graph_baseline"):
+            baseline = document["graph_baseline"]
+        elif document.get("baseline"):
+            # Only explicit init-state facts may bootstrap an unknown graph.
+            # Capturing/publishing an uncompiled new body is NOT a baseline.
+            baseline = document.get("corpus", {})
+        else:
+            baseline = {}
+        row["baseline"] = dict(baseline)
+        row["previous_corpus"] = dict(document.get("corpus", {}))
+        row["previous_graph"] = dict(document.get("graph", {}))
+        row["previous_corpus_sha256"] = (
+            file_digest(output) if output.is_file() else None
+        )
+        raw_path = Path(raw["path"])
+        if descriptor(book, row, raw_path)["metadata"] != raw["metadata"]:
+            raise ValueError(f"admitted metadata mismatch for {identifier}")
+        witness = run.directory / "plan-inputs" / f"{index}.md"
+        witness.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(raw_path, witness)
+        row["input_copy"] = str(witness)
+        row["raw_sha256"] = file_digest(witness)
+        if row["raw_sha256"] != raw["sha256"]:
+            raise ValueError(f"admitted raw SHA-256 mismatch for {identifier}")
+        row["resources"] = raw.get("resources")
+        baseline_path = row["baseline"].get("path")
+        if baseline_path and Path(baseline_path).is_file():
+            expected = run.directory / "baseline-inputs" / f"{index}.md"
+            expected.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(baseline_path, expected)
+            row["baseline_input_copy"] = str(expected)
+            row["baseline_input_sha256"] = file_digest(expected)
+        row["raw_path"] = str(raw_path)
+        rows.append(row)
+    run.data["sources"] = sorted({row["source_key"] for row in rows})
+    atomic_json(prepared_path, {row["document_id"]: row for row in rows})
+    run.data["artifacts"]["prepared_inputs"] = str(prepared_path)
+    run.save()
+    return rows
+
+
 def catalog_failed_exports(settings, book, run, rows):
     failures = [
         item
@@ -633,7 +781,20 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
             }
             for row in active:
                 row["resources"] = resources.get(row["document_id"], [])
-                if not replan:
+            if not replan and run.data.get("artifacts", {}).get("admitted_run"):
+                # Comparison-derived resources must not rewrite an admitted raw
+                # fact; the admission record stays byte-exact for revalidation.
+                # Persist them on the prepared rows so a later resume keeps
+                # the catalog instead of re-deriving it.
+                prepared = Path(run.data["artifacts"]["prepared_inputs"])
+                cataloged = read_json(prepared)
+                for prepared_row in active:
+                    cataloged[prepared_row["document_id"]]["resources"] = prepared_row[
+                        "resources"
+                    ]
+                atomic_json(prepared, cataloged)
+            elif not replan:
+                for row in active:
                     store.document(row["document_id"])["raw"]["resources"] = row[
                         "resources"
                     ]
@@ -1241,19 +1402,30 @@ def apply_run(
             read_checkpoint(run, "collect", "differences")
             rows = list(read_checkpoint(run, "collect", "prepared_inputs").values())
         else:
+            input_bytes = None
             if resume:
                 if not artifacts.get("differences"):
                     raise ValueError(
                         "run has no frozen difference scope; start a new discovery"
                     )
-                differences = read_json(Path(artifacts["differences"]))
+                differences = Path(artifacts["differences"])
             if isinstance(differences, (str, Path)):
-                differences = read_json(Path(differences))
+                input_bytes = Path(differences).read_bytes()
+                differences = json.loads(input_bytes)
             if not isinstance(differences, dict):
                 raise ValueError("a difference scope is required")
-            rows = prepare_inputs(
-                settings, book, store, run, differences, concurrency=concurrency
-            )
+            if differences.get("schema") == "dogpdkb-admitted-export-1" or run.data.get(
+                "admitted_sha256"
+            ):
+                if input_bytes is None:
+                    raise ValueError("admitted exports must be resumed from a run")
+                rows = prepare_admitted_inputs(
+                    settings, book, store, run, differences, input_bytes
+                )
+            else:
+                rows = prepare_inputs(
+                    settings, book, store, run, differences, concurrency=concurrency
+                )
             if sync:
                 # Export progress uses this same file; only this final version
                 # is the handoff, with exactly the verified acquired inputs.
@@ -1280,6 +1452,53 @@ def apply_run(
         run.stage("plan", total=len(rows), completed=len(rows))
         if sync:
             seal_phase(run, "plan", "plan")
+    if artifacts.get("admitted_run"):
+        # A newer export, replaced handoff, membership change or destination
+        # collision since planning supersedes the admission; refuse before
+        # OCR or publication can build on stale witnesses.
+        from dogpdkb.export_recovery import verify_admission
+
+        admitted_bytes = Path(artifacts["differences"]).read_bytes()
+        if (
+            run.data.get("admitted_sha256")
+            and hashlib.sha256(admitted_bytes).hexdigest()
+            != run.data["admitted_sha256"]
+        ):
+            raise ValueError(
+                "admitted input changed after planning; generate a new plan"
+            )
+        admitted_payload = json.loads(admitted_bytes)
+        verify_admission(store, admitted_payload, admitted_bytes)
+        for admitted_row in admitted_payload["documents"]:
+            identifier = admitted_row["document_id"]
+            admitted_membership(
+                enabled_bindings(store.book),
+                store.data["documents"][identifier],
+                identifier,
+            )
+        plan_rows = {
+            (row["document_id"], row.get("raw_sha256")) for row in plan["documents"]
+        }
+        admitted_scope = {
+            (row["document_id"], row.get("sha256"))
+            for row in admitted_payload["documents"]
+        }
+        if plan_rows != admitted_scope:
+            raise ValueError("plan does not match the verified admission")
+        owners = {}
+        for identity, document in store.data["documents"].items():
+            if path := document.get("corpus", {}).get("path"):
+                owners.setdefault(Path(path), set()).add(identity)
+        for row in plan["documents"]:
+            identifier = row["document_id"]
+            output = corpus_destination(
+                book, identifier, row.get("previous_corpus", {})
+            )
+            if (output.exists() or output.is_symlink()) and output not in owners:
+                owners[output] = {None}
+            owners.setdefault(output, set()).add(identifier)
+            if owners[output] != {identifier} or output.is_symlink():
+                raise ValueError(f"corpus destination conflict for {identifier}")
     if stop_after == "plan":
         validate_inputs(plan["documents"])
         return pause(run, "plan", stop_after)
@@ -1318,9 +1537,11 @@ def apply_run(
         except InvalidOcrBatchBinding:
             from dogpdkb.inputs import retain_blocked_raw
 
-            retain_blocked_raw(
-                store, [row for row in rows if row["document_id"] not in stale]
-            )
+            if not artifacts.get("admitted_run"):
+                retain_blocked_raw(
+                    store,
+                    [row for row in rows if row["document_id"] not in stale],
+                )
             raise
         rows = [row for row in rows if row["document_id"] not in stale]
         validate_plan({**plan, "documents": rows}, book, store, check_baseline=True)
