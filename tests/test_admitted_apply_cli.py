@@ -1,6 +1,8 @@
 """Committed export admissions drive apply plan/Corpus adoption without refetch."""
 
+import hashlib
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -25,8 +27,12 @@ def skylark_calls(root):
     ]
 
 
-def admission_case(root, count):
-    """Admit `count` staged exports committed against a frozen failed run."""
+def admission_case(root, count, image_path=None):
+    """Admit `count` staged exports committed against a frozen failed run.
+
+    With `image_path`, the second admitted body embeds that local image via an
+    absolute reference so the bytes survive copying to durable evidence.
+    """
     config, _ = instance(root)
     books = root / "books.json"
     data = json.loads(books.read_bytes())
@@ -71,7 +77,10 @@ def admission_case(root, count):
             report=str(report),
         )
         md = root / f"{remote}.md"
-        body = f"# {remote}\n\nStaged body.\n".encode()
+        text = f"# {remote}\n\nStaged body.\n"
+        if image_path is not None and remote == REMOTES[1]:
+            text += f"\n![chart]({image_path})\n"
+        body = text.encode()
         md.write_bytes(body)
         staged_request, staged_report = (
             root / f"{remote}.{name}.json" for name in ("request", "report")
@@ -302,6 +311,66 @@ def test_admitted_refuses_drift_before_any_fetch(tmp_path, tamper, fragment):
     assert not skylark_calls(tmp_path)
     assert state_path(tmp_path).read_bytes() == state_before
     assert not list((tmp_path / "corpus").glob("*.md"))
+
+
+def test_admitted_local_image_compiles_with_ocr_decision_and_no_refetch(tmp_path):
+    from PIL import Image
+
+    from tests.ocr_fixture import write_ocr_fixture
+
+    png = tmp_path / "images" / "chart.png"
+    png.parent.mkdir()
+    Image.new("RGB", (8, 8), (12, 34, 56)).save(png)
+    config, receipt = admission_case(tmp_path, 2, image_path=png)
+    tool = tmp_path / "ocr_fixture.py"
+    write_ocr_fixture(
+        tool,
+        "import json,sys\n"
+        "fixture_result({'schema_version': 'mdocr-result-2', "
+        "'documents': [{'status': 'completed'} for _ in fixture_plan['documents']]})\n",
+    )
+    config.write_text(
+        config.read_text().replace(
+            json.dumps([sys.executable, str(tmp_path / "remote.py"), "mdocr"]),
+            json.dumps([sys.executable, str(tool)]),
+        )
+    )
+    admitted = {row["document_id"] for row in admitted_rows(tmp_path, receipt)}
+    rows_before = {
+        key: hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+        for key, value in json.loads(state_path(tmp_path).read_bytes())[
+            "documents"
+        ].items()
+    }
+    applied = cli("apply", "--config", config, "--input", receipt["admitted"])
+    assert applied.returncode == 0, applied.stderr
+    assert not skylark_calls(tmp_path)
+    run = json.loads(Path(json.loads(applied.stdout)["run"]).read_bytes())
+    plan = json.loads(Path(run["artifacts"]["plan"]).read_bytes())
+    assert {row["document_id"] for row in plan["documents"]} == admitted
+    assert all(row["action"] == "compile" for row in plan["documents"])
+    manifest = json.loads(Path(json.loads(applied.stdout)["manifest"]).read_bytes())
+    assert len(manifest["documents"]) == 2
+    bodies = {}
+    for row in manifest["documents"]:
+        published = Path(row["path"])
+        assert published.parent == tmp_path / "corpus"
+        assert row["ocr_status"] == "completed"
+        bodies[row["document_id"]] = published.read_text()
+    (image_doc,) = [
+        key for key, body in bodies.items() if "mdocr:ocr-begin" in body
+    ]
+    assert image_doc in admitted
+    (text_doc,) = [key for key in admitted if key != image_doc]
+    assert bodies[text_doc] == "# alpha\n\nStaged body.\n"
+    state = json.loads(state_path(tmp_path).read_bytes())
+    changed = {
+        key
+        for key, value in state["documents"].items()
+        if hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+        != rows_before.get(key)
+    }
+    assert changed == admitted
 
 
 def test_admitted_resume_reuses_frozen_handoff(tmp_path):
