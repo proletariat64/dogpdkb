@@ -58,6 +58,10 @@ def _dispatch(argv: list[str] | None = None):
         from dogpdkb.apply import main as apply_main
 
         return apply_main(arguments[1:])
+    if arguments and arguments[0] == "recover-export":
+        from dogpdkb.export_recovery import main as recover_export_main
+
+        return recover_export_main(arguments[1:])
     if arguments and arguments[0] == "recover-ocr":
         from dogpdkb.ocr_recovery import main as recover_main
 
@@ -88,6 +92,7 @@ def _dispatch(argv: list[str] | None = None):
         "update-graph",
         "sync",
         "recover-ocr",
+        "recover-export",
         "publish-web",
     ):
         commands.add_parser(name, help=f"run {name}; use {name} --help for options")

@@ -1,0 +1,3 @@
+Use a dogpdkb-staged-export-1 document set with source_key, remote_id,
+request, report and markdown in each row. Paths are canonical and absolute.
+Preparation writes a private receipt only; explicit publication records only raw facts.
