@@ -584,13 +584,18 @@ def _execute(root, request, store, run, call_tool, *, allow_dispatch=True):
                     state = _tool_result(root, journal, plan_sha)
                     if state["status"] in {"completed", "partial"}:
                         if report_path.exists():
-                            _tool_result(root, report_path, plan_sha)
-                            if report_path.read_bytes() != journal.read_bytes():
-                                # Native journal is written first. Never replace
-                                # or pass off an older mirror as a final report.
-                                report = journal
+                            try:
+                                _tool_result(root, report_path, plan_sha)
+                            except _INVALID:
+                                reason = "OCR_RESULT_BINDING_INVALID"
                             else:
-                                report = report_path
+                                # A correctly bound but stale mirror can be
+                                # behind the authoritative terminal journal.
+                                report = (
+                                    journal
+                                    if report_path.read_bytes() != journal.read_bytes()
+                                    else report_path
+                                )
                         else:
                             report = journal
                     else:
@@ -614,7 +619,7 @@ def _execute(root, request, store, run, call_tool, *, allow_dispatch=True):
                     raise ValueError("OCR execution journal is missing")
             elif report_path.exists() or journal.exists():
                 raise ValueError("unowned OCR execution artifacts")
-            if report is None:
+            if reason is None and report is None:
                 settings = plan["settings"]
                 if (
                     settings["mode"] == "llm"

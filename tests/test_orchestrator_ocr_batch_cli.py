@@ -762,3 +762,31 @@ def test_global_invalid_binding_blocks_apply_and_resume_without_redispatch(tmp_p
     assert cli(*args, "--resume", run_path).returncode == 1
     assert (tmp_path / "ocr-argv").read_bytes() == calls
     assert seal.read_bytes() == saved
+
+
+def test_resume_blocks_terminal_mirror_with_wrong_plan_binding(tmp_path):
+    config, differences = _native_instance(tmp_path)
+    driver = tmp_path / "offline_mdocr.py"
+    driver.write_text(
+        driver.read_text().replace(
+            "raise SystemExit(main())",
+            """code = main()
+if sys.argv[1] == 'run':
+    import json
+    result = Path(sys.argv[sys.argv.index('--result')+1])
+    payload = json.loads(result.read_bytes())
+    assert payload['status'] in {'completed', 'partial'}
+    payload['plan_sha256'] = '0' * 64
+    result.write_text(json.dumps(payload))
+    raise SystemExit(143)
+raise SystemExit(code)""",
+        )
+    )
+    first = cli("apply", "--config", config, "--input", differences)
+    assert first.returncode == 143, first.stderr
+    (run,) = (tmp_path / "runs/funds").glob("run-*/run.json")
+    resumed = cli("apply", "--config", config, "--resume", run)
+    assert resumed.returncode == 1 and "OCR_RESULT_BINDING_INVALID" in resumed.stderr
+    assert not list((tmp_path / "corpus").glob("*.md"))
+    (seal,) = (tmp_path / "state/funds/ocr").glob("*/settled.json")
+    assert json.loads(seal.read_bytes())["reason"] == "OCR_RESULT_BINDING_INVALID"
