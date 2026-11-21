@@ -452,6 +452,11 @@ def prepare_inputs(
                             "export",
                             "EXPORT_FAILED_OR_VERSION_MISMATCH",
                             exit_code=code,
+                            inputs=[
+                                str(
+                                    run.directory / f"export-{row['slot']}-request.json"
+                                )
+                            ],
                             report=str(report),
                         )
                     if code not in {0, 2}:

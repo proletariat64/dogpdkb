@@ -70,3 +70,24 @@ Validation: public CLI subprocess tests use a local fake stdio MCP proxy and rea
 Markdown outputs: complete metadata-only listing; incomplete listing rejection;
 regular/table export; malformed source isolation; null/boolean/string listing total rejection. Existing eight transport/retry
 tests also pass. No live gateway, paid OCR, graph extraction or production write.
+
+## Explicit admission of staged exports
+
+`dogpdkb recover-export --run ORIGINAL --input STAGED --output-dir PRIVATE`
+prepares a SHA-256 approval receipt read-only against the configured book. The
+`dogpdkb-staged-export-1` input specifies a nonempty `documents` list; each
+row has `source_key`, `remote_id`, and absolute canonical `request`, `report`,
+and `markdown` paths. Every row must be within the saved source subscription
+and uniquely match a frozen, known failed export. Both the report and current
+observation must match the original version. The Markdown must match the
+completed report's exact path and byte count. Preparation does not attest to
+an independent remote fetch.
+
+`recover-export --publish RECEIPT --receipt-sha256 SHA` revalidates the whole
+set under the writer locks, copies the original failure and staged evidence to
+durable storage, and commits only the exact raw and export facts in one state
+save. The command neither starts external tools nor touches Corpus or Graph.
+`--resume RUN` verifies an already committed raw admission and finalizes its
+run record if interrupted after the state save. If the state was not committed,
+re-validate and publish the original approved receipt instead. The resulting
+`dogpdkb-admitted-export-1` is raw evidence, not an `apply` or Graphify manifest.

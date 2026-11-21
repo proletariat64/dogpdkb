@@ -38,6 +38,8 @@ def failure_files(store, run):
                 failure["input"] = corpus
             else:
                 failure["input"] = raw
+        if failure.get("step") == "export" and failure.get("report"):
+            retain(run.data["artifacts"].get("differences"))
         retain(failure.get("input"))
         for resource in failure.get("resources", []):
             retain(resource.get("path"))
