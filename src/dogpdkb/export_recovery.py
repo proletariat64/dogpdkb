@@ -125,7 +125,9 @@ def _snapshot(store, source_id, scope):
         _, requested = _single(request, "skylark-export-request-1", remote)
         ok, result = _single(report, "skylark-export-result-1", remote)
         metadata = result["metadata"]
-        timestamp = metadata.get("content_updated_at") or metadata.get("updated_at")
+        timestamp = metadata.get("content_updated_at")
+        if timestamp is None:
+            timestamp = metadata.get("updated_at")
         if (
             failed["status"] != "failed"
             or failed["path"] != prior["path"]

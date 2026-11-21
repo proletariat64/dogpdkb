@@ -151,6 +151,13 @@ def test_generic_raw_only_set_rejects_bad_scope_version_and_hash(tmp_path):
     atomic_json(report, bad_version)
     assert prep(specs[:2], "wrong-version").returncode == 1
     report.write_bytes(correct)
+    inconsistent = json.loads(correct)
+    meta = inconsistent["documents"][0]["metadata"]
+    meta.pop("updated_at")
+    meta["content_updated_at"] = ""
+    atomic_json(report, inconsistent)
+    assert prep(specs[:2], "empty-metadata-version").returncode == 1
+    report.write_bytes(correct)
     state = json.loads(initial)
     state["documents"][document_identity("team", "beta")]["absence"] = {
         "run_id": "later-scan"
