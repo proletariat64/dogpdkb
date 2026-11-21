@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import ctypes
 import hashlib
 import json
 import os
 import re
-import shutil
 import sys
 import tempfile
-import unicodedata
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 
 from dogpdkb.help import HelpParser
 from dogpdkb.phases import check_graph_manifest, graph_generation
@@ -21,7 +18,7 @@ from dogpdkb.records import Run, Store, atomic_json, read_json, version_key
 from dogpdkb.settings import load_config, select_book
 
 
-def _manifest(settings, book, store, run, reference):
+def _manifest(book, store, run, reference):
     data = reference if isinstance(reference, dict) else read_json(Path(reference))
     if (
         not isinstance(data, dict)
@@ -82,37 +79,19 @@ def _manifest(settings, book, store, run, reference):
     return data
 
 
-def _graph(path):
-    data = read_json(path)
-    if (
-        not isinstance(data, dict)
-        or not isinstance(data.get("nodes"), list)
-        or not isinstance(data.get("links", data.get("edges")), list)
-        or not all(
-            isinstance(data.get(kind, []), list)
-            and all(isinstance(record, dict) for record in data.get(kind, []))
-            for kind in ("nodes", "edges", "links", "hyperedges")
-        )
-    ):
-        raise TypeError("Graphify did not produce a graph artifact")
-    return data
-
-
-_NATIVE_VERSION = "graphify 0.9.111"
 _NATIVE_ENV = {
-    "GRAPHIFY_OUT": "graphify-out",
     "GRAPHIFY_FORCE": "0",
     "GRAPHIFY_OPENAI_OAUTH_PARALLEL": "1",
 }
 
 
-def _native_extract(command, corpus, workspace, token_budget, model, concurrency):
+def _native_extract(command, corpus, token_budget, model, concurrency):
     argv = [
         *command,
         "extract",
         str(corpus),
         "--out",
-        str(workspace),
+        str(corpus),
         "--no-cluster",
         "--backend",
         "openai-oauth",
@@ -124,52 +103,6 @@ def _native_extract(command, corpus, workspace, token_budget, model, concurrency
     if token_budget is not None:
         argv.extend(["--token-budget", str(token_budget)])
     return argv
-
-
-def _native_preflight(command, workspace, token_budget, model, concurrency):
-    """Check the attested CLI protocol without reading live credentials or documents."""
-    isolated = {
-        **_NATIVE_ENV,
-        "HOME": str(workspace),
-        "GRAPHIFY_OPENAI_OAUTH_AUTH_FILE": str(workspace / "no-oauth.json"),
-        "GRAPHIFY_CODEX_BASE_URL": "http://127.0.0.1:1",
-    }
-    log = workspace / "version.log"
-    code = run_command(
-        [*command, "--version"], log=log, cwd=workspace, timeout=15, env=isolated
-    )
-    if (
-        code in {130, 143}
-        or code != 0
-        or _NATIVE_VERSION not in log.read_text().splitlines()
-    ):
-        return code if code in {130, 143} else 2, log
-    probe = workspace / "capability"
-    probe.mkdir()
-    (probe / "probe.md").write_text(
-        "# Graphify capability probe\n\nSynthetic test input.\n"
-    )
-    log = workspace / "capability.log"
-    code = run_command(
-        _native_extract(
-            command,
-            probe,
-            workspace / "capability-output",
-            token_budget,
-            model,
-            concurrency,
-        ),
-        log=log,
-        cwd=workspace,
-        timeout=15,
-        env=isolated,
-    )
-    if code in {130, 143}:
-        return code, log
-    expected = (
-        "error: backend 'openai-oauth' requires a ChatGPT subscription OAuth login."
-    )
-    return (0 if code == 1 and expected in log.read_text() else 2), log
 
 
 def _prove_native_result(log, graph_path):
@@ -236,362 +169,14 @@ def _prove_native_result(log, graph_path):
         raise IncompleteExtraction("native chunk completion is missing or inconsistent")
     if cache is not None and cache[1] != dispatched:
         raise IncompleteExtraction("native cache misses were not all dispatched")
-    return dispatched + (cache[0] if cache else 0)
 
 
 class IncompleteExtraction(ValueError):
-    """The candidate cannot prove complete extraction of the frozen inputs."""
+    """Native result did not complete the selected graph handoff."""
 
 
-class NonportableManifest(ValueError):
-    """A native manifest cannot be relocated without changing identities."""
-
-
-def _portable_manifest(path):
-    data = read_json(path)
-    if not isinstance(data, dict):
-        raise TypeError("Graphify manifest must be an object")
-    for name in data:
-        relative = Path(name)
-        if (
-            relative == Path(".")
-            or relative.is_absolute()
-            or ".." in relative.parts
-            or PureWindowsPath(name).drive
-            or "\\" in name
-        ):
-            raise NonportableManifest(f"nonportable Graphify manifest key: {name}")
-    return data
-
-
-def _input_name(relative):
-    return unicodedata.normalize("NFC", relative.as_posix())
-
-
-def _tree_files(root):
-    files = {}
-    for path in root.rglob("*"):
-        if path.is_symlink() or not (path.is_file() or path.is_dir()):
-            raise ValueError("Graphify requires an ordinary file tree")
-        if path.is_file():
-            name = _input_name(path.relative_to(root))
-            if name in files:
-                raise ValueError(
-                    "Graphify input names collide after Unicode normalization"
-                )
-            files[name] = path
-    return files
-
-
-def _digest(path, algorithm="sha256"):
-    digest = hashlib.new(algorithm, usedforsecurity=algorithm != "md5")
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _snapshot(root):
-    """Bind the whole actual directory input, not just compile rows."""
-    return {name: _digest(path) for name, path in _tree_files(root).items()}
-
-
-def _semantic_owners(graph):
-    nodes = [
-        n for n in graph.get("nodes", []) if isinstance(n.get("id"), str) and n["id"]
-    ]
-    ids = {node["id"] for node in nodes}
-    hyperedges = [
-        edge
-        for edge in graph.get("hyperedges", [])
-        if isinstance(edge.get("nodes"), list)
-        and edge["nodes"]
-        and all(isinstance(member, str) and member in ids for member in edge["nodes"])
-    ]
-    return {
-        unicodedata.normalize("NFC", record["source_file"])
-        for record in (*nodes, *hyperedges)
-        if isinstance(record.get("source_file"), str)
-    }
-
-
-def _prove_coverage(
-    corpus,
-    witnesses,
-    tool_manifest,
-    graph,
-    baseline_manifest,
-    baseline_graph,
-    native_work,
-):
-    required = {
-        unicodedata.normalize("NFC", target.relative_to(corpus).as_posix())
-        for target, _ in witnesses
-    }
-    files = _tree_files(corpus)
-    required.update(name for name in files if Path(name).suffix.lower() == ".md")
-    if not required <= _semantic_owners(graph) or not required <= tool_manifest.keys():
-        raise IncompleteExtraction(
-            "Graphify manifest or graph omitted frozen Markdown or a selected source"
-        )
-    baseline_owners = _semantic_owners(baseline_graph)
-    changed = 0
-    for name, entry in tool_manifest.items():
-        if name not in files or not isinstance(entry, dict):
-            raise IncompleteExtraction(
-                f"Graphify manifest has an unbound source: {name}"
-            )
-        # Native manifest uses MD5 as a change stamp, not a trust digest.
-        expected = _digest(files[name], "md5")
-        field = "semantic_hash" if name in required else "ast_hash"
-        if entry.get(field) != expected:
-            raise IncompleteExtraction(
-                f"Graphify manifest lacks current byte coverage: {name}"
-            )
-        if name in required:
-            prior = baseline_manifest.get(name)
-            if (
-                name not in baseline_owners
-                or not isinstance(prior, dict)
-                or prior.get("semantic_hash") != expected
-            ):
-                changed += 1
-    if changed > native_work:
-        raise IncompleteExtraction(
-            "native extraction or cache evidence omitted changed sources"
-        )
-
-
-def _check_historical_inputs(corpus, book, pending, manifest, graph):
-    selected = {
-        unicodedata.normalize(
-            "NFC", Path(row["path"]).resolve().relative_to(book.corpus).as_posix()
-        )
-        for row in pending
-    }
-    owners = _semantic_owners(graph)
-    for name, path in _tree_files(corpus).items():
-        if Path(name).suffix.lower() != ".md" or name in selected:
-            continue
-        entry = manifest.get(name)
-        if (
-            not isinstance(entry, dict)
-            or name not in owners
-            or entry.get("semantic_hash") != _digest(path, "md5")
-        ):
-            raise IncompleteExtraction(f"unstamped historical graph input: {name}")
-
-
-def _sync_path(path):
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _exchange_dirs(exchange, staged, public):
-    # renameat2(AT_FDCWD, staged, AT_FDCWD, public, RENAME_EXCHANGE).
-    if exchange(-100, os.fsencode(staged), -100, os.fsencode(public), 2):
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), public)
-
-
-def _publication_capability(public, exchange):
-    if exchange is None or public.is_symlink() or os.path.ismount(public):
-        raise OSError("graph target cannot be exchanged atomically")
-    with tempfile.TemporaryDirectory(
-        prefix=".dogpdkb-graph-", dir=public.parent
-    ) as temporary:
-        first, second = Path(temporary) / "a", Path(temporary) / "b"
-        first.mkdir()
-        second.mkdir()
-        _exchange_dirs(exchange, first, second)
-
-
-def _publish_generation(candidate, public, exchange):
-    """Switch graph, manifest and native cache in one filesystem operation."""
-    with tempfile.TemporaryDirectory(
-        prefix=".dogpdkb-graph-", dir=public.parent
-    ) as temporary:
-        staged = Path(temporary) / "generation"
-        shutil.copytree(candidate, staged)
-        # Store.lock guards this inode. Keep it stable across the switch.
-        os.link(public / ".dogpdkb.lock", staged / ".dogpdkb.lock")
-        for folder, _, files in os.walk(staged, topdown=False):
-            for name in files:
-                _sync_path(Path(folder) / name)
-            _sync_path(Path(folder))
-        _exchange_dirs(exchange, staged, public)
-        _sync_path(public.parent)
-
-
-def _previous_graph_input(store, doc_id, document):
-    descriptor = dict(document.get("graph_baseline") or {})
-    graph = document.get("graph") or {}
-    step = store.step(doc_id, "graph") or {}
-    if (
-        graph.get("status") == "completed"
-        and step.get("status") == "completed"
-        and version_key(graph.get("version")) == version_key(step.get("version"))
-    ):
-        descriptor.update(
-            path=step.get("input_copy"),
-            source_file=graph.get("source_file"),
-            version=graph.get("version"),
-        )
-    return descriptor
-
-
-def _unowned_deferred_sources(settings, book, store, data, *, initial_recovery=False):
-    """Omit only new deferred sources absent from both native ownership artifacts."""
-    candidates = {}
-    for row in data["documents"]:
-        document = store.data["documents"].get(row["document_id"], {})
-        if row["action"] == "defer" and not any(
-            document.get(key) for key in ("baseline", "graph_baseline", "graph")
-        ):
-            candidates[row["document_id"]] = Path(row["path"]).resolve()
-    if not candidates:
-        return set()
-    native = settings.graph_for(book)
-    files = tuple((native / name).is_file() for name in ("graph.json", "manifest.json"))
-    if not any(files) and initial_recovery:
-        return set(candidates)  # No published generation can own these deferred paths.
-    if not all(files):
-        return set()
-    manifest = read_json(native / "manifest.json")
-    if not isinstance(manifest, dict):
-        raise TypeError("Graphify baseline manifest must be an object")
-    graph = _graph(native / "graph.json")
-    sources = list(manifest)
-    for kind in ("nodes", "links", "edges", "hyperedges"):
-        records = graph.get(kind, [])
-        if not isinstance(records, list):
-            raise TypeError("Graphify ownership records must be arrays")
-        for record in records:
-            if not isinstance(record, dict):
-                raise TypeError("Graphify ownership record must be an object")
-            if record.get("source_file"):
-                sources.append(record["source_file"])
-
-    def identity(value):
-        if not isinstance(value, str):
-            raise TypeError("Graphify source_file must be a string")
-        path = Path(value.replace("\\", "/"))
-        if not path.is_absolute():
-            path = book.corpus / path
-        return unicodedata.normalize("NFC", str(path.resolve()))
-
-    owned = {identity(source) for source in sources}
-    return {
-        doc_id
-        for doc_id, path in candidates.items()
-        if identity(str(path)) not in owned
-    }
-
-
-def _retained_corpus(
-    settings, book, store, run, data, pending, workspace, omitted, graphify_inputs
-):
-    """Freeze previous full graph bodies without excluding their native sources."""
-    selected = {row["document_id"] for row in pending}
-    rows = {row["document_id"]: row for row in data["documents"]}
-    retained = []
-    omitted_paths = []
-    for doc_id, document in store.data["documents"].items():
-        if doc_id in selected:
-            continue
-        current = document.get("corpus", {}).get("path")
-        if not current:
-            continue
-        current = Path(current).resolve()
-        if not current.is_absolute() or not current.resolve().is_relative_to(
-            book.corpus
-        ):
-            continue
-        if doc_id in omitted:
-            omitted_paths.append(current.relative_to(book.corpus))
-            continue
-        descriptor = _previous_graph_input(store, doc_id, document)
-        witness, source_file = descriptor.get("path"), descriptor.get("source_file")
-        required = rows.get(doc_id, {}).get("action") in {
-            "retain",
-            "defer",
-            "reuse",
-            "metadata",
-        }
-        if not witness or not source_file or not Path(witness).is_file():
-            if required or descriptor:
-                run.failure(
-                    document_id=doc_id,
-                    step="graph",
-                    reason="GRAPHIFY_RETAINED_INPUT_REQUIRED",
-                )
-                return None, []
-            continue
-        relative = Path(source_file)
-        if relative.is_absolute() or ".." in relative.parts or relative == Path("."):
-            raise ValueError("retained graph source must have a relative corpus path")
-        if graphify_inputs == "text" and relative.suffix.lower() != ".md":
-            raise ValueError("text Graphify inputs require Markdown retained sources")
-        retained.append((current.relative_to(book.corpus), relative, Path(witness)))
-    # Newer Graphify anchors manifests to --out's parent when the scan root
-    # lives beneath it. A sibling keeps the original corpus-relative keys.
-    mirror = workspace.with_name(workspace.name + "-corpus")
-    excluded = [settings.graph_for(book).resolve(), settings.staging.resolve()]
-
-    def ignore(folder, names):
-        ignored = {
-            name
-            for name in names
-            if name == ".dogpdkb.lock"
-            or name.startswith(".dogpdkb-graph-")
-            or (
-                graphify_inputs == "text"
-                and not (Path(folder) / name).is_dir()
-                and Path(name).suffix.lower() != ".md"
-                and name not in {".gitignore", ".graphifyignore"}
-            )
-            or any(
-                (Path(folder) / name).resolve().is_relative_to(path)
-                for path in excluded
-            )
-        }
-        if any((Path(folder) / name).is_symlink() for name in set(names) - ignored):
-            raise ValueError(
-                "graph corpus mirror requires ordinary files and directories"
-            )
-        return ignored
-
-    shutil.copytree(book.corpus, mirror, ignore=ignore, symlinks=True)
-    for relative in omitted_paths:
-        (mirror / relative).unlink()
-    selected_paths = {
-        Path(row["path"]).resolve().relative_to(book.corpus) for row in pending
-    }
-    destinations = set()
-    witnesses = []
-    for current, relative, _witness in retained:
-        if current != relative:
-            (mirror / current).unlink(missing_ok=True)
-    for current, relative, witness in retained:
-        if relative in selected_paths or relative in destinations:
-            raise ValueError("retained graph source collides with another source")
-        destinations.add(relative)
-        target = mirror / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(witness, target)
-        witnesses.append((target, witness))
-    for row in pending:
-        witnesses.append(
-            (
-                mirror / Path(row["path"]).resolve().relative_to(book.corpus),
-                Path(row["input_copy"]),
-            )
-        )
-    run.data["artifacts"]["graph_corpus"] = str(mirror)
-    return mirror, witnesses
+def _digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def run_graph(
@@ -602,27 +187,17 @@ def run_graph(
     manifest=None,
     *,
     retry_graph=False,
-    graphify_inputs=None,
     replan=False,
 ) -> int:
-    """Run native directory extraction; publish only a complete batch."""
+    """Run native extraction in place and acknowledge only a settled result."""
     manifest = manifest or run.data["artifacts"].get("manifest")
     if not manifest:
         raise ValueError("a complete-source compile manifest is required")
     if "graph_retry" in run.data:
         frozen = Path(manifest).read_bytes()
-        graphify_inputs = check_graph_manifest(
-            run, manifest, graphify_inputs, content=frozen
-        )
+        check_graph_manifest(run, manifest, content=frozen)
         manifest = json.loads(frozen)
-    graphify_inputs = graphify_inputs or "text"
-    if graphify_inputs not in {"all", "text"}:
-        raise ValueError("graphify inputs must be 'all' or 'text'")
-    data = _manifest(settings, book, store, run, manifest)
-    if graphify_inputs == "text" and any(
-        Path(row["path"]).suffix.lower() != ".md" for row in data["documents"]
-    ):
-        raise ValueError("text Graphify inputs require Markdown (.md) sources")
+    data = _manifest(book, store, run, manifest)
     partial = bool(data.get("failures")) or any(
         row["action"] == "defer" for row in data["documents"]
     )
@@ -637,6 +212,7 @@ def run_graph(
             and previous.get("run_id") == run.id
             and version_key(previous.get("version")) == version_key(row["version"])
             and previous.get("metadata") == row.get("metadata", {})
+            and previous.get("input_sha256") == _digest(Path(row["path"]))
             and Path(previous.get("input_copy", "")).is_file()
             and Path(previous["input_copy"]).read_bytes()
             == Path(row["path"]).read_bytes()
@@ -648,196 +224,64 @@ def run_graph(
         run.data["graph_publication"] = "published" if reconciled else "no_work"
         run.stage("graphify", total=reconciled, completed=reconciled, failed=0)
         return 2 if partial else 0
-    binding = run.data.get("graph_retry")
-    if (
-        retry_graph
-        and binding is not None
-        and not (replan or binding.get("input_tree_sha256"))
-    ):
-        raise ValueError(
-            "no frozen graph input tree to retry; resume the phase or generate a new plan"
-        )
     if (
         retry_graph
         and "graph_generation" in run.data
-        and (graph_generation(store, book) != run.data["graph_generation"])
+        and graph_generation(store, book) != run.data["graph_generation"]
     ):
         run.failure(step="graph", reason="STALE_GRAPH_HANDOFF", send_state="not_sent")
         return 2
     selected = {row["document_id"] for row in pending}
-    manifest_ids = {row["document_id"] for row in data["documents"]}
-    recovery = run.data.get("command") == "recover-ocr"
-    recovered_scope = set()
-    if recovery:
-        from dogpdkb.ocr_recovery import changed_graph_scope
-
-        recovered_scope = changed_graph_scope(store, run, data)
-    omitted = _unowned_deferred_sources(
-        settings, book, store, data, initial_recovery=recovery
-    )
-    # A directory scan could otherwise silently retry a blocked source from an
-    # earlier batch, even when the new plan selected different documents.
+    retrying = False
+    # The native scan sees the fixed Corpus, including files this plan did not
+    # select. A same-version hold is not permission to send those bytes again.
     for doc_id, document in store.data["documents"].items():
-        version = document.get("corpus", {}).get("version")
-        retained_input = False
-        if doc_id not in selected:
-            previous_input = _previous_graph_input(store, doc_id, document)
-            witness = previous_input.get("path")
-            if (
-                witness
-                and previous_input.get("source_file")
-                and Path(witness).is_file()
-            ):
-                version = previous_input.get("version")
-                retained_input = True
-        if version and store.suppressed(doc_id, "graph", version):
-            previous = store.step(doc_id, "graph") or {}
-            if doc_id in recovered_scope and (
-                doc_id in selected or retained_input or doc_id in omitted
-            ):
-                # Interrupted old bytes were not published. Only changed bodies
-                # enter this new request; retained/omitted peers are not replayed.
-                continue
-            # Replanning can retain or omit an own-run source that used to be
-            # selected. Authorize only its validated mirror representation;
-            # leave its failed record intact because it is not acknowledged.
-            if (
-                retry_graph
-                and (
-                    doc_id in selected
-                    or (
-                        doc_id in manifest_ids and (retained_input or doc_id in omitted)
-                    )
-                )
-                and previous.get("run_id") == run.id
-                and previous.get("status") in {"running", "failed", "unknown"}
-                and version_key(previous["version"]) == version_key(version)
-            ):
-                continue
-            run.failure(
-                document_id=doc_id,
-                version=version,
-                step="graph",
-                reason="SAME_VERSION_NOT_RETRIED",
-            )
-            return 2
+        corpus_fact = document.get("corpus", {})
+        version = corpus_fact.get("version")
+        path = corpus_fact.get("path")
+        if not (
+            version
+            and path
+            and Path(path).is_file()
+            and Path(path).resolve().is_relative_to(book.corpus)
+            and store.suppressed(doc_id, "graph", version)
+        ):
+            continue
+        attempt = store.blocked_attempt(doc_id, "graph", version)
+        if (
+            retry_graph
+            and doc_id in selected
+            and attempt
+            and attempt.get("run_id") == run.id
+        ):
+            retrying = True
+            continue
+        run.failure(
+            document_id=doc_id,
+            version=version,
+            step="graph",
+            reason="SAME_VERSION_NOT_RETRIED",
+            send_state="not_sent",
+        )
+        return 2
+
+    if retry_graph and "graph_retry" in run.data and not (retrying or replan):
+        raise ValueError(
+            "no prior graph attempt to retry; resume the graph stage instead"
+        )
+
+    corpus = book.corpus
     graph_dir = settings.graph_for(book)
     graph_path = graph_dir / "graph.json"
     native_manifest = graph_dir / "manifest.json"
-    if graph_path.exists() != native_manifest.is_file():
-        run.failure(step="graph", reason="GRAPHIFY_BASELINE_MANIFEST_REQUIRED")
-        return 1
-    baseline_graph, baseline_manifest = {}, {}
-    if graph_path.exists():
-        baseline_graph = _graph(graph_path)
-        try:
-            baseline_manifest = _portable_manifest(native_manifest)
-        except NonportableManifest as error:
-            run.failure(
-                step="graph",
-                reason="GRAPHIFY_PORTABLE_BASELINE_REQUIRED",
-                message=str(error),
-            )
-            return 2
-    else:
-        selected = {Path(row["path"]).resolve() for row in pending}
-        selected.update(
-            Path(row["path"]).resolve()
-            for row in data["documents"]
-            if row["document_id"] in omitted
-        )
-        if any(
-            path.resolve() not in selected
-            for path in book.corpus.rglob("*")
-            if path.is_file()
-            and not path.is_symlink()
-            and path.suffix.lower() == ".md"
-            and not path.is_relative_to(graph_dir)
-            and not path.is_relative_to(settings.staging)
-            and not any(
-                part.startswith(".dogpdkb-graph-")
-                for part in path.relative_to(book.corpus).parts
-            )
-        ):
-            run.failure(step="graph", reason="GRAPHIFY_BASELINE_REQUIRED")
-            return 1
-    exchange = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
-    try:
-        _publication_capability(graph_dir, exchange)
-    except OSError as error:
-        run.failure(
-            step="graph",
-            reason="GRAPHIFY_ATOMIC_PUBLICATION_UNAVAILABLE",
-            message=str(error),
-        )
-        return 2
-
+    input_digests = {row["document_id"]: _digest(Path(row["path"])) for row in pending}
     run.stage("graphify", total=len(pending), completed=0, failed=0, phase="prepare")
-    workspace = Path(tempfile.mkdtemp(prefix="graphify-", dir=run.directory))
-    public_snapshot = _snapshot(graph_dir)
-    corpus, witnesses = _retained_corpus(
-        settings, book, store, run, data, pending, workspace, omitted, graphify_inputs
-    )
-    if corpus is None:
-        return 2
-    try:
-        _check_historical_inputs(
-            corpus, book, pending, baseline_manifest, baseline_graph
-        )
-    except IncompleteExtraction as error:
-        run.failure(
-            step="graph",
-            reason="GRAPHIFY_BASELINE_COVERAGE_REQUIRED",
-            message=str(error),
-        )
-        return 2
-    snapshot = _snapshot(corpus)
-    input_digests = {
-        row["document_id"]: snapshot[
-            _input_name(Path(row["path"]).relative_to(book.corpus))
-        ]
-        for row in pending
-    }
-    if binding is not None:
-        scope = hashlib.sha256(
-            json.dumps(snapshot, sort_keys=True).encode()
-        ).hexdigest()
-        if binding.setdefault("input_tree_sha256", scope) != scope:
-            raise ValueError("saved graph input tree changed; generate a new plan")
-        run.save(durable=True)
-    command = settings.command("graphify")
-    token_budget = settings.graphify_token_budget
-    model = settings.graphify_model
-    concurrency = settings.graphify_concurrency
-    preflight, preflight_log = _native_preflight(
-        command, workspace, token_budget, model, concurrency
-    )
-    if preflight:
-        run.failure(
-            step="graph",
-            reason=(
-                "GRAPHIFY_PREFLIGHT_INTERRUPTED"
-                if preflight in {130, 143}
-                else "GRAPHIFY_NATIVE_PROOF_UNSUPPORTED"
-            ),
-            report=str(preflight_log),
-            send_state="not_sent",
-        )
-        return preflight
-    candidate = workspace / "graphify-out"
-    shutil.copytree(
-        graph_dir, candidate, ignore=shutil.ignore_patterns(".dogpdkb.lock")
-    )
-    if _snapshot(candidate) != {
-        name: digest
-        for name, digest in public_snapshot.items()
-        if name != ".dogpdkb.lock"
-    }:
-        raise ValueError("public Graphify generation changed while freezing baseline")
-    report = workspace / "result.json"
-    run.data["artifacts"].update(
-        graph_report=str(report), graph_candidate=str(candidate)
-    )
+    evidence_root = store.path.parent / "graph-evidence"
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    evidence_dir = Path(tempfile.mkdtemp(prefix="graphify-", dir=evidence_root))
+    report = evidence_dir / "result.json"
+    log = evidence_dir / "extract.log"
+    run.data["artifacts"]["graph_report"] = str(report)
     store.complete_batch(
         (
             {
@@ -855,45 +299,32 @@ def run_graph(
         durable=True,
     )
     run.stage("graphify", total=len(pending), completed=0, failed=0, phase="tools")
-    argv = _native_extract(command, corpus, workspace, token_budget, model, concurrency)
-    log = workspace / "extract.log"
+    argv = _native_extract(
+        settings.command("graphify"),
+        corpus,
+        settings.graphify_token_budget,
+        settings.graphify_model,
+        settings.graphify_concurrency,
+    )
     code = run_command(
-        argv,
-        log=log,
-        env=_NATIVE_ENV,
+        argv, log=log, env={**_NATIVE_ENV, "GRAPHIFY_OUT": str(graph_dir)}
     )
     status, reason = "failed", None
-    publication_attempted = False
     if code in {124, 130, 143}:
         status, reason = "unknown", "Graphify interrupted before a known result"
     elif code:
         reason = f"Graphify directory extraction exited {code}"
     else:
         try:
-            graph = _graph(candidate / "graph.json")
-            native_work = _prove_native_result(log, candidate / "graph.json")
-            tool_manifest = _portable_manifest(candidate / "manifest.json")
-            # Extraction may take hours. Do not publish if an input changed.
-            _manifest(settings, book, store, run, data)
-            if _snapshot(corpus) != snapshot or any(
-                target.read_bytes() != witness.read_bytes()
-                for target, witness in witnesses
+            if not (graph_path.is_file() and native_manifest.is_file()):
+                raise ValueError("native graph or manifest is missing")
+            _prove_native_result(log, graph_path)
+            _manifest(book, store, run, data)
+            if any(
+                _digest(Path(row["path"])) != input_digests[row["document_id"]]
+                for row in pending
             ):
-                raise ValueError("graph corpus mirror changed during extraction")
-            _prove_coverage(
-                corpus,
-                witnesses,
-                tool_manifest,
-                graph,
-                baseline_manifest,
-                baseline_graph,
-                native_work,
-            )
-            _tree_files(candidate)
-            if _snapshot(graph_dir) != public_snapshot:
-                raise ValueError("public Graphify generation changed during extraction")
-            publication_attempted = True
-            _publish_generation(candidate, graph_dir, exchange)
+                raise ValueError("selected Corpus changed while Graphify was running")
             status = "completed"
         except IncompleteExtraction as error:
             reason = f"GRAPHIFY_INCOMPLETE_EXTRACTION: {error}"
@@ -905,32 +336,15 @@ def run_graph(
         "exit_code": code,
         "argv": diagnostic_argv(argv),
         "graph": str(graph_path),
-        "candidate": str(candidate),
-        "native_version": _NATIVE_VERSION,
         "native_log": str(log),
-        "input_sha256": snapshot,
+        "input_sha256": input_digests,
         "corpus": str(corpus),
-        "graphify_inputs": graphify_inputs,
-        "graphify_model": model,
-        "graphify_token_budget": token_budget,
-        "graphify_concurrency": concurrency,
-        "omitted_deferred_sources": sorted(omitted),
+        "graphify_model": settings.graphify_model,
+        "graphify_token_budget": settings.graphify_token_budget,
+        "graphify_concurrency": settings.graphify_concurrency,
         "reason": reason,
     }
     atomic_json(report, evidence, durable=True)
-    retained_report = report
-    if status == "completed":
-        evidence_dir = store.path.parent / "graph-evidence" / workspace.name
-        evidence_dir.mkdir(parents=True)
-        retained_log = evidence_dir / log.name
-        shutil.copyfile(log, retained_log)
-        _sync_path(retained_log)
-        retained_report = evidence_dir / report.name
-        atomic_json(
-            retained_report,
-            {**evidence, "candidate": None, "native_log": str(retained_log)},
-            durable=True,
-        )
     run.stage(
         "graphify", total=len(pending), completed=0, failed=0, phase="record-results"
     )
@@ -939,12 +353,9 @@ def run_graph(
         doc_id = row["document_id"]
         acknowledgement = {}
         if status == "completed":
-            witness = (
-                retained_report.parent / f"{store.input_directory(doc_id).name}.md"
-            )
+            document = store.document(doc_id)
+            witness = row.get("input_copy") or document["corpus"]["input_copy"]
             source_file = Path(row["path"]).relative_to(book.corpus)
-            shutil.copyfile(corpus / source_file, witness)
-            _sync_path(witness)
             acknowledgement = {
                 "input_copy": str(witness),
                 "action": row["action"],
@@ -957,7 +368,7 @@ def run_graph(
                 "source_file": str(source_file),
                 "sha256": input_digests[doc_id],
                 "run_id": run.id,
-                "report": str(retained_report),
+                "report": str(report),
             }
             document["graph_baseline"] = {
                 "path": str(witness),
@@ -983,8 +394,9 @@ def run_graph(
                 "version": row["version"],
                 "status": status,
                 "run_id": run.id,
-                "report": str(retained_report),
+                "report": str(report),
                 "reason": reason,
+                "input_sha256": input_digests[doc_id],
                 **acknowledgement,
             }
         )
@@ -1005,14 +417,14 @@ def run_graph(
                 argv=diagnostic_argv(argv),
                 input_sha256=input_digests[doc_id],
             )
-    if status == "completed":
-        _sync_path(retained_report.parent)
     store.complete_batch(outcomes, durable=True)
     complete = len(pending) if status == "completed" else 0
     run.data["graph_result"] = status
-    run.data["graph_publication"] = (
-        "published" if complete else "unknown" if publication_attempted else "retained"
-    )
+    run.data["graph_publication"] = "published" if complete else "unknown"
+    # Explicit retry is bound to the state left by this attempt, not to the
+    # pre-extract bytes that native Graphify may already have changed.
+    if "graph_generation" in run.data:
+        run.data["graph_generation"] = graph_generation(store, book)
     run.stage(
         "graphify",
         total=len(pending),
@@ -1035,7 +447,6 @@ def main(argv=None) -> int:
     parser.add_argument("--config", type=Path)
     parser.add_argument("--book")
     parser.add_argument("--retry-graph", action="store_true")
-    parser.add_argument("--graphify-inputs", choices=["all", "text"])
     parser.add_argument(
         "-i",
         "--input",
@@ -1068,7 +479,6 @@ def main(argv=None) -> int:
                 run,
                 args.input,
                 retry_graph=args.retry_graph,
-                graphify_inputs=args.graphify_inputs,
             )
             run.finish(
                 "interrupted"

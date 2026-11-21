@@ -1353,9 +1353,7 @@ def seal_corpus(run):
     # An older unsealed handoff without a saved baseline cannot adopt live graph.
     run.data.setdefault("graph_generation", None)
     manifest = Path(run.data["artifacts"]["manifest"])
-    bind_graph_manifest(
-        run, manifest, read_json(manifest), run.data["sync_policy"]["graphify_inputs"]
-    )
+    bind_graph_manifest(run, manifest, read_json(manifest))
     seal_phase(run, "corpus", "manifest")
 
 
@@ -1576,7 +1574,7 @@ def replan_published(settings, book, store, run):
 
     from dogpdkb.graph import _manifest
 
-    original = _manifest(settings, book, store, run, run.data["artifacts"]["manifest"])
+    original = _manifest(book, store, run, run.data["artifacts"]["manifest"])
     plan = load_plan(run, book, store)
     if plan.get("run_id") != run.id or not Path(
         run.data["artifacts"]["plan"]
@@ -1632,7 +1630,7 @@ def replan_published(settings, book, store, run):
         source.read_bytes() != target.read_bytes() for source, target in frozen_inputs
     ):
         raise ValueError("original comparison snapshots changed during replan")
-    _manifest(settings, book, store, run, original)
+    _manifest(book, store, run, original)
     refreshed = make_plan(
         book, run, rows, knowledge, comparison, semantic, workspace=workspace
     )
@@ -1673,9 +1671,7 @@ def replan_published(settings, book, store, run):
     )
     run.data["artifacts"]["manifest"] = str(target)
     if "graph_retry" in run.data:
-        bind_graph_manifest(
-            run, target, manifest, run.data["graph_retry"]["input_mode"]
-        )
+        bind_graph_manifest(run, target, manifest)
     store.save()
     run.save(durable=True)
     return target
@@ -1737,7 +1733,6 @@ def parser_for(command="apply"):
         inputs = parser.add_mutually_exclusive_group()
         inputs.add_argument("--source", action="append", metavar="KEY")
         inputs.add_argument("--dir", type=Path, metavar="PATH")
-        parser.add_argument("--graphify-inputs", choices=["all", "text"])
         parser.add_argument("--retry-graph", action="store_true")
         parser.add_argument("--replan", action="store_true")
     return parser

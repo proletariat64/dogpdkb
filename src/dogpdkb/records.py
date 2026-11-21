@@ -381,7 +381,7 @@ def _failure_items(store, run, *, interrupted=False):
             and (key, name) not in recorded
         )
     binding = run.get("graph_retry", {})
-    graph_retriable = bool(binding.get("input_tree_sha256")) and not any(
+    graph_retriable = bool(binding.get("manifest")) and not any(
         f.get("reason") == "STALE_GRAPH_HANDOFF" for f in failures
     )
     items = []
@@ -423,6 +423,7 @@ def _failure_items(store, run, *, interrupted=False):
             if (
                 not resolved
                 and graph_retriable
+                and frozen.get("action") == "compile"
                 and step["status"] in {"failed", "unknown", "running"}
             ):
                 retry = "graph_batch"

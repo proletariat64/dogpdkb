@@ -27,12 +27,11 @@ def read_checkpoint(run, phase, key):
     return read_json(path)
 
 
-def bind_graph_manifest(run, path, manifest, input_mode):
-    """Freeze the scope and mode authorized for explicit graph-only recovery."""
+def bind_graph_manifest(run, path, manifest):
+    """Freeze compile rows authorized for explicit graph-only recovery."""
     run.data["graph_retry"] = {
         "manifest": str(path),
         "sha256": file_digest(Path(path)),
-        "input_mode": input_mode,
         "documents": {
             row["document_id"]: {
                 "version": row["version"],
@@ -45,12 +44,10 @@ def bind_graph_manifest(run, path, manifest, input_mode):
     }
 
 
-def check_graph_manifest(run, path, input_mode, *, content=None):
+def check_graph_manifest(run, path, *, content=None):
     bound = run.data.get("graph_retry")
     if bound is None:
-        return input_mode or "text"
-    if input_mode is not None and input_mode != bound["input_mode"]:
-        raise ValueError("retry cannot change the saved Graphify input mode")
+        return
     digest = (
         file_digest(Path(path))
         if content is None
@@ -58,13 +55,11 @@ def check_graph_manifest(run, path, input_mode, *, content=None):
     )
     if str(Path(path).resolve()) != bound["manifest"] or digest != bound["sha256"]:
         raise ValueError("saved graph manifest changed; generate a new plan")
-    return bound["input_mode"]
 
 
 def graph_generation(store, book):
     graph = store.settings.graph_for(book)
-    # Native publication exchanges the entire directory. Its identity also
-    # detects a new cache/report generation with identical graph/manifest bytes.
+    # Keep the saved handoff identity as well as current native output bytes.
     generation = graph.stat() if graph.is_dir() else None
     return {
         "directory": [generation.st_dev, generation.st_ino] if generation else None,

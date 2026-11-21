@@ -65,7 +65,10 @@ def test_status_shows_phase_and_separate_publication_facts(tmp_path):
     rejected = cli(
         tmp_path, "sync", "--config", config, "--resume", run, "--retry-graph"
     )
-    assert rejected.returncode == 1 and "no frozen graph input tree" in rejected.stderr
+    assert (
+        rejected.returncode == 1
+        and "no prior graph attempt to retry" in rejected.stderr
+    )
     assert (tmp_path / "commands.jsonl").read_bytes() == commands
 
     run_data(cli(tmp_path, "sync", "--config", config, "--resume", run))
@@ -99,7 +102,7 @@ def test_cleanup_handoff_binds_graph_retry_to_original_scope(tmp_path):
     assert result.returncode == 2, result.stderr
     run = Path(json.loads(result.stdout)["run"])
     snapshot = status(tmp_path, config, run)
-    assert snapshot["publication"] == {"corpus": "published", "graph": "retained"}
+    assert snapshot["publication"] == {"corpus": "published", "graph": "unknown"}
     handoff = snapshot["handoff"]
     [failure] = handoff["items"]
     assert failure["run_id"] == snapshot["run_id"]
@@ -121,8 +124,8 @@ def test_cleanup_handoff_binds_graph_retry_to_original_scope(tmp_path):
     calls = (tmp_path / "commands.jsonl").read_bytes()
     recovery = (*sync, "--resume", run, "--retry-graph")
     widened = cli(tmp_path, *recovery, "--graphify-inputs", "all")
-    assert widened.returncode == 1, widened.stderr
-    assert "saved Graphify input mode" in widened.stderr
+    assert widened.returncode == 64, widened.stderr
+    assert "unrecognized arguments: --graphify-inputs" in widened.stderr
     altered = json.loads(before)
     altered["documents"][0]["action"] = "defer"
     manifest.write_text(json.dumps(altered))
@@ -132,13 +135,6 @@ def test_cleanup_handoff_binds_graph_retry_to_original_scope(tmp_path):
     assert (tmp_path / "commands.jsonl").read_bytes() == calls
 
     manifest.write_bytes(before)
-    scan_control = tmp_path / "corpus/funds/.graphifyignore"
-    scan_control.write_text("# A changed scan scope\n")
-    rejected = cli(tmp_path, *recovery)
-    assert rejected.returncode == 1, rejected.stderr
-    assert "graph input tree changed" in rejected.stderr
-    assert (tmp_path / "commands.jsonl").read_bytes() == calls
-    scan_control.unlink()
     recovered = cli(tmp_path, *recovery)
     assert recovered.returncode == 0, recovered.stderr
     after = status(tmp_path, config, run)

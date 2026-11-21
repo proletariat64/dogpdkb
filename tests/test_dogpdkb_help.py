@@ -62,19 +62,19 @@ def test_quick_help_teaches_run_watch_resume_before_advanced_options(tmp_path):
         "--resume RUN",
     ):
         assert example in root.stdout
-    for flag in ("--replan", "--graphify-inputs", "--concurrency"):
+    for flag in ("--replan", "--concurrency"):
         assert flag not in overview.stdout and flag in details.stdout
     assert "dogpdkb-handoff-1" in details.stdout
     assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize("command", ["sync", "update-graph"])
-def test_graphify_input_mode_is_documented_locally(tmp_path, command):
+def test_fixed_graphify_handoff_is_documented_locally(tmp_path, command):
     result = invoke(tmp_path, command, "--help", "--full")
     assert result.returncode == 0, result.stderr
-    assert "--graphify-inputs {all,text}" in result.stdout
-    assert "Markdown" in result.stdout
-    assert "default" in result.stdout
+    assert "--graphify-inputs" not in result.stdout
+    assert "fixed Corpus" in result.stdout
+    assert "Graphify owns" in result.stdout or "native CLI owns" in result.stdout
     assert not list(tmp_path.iterdir())
 
 

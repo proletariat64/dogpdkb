@@ -153,8 +153,8 @@ option remains a scheduler limit rather than part of the frozen plan.
 
 `run.json` records `completed_phase`, SHA-256 `checkpoints` keyed by phase and
 artifact, and `sync_policy`. The policy captures the selected tools, OCR and
-score limits, explicit body-recovery inputs, and Graphify input mode before
-collection. It does not include provider credentials. The handoffs are:
+score limits, explicit body-recovery inputs, and Graphify execution settings
+before collection. It does not include provider credentials. The handoffs are:
 
 | Phase | Frozen output |
 | --- | --- |
@@ -162,7 +162,7 @@ collection. It does not include provider credentials. The handoffs are:
 | plan | `plan` and frozen per-document routing; no OCR or public writes |
 | ocr | Native OCR request/plan/result/journal and a `publication` handoff of verified OCR or readable fallback bytes; no corpus replacement |
 | corpus | Final `manifest`, containing only published documents, and the pre-extraction public graph generation |
-| graph | Settled graph exit; native result proof and atomic publication remain the Graphify adapter's responsibility |
+| graph | Settled command outcome and native log; Graphify owns writes to its fixed output |
 
 Compare, OCR and corpus publication exclude documents whose frozen state has
 been superseded (`STALE_DOCUMENT`), while nonconflicting peers continue. A
@@ -200,48 +200,17 @@ pending fields/failures remain readable; usable bodies proceed to Graphify.
 Explicit recovery of older failed runs belongs to the external agent; there is
 no automatic historical migration or retry layer.
 
-### Explicit recovery of a sealed interrupted OCR batch
+### Graph-only retry of a saved run
 
-Use `dogpdkb recover-ocr --config CONFIG --book BOOK --run ORIGINAL_ID
---execution-version VERSION --output-dir NEW_PRIVATE_DIRECTORY` to preflight
-and create a checksummed recovery receipt. Only a sealed global result-binding
-failure with matching native running journal and result mirror is eligible.
-This reads the source and current baselines without the write lock; it does not
-mutate original receipts or publish. `mdocr assemble` does not make new requests.
+Cleaned completed/partial runs do not ordinarily resume. Explicit
+`sync --resume RUN --retry-graph` uses the retained final compile manifest and
+revalidates the current Corpus under the writer locks. It never re-enters
+collect, plan, OCR, or Corpus publication. `--replan` can reselect the same
+published inputs, not add documents or authorize another run's failed work.
+A superseding graph handoff stops the retry. The native Graphify directory is
+used in place; a failed or interrupted invocation may have changed its files.
+Old runs are not imported, migrated, or replayed as part of rebuilding a book.
 
-After reviewing the receipt, `dogpdkb recover-ocr --config CONFIG --book BOOK
---publish RECEIPT --receipt-sha256 SHA256` takes the standard write lock and
-revalidates source, current versions/bytes, scope and graph generation. It
-reassembles offline into a new durable recovery run before publishing. It only
-replaces verified complete Markdown whose bytes changed due to OCR. A partial
-exit (2) returns a bound compile manifest; unresolved and unchanged documents
-are explicitly deferred, and their existing corpus bytes stay intact. To resume
-an interrupted local publication after its checkpoint, use `recover-ocr --resume
-RECOVERY_ID` under the same configuration. No old seal or journal is rewritten.
-
-Use `update-graph --input NEW_MANIFEST` as a separate action. An interrupted old
-graph attempt for the same document version may authorize only a newly proven
-body SHA, after verifying the original graph manifest and frozen body witness.
-Unchanged or partial rows are retained at proved old graph inputs or excluded
-when no native graph owns them. This does not import an interrupted Graphify
-candidate or retry its unchanged/unknown inputs.
-
-Cleaned completed/partial runs are not ordinarily resumable. Explicit
-`sync --resume RUN --retry-graph` uses only a retained final compile manifest,
-including after cleanup, and revalidates it through the graph stage. It never
-re-enters discovery, download, comparison, OCR or corpus publication. New sync
-runs bind the manifest SHA-256 and input mode at the corpus checkpoint, and the
-actual mirror tree digest before extraction. Recovery rejects changed witnesses,
-mode, input tree or a superseding graph generation. If a new run never froze
-its mirror, there is no graph batch to retry; resume the unfinished phase or
-make a new plan. `--replan` is the separate,
-explicit reselection of the same published inputs, not a way to add documents.
-Historical failures stay recorded; unresolved non-graph work still yields exit 2
-when graph recovery succeeds. Preexisting manifests without a binding keep the
-legacy validation path; no missing witnesses are invented.
-Recovery snapshots the already-cleaned run's retained file paths before the new
-attempt, so cleanup preserves its failure bundles even when the old plan was
-pruned. Newly created disposable graph workspace files can still be reclaimed.
 Manual `purge` deletes only
 selected wash; force permits discarding unfinished runs but never bypasses locks
 or clears durable facts, corpus, graphs, persistent inputs or tool caches.
