@@ -14,7 +14,12 @@ from pathlib import Path
 
 from dogpdkb.directory_snapshot import catalog_paths, copy_snapshot
 from dogpdkb.help import HelpParser
-from dogpdkb.ocr_batch import file_digest, ocr_inputs, verify_completed_ocr
+from dogpdkb.ocr_batch import (
+    InvalidOcrBatchBinding,
+    file_digest,
+    ocr_inputs,
+    verify_completed_ocr,
+)
 from dogpdkb.phases import (
     SYNC_PHASES,
     bind_graph_manifest,
@@ -1301,7 +1306,15 @@ def apply_run(
             store,
             check_baseline=True,
         )
-        results = ocr_inputs(settings, book, store, run, rows, stale=stale)
+        try:
+            results = ocr_inputs(settings, book, store, run, rows, stale=stale)
+        except InvalidOcrBatchBinding:
+            from dogpdkb.inputs import retain_blocked_raw
+
+            retain_blocked_raw(
+                store, [row for row in rows if row["document_id"] not in stale]
+            )
+            raise
         rows = [row for row in rows if row["document_id"] not in stale]
         validate_plan({**plan, "documents": rows}, book, store, check_baseline=True)
         from dogpdkb.inputs import retain_inputs

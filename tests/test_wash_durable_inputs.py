@@ -133,7 +133,7 @@ def test_raw_relative_images_remain_readable_after_wash_deletion(tmp_path):
     )
 
 
-def test_unknown_ocr_report_remains_partial_and_retains_raw_baseline(tmp_path):
+def test_invalid_ocr_batch_blocks_corpus_but_retains_raw_baseline(tmp_path):
     config, differences = enriched_instance(tmp_path)
     tool = tmp_path / "enrich.py"
     write_ocr_fixture(
@@ -141,10 +141,12 @@ def test_unknown_ocr_report_remains_partial_and_retains_raw_baseline(tmp_path):
         "_argument('--result').write_text('invalid')\nraise SystemExit(2)\n",
     )
     result = cli("apply", "--config", config, "--input", differences)
-    assert result.returncode == 2, result.stderr
+    assert result.returncode == 1 and "OCR_RESULT_BINDING_INVALID" in result.stderr
+    assert not list((tmp_path / "corpus").glob("*.md"))
     state = json.loads((tmp_path / "state/funds/state.json").read_text())
     assert state["documents"][team_id("42")]["steps"]["ocr"]["status"] == "unknown"
-    shutil.rmtree(Path(json.loads(result.stdout)["run"]).parent)
+    (run,) = (tmp_path / "runs/funds").glob("run-*/run.json")
+    shutil.rmtree(run.parent)
     assert Path(state["documents"][team_id("42")]["raw"]["path"]).is_file()
 
 

@@ -699,9 +699,13 @@ def _execute(root, request, store, run, call_tool, *, allow_dispatch=True):
     return seal
 
 
+class InvalidOcrBatchBinding(ValueError):
+    """A globally unbound OCR result cannot authorize publication."""
+
+
 def _require_batch_binding(reason):
     if reason == "OCR_RESULT_BINDING_INVALID":
-        raise ValueError(
+        raise InvalidOcrBatchBinding(
             "OCR_RESULT_BINDING_INVALID: Corpus and Graphify publication blocked"
         )
 
@@ -766,6 +770,19 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
                 retry_scope="document" if send == "not_sent" else "none",
                 **details,
             )
+
+    # Fresh apply must not bypass a globally unbound same-version attempt.
+    for row in candidates:
+        identifier = row["document_id"]
+        previous = store.step(identifier, "ocr")
+        if (
+            identifier not in stale
+            and previous
+            and previous["run_id"] != run.id
+            and same_version(previous["version"], row["version"])
+            and store.suppressed(identifier, "ocr", row["version"])
+        ):
+            _require_batch_binding(previous.get("reason"))
 
     for row in candidates:
         identifier, version = row["document_id"], row["version"]

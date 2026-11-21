@@ -251,7 +251,13 @@ def test_ocr_request_survives_cleanup_after_earlier_export_failure(tmp_path):
     script = script.replace(
         "if tool in ('mdcompare', 'mdocr'):",
         "if tool == 'mdocr' and args[0] == 'run':\n"
-        "    pathlib.Path(args[args.index('--result')+1]).write_text('invalid')\n"
+        "    from mdocr.plan import read_plan\n"
+        "    from mdocr.runner import Execution, _sha\n"
+        "    p=pathlib.Path(args[args.index('--plan')+1]); r=pathlib.Path(args[args.index('--result')+1])\n"
+        "    plan=read_plan(p); e=Execution(plan,_sha(p.read_bytes()),p.with_name(p.name+'.execution.json'),r,p.with_name(p.name+'.evidence'),False)\n"
+        "    _,_,layout=e.plan_jobs(); e.publish([pathlib.Path(d['path']).read_bytes().decode() for d in plan['documents']],layout)\n"
+        "    data=json.loads(r.read_bytes()); data['status']='partial'; data['documents'][0].update(status='partial',output=None,ocr=None,reason='FIXTURE_PARTIAL')\n"
+        "    for target in (r, p.with_name(p.name+'.execution.json')): target.write_text(json.dumps(data))\n"
         "    raise SystemExit(2)\n"
         "if tool in ('mdcompare', 'mdocr'):",
     )
