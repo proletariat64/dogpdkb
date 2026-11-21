@@ -149,19 +149,35 @@ The operator supplies a `dogpdkb-graph-scope-1` JSON object with `book`,
 | `inputs` | normalized mirror-relative path → SHA-256 of the approved bytes, including scan controls |
 | `misses` | approved new compile paths → SHA-256; exactly the new selected Markdown in `inputs` |
 | `semantic_cache` | path relative to `cache/semantic` → SHA-256 of the approved native cache files |
+| `runtime` | approved installed tool, invocation and source cache-check witnesses (below) |
 
 Prepare these witnesses from separately verified native scan/cache evidence,
 not from whatever bytes happen to be live when a run begins. Under the existing
 writer locks, check each hold's canonical identity, corpus path and version,
 matching failed/unknown suppression owned by the historical run, absence from
-the current compile and from published graph ownership, and absence of a prior
-graph fact or baseline. Only those approved held paths are omitted from the
+the current compile and the public native ownership manifest, and absence of
+prior graph facts or baselines. The approved public pair digest binds separate
+content acceptance; hold admission does not inspect graph relationship records. Only those approved held paths are omitted from the
 mirror; no held row, suppression, or graph fact is written or acknowledged.
 Other frozen Markdown must already be covered by the previous native generation;
 its prior graph input witnesses are still used. Immediately before extraction,
 compare the actual mirror and copied native pair/cache with the approved hashes.
 Any mismatch refuses extraction. The result records the approved scope SHA and
 omitted historical IDs separately from same-run deferred ones.
+
+`runtime` binds the existing `cache_check` record and exact `wheel` bytes with
+`{path, sha256}` witnesses (absolute paths). `argv` is the effective native
+extract argv with the two generated paths replaced by `{corpus}` and
+`{workspace}`. `installation_sha256` covers the absolute venv console script,
+resolved interpreter, `pyvenv.cfg` and installed site files. The installed
+Graphify package is compared to wheel contents. `native_tree_sha256` covers
+the copied native workspace excluding the writer lock, including files that
+can affect incremental scanning. `environment_sha256` covers the scoped
+child environment: approved Graphify, home, locale and transport settings,
+without caller Python overrides. Digests of mappings use sorted-key JSON.
+The wrapper also selects a fresh bytecode path and refuses disabled incremental
+cache. No probe or second `cache-check` reads production credentials or reruns
+the previously verified scan. A matching CLI version alone is not sufficient.
 
 This is an input-scope check, not a Graphify cache interpreter, model-send limit,
 preview, or graph-content approval. It still uses the existing native incremental

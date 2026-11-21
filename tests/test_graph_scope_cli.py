@@ -5,10 +5,18 @@ import json
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
 
+from dogpdkb.graph import (
+    _graph_install_sha256,
+    _mapping_sha256,
+    _native_extract,
+    _scoped_graph_environment,
+    _snapshot,
+)
 from dogpdkb.settings import document_identity
 from tests.test_orchestrator_graph_cli import ROOT, VERSION, fixture, write
 
@@ -39,6 +47,45 @@ def _call(config, manifest, *options):
         text=True,
         check=False,
     )
+
+
+def _fixture_runtime(config, tmp_path, public):
+    launcher = tmp_path / "venv/bin/graphify"
+    launcher.parent.mkdir(parents=True)
+    python = launcher.with_name("python")
+    python.symlink_to(sys.executable)
+    (launcher.parent.parent / "pyvenv.cfg").write_text(
+        f"home = {Path(sys.executable).parent}\n"
+    )
+    script = (tmp_path / "graphify.py").read_text()
+    launcher.write_text(
+        f"#!{python}\nimport sys\nsys.argv.insert(1, {str(tmp_path)!r})\n" + script
+    )
+    launcher.chmod(0o700)
+    config.write_text(
+        config.read_text().split("graphify=")[0]
+        + "graphify="
+        + json.dumps([str(launcher)])
+        + "\n"
+    )
+    site = tmp_path / "venv/lib/python3/site-packages/graphify"
+    site.mkdir(parents=True)
+    module = site / "__init__.py"
+    module.write_text("# approved wheel payload\n")
+    wheel = tmp_path / "approved.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.write(module, "graphify/__init__.py")
+    check = tmp_path / "cache-check.json"
+    write(check, {"scanned": 2, "cache_hits": 1, "model_misses": 1})
+    command = [str(launcher)]
+    return {
+        "argv": _native_extract(command, "{corpus}", "{workspace}", None, None, 3),
+        "environment_sha256": _mapping_sha256(_scoped_graph_environment()),
+        "installation_sha256": _graph_install_sha256(command, wheel),
+        "native_tree_sha256": _mapping_sha256(_snapshot(public)),
+        "wheel": {"path": str(wheel), "sha256": _sha(wheel)},
+        "cache_check": {"path": str(check), "sha256": _sha(check)},
+    }
 
 
 def _case(tmp_path):
@@ -96,6 +143,7 @@ def _case(tmp_path):
         "book": "funds",
         "run_id": "run-graph",
         "compile_sha256": _sha(compile_manifest),
+        "runtime": _fixture_runtime(config, tmp_path, public),
         "baseline": {
             name: _sha(public / name) for name in ("graph.json", "manifest.json")
         },
@@ -122,6 +170,15 @@ def _approved_call(config, manifest, scope, tmp_path, *, sha=None):
 
 def test_scope_excludes_only_approved_hold_and_keeps_historical_witness(tmp_path):
     config, manifest, state_file, held, held_path, public, scope = _case(tmp_path)
+    # The approved public pair may contain opaque native edge data; the new
+    # hold gate consults the native manifest, not relationship metadata.
+    graph = _read(public / "graph.json")
+    graph["links"] = [
+        {"source": "known", "target": "known", "source_file": held_path.name}
+    ]
+    write(public / "graph.json", graph)
+    scope["baseline"]["graph.json"] = _sha(public / "graph.json")
+    scope["runtime"]["native_tree_sha256"] = _mapping_sha256(_snapshot(public))
     before = _read(state_file)["documents"]
     first = _call(config, manifest)
     assert first.returncode == 2
@@ -152,7 +209,6 @@ def test_scope_excludes_only_approved_hold_and_keeps_historical_witness(tmp_path
         "suppression",
         "selected",
         "native-manifest",
-        "native-edge",
         "baseline",
         "scan-controls",
         "cache",
@@ -190,20 +246,13 @@ def test_unproven_graph_scope_refuses_without_dispatch(tmp_path, defect):
         path = public / "manifest.json"
         write(path, {**_read(path), held_path.name: {}})
         scope["baseline"][path.name] = _sha(path)
-    elif defect == "native-edge":
-        path = public / "graph.json"
-        graph = _read(path)
-        graph["links"] = [
-            {"source": "known", "target": "known", "source_file": held_path.name}
-        ]
-        write(path, graph)
-        scope["baseline"][path.name] = _sha(path)
     elif defect == "baseline":
         scope["baseline"]["graph.json"] = "0" * 64
     elif defect == "scan-controls":
         (held_path.parent / ".graphifyignore").write_text("*.md\n")
     elif defect == "cache":
         (public / "cache/semantic/entry.json").write_text("changed")
+        scope["runtime"]["native_tree_sha256"] = _mapping_sha256(_snapshot(public))
     elif defect == "misses":
         scope["misses"] = {}
     write(state_file, state)
@@ -244,5 +293,50 @@ def test_scope_does_not_clear_another_historical_suppression(tmp_path):
     result = _approved_call(config, manifest, scope, tmp_path)
     assert result.returncode == 2, result.stdout + result.stderr
     assert "SAME_VERSION_NOT_RETRIED" in (manifest.parent / "run.json").read_text()
+    assert state_file.read_bytes() == before
+    assert not (tmp_path / "calls.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "banner-replacement",
+        "wheel",
+        "installed-module",
+        "argv",
+        "env",
+        "cache-check",
+        "native-settings",
+    ],
+)
+def test_scoped_native_runtime_drift_refuses_before_dispatch(
+    tmp_path, monkeypatch, drift
+):
+    config, manifest, state_file, _held, _path, public, scope = _case(tmp_path)
+    if drift == "banner-replacement":
+        launcher = tmp_path / "venv/bin/graphify"
+        launcher.write_text(
+            launcher.read_text() + "\n# different build, same version banner\n"
+        )
+    elif drift == "wheel":
+        with (tmp_path / "approved.whl").open("ab") as stream:
+            stream.write(b"different bytes")
+    elif drift == "installed-module":
+        (tmp_path / "venv/lib/python3/site-packages/graphify/__init__.py").write_text(
+            "# different installation\n"
+        )
+    elif drift == "argv":
+        with config.open("a") as stream:
+            stream.write('\n[graphify]\nmodel = "different-model"\n')
+    elif drift == "env":
+        monkeypatch.setenv("GRAPHIFY_NO_INCREMENTAL_CACHE", "1")
+    elif drift == "cache-check":
+        write(tmp_path / "cache-check.json", {"model_misses": 2})
+    else:
+        write(public / ".graphify_build.json", {"excludes": ["retained.md"]})
+    before = state_file.read_bytes()
+    result = _approved_call(config, manifest, scope, tmp_path)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "frozen Graphify" in result.stderr or "approved wheel" in result.stderr
     assert state_file.read_bytes() == before
     assert not (tmp_path / "calls.jsonl").exists()

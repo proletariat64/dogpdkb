@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import unicodedata
+import zipfile
 from pathlib import Path, PureWindowsPath
 
 from dogpdkb.help import HelpParser
@@ -126,17 +127,24 @@ def _native_extract(command, corpus, workspace, token_budget, model, concurrency
     return argv
 
 
-def _native_preflight(command, workspace, token_budget, model, concurrency):
+def _native_preflight(
+    command, workspace, token_budget, model, concurrency, *, environment=None
+):
     """Check the attested CLI protocol without reading live credentials or documents."""
     isolated = {
-        **_NATIVE_ENV,
+        **(_NATIVE_ENV if environment is None else environment),
         "HOME": str(workspace),
         "GRAPHIFY_OPENAI_OAUTH_AUTH_FILE": str(workspace / "no-oauth.json"),
         "GRAPHIFY_CODEX_BASE_URL": "http://127.0.0.1:1",
     }
     log = workspace / "version.log"
     code = run_command(
-        [*command, "--version"], log=log, cwd=workspace, timeout=15, env=isolated
+        [*command, "--version"],
+        log=log,
+        cwd=workspace,
+        timeout=15,
+        env=isolated,
+        inherit_env=environment is None,
     )
     if (
         code in {130, 143}
@@ -163,6 +171,7 @@ def _native_preflight(command, workspace, token_budget, model, concurrency):
         cwd=workspace,
         timeout=15,
         env=isolated,
+        inherit_env=environment is None,
     )
     if code in {130, 143}:
         return code, log
@@ -472,15 +481,6 @@ def _unowned_deferred_sources(settings, book, store, data, *, initial_recovery=F
         return set(candidates)  # No published generation can own these deferred paths.
     if not all(files):
         return set()
-    owned = _native_source_paths(book, native)
-    return {
-        doc_id
-        for doc_id, path in candidates.items()
-        if unicodedata.normalize("NFC", str(path)) not in owned
-    }
-
-
-def _native_source_paths(book, native):
     manifest = read_json(native / "manifest.json")
     if not isinstance(manifest, dict):
         raise TypeError("Graphify baseline manifest must be an object")
@@ -504,7 +504,12 @@ def _native_source_paths(book, native):
             path = book.corpus / path
         return unicodedata.normalize("NFC", str(path.resolve()))
 
-    return {identity(source) for source in sources}
+    owned = {identity(source) for source in sources}
+    return {
+        doc_id
+        for doc_id, path in candidates.items()
+        if identity(str(path)) not in owned
+    }
 
 
 def _load_graph_scope(path, approved_sha, manifest_bytes, book, run):
@@ -522,7 +527,14 @@ def _load_graph_scope(path, approved_sha, manifest_bytes, book, run):
         or scope.get("compile_sha256") != hashlib.sha256(manifest_bytes).hexdigest()
         or not all(
             isinstance(scope.get(name), dict)
-            for name in ("holds", "baseline", "inputs", "semantic_cache", "misses")
+            for name in (
+                "holds",
+                "baseline",
+                "inputs",
+                "semantic_cache",
+                "misses",
+                "runtime",
+            )
         )
         or not scope["holds"]
     ):
@@ -537,7 +549,9 @@ def _historical_holds(book, store, run, data, native, scope):
     }
     if scope["baseline"] != baseline:
         raise ValueError("frozen graph baseline changed")
-    owned = _native_source_paths(book, native)
+    owned = {
+        _input_name(Path(name)) for name in _portable_manifest(native / "manifest.json")
+    }
     selected = {row["document_id"] for row in data["documents"]}
     documents = store.data["documents"]
     corpus_paths = [doc.get("corpus", {}).get("path") for doc in documents.values()]
@@ -559,7 +573,7 @@ def _historical_holds(book, store, run, data, native, scope):
             or corpus_paths.count(str(path)) != 1
             or not path.is_file()
             or path.resolve() != path
-            or unicodedata.normalize("NFC", str(path)) in owned
+            or _input_name(path.relative_to(book.corpus)) in owned
             or any(doc.get(key) for key in ("baseline", "graph_baseline", "graph"))
             or not isinstance(hold.get("run_id"), str)
             or not hold["run_id"]
@@ -603,6 +617,108 @@ def _check_frozen_graph_scope(scope, book, pending, snapshot, baseline, candidat
         or _snapshot(cache) != scope["semantic_cache"]
     ):
         raise ValueError("frozen Graphify semantic cache changed")
+
+
+def _mapping_sha256(mapping):
+    return hashlib.sha256(json.dumps(mapping, sort_keys=True).encode()).hexdigest()
+
+
+def _scoped_graph_environment():
+    if os.environ.get("GRAPHIFY_NO_INCREMENTAL_CACHE"):
+        raise ValueError("frozen Graphify scope requires incremental cache")
+    inherited = {
+        "HOME",
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+        "TMPDIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+    }
+    return {
+        **{
+            key: value
+            for key, value in os.environ.items()
+            if key in inherited or key.startswith(("GRAPHIFY_", "XDG_"))
+        },
+        **_NATIVE_ENV,
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+
+
+def _graph_install_sha256(command, wheel):
+    """Bind a single wheel-installed console script to its actual venv payload."""
+    launcher = Path(command[0])
+    venv = launcher.parent.parent
+    python = venv / "bin/python"
+    sites = list(venv.glob("lib/python*/site-packages"))
+    if (
+        len(command) != 1
+        or not launcher.is_absolute()
+        or launcher.resolve() != launcher
+        or launcher.name != "graphify"
+        or launcher.parent.name != "bin"
+        or len(sites) != 1
+        or launcher.read_bytes().splitlines()[:1] != [os.fsencode(f"#!{python}")]
+    ):
+        raise ValueError(
+            "frozen graph scope requires an absolute wheel-installed Graphify executable"
+        )
+    installed = _snapshot(sites[0])
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            package = {
+                name: hashlib.sha256(archive.read(name)).hexdigest()
+                for name in archive.namelist()
+                if name.startswith("graphify/") and not name.endswith("/")
+            }
+    except zipfile.BadZipFile as error:
+        raise ValueError("approved Graphify artifact is not a wheel") from error
+    if not package or any(installed.get(name) != sha for name, sha in package.items()):
+        raise ValueError("installed Graphify package differs from approved wheel")
+    return _mapping_sha256(
+        {
+            "launcher": _digest(launcher),
+            "python": [str(python.resolve()), _digest(python)],
+            "venv": _digest(venv / "pyvenv.cfg"),
+            "site": installed,
+        }
+    )
+
+
+def _check_scoped_runtime(
+    scope, command, token_budget, model, concurrency, environment
+):
+    runtime = scope["runtime"]
+    argv = _native_extract(
+        command, "{corpus}", "{workspace}", token_budget, model, concurrency
+    )
+    if runtime.get("argv") != argv or runtime.get(
+        "environment_sha256"
+    ) != _mapping_sha256(environment):
+        raise ValueError("frozen Graphify argv or environment changed")
+    for key in ("wheel", "cache_check"):
+        artifact = runtime.get(key)
+        if not isinstance(artifact, dict) or not isinstance(artifact.get("path"), str):
+            raise TypeError(f"missing frozen Graphify {key} witness")
+        path = Path(artifact["path"])
+        if not path.is_absolute() or _digest(path) != artifact.get("sha256"):
+            raise ValueError(f"frozen Graphify {key} witness changed")
+    wheel = Path(runtime["wheel"]["path"])
+    if runtime.get("installation_sha256") != _graph_install_sha256(command, wheel):
+        raise ValueError("frozen Graphify installation changed")
 
 
 def _retained_corpus(
@@ -939,8 +1055,16 @@ def run_graph(
     token_budget = settings.graphify_token_budget
     model = settings.graphify_model
     concurrency = settings.graphify_concurrency
+    environment = None
+    if graph_scope is not None:
+        environment = _scoped_graph_environment()
+        _check_scoped_runtime(
+            graph_scope, command, token_budget, model, concurrency, environment
+        )
+        # Read neither old bytecode nor modules injected by the caller's Python environment.
+        environment["PYTHONPYCACHEPREFIX"] = str(workspace / "python-bytecode")
     preflight, preflight_log = _native_preflight(
-        command, workspace, token_budget, model, concurrency
+        command, workspace, token_budget, model, concurrency, environment=environment
     )
     if preflight:
         run.failure(
@@ -958,13 +1082,18 @@ def run_graph(
     shutil.copytree(
         graph_dir, candidate, ignore=shutil.ignore_patterns(".dogpdkb.lock")
     )
-    if _snapshot(candidate) != {
+    candidate_snapshot = _snapshot(candidate)
+    if candidate_snapshot != {
         name: digest
         for name, digest in public_snapshot.items()
         if name != ".dogpdkb.lock"
     }:
         raise ValueError("public Graphify generation changed while freezing baseline")
     if graph_scope is not None:
+        if _mapping_sha256(candidate_snapshot) != graph_scope["runtime"].get(
+            "native_tree_sha256"
+        ):
+            raise ValueError("frozen Graphify native workspace changed")
         _check_frozen_graph_scope(
             graph_scope, book, pending, _snapshot(corpus), baseline_manifest, candidate
         )
@@ -994,7 +1123,9 @@ def run_graph(
     code = run_command(
         argv,
         log=log,
-        env=_NATIVE_ENV,
+        env=_NATIVE_ENV if environment is None else environment,
+        cwd=None if environment is None else workspace,
+        inherit_env=environment is None,
     )
     status, reason = "failed", None
     publication_attempted = False
