@@ -315,7 +315,7 @@ def verify_admission(store, data, body):
         run_ids.add(step["run_id"])
     if len(run_ids) != 1:
         raise ValueError("admitted documents do not share one admission run")
-    run = Run.load(store, run_ids.pop())
+    run = Run.load(store, store.runs / run_ids.pop())
     if run.data["command"] != "recover-export":
         raise ValueError("resume requires a staged export recovery run")
     durable = store.path.parent / "export-recovery" / run.id
@@ -363,11 +363,21 @@ def verify_admission(store, data, body):
             current.get("raw") != raw
             or step.get("run_id") != run.id
             or not same_version(step.get("version"), raw.get("version"))
+            or step.get("path") != raw["path"]
+            or step.get("recovery_receipt") != str(receipt)
             or digest(_bytes(raw["path"], durable)) != raw["sha256"]
         ):
             raise ValueError(
                 "raw state was not committed or has drifted; do not reuse this handoff"
             )
+        if "metadata" in selected:
+            expected_metadata = descriptor(
+                store.book,
+                {**selected, "document_id": identifier},
+                Path(raw["path"]),
+            )["metadata"]
+            if expected_metadata != raw["metadata"]:
+                raise ValueError(f"admitted metadata drifted for {identifier}")
         evidence = durable / identifier
         for name, expected in receipt_row["sha256"].items():
             if digest(_bytes(evidence / name, durable)) != expected:
@@ -376,11 +386,13 @@ def verify_admission(store, data, body):
 
 
 def resume(store, reference):
-    run = Run.load(store, reference)
+    run = Run.load(store, store.runs / reference)
     handoff = Path(run.data["artifacts"]["admitted"])
     body = _bytes(handoff, store.path.parent / "export-recovery" / run.id)
     data = json.loads(body)
-    verify_admission(store, data, body)
+    verified = verify_admission(store, data, body)
+    if verified.id != run.id:
+        raise ValueError("admission was committed by a different recovery run")
     if run.data["status"] != "completed":
         run.stage(
             "download", total=len(data["documents"]), completed=len(data["documents"])

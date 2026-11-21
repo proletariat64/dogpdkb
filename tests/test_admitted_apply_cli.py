@@ -214,6 +214,10 @@ def test_admitted_full_run_publishes_corpus_without_export(tmp_path):
     applied = cli("apply", "--config", config, "--input", receipt["admitted"])
     assert applied.returncode == 0, applied.stderr
     assert not skylark_calls(tmp_path)
+    # The apply pipeline must not rewrite the byte-exact admission record:
+    # the committed recovery run still verifies and finalizes afterwards.
+    resumed = cli("recover-export", "--config", config, "--resume", receipt["run"])
+    assert resumed.returncode == 0, resumed.stderr
     manifest = json.loads(Path(json.loads(applied.stdout)["manifest"]).read_bytes())
     assert manifest["schema"] == "dogpdkb-compile-1"
     assert len(manifest["documents"]) == 3
@@ -507,6 +511,57 @@ def test_admitted_resume_refuses_superseded_raw_fact(tmp_path):
     assert "drifted" in resumed.stderr
     assert not skylark_calls(tmp_path)
     assert not list((tmp_path / "corpus").glob("*.md"))
+
+
+def test_admitted_resume_refuses_membership_change_after_pause(tmp_path):
+    config, receipt = admission_case(tmp_path, 2)
+    paused = cli(
+        "apply",
+        "--config",
+        config,
+        "--input",
+        receipt["admitted"],
+        "--stop-after",
+        "plan",
+    )
+    assert paused.returncode == 0, paused.stderr
+    books = tmp_path / "books.json"
+    data = json.loads(books.read_bytes())
+    staged = json.loads((tmp_path / "staged.json").read_bytes())["documents"]
+    excluded = {row["remote_id"] for row in staged[:1]}
+    data[0]["sources"][0]["document_ids"] = [
+        remote for remote in REMOTES if remote not in excluded
+    ]
+    atomic_json(books, data)
+    resumed = cli(
+        "apply", "--config", config, "--resume", json.loads(paused.stdout)["run"]
+    )
+    assert resumed.returncode == 1
+    assert "subscription" in resumed.stderr
+    assert not skylark_calls(tmp_path)
+
+
+def test_admitted_resume_refuses_replaced_handoff_after_pause(tmp_path):
+    config, receipt = admission_case(tmp_path, 2)
+    paused = cli(
+        "apply",
+        "--config",
+        config,
+        "--input",
+        receipt["admitted"],
+        "--stop-after",
+        "plan",
+    )
+    assert paused.returncode == 0, paused.stderr
+    run = json.loads(Path(json.loads(paused.stdout)["run"]).read_bytes())
+    frozen = Path(run["artifacts"]["differences"])
+    frozen.write_bytes(frozen.read_bytes() + b"\n")
+    resumed = cli(
+        "apply", "--config", config, "--resume", json.loads(paused.stdout)["run"]
+    )
+    assert resumed.returncode == 1
+    assert "changed after planning" in resumed.stderr
+    assert not skylark_calls(tmp_path)
 
 
 def test_admitted_resume_reuses_frozen_handoff(tmp_path):

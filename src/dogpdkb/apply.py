@@ -482,6 +482,21 @@ def prepare_inputs(
     return rows
 
 
+def admitted_membership(bindings, document, identifier):
+    """Refuse admitted identities outside the given source subscription."""
+    binding = bindings.get(document.get("source_key"))
+    include = binding.get("document_ids") if binding else None
+    remote = document.get("source_document_id")
+    if (
+        binding is None
+        or (include is not None and remote not in include)
+        or remote in binding.get("exclude_document_ids", ())
+    ):
+        raise ValueError(
+            f"admitted identity outside the current subscription: {identifier}"
+        )
+
+
 def prepare_admitted_inputs(settings, book, store, run, admitted, body):
     """Adopt a committed export admission as plan inputs without any export fetch.
 
@@ -509,13 +524,13 @@ def prepare_admitted_inputs(settings, book, store, run, admitted, body):
             stream.write(body)
     run.data["artifacts"]["differences"] = str(frozen)
     run.data["artifacts"]["admitted_run"] = source_run.id
+    run.data["admitted_sha256"] = hashlib.sha256(body).hexdigest()
 
     owners = {}
     for identity, document in store.data["documents"].items():
         if path := document.get("corpus", {}).get("path"):
             owners.setdefault(Path(path), set()).add(identity)
 
-    bindings = run.data["targets"]["sources"]
     rows = []
     for index, admitted_row in enumerate(payload["documents"]):
         identifier = admitted_row["document_id"]
@@ -525,16 +540,9 @@ def prepare_admitted_inputs(settings, book, store, run, admitted, body):
         }
         source_key = document.get("source_key")
         source_document_id = document.get("source_document_id")
-        binding = bindings.get(source_key)
-        include = binding.get("document_ids") if binding else None
-        if (
-            not source_key
-            or not source_document_id
-            or binding is None
-            or (include is not None and source_document_id not in include)
-            or source_document_id in binding.get("exclude_document_ids", ())
-        ):
-            raise ValueError("admitted identity outside the current subscription")
+        if not source_key or not source_document_id:
+            raise ValueError(f"admitted identity missing for {identifier}")
+        admitted_membership(run.data["targets"]["sources"], document, identifier)
         row = {
             "document_id": identifier,
             "source_key": source_key,
@@ -1414,12 +1422,38 @@ def apply_run(
         if sync:
             seal_phase(run, "plan", "plan")
     if artifacts.get("admitted_run"):
-        # A newer export or any drift since planning supersedes the admission;
-        # refuse before OCR or publication can build on stale witnesses.
+        # A newer export, replaced handoff, membership change or destination
+        # collision since planning supersedes the admission; refuse before
+        # OCR or publication can build on stale witnesses.
         from dogpdkb.export_recovery import verify_admission
 
         admitted_bytes = Path(artifacts["differences"]).read_bytes()
-        verify_admission(store, json.loads(admitted_bytes), admitted_bytes)
+        if (
+            run.data.get("admitted_sha256")
+            and hashlib.sha256(admitted_bytes).hexdigest()
+            != run.data["admitted_sha256"]
+        ):
+            raise ValueError("admitted input changed after planning; generate a new plan")
+        admitted_payload = json.loads(admitted_bytes)
+        verify_admission(store, admitted_payload, admitted_bytes)
+        for admitted_row in admitted_payload["documents"]:
+            identifier = admitted_row["document_id"]
+            admitted_membership(
+                store.book.source_bindings(),
+                store.data["documents"][identifier],
+                identifier,
+            )
+        owners = {}
+        for identity, document in store.data["documents"].items():
+            if path := document.get("corpus", {}).get("path"):
+                owners.setdefault(Path(path), set()).add(identity)
+        for row in plan["documents"]:
+            identifier = row["document_id"]
+            output = corpus_destination(
+                book, identifier, store.data["documents"][identifier].get("corpus", {})
+            )
+            if (output.exists() or output.is_symlink()) and output not in owners:
+                raise ValueError(f"corpus destination conflict for {identifier}")
     if stop_after == "plan":
         validate_inputs(plan["documents"])
         return pause(run, "plan", stop_after)
