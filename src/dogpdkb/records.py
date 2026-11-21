@@ -226,6 +226,8 @@ class Store:
         blocked = document.setdefault("blocked_versions", {}).setdefault(name, {})
         if status in {"running", "failed", "unknown"}:
             blocked[key] = {"status": status, "run_id": run_id}
+            if name == "ocr" and details.get("input"):
+                blocked[key]["input"] = details["input"]
         elif status == "completed" or (
             name in {"ocr", "semantic_score"}
             and status == "skipped"

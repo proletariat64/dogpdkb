@@ -294,3 +294,27 @@ def test_global_invalid_binding_keeps_sync_graph_and_corpus_unchanged(tmp_path):
     calls = (tmp_path / "commands.jsonl").read_bytes()
     assert cli("sync", "--config", config, "--resume", failed["run_id"]).returncode == 1
     assert (tmp_path / "commands.jsonl").read_bytes() == calls
+
+
+def test_saved_ocr_handoff_rechecks_binding_before_corpus(tmp_path):
+    from dogpdkb.records import Store, atomic_json
+    from dogpdkb.settings import load_config, select_book
+
+    config, _ = instance(tmp_path)
+    paused = cli("sync", "--config", config, "--stop-after", "ocr")
+    assert paused.returncode == 0, paused.stderr
+    data = read(json.loads(paused.stdout)["run"])
+    publication = read(data["artifacts"]["publication"])
+    row = publication["documents"][0]
+    settings = load_config(config)
+    store = Store(settings, select_book(settings, None))
+    owner = "run-20261112-100000-11111111"
+    request = store.path.parent / "ocr" / owner / "request.json"
+    store.attempt(row["document_id"], "ocr", row["version"], owner, input=str(request))
+    atomic_json(
+        request.with_name("settled.json"), {"reason": "OCR_RESULT_BINDING_INVALID"}
+    )
+    resumed = cli("sync", "--config", config, "--resume", data["run_id"])
+    assert resumed.returncode == 1 and "OCR_RESULT_BINDING_INVALID" in resumed.stderr
+    assert not list((tmp_path / "corpus").glob("*.md"))
+    assert "graphify" not in (tmp_path / "commands.jsonl").read_text()

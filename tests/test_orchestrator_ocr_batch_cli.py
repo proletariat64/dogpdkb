@@ -764,19 +764,22 @@ def test_global_invalid_binding_blocks_apply_and_resume_without_redispatch(tmp_p
     assert seal.read_bytes() == saved
 
 
-def test_resume_blocks_terminal_mirror_with_wrong_plan_binding(tmp_path):
+@pytest.mark.parametrize("mutation", ["wrong-plan", "missing-row", "running"])
+def test_resume_checks_terminal_mirror_binding(tmp_path, mutation):
     config, differences = _native_instance(tmp_path)
     driver = tmp_path / "offline_mdocr.py"
     driver.write_text(
         driver.read_text().replace(
             "raise SystemExit(main())",
-            """code = main()
+            f"""code = main()
 if sys.argv[1] == 'run':
     import json
     result = Path(sys.argv[sys.argv.index('--result')+1])
     payload = json.loads(result.read_bytes())
-    assert payload['status'] in {'completed', 'partial'}
-    payload['plan_sha256'] = '0' * 64
+    assert payload['status'] in {{'completed', 'partial'}}
+    if {mutation!r} == 'wrong-plan': payload['plan_sha256'] = '0' * 64
+    elif {mutation!r} == 'missing-row': payload['documents'].pop()
+    else: payload.update(status='running', documents=[])
     result.write_text(json.dumps(payload))
     raise SystemExit(143)
 raise SystemExit(code)""",
@@ -786,7 +789,34 @@ raise SystemExit(code)""",
     assert first.returncode == 143, first.stderr
     (run,) = (tmp_path / "runs/funds").glob("run-*/run.json")
     resumed = cli("apply", "--config", config, "--resume", run)
+    if mutation == "running":
+        assert resumed.returncode == 2, resumed.stderr
+        assert json.loads(resumed.stdout)["manifest"]
+        return
     assert resumed.returncode == 1 and "OCR_RESULT_BINDING_INVALID" in resumed.stderr
     assert not list((tmp_path / "corpus").glob("*.md"))
     (seal,) = (tmp_path / "state/funds/ocr").glob("*/settled.json")
     assert json.loads(seal.read_bytes())["reason"] == "OCR_RESULT_BINDING_INVALID"
+
+
+def test_versioned_block_keeps_seal_reference_before_ocr_settlement(tmp_path):
+    from dogpdkb.ocr_batch import InvalidOcrBatchBinding, require_prior_ocr_binding
+    from dogpdkb.records import Store, atomic_json
+    from dogpdkb.settings import load_config, select_book
+
+    config, _ = instance(tmp_path)
+    settings = load_config(config)
+    store = Store(settings, select_book(settings, None))
+    identity = team_id("42")
+    old = "run-20261112-100000-11111111"
+    request = store.path.parent / "ocr" / f"{old}-revision" / "request.json"
+    store.attempt(identity, "ocr", "v2", old, input=str(request))
+    atomic_json(
+        request.with_name("settled.json"), {"reason": "OCR_RESULT_BINDING_INVALID"}
+    )
+    with pytest.raises(InvalidOcrBatchBinding):
+        require_prior_ocr_binding(store, [{"document_id": identity, "version": "v2"}])
+    store.attempt(identity, "ocr", "v3", "run-20261112-100100-22222222")
+    with pytest.raises(InvalidOcrBatchBinding):
+        require_prior_ocr_binding(store, [{"document_id": identity, "version": "v2"}])
+    require_prior_ocr_binding(store, [{"document_id": identity, "version": "v3"}])

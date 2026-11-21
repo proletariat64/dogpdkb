@@ -18,6 +18,7 @@ from dogpdkb.ocr_batch import (
     InvalidOcrBatchBinding,
     file_digest,
     ocr_inputs,
+    require_prior_ocr_binding,
     verify_completed_ocr,
 )
 from dogpdkb.phases import (
@@ -1323,6 +1324,8 @@ def apply_run(
         publication = prepare_publication(book, store, run, rows, results)
     if sync and "ocr" not in checkpoints:
         seal_phase(run, "ocr", "publication")
+    # A saved handoff may predate a same-version globally invalid OCR attempt.
+    require_prior_ocr_binding(store, publication["documents"])
     if result := pause(run, "ocr", stop_after):
         return result
     if sync and "graph_generation" not in run.data:
