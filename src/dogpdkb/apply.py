@@ -517,6 +517,9 @@ def prepare_admitted_inputs(settings, book, store, run, admitted, body):
 
     if run.data["command"] == "sync":
         raise ValueError("admitted exports enter through apply, not sync")
+    recorded = run.data.get("admitted_sha256")
+    if recorded and recorded != hashlib.sha256(body).hexdigest():
+        raise ValueError("admitted input changed; start a new run")
     payload = json.loads(body)
     if payload != admitted or payload.get("schema") != "dogpdkb-admitted-export-1":
         raise ValueError("admitted input must be the exact recorded bytes")
@@ -544,10 +547,17 @@ def prepare_admitted_inputs(settings, book, store, run, admitted, body):
     validate_inputs(prepared.values(), check_baseline=True)
     for index, admitted_row in enumerate(payload["documents"]):
         identifier = admitted_row["document_id"]
+        document = store.data["documents"][identifier]
+        admitted_membership(enabled_bindings(book), document, identifier)
+        output = corpus_destination(book, identifier, document.get("corpus", {}))
+        if (output.exists() or output.is_symlink()) and output not in owners:
+            owners[output] = {None}
+        owners.setdefault(output, set()).add(identifier)
+        if owners[output] != {identifier} or output.is_symlink():
+            raise ValueError(f"corpus destination conflict for {identifier}")
         if identifier in prepared:
             rows.append(prepared[identifier])
             continue
-        document = store.data["documents"][identifier]
         raw = {
             key: value for key, value in admitted_row.items() if key != "document_id"
         }
@@ -555,7 +565,6 @@ def prepare_admitted_inputs(settings, book, store, run, admitted, body):
         source_document_id = document.get("source_document_id")
         if not source_key or not source_document_id:
             raise ValueError(f"admitted identity missing for {identifier}")
-        admitted_membership(enabled_bindings(book), document, identifier)
         row = {
             "document_id": identifier,
             "source_key": source_key,
@@ -564,12 +573,6 @@ def prepare_admitted_inputs(settings, book, store, run, admitted, body):
             "slot": index,
             "metadata": raw["metadata"],
         }
-        output = corpus_destination(book, identifier, document.get("corpus", {}))
-        if (output.exists() or output.is_symlink()) and output not in owners:
-            owners[output] = {None}
-        owners.setdefault(output, set()).add(identifier)
-        if owners[output] != {identifier} or output.is_symlink():
-            raise ValueError(f"corpus destination conflict for {identifier}")
         version_key(row["version"])
         reject_rollback(store, [row])
         graph_step = store.step(identifier, "graph") or {}
@@ -1453,10 +1456,18 @@ def apply_run(
         for admitted_row in admitted_payload["documents"]:
             identifier = admitted_row["document_id"]
             admitted_membership(
-                store.book.source_bindings(),
+                enabled_bindings(store.book),
                 store.data["documents"][identifier],
                 identifier,
             )
+        plan_rows = {
+            (row["document_id"], row.get("raw_sha256")) for row in plan["documents"]
+        }
+        admitted_scope = {
+            (row["document_id"], row.get("sha256")) for row in admitted_payload["documents"]
+        }
+        if plan_rows != admitted_scope:
+            raise ValueError("plan does not match the verified admission")
         owners = {}
         for identity, document in store.data["documents"].items():
             if path := document.get("corpus", {}).get("path"):
@@ -1464,6 +1475,8 @@ def apply_run(
         for row in plan["documents"]:
             identifier = row["document_id"]
             output = corpus_destination(book, identifier, row.get("previous_corpus", {}))
+            if (output.exists() or output.is_symlink()) and output not in owners:
+                owners[output] = {None}
             owners.setdefault(output, set()).add(identifier)
             if owners[output] != {identifier} or output.is_symlink():
                 raise ValueError(f"corpus destination conflict for {identifier}")

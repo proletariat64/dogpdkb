@@ -315,7 +315,10 @@ def verify_admission(store, data, body):
         run_ids.add(step["run_id"])
     if len(run_ids) != 1:
         raise ValueError("admitted documents do not share one admission run")
-    run = Run.load(store, store.runs / run_ids.pop())
+    candidate = store.runs / run_ids.pop()
+    if not candidate.resolve().is_relative_to(store.runs.resolve()):
+        raise ValueError("recovery run is outside the committed staging root")
+    run = Run.load(store, candidate)
     if run.data["command"] != "recover-export":
         raise ValueError("resume requires a staged export recovery run")
     if not run.path.resolve().is_relative_to(store.runs.resolve()):
