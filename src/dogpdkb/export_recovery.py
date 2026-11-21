@@ -301,31 +301,56 @@ def publish(store, path, sha):
     }
 
 
-def resume(store, reference):
-    run = Run.load(store, reference)
+def verify_admission(store, data, body):
+    """Revalidate an admitted-export handoff against committed state, read-only.
+
+    Returns the recover-export run that committed the admission. Raises on any
+    drift; never starts external tools and never enters the Skylark path.
+    """
+    run_ids = set()
+    for row in data["documents"]:
+        step = store.step(row["document_id"], "export") or {}
+        if step.get("status") != "completed" or step.get("run_id") is None:
+            raise ValueError(
+                f"{row['document_id']} has no completed export admission"
+            )
+        run_ids.add(step["run_id"])
+    if len(run_ids) != 1:
+        raise ValueError("admitted documents do not share one admission run")
+    run = Run.load(store, run_ids.pop())
     if run.data["command"] != "recover-export":
         raise ValueError("resume requires a staged export recovery run")
     durable = store.path.parent / "export-recovery" / run.id
     handoff = Path(run.data["artifacts"]["admitted"])
-    body = _bytes(handoff, durable)
-    sha = digest(body)
-    if sha != run.data["admitted_sha256"]:
+    if _bytes(handoff, durable) != body:
+        raise ValueError("admitted handoff differs from the recorded run")
+    if digest(body) != run.data["admitted_sha256"]:
         raise ValueError("admitted handoff SHA-256 changed")
-    data = json.loads(body)
     receipt = Path(run.data["artifacts"]["receipt"])
     if digest(_bytes(receipt, durable)) != data["receipt_sha256"]:
         raise ValueError("durable receipt SHA-256 changed")
     for row in data["documents"]:
         identifier = row["document_id"]
         raw = {key: value for key, value in row.items() if key != "document_id"}
+        step = store.step(identifier, "export") or {}
         if (
             store.data["documents"][identifier].get("raw") != raw
-            or (store.step(identifier, "export") or {}).get("run_id") != run.id
+            or step.get("run_id") != run.id
+            or not same_version(step.get("version"), raw.get("version"))
             or digest(_bytes(raw["path"], durable)) != raw["sha256"]
         ):
             raise ValueError(
                 "raw state was not committed or has drifted; do not reuse this handoff"
             )
+    return run
+
+
+def resume(store, reference):
+    run = Run.load(store, reference)
+    handoff = Path(run.data["artifacts"]["admitted"])
+    body = _bytes(handoff, store.path.parent / "export-recovery" / run.id)
+    data = json.loads(body)
+    verify_admission(store, data, body)
     if run.data["status"] != "completed":
         run.stage(
             "download", total=len(data["documents"]), completed=len(data["documents"])
@@ -334,7 +359,7 @@ def resume(store, reference):
     return {
         "run": str(run.path),
         "admitted": str(handoff),
-        "admitted_sha256": sha,
+        "admitted_sha256": digest(body),
         "documents": len(data["documents"]),
     }
 
