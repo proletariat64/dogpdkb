@@ -1518,9 +1518,11 @@ def apply_run(
         except InvalidOcrBatchBinding:
             from dogpdkb.inputs import retain_blocked_raw
 
-            retain_blocked_raw(
-                store, [row for row in rows if row["document_id"] not in stale]
-            )
+            if not artifacts.get("admitted_run"):
+                retain_blocked_raw(
+                    store,
+                    [row for row in rows if row["document_id"] not in stale],
+                )
             raise
         rows = [row for row in rows if row["document_id"] not in stale]
         validate_plan({**plan, "documents": rows}, book, store, check_baseline=True)

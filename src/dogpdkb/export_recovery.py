@@ -316,7 +316,10 @@ def verify_admission(store, data, body):
     if len(run_ids) != 1:
         raise ValueError("admitted documents do not share one admission run")
     candidate = store.runs / run_ids.pop()
-    if not candidate.resolve().is_relative_to(store.runs.resolve()):
+    resolved_runs = store.runs.resolve()
+    if not candidate.resolve().is_relative_to(resolved_runs) or not (
+        candidate / "run.json"
+    ).resolve().is_relative_to(resolved_runs):
         raise ValueError("recovery run is outside the committed staging root")
     run = Run.load(store, candidate)
     if run.data["command"] != "recover-export":
@@ -395,7 +398,13 @@ def verify_admission(store, data, body):
 
 def resume(store, reference):
     match = re.fullmatch(r"run-\d{8}-\d{6}-[0-9a-f]{8}", reference)
-    run = Run.load(store, store.runs / reference if match else Path(reference))
+    candidate = store.runs / reference if match else Path(reference)
+    resolved_runs = store.runs.resolve()
+    if not candidate.resolve().is_relative_to(resolved_runs) or not (
+        candidate / "run.json"
+    ).resolve().is_relative_to(resolved_runs):
+        raise ValueError("recovery run is outside the committed staging root")
+    run = Run.load(store, candidate)
     handoff = Path(run.data["artifacts"]["admitted"])
     body = _bytes(handoff, store.path.parent / "export-recovery" / run.id)
     data = json.loads(body)
