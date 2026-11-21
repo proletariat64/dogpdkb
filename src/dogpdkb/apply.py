@@ -14,7 +14,13 @@ from pathlib import Path
 
 from dogpdkb.directory_snapshot import catalog_paths, copy_snapshot
 from dogpdkb.help import HelpParser
-from dogpdkb.ocr_batch import file_digest, ocr_inputs, verify_completed_ocr
+from dogpdkb.ocr_batch import (
+    InvalidOcrBatchBinding,
+    file_digest,
+    ocr_inputs,
+    require_prior_ocr_binding,
+    verify_completed_ocr,
+)
 from dogpdkb.phases import (
     SYNC_PHASES,
     bind_graph_manifest,
@@ -1113,6 +1119,9 @@ def publish_corpus(book, store, run, plan, publication, *, verify_ocr=False):
     if run.data["command"] == "sync":
         rows = current_rows(book, store, run, rows, "corpus", expected=published)
         documents = [published[row["document_id"]] for row in rows]
+    if run.data["command"] in {"apply", "sync"}:
+        # Only rows that can actually publish participate in the OCR gate.
+        require_prior_ocr_binding(store, rows)
     validate_plan({**plan, "documents": rows}, book, store)
     for row, document in zip(rows, documents):
         expected = corpus_destination(book, row["document_id"], row["previous_corpus"])
@@ -1125,6 +1134,9 @@ def publish_corpus(book, store, run, plan, publication, *, verify_ocr=False):
         validate_publication_target(document)
         if verify_ocr and document.get("ocr_status") == "completed":
             verify_completed_ocr(store, row, document.get("ocr"))
+    if run.data["command"] == "sync" and "graph_generation" not in run.data:
+        run.data["graph_generation"] = graph_generation(store, book)
+        run.save(durable=True)
     run.stage("corpus", total=len(documents))
     dirty = False
     try:
@@ -1301,7 +1313,15 @@ def apply_run(
             store,
             check_baseline=True,
         )
-        results = ocr_inputs(settings, book, store, run, rows, stale=stale)
+        try:
+            results = ocr_inputs(settings, book, store, run, rows, stale=stale)
+        except InvalidOcrBatchBinding:
+            from dogpdkb.inputs import retain_blocked_raw
+
+            retain_blocked_raw(
+                store, [row for row in rows if row["document_id"] not in stale]
+            )
+            raise
         rows = [row for row in rows if row["document_id"] not in stale]
         validate_plan({**plan, "documents": rows}, book, store, check_baseline=True)
         from dogpdkb.inputs import retain_inputs
@@ -1312,9 +1332,6 @@ def apply_run(
         seal_phase(run, "ocr", "publication")
     if result := pause(run, "ocr", stop_after):
         return result
-    if sync and "graph_generation" not in run.data:
-        run.data["graph_generation"] = graph_generation(store, book)
-        run.save(durable=True)
     manifest = publish_corpus(
         book, store, run, plan, publication, verify_ocr=has_publication
     )

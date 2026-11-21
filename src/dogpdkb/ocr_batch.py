@@ -166,6 +166,14 @@ def _tool_result(root, path, plan_sha):
     return report
 
 
+def _verify_terminal_scope(payload, docs):
+    if (
+        payload["status"] not in {"completed", "partial"}
+        or _index(payload["documents"]).keys() != docs.keys()
+    ):
+        raise ValueError("OCR terminal result has the wrong identity set")
+
+
 def _request_history(report):
     attempts = report["requests"]
     if not attempts or report["budget"]["requests"] != len(attempts):
@@ -584,13 +592,20 @@ def _execute(root, request, store, run, call_tool, *, allow_dispatch=True):
                     state = _tool_result(root, journal, plan_sha)
                     if state["status"] in {"completed", "partial"}:
                         if report_path.exists():
-                            _tool_result(root, report_path, plan_sha)
-                            if report_path.read_bytes() != journal.read_bytes():
-                                # Native journal is written first. Never replace
-                                # or pass off an older mirror as a final report.
-                                report = journal
+                            try:
+                                mirror = _tool_result(root, report_path, plan_sha)
+                                if mirror["status"] != "running":
+                                    _verify_terminal_scope(mirror, docs)
+                            except _INVALID:
+                                reason = "OCR_RESULT_BINDING_INVALID"
                             else:
-                                report = report_path
+                                # A correctly bound but stale mirror can be
+                                # behind the authoritative terminal journal.
+                                report = (
+                                    journal
+                                    if report_path.read_bytes() != journal.read_bytes()
+                                    else report_path
+                                )
                         else:
                             report = journal
                     else:
@@ -614,7 +629,7 @@ def _execute(root, request, store, run, call_tool, *, allow_dispatch=True):
                     raise ValueError("OCR execution journal is missing")
             elif report_path.exists() or journal.exists():
                 raise ValueError("unowned OCR execution artifacts")
-            if report is None:
+            if reason is None and report is None:
                 settings = plan["settings"]
                 if (
                     settings["mode"] == "llm"
@@ -671,11 +686,7 @@ def _execute(root, request, store, run, call_tool, *, allow_dispatch=True):
             ):
                 raise ValueError("Terminal OCR report differs from native journal")
             payload = _tool_result(root, report, initial["plan.json"])
-            if (
-                payload["status"] not in {"completed", "partial"}
-                or _index(payload["documents"]).keys() != docs.keys()
-            ):
-                raise ValueError("OCR terminal result has the wrong identity set")
+            _verify_terminal_scope(payload, docs)
         except _INVALID:
             report, reason = None, "OCR_RESULT_BINDING_INVALID"
     seal = {
@@ -692,6 +703,48 @@ def _execute(root, request, store, run, call_tool, *, allow_dispatch=True):
     }
     atomic_json(seal_path, seal, durable=True)
     return seal
+
+
+class InvalidOcrBatchBinding(ValueError):
+    """A globally unbound OCR result cannot authorize publication."""
+
+
+def _require_batch_binding(reason):
+    if reason == "OCR_RESULT_BINDING_INVALID":
+        raise InvalidOcrBatchBinding(
+            "OCR_RESULT_BINDING_INVALID: Corpus and Graphify publication blocked"
+        )
+
+
+def require_prior_ocr_binding(store, rows, *, excluding_run=None):
+    """Consult the durable seal of the exact blocked version, not the latest step."""
+    batches = store.path.parent / "ocr"
+    checked = set()
+    for row in rows:
+        identifier, version = row["document_id"], row["version"]
+        block = store.blocked_attempt(identifier, "ocr", version)
+        if not block or block["run_id"] == excluding_run:
+            continue
+        owner = block["run_id"]
+        current = store.step(identifier, "ocr") or {}
+        same_owner = current.get("run_id") == owner and same_version(
+            current["version"], version
+        )
+        if same_owner:
+            _require_batch_binding(current.get("reason"))
+        request_path = block.get("input") or (
+            current.get("input") if same_owner else None
+        )
+        if not request_path:
+            # Pre-upgrade version blocks did not record the enrollment path.
+            run_path = store.runs / owner / "run.json"
+            if run_path.is_file():
+                request_path = read_json(run_path)["artifacts"].get("ocr_request")
+        request_path = _path(batches, request_path or batches / owner / "request.json")
+        seal = _path(batches, request_path.parent / "settled.json")
+        if seal not in checked and seal.is_file():
+            _require_batch_binding(read_json(seal).get("reason"))
+            checked.add(seal)
 
 
 def ocr_inputs(settings, book, store, run, rows, *, stale=()):
@@ -754,6 +807,12 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
                 retry_scope="document" if send == "not_sent" else "none",
                 **details,
             )
+
+    require_prior_ocr_binding(
+        store,
+        [row for row in candidates if row["document_id"] not in stale],
+        excluding_run=run.id,
+    )
 
     for row in candidates:
         identifier, version = row["document_id"], row["version"]
@@ -970,7 +1029,9 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
                 ],
                 exit_code=seal["exit_code"],
             )
-        store.complete_batch(observed.values())
+        store.complete_batch(
+            observed.values(), durable=batch_reason == "OCR_RESULT_BINDING_INVALID"
+        )
         run.data["failures"] = [
             item
             for item in run.data["failures"]
@@ -986,4 +1047,6 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
         completed=sum(r["status"] == "completed" for r in results.values()),
         failed=sum(r["status"] in {"failed", "unknown"} for r in results.values()),
     )
+    if enrolled and existing is not None:
+        _require_batch_binding(batch_reason)
     return results

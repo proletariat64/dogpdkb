@@ -3,6 +3,9 @@
 import fcntl
 import hashlib
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,7 +18,7 @@ def read(path):
     return json.loads(Path(path).read_bytes())
 
 
-def recovery_case(tmp_path, *, pre_send=False):
+def recovery_case(tmp_path, *, pre_send=False, historic=True):
     config, tool = instance(tmp_path)
     body = (
         tool.read_text()
@@ -65,7 +68,32 @@ if tool in ('mdcompare', 'mdocr'):""",
         e.state['requests'].append(item)""",
         )
     tool.write_text(body)
-    interrupted = cli("sync", "--config", config, "--stop-after", "corpus")
+    if not historic:
+        return config, cli("sync", "--config", config)
+    # Create the v0.3.6 historical incident wire artifacts: that release let
+    # an invalid OCR seal fall back to raw Corpus. Never disable this gate for
+    # the actual recovery commands or other tests.
+    source = Path(__file__).resolve().parents[1] / "src"
+    interrupted = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from dogpdkb import ocr_batch; "
+                "ocr_batch._require_batch_binding = lambda _reason: None; "
+                "from dogpdkb.cli import _main; raise SystemExit(_main())"
+            ),
+            "sync",
+            "--config",
+            str(config),
+            "--stop-after",
+            "corpus",
+        ],
+        env={**os.environ, "PYTHONPATH": str(source)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     assert interrupted.returncode == 0, interrupted.stderr
     old = read(json.loads(interrupted.stdout)["run"])
     original = tmp_path / "state/funds/ocr" / old["run_id"]
@@ -242,3 +270,74 @@ def test_conventional_batch_prepares_after_wash_record_is_removed(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["documents"]["replace"] == 1
+
+
+def test_global_invalid_binding_keeps_sync_graph_and_corpus_unchanged(tmp_path):
+    config, result = recovery_case(tmp_path, historic=False)
+    assert result.returncode == 1 and "OCR_RESULT_BINDING_INVALID" in result.stderr
+    runs = [read(path) for path in (tmp_path / "runs/funds").glob("*/run.json")]
+    (failed,) = [run for run in runs if run["status"] == "failed"]
+    assert failed["stage"] == "ocr" and failed["completed_phase"] == "plan"
+    assert (
+        "manifest" not in failed["artifacts"]
+        and "publication" not in failed["artifacts"]
+    )
+    assert not any(
+        b"Changed body for recovery." in path.read_bytes()
+        for path in (tmp_path / "corpus").glob("*.md")
+    )
+    commands = [
+        json.loads(line)[:2]
+        for line in (tmp_path / "commands.jsonl").read_text().splitlines()
+    ]
+    assert commands.count(["graphify", "extract"]) == 1
+    calls = (tmp_path / "commands.jsonl").read_bytes()
+    assert cli("sync", "--config", config, "--resume", failed["run_id"]).returncode == 1
+    assert (tmp_path / "commands.jsonl").read_bytes() == calls
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_saved_ocr_handoff_rechecks_publishable_binding(tmp_path, stale):
+    from dogpdkb.records import Store, atomic_json
+    from dogpdkb.settings import load_config, select_book
+
+    config, _ = instance(tmp_path)
+    paused = cli("sync", "--config", config, "--stop-after", "ocr")
+    assert paused.returncode == 0, paused.stderr
+    data = read(json.loads(paused.stdout)["run"])
+    publication = read(data["artifacts"]["publication"])
+    row = publication["documents"][0]
+    settings = load_config(config)
+    store = Store(settings, select_book(settings, None))
+    owner = "run-20261112-100000-11111111"
+    request = store.path.parent / "ocr" / owner / "request.json"
+    store.attempt(row["document_id"], "ocr", row["version"], owner, input=str(request))
+    atomic_json(
+        request.with_name("settled.json"), {"reason": "OCR_RESULT_BINDING_INVALID"}
+    )
+    args = ("sync", "--config", config, "--resume", data["run_id"])
+    refused = cli(*args)
+    assert refused.returncode == 1 and "OCR_RESULT_BINDING_INVALID" in refused.stderr
+    assert not list((tmp_path / "corpus").glob("*.md"))
+    assert "graph_generation" not in read(json.loads(paused.stdout)["run"])
+    if stale:
+        from dogpdkb.phases import graph_generation
+
+        store.document(row["document_id"])["raw"]["version"] = "2026-11-14T01:00:00Z"
+        store.save()
+        # A different writer can advance the native generation after refusal.
+        atomic_json(
+            settings.graph_for(store.book) / "graph.json", {"nodes": [], "links": []}
+        )
+        atomic_json(settings.graph_for(store.book) / "manifest.json", {})
+        generation = graph_generation(store, store.book)
+        resumed = cli(*args, "--stop-after", "corpus")
+        assert resumed.returncode == 0, resumed.stderr
+        output = json.loads(resumed.stdout)
+        manifest = read(output["manifest"])
+        assert [r["document_id"] for r in manifest["documents"]] == [
+            publication["documents"][1]["document_id"]
+        ]
+        assert read(output["run"])["graph_generation"] == generation
+        assert not Path(row["path"]).exists()
+    assert "graphify" not in (tmp_path / "commands.jsonl").read_text()

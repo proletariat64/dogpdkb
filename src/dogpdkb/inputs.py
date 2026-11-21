@@ -65,6 +65,29 @@ def retain_raw(directory, source, resources):
             shutil.rmtree(staging)
 
 
+def retain_blocked_raw(store, rows):
+    """Keep acquired bytes durable even when Corpus publication is blocked."""
+    changed = False
+    for row in rows:
+        identifier = row["document_id"]
+        raw = store.document(identifier)["raw"]
+        source = Path(raw["path"])
+        if not source.is_relative_to(store.runs):
+            continue  # A resumed failure may already point to durable raw.
+        parent = store.input_directory(identifier)
+        parent.mkdir(parents=True, exist_ok=True)
+        directory = Path(tempfile.mkdtemp(prefix="retained-", dir=parent))
+        target, resources = retain_raw(
+            directory, source, [dict(r) for r in raw.get("resources") or []]
+        )
+        if hashlib.sha256(target.read_bytes()).hexdigest() != raw["sha256"]:
+            raise ValueError("blocked raw changed during retention")
+        raw.update(path=str(target), resources=resources)
+        changed = True
+    if changed:
+        store.save(durable=True)
+
+
 def retain_inputs(store, run, rows, results):
     for row in rows:
         identifier = row["document_id"]

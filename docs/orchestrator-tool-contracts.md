@@ -53,6 +53,12 @@ the global request budget are per image; concurrency limits active Markdown pipe
 with one image at a time per document. Exit 0 means complete, 2 incomplete, and 1 fatal
 invocation or artifact error.
 
+A batch-wide invalid result binding (`OCR_RESULT_BINDING_INVALID`) preserves
+its seal and per-document attempt evidence but stops `apply`/`sync` before
+Corpus or Graphify handoff. Ordinary resume cannot replay that seal. Invalid
+individual rows in an otherwise bound terminal result retain the usual raw
+fallback and do not discard independently verified peers.
+
 ### Explicit offline assembly
 
 `mdocr assemble --plan PLAN --journal PLAN.execution.json --execution-version VERSION

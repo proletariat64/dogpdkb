@@ -600,6 +600,12 @@ def test_unreliable_ocr_report_is_never_reused_as_success(tmp_path, schema, code
         )
     )
     first = cli("apply", "--config", config, "--input", differences)
+    if schema == "unsupported":
+        assert first.returncode == 1 and "OCR_RESULT_BINDING_INVALID" in first.stderr
+        again = cli("apply", "--config", config, "--input", differences)
+        assert again.returncode == 1 and "OCR_RESULT_BINDING_INVALID" in again.stderr
+        assert not list((tmp_path / "corpus").glob("*.md"))
+        return
     assert first.returncode == 2, first.stderr
     second = cli("apply", "--config", config, "--input", differences)
     assert second.returncode == 2, second.stdout + second.stderr
