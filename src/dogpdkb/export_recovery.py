@@ -311,9 +311,7 @@ def verify_admission(store, data, body):
     for row in data["documents"]:
         step = store.step(row["document_id"], "export") or {}
         if step.get("status") != "completed" or step.get("run_id") is None:
-            raise ValueError(
-                f"{row['document_id']} has no completed export admission"
-            )
+            raise ValueError(f"{row['document_id']} has no completed export admission")
         run_ids.add(step["run_id"])
     if len(run_ids) != 1:
         raise ValueError("admitted documents do not share one admission run")
@@ -327,14 +325,42 @@ def verify_admission(store, data, body):
     if digest(body) != run.data["admitted_sha256"]:
         raise ValueError("admitted handoff SHA-256 changed")
     receipt = Path(run.data["artifacts"]["receipt"])
-    if digest(_bytes(receipt, durable)) != data["receipt_sha256"]:
+    receipt_bytes = _bytes(receipt, durable)
+    if digest(receipt_bytes) != data["receipt_sha256"]:
         raise ValueError("durable receipt SHA-256 changed")
+    receipt_rows = {
+        row["selected"]["document_id"]: row
+        for row in json.loads(receipt_bytes)["documents"]
+    }
+    if set(receipt_rows) != {row["document_id"] for row in data["documents"]}:
+        raise ValueError("admitted scope does not match its authenticated receipt")
     for row in data["documents"]:
         identifier = row["document_id"]
+        receipt_row = receipt_rows[identifier]
+        selected = receipt_row["selected"]
+        spec = receipt_row["input"]
+        current = store.data["documents"][identifier]
+        if current.get("absence"):
+            raise ValueError(
+                f"{identifier} has a recorded absence; do not reuse this handoff"
+            )
+        if (
+            current.get("source_key") != spec["source_key"]
+            or current.get("source_document_id") != spec["remote_id"]
+        ):
+            raise ValueError(f"admitted identity drifted for {identifier}")
+        try:
+            observed = same_version(
+                current.get("observed", {}).get("version"), selected["version"]
+            )
+        except (TypeError, ValueError):
+            observed = False
+        if not observed:
+            raise ValueError(f"frozen version no longer observed for {identifier}")
         raw = {key: value for key, value in row.items() if key != "document_id"}
         step = store.step(identifier, "export") or {}
         if (
-            store.data["documents"][identifier].get("raw") != raw
+            current.get("raw") != raw
             or step.get("run_id") != run.id
             or not same_version(step.get("version"), raw.get("version"))
             or digest(_bytes(raw["path"], durable)) != raw["sha256"]
@@ -342,6 +368,10 @@ def verify_admission(store, data, body):
             raise ValueError(
                 "raw state was not committed or has drifted; do not reuse this handoff"
             )
+        evidence = durable / identifier
+        for name, expected in receipt_row["sha256"].items():
+            if digest(_bytes(evidence / name, durable)) != expected:
+                raise ValueError(f"durable evidence changed for {identifier}")
     return run
 
 

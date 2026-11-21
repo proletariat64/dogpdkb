@@ -500,8 +500,13 @@ def prepare_admitted_inputs(settings, book, store, run, admitted, body):
         raise ValueError("admitted input must be the exact recorded bytes")
     source_run = verify_admission(store, payload, body)
     frozen = run.directory / "admitted.json"
-    with frozen.open("xb") as stream:
-        stream.write(body)
+    if frozen.exists():
+        # Resume reuses the exact frozen bytes instead of recreating them.
+        if frozen.read_bytes() != body:
+            raise ValueError("frozen admitted input changed; start a new run")
+    else:
+        with frozen.open("xb") as stream:
+            stream.write(body)
     run.data["artifacts"]["differences"] = str(frozen)
     run.data["artifacts"]["admitted_run"] = source_run.id
 
@@ -510,6 +515,7 @@ def prepare_admitted_inputs(settings, book, store, run, admitted, body):
         if path := document.get("corpus", {}).get("path"):
             owners.setdefault(Path(path), set()).add(identity)
 
+    bindings = run.data["targets"]["sources"]
     rows = []
     for index, admitted_row in enumerate(payload["documents"]):
         identifier = admitted_row["document_id"]
@@ -519,8 +525,16 @@ def prepare_admitted_inputs(settings, book, store, run, admitted, body):
         }
         source_key = document.get("source_key")
         source_document_id = document.get("source_document_id")
-        if not source_key or not source_document_id:
-            raise ValueError(f"admitted identity missing for {identifier}")
+        binding = bindings.get(source_key)
+        include = binding.get("document_ids") if binding else None
+        if (
+            not source_key
+            or not source_document_id
+            or binding is None
+            or (include is not None and source_document_id not in include)
+            or source_document_id in binding.get("exclude_document_ids", ())
+        ):
+            raise ValueError("admitted identity outside the current subscription")
         row = {
             "document_id": identifier,
             "source_key": source_key,
@@ -530,6 +544,8 @@ def prepare_admitted_inputs(settings, book, store, run, admitted, body):
             "metadata": raw["metadata"],
         }
         output = corpus_destination(book, identifier, document.get("corpus", {}))
+        if (output.exists() or output.is_symlink()) and output not in owners:
+            owners[output] = {None}
         owners.setdefault(output, set()).add(identifier)
         if owners[output] != {identifier} or output.is_symlink():
             raise ValueError(f"corpus destination conflict for {identifier}")
@@ -737,7 +753,11 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
             }
             for row in active:
                 row["resources"] = resources.get(row["document_id"], [])
-                if not replan:
+                # Comparison-derived resources must not rewrite an admitted raw
+                # fact; the admission record stays byte-exact for revalidation.
+                if not replan and not run.data.get("artifacts", {}).get(
+                    "admitted_run"
+                ):
                     store.document(row["document_id"])["raw"]["resources"] = row[
                         "resources"
                     ]
@@ -1393,6 +1413,13 @@ def apply_run(
         run.stage("plan", total=len(rows), completed=len(rows))
         if sync:
             seal_phase(run, "plan", "plan")
+    if artifacts.get("admitted_run"):
+        # A newer export or any drift since planning supersedes the admission;
+        # refuse before OCR or publication can build on stale witnesses.
+        from dogpdkb.export_recovery import verify_admission
+
+        admitted_bytes = Path(artifacts["differences"]).read_bytes()
+        verify_admission(store, json.loads(admitted_bytes), admitted_bytes)
     if stop_after == "plan":
         validate_inputs(plan["documents"])
         return pause(run, "plan", stop_after)
