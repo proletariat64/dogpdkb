@@ -3,6 +3,9 @@
 import fcntl
 import hashlib
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,7 +18,7 @@ def read(path):
     return json.loads(Path(path).read_bytes())
 
 
-def recovery_case(tmp_path, *, pre_send=False):
+def recovery_case(tmp_path, *, pre_send=False, historic=True):
     config, tool = instance(tmp_path)
     body = (
         tool.read_text()
@@ -65,7 +68,32 @@ if tool in ('mdcompare', 'mdocr'):""",
         e.state['requests'].append(item)""",
         )
     tool.write_text(body)
-    interrupted = cli("sync", "--config", config, "--stop-after", "corpus")
+    if not historic:
+        return config, cli("sync", "--config", config)
+    # Create the v0.3.6 historical incident wire artifacts: that release let
+    # an invalid OCR seal fall back to raw Corpus. Never disable this gate for
+    # the actual recovery commands or other tests.
+    source = Path(__file__).resolve().parents[1] / "src"
+    interrupted = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from dogpdkb import ocr_batch; "
+                "ocr_batch._require_batch_binding = lambda _reason: None; "
+                "from dogpdkb.cli import _main; raise SystemExit(_main())"
+            ),
+            "sync",
+            "--config",
+            str(config),
+            "--stop-after",
+            "corpus",
+        ],
+        env={**os.environ, "PYTHONPATH": str(source)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     assert interrupted.returncode == 0, interrupted.stderr
     old = read(json.loads(interrupted.stdout)["run"])
     original = tmp_path / "state/funds/ocr" / old["run_id"]
@@ -242,3 +270,27 @@ def test_conventional_batch_prepares_after_wash_record_is_removed(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["documents"]["replace"] == 1
+
+
+def test_global_invalid_binding_keeps_sync_graph_and_corpus_unchanged(tmp_path):
+    config, result = recovery_case(tmp_path, historic=False)
+    assert result.returncode == 1 and "OCR_RESULT_BINDING_INVALID" in result.stderr
+    runs = [read(path) for path in (tmp_path / "runs/funds").glob("*/run.json")]
+    (failed,) = [run for run in runs if run["status"] == "failed"]
+    assert failed["stage"] == "ocr" and failed["completed_phase"] == "plan"
+    assert (
+        "manifest" not in failed["artifacts"]
+        and "publication" not in failed["artifacts"]
+    )
+    assert not any(
+        b"Changed body for recovery." in path.read_bytes()
+        for path in (tmp_path / "corpus").glob("*.md")
+    )
+    commands = [
+        json.loads(line)[:2]
+        for line in (tmp_path / "commands.jsonl").read_text().splitlines()
+    ]
+    assert commands.count(["graphify", "extract"]) == 1
+    calls = (tmp_path / "commands.jsonl").read_bytes()
+    assert cli("sync", "--config", config, "--resume", failed["run_id"]).returncode == 1
+    assert (tmp_path / "commands.jsonl").read_bytes() == calls

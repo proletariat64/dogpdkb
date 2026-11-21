@@ -694,6 +694,13 @@ def _execute(root, request, store, run, call_tool, *, allow_dispatch=True):
     return seal
 
 
+def _require_batch_binding(reason):
+    if reason == "OCR_RESULT_BINDING_INVALID":
+        raise ValueError(
+            "OCR_RESULT_BINDING_INVALID: Corpus and Graphify publication blocked"
+        )
+
+
 def ocr_inputs(settings, book, store, run, rows, *, stale=()):
     from dogpdkb.apply import call_tool, failure
 
@@ -970,7 +977,9 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
                 ],
                 exit_code=seal["exit_code"],
             )
-        store.complete_batch(observed.values())
+        store.complete_batch(
+            observed.values(), durable=batch_reason == "OCR_RESULT_BINDING_INVALID"
+        )
         run.data["failures"] = [
             item
             for item in run.data["failures"]
@@ -986,4 +995,6 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
         completed=sum(r["status"] == "completed" for r in results.values()),
         failed=sum(r["status"] in {"failed", "unknown"} for r in results.values()),
     )
+    if enrolled and existing is not None:
+        _require_batch_binding(batch_reason)
     return results
