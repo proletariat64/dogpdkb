@@ -301,7 +301,7 @@ def test_corpus_whitelist_serializes_concurrent_books(tmp_path):
         assert rules.count(f"!/corpus/book-{index}/**") == 1
 
 
-def test_corpus_whitelist_supports_linked_worktree_exclude_file(tmp_path):
+def test_corpus_whitelist_supports_linked_worktree_exclude_file(tmp_path, monkeypatch):
     root = tmp_path / "root"
     subprocess.run(["git", "init", "--quiet", str(root)], check=True)
     (root / ".git/info/exclude").write_text("*\n")
@@ -330,6 +330,11 @@ def test_corpus_whitelist_supports_linked_worktree_exclude_file(tmp_path):
     )
     corpus = linked / "corpus"
     corpus.mkdir()
+    other = tmp_path / "other"
+    subprocess.run(["git", "init", "--quiet", str(other)], check=True)
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_COMMON_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
 
     _ensure_corpus_whitelist(corpus)
 
@@ -456,6 +461,19 @@ def test_git_exclude_path_uses_filesystem_decoding(tmp_path, monkeypatch):
     monkeypatch.setattr("dogpdkb.graph.subprocess.run", resolved)
     result = _git_info_exclude(tmp_path)
     assert os.fsencode(result) == raw
+
+
+def test_non_regular_graphifyignore_is_rejected_before_read(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    os.mkfifo(tmp_path / ".graphifyignore")
+
+    with pytest.raises(ValueError, match="regular file"):
+        _ensure_corpus_whitelist(corpus)
+
+    assert not (tmp_path / ".graphifyignore.lock").exists()
 
 
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):

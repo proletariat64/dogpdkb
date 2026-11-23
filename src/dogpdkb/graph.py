@@ -117,6 +117,11 @@ def _git_info_exclude(root):
             capture_output=True,
             timeout=10,
             check=False,
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if key not in {"GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"}
+            },
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ValueError("cannot resolve the Git worktree exclude file") from error
@@ -127,6 +132,11 @@ def _git_info_exclude(root):
 
 
 def _missing_whitelist(path, rules):
+    if path.is_symlink():
+        if not path.is_file():
+            raise ValueError(".graphifyignore symlink must resolve to a regular file")
+    elif path.exists() and not path.is_file():
+        raise ValueError(".graphifyignore must be a regular file")
     existing = path.read_bytes() if path.exists() else b""
 
     def key(line):
