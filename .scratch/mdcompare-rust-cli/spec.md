@@ -1,6 +1,6 @@
 # Rust mdcompare CLI 规格
 
-Status: ready-for-agent
+Status: resolved
 
 ## 目标和职责
 
