@@ -16,6 +16,18 @@ exchange graph output, provide per-run scan modes, or require an operator scope
 file, checksum, or other wrapper-generated proof. Existing corpus files and
 native Graphify output are used in place.
 
+Every extract passes `--no-gitignore`, so `.gitignore`, `.git/info/exclude` and
+Git's user-wide excludes cannot remove published Corpus sources from the scan.
+Graphify's own `.graphifyignore` rules remain active. Before dispatch inside a
+Git worktree, dogpdkb selects the nearest existing `.graphifyignore` in the
+worktree-to-Corpus directory chain, defaulting to the worktree root. It inserts
+any missing anchored negations for the configured Corpus path and its parent
+directories before that file's existing rules. Existing lines remain unchanged
+and retain their last-match priority, and a complete existing whitelist is not
+duplicated. This
+small scope guard is orchestrator-owned input selection; Graphify still owns
+pattern evaluation and scanning.
+
 Graphify's manifest and cache decide which sources need work. The orchestrator
 uses its workflow state to suppress a new directory dispatch when it would
 silently resend a known failed or unknown input at the same version. This does

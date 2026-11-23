@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from dogpdkb.graph import _ensure_corpus_whitelist
 from scripts.smoke_install import GRAPHIFY_PREFLIGHT, GRAPHIFY_PROOF
 from tests.source_fixture import graphify_offline_env, graphify_sse, yuque_binding
 
@@ -27,9 +28,9 @@ def write(path, value):
     path.write_text(json.dumps(value))
 
 
-def fixture(tmp_path, *, title="Title"):
-    corpus = tmp_path / "corpus"
-    corpus.mkdir()
+def fixture(tmp_path, *, title="Title", corpus_path="corpus"):
+    corpus = tmp_path / corpus_path
+    corpus.mkdir(parents=True)
     run = tmp_path / "runs/funds/run-graph"
     run.mkdir(parents=True)
     source = corpus / f"{title}-2026-11-12-[42].md"
@@ -120,7 +121,7 @@ def fixture(tmp_path, *, title="Title"):
                         "url": "https://example.invalid/book",
                     }
                 ],
-                "corpus": "corpus",
+                "corpus": corpus_path,
             }
         ],
     )
@@ -134,6 +135,7 @@ def value(flag): return args[args.index(flag)+1]
 with (root/'calls.jsonl').open('a') as log: log.write(json.dumps(sys.argv[2:])+'\\n')
 assert command=='extract', command
 assert '--no-cluster' in args
+assert '--no-gitignore' in args
 assert value('--backend')=='openai-oauth'
 assert value('--max-concurrency')=='3'
 assert os.environ['GRAPHIFY_OPENAI_OAUTH_PARALLEL']=='1'
@@ -192,6 +194,38 @@ def cli(config, manifest, environment=None, *, retry_graph=False):
     )
 
 
+def test_corpus_whitelist_uses_configured_nested_path(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    corpus = tmp_path / "published/custom-book"
+    corpus.mkdir(parents=True)
+    ignore_file = tmp_path / ".graphifyignore"
+    ignore_file.write_text("# Existing rule\nbuild/\n")
+
+    _ensure_corpus_whitelist(corpus)
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == (
+        b"!/published/\n"
+        b"!/published/custom-book/\n"
+        b"!/published/custom-book/**\n"
+        b"# Existing rule\nbuild/\n"
+    )
+
+
+def test_corpus_whitelist_uses_existing_corpus_ignore_file(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    corpus = tmp_path / "published/custom-book"
+    corpus.mkdir(parents=True)
+    ignore_file = corpus / ".graphifyignore"
+    ignore_file.write_text("# Corpus-local rules\nignored.md\n")
+
+    _ensure_corpus_whitelist(corpus)
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == b"!/**\n# Corpus-local rules\nignored.md\n"
+    assert not (tmp_path / ".graphifyignore").exists()
+
+
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):
     config, manifest, source = fixture(tmp_path, title="Cafe\u0301")
     result = cli(config, manifest)
@@ -224,6 +258,7 @@ def test_complete_source_calls_only_public_graphify_and_records_success(
     assert "candidate" not in report
     assert (Path(calls[0][1]) / source.name).read_bytes() == source.read_bytes()
     assert "--no-cluster" in calls[0]
+    assert "--no-gitignore" in calls[0]
     if budget is None:
         assert "--token-budget" not in calls[0]
     else:
@@ -819,6 +854,124 @@ def test_original_graphify_incremental_directory_preserves_other_sources(tmp_pat
         server.server_close()
 
 
+@pytest.mark.parametrize(
+    ("git_exclude", "git_pattern", "corpus_path", "whitelist"),
+    [
+        (
+            ".gitignore",
+            "*",
+            "corpus",
+            "!/corpus/\n!/corpus/**\n",
+        ),
+        (
+            ".git/info/exclude",
+            "*",
+            "corpus",
+            "!/corpus/\n!/corpus/**\n",
+        ),
+        (
+            ".gitignore",
+            "published/custom-book/",
+            "published/custom-book",
+            "!/published/\n!/published/custom-book/\n!/published/custom-book/**\n",
+        ),
+        (
+            ".git/info/exclude",
+            "published/",
+            "published/custom-book",
+            "!/published/\n!/published/custom-book/\n!/published/custom-book/**\n",
+        ),
+        (
+            ".git/info/exclude",
+            "published/custom-*/",
+            "published/custom-book",
+            "!/published/\n!/published/custom-book/\n!/published/custom-book/**\n",
+        ),
+        (
+            ".gitignore",
+            "published/custom-book/Title*",
+            "published/custom-book",
+            "!/published/\n!/published/custom-book/\n!/published/custom-book/**\n",
+        ),
+    ],
+)
+def test_installed_graphify_bypasses_git_exclusions_and_preserves_ignore_rules(
+    tmp_path, git_exclude, git_pattern, corpus_path, whitelist
+):
+    import shutil
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    executable = shutil.which("graphify")
+    if not executable:
+        pytest.skip("patched Graphify CLI is not installed")
+    config, manifest, source = fixture(tmp_path, corpus_path=corpus_path)
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / git_exclude).write_text(git_pattern + "\n")
+    ignored = source.with_name("ignored.md")
+    ignored.write_text("# Explicitly excluded by Graphify rules\n")
+    ignore_file = tmp_path / ".graphifyignore"
+    ignore_file.write_text("# Retain user rules\nignored.md\n")
+    config.write_text(
+        config.read_text().split("[tools]")[0]
+        + "[tools]\ngraphify="
+        + json.dumps(executable)
+        + "\n"
+    )
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            body = request["input"][0]["content"][0]["text"]
+            calls.append(body)
+            assert source.name in body
+            assert ignored.name not in body
+            result = graphify_sse(
+                [
+                    {
+                        "id": "current",
+                        "label": "current",
+                        "source_file": source.name,
+                        "file_type": "concept",
+                    }
+                ]
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(result)))
+            self.end_headers()
+            self.wfile.write(result)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    environment = graphify_offline_env(tmp_path, server.server_port)
+    try:
+        result = cli(config, manifest, environment)
+        assert result.returncode == 0, result.stdout + result.stderr
+        report = json.loads(Path(json.loads(result.stdout)["report"]).read_text())
+        assert "--no-gitignore" in report["argv"]
+        graph = json.loads((source.parent / "graphify-out/graph.json").read_text())
+        assert source.name in {n.get("source_file") for n in graph["nodes"]}
+        assert ignored.name not in {n.get("source_file") for n in graph["nodes"]}
+        expected = (whitelist + "# Retain user rules\nignored.md\n").encode()
+        assert ignore_file.read_bytes() == expected
+
+        # A real second dispatch preserves existing rules and adds no duplicate.
+        source.write_text("# Changed source\n\nCurrent full Markdown.\n")
+        data = json.loads(manifest.read_text())
+        Path(data["documents"][0]["input_copy"]).write_bytes(source.read_bytes())
+        assert cli(config, manifest, environment).returncode == 0
+        assert ignore_file.read_bytes() == expected
+        assert len(calls) == 2
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_installed_graphify_budget_recovers_omissions_with_three_inflight(tmp_path):
     import shutil
     import threading
@@ -914,7 +1067,9 @@ def test_installed_graphify_budget_recovers_omissions_with_three_inflight(tmp_pa
         assert result.returncode == 2, result.stdout + result.stderr
         assert dispatched == [names]
         failed = json.loads(
-            next(manifest.parent.glob("graphify-*/result.json")).read_text()
+            next(
+                (tmp_path / "state/funds/graph-evidence").glob("graphify-*/result.json")
+            ).read_text()
         )
         assert failed["exit_code"] == 0
         assert "GRAPHIFY_INCOMPLETE_EXTRACTION" in failed["reason"]
@@ -925,7 +1080,8 @@ def test_installed_graphify_budget_recovers_omissions_with_three_inflight(tmp_pa
             in log
         )
         public_graph = corpus / "graphify-out/graph.json"
-        assert not public_graph.exists()
+        # Native extraction writes in place; dogpdkb withholds acknowledgement.
+        assert public_graph.is_file()
         assert all(
             not row.get("graph")
             for row in json.loads(state_path.read_text())["documents"].values()
@@ -940,10 +1096,11 @@ def test_installed_graphify_budget_recovers_omissions_with_three_inflight(tmp_pa
         peak = 0
         result = cli(config, manifest, environment, retry_graph=True)
         assert result.returncode == 0, result.stdout + result.stderr
-        assert len(dispatched) == len(names)
-        assert set.union(*dispatched) == names
+        omitted = names - {source.name}
+        assert len(dispatched) == len(omitted)
+        assert set.union(*dispatched) == omitted
         assert peak == 3
-        assert models == ["gpt-6.1-terra"] * len(names)
+        assert models == ["gpt-6.1-terra"] * len(omitted)
         assert {
             n["source_file"] for n in json.loads(public_graph.read_text())["nodes"]
         } == names
@@ -954,7 +1111,7 @@ def test_installed_graphify_budget_recovers_omissions_with_three_inflight(tmp_pa
         report = json.loads(Path(documents["42"]["graph"]["report"]).read_text())
         assert report["graphify_model"] == "gpt-6.1-terra"
         assert report["graphify_token_budget"] == 512
-        assert "chunk 5/5 done" in Path(report["native_log"]).read_text()
+        assert "chunk 4/4 done" in Path(report["native_log"]).read_text()
     finally:
         server.shutdown()
         server.server_close()

@@ -167,6 +167,7 @@ def test_failed_graph_keeps_input_and_report_without_candidate_graph(tmp_path):
             "--out",
             report["corpus"],
             "--no-cluster",
+            "--no-gitignore",
             "--backend",
             "openai-oauth",
             "--max-concurrency",

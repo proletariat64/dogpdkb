@@ -85,6 +85,55 @@ _NATIVE_ENV = {
 }
 
 
+def _ensure_corpus_whitelist(corpus):
+    """Keep Git excludes from hiding a configured Corpus from Graphify."""
+    corpus = corpus.resolve()
+    root = None
+    home = Path.home()
+    for directory in (corpus, *corpus.parents):
+        if (directory / ".git").exists():
+            root = directory
+            break
+        if directory == home:
+            break
+    if root is None:
+        return
+
+    relative = corpus.relative_to(root)
+    anchor = root
+    current_path = root
+    chain = [root]
+    for part in relative.parts:
+        current_path /= part
+        chain.append(current_path)
+    for directory in reversed(chain):
+        if (directory / ".graphifyignore").is_file():
+            anchor = directory
+            break
+
+    relative = corpus.relative_to(anchor)
+    rules = []
+    current = ""
+    for part in relative.parts:
+        current += f"/{part}"
+        rules.append(f"!{current}/")
+    rules.append(f"!{current}/**" if current else "!/**")
+
+    path = anchor / ".graphifyignore"
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def key(line):
+        line = line.strip()
+        return "!/" + line[1:].lstrip("/") if line.startswith("!") else line
+
+    present = {key(line) for line in existing.splitlines()}
+    missing = [rule for rule in rules if key(rule) not in present]
+    if not missing:
+        return
+    # Existing Graphify rules come later and retain their last-match priority.
+    path.write_text("\n".join(missing) + "\n" + existing, encoding="utf-8")
+
+
 def _native_extract(command, corpus, token_budget, model, concurrency):
     argv = [
         *command,
@@ -93,6 +142,7 @@ def _native_extract(command, corpus, token_budget, model, concurrency):
         "--out",
         str(corpus),
         "--no-cluster",
+        "--no-gitignore",
         "--backend",
         "openai-oauth",
         "--max-concurrency",
@@ -313,6 +363,7 @@ def run_graph(
     graph_dir = settings.graph_for(book)
     graph_path = graph_dir / "graph.json"
     native_manifest = graph_dir / "manifest.json"
+    _ensure_corpus_whitelist(corpus)
     run.stage("graphify", total=len(pending), completed=0, failed=0, phase="prepare")
     evidence_root = store.path.parent / "graph-evidence"
     evidence_root.mkdir(parents=True, exist_ok=True)
