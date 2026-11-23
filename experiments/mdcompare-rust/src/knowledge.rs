@@ -1,3 +1,4 @@
+use crate::{offline::Snapshots, summary::Progress};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
@@ -371,12 +372,16 @@ fn excerpt(text: &str, limit: usize) -> (&str, usize) {
 }
 
 pub(crate) fn compare_documents(
-    baseline: &BTreeMap<Identity, Document>,
-    incoming: &BTreeMap<Identity, Document>,
-    order: &[Identity],
+    snapshots: &Snapshots,
     options: &Options,
     reader: &mut Reader,
+    progress: &Progress,
 ) -> Value {
+    let Snapshots {
+        baseline,
+        incoming,
+        order,
+    } = snapshots;
     let mut old_units = BTreeMap::new();
     let mut failed = BTreeMap::new();
     let mut index = UnitIndex::new();
@@ -441,6 +446,7 @@ pub(crate) fn compare_documents(
             }
         }
         results.push(row);
+        progress.update("compare", results.len(), incoming.len(), 0, 0);
     }
     if !reader.changed_paths().is_empty() {
         for row in &mut results {

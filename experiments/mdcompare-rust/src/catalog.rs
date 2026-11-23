@@ -36,15 +36,22 @@ fn candidate(doc: &Document, url: &str) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let parent = doc.path.parent().context("INPUT_PATH_INVALID")?;
-    Ok(Some(resolved(&parent.join(decoded(target.path)))?))
+    Ok(Some(parent.join(decoded(target.path))))
+}
+
+fn urls(declared: &[Value]) -> BTreeMap<&str, &Value> {
+    let mut by_url = BTreeMap::new();
+    for entry in declared {
+        if let Some(url) = entry["url"].as_str() {
+            by_url.entry(url).or_insert(entry);
+        }
+    }
+    by_url
 }
 
 pub(crate) fn local_candidates(doc: &Document, bytes: &[u8]) -> Result<Vec<PathBuf>> {
     let (declared, _) = declarations(doc)?;
-    let by_url: BTreeMap<_, _> = declared
-        .iter()
-        .filter_map(|entry| Some((entry["url"].as_str()?, entry)))
-        .collect();
+    let by_url = urls(&declared);
     let (references, _) = uses(bytes, &by_url.keys().copied().collect());
     let mut paths = Vec::new();
     for usage in references {
@@ -52,7 +59,7 @@ pub(crate) fn local_candidates(doc: &Document, bytes: &[u8]) -> Result<Vec<PathB
             .get(usage.url.as_str())
             .and_then(|entry| entry["path"].as_str())
         {
-            Some(path) => Some(resolved(&doc.resolve(path))?),
+            Some(path) => Some(doc.resolve(path)),
             None => candidate(doc, &usage.url)?,
         };
         paths.extend(path);
@@ -84,16 +91,12 @@ fn catalog_document(doc: &Document, data: &[u8], reader: &mut Reader) -> Result<
     }
 
     let (declared, by_id) = declarations(doc)?;
-    let mut by_url = BTreeMap::new();
-    for entry in &declared {
-        if let Some(url) = entry["url"].as_str() {
-            by_url.entry(url).or_insert(entry);
-        }
-    }
+    let by_url = urls(&declared);
     let declared_urls = by_url.keys().copied().collect();
     let (used, warnings) = uses(data, &declared_urls);
     let historical = doc.content_kind() == "enriched";
     let mut resources = Vec::new();
+    let mut unverified = Vec::new();
     let mut retained = BTreeSet::new();
     if historical {
         for value in &declared {
@@ -120,12 +123,29 @@ fn catalog_document(doc: &Document, data: &[u8], reader: &mut Reader) -> Result<
         entry["resource_id"] = json!(id);
         entry["url"] = json!(usage.url);
         entry["kind"] = json!(usage.kind);
-        if entry["path"].is_string() {
-            absolute(doc, &mut entry, "path")?;
-        } else if let Some(candidate) = candidate(doc, &usage.url)? {
-            if reader.local_file_exists(&candidate)? {
-                entry["path"] = json!(candidate);
+        let declared_path = entry["path"].as_str().map(|path| doc.resolve(path));
+        let local = match &declared_path {
+            Some(path) => Some(path.clone()),
+            None => candidate(doc, &usage.url)?,
+        };
+        let reason = match local {
+            Some(path) => {
+                let (path, exists) = reader.local_file(&path)?;
+                if exists || declared_path.is_some() {
+                    entry["path"] = json!(path);
+                }
+                (!exists).then_some("LOCAL_RESOURCE_UNAVAILABLE")
             }
+            None if entry["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("data:")) =>
+            {
+                Some("EMBEDDED_BYTES_UNVERIFIED")
+            }
+            None => Some("REMOTE_RESOURCE_UNVERIFIED"),
+        };
+        if let Some(reason) = reason {
+            unverified.push(json!({"resource_id":id,"reason_code":reason}));
         }
         if retained.insert(id) {
             resources.push(entry);
@@ -134,6 +154,7 @@ fn catalog_document(doc: &Document, data: &[u8], reader: &mut Reader) -> Result<
     row["path"] = json!(resolved(&doc.path)?);
     row["resources"] = json!(resources);
     row["resource_warnings"] = json!(warnings);
+    row["unverified_resources"] = json!(unverified);
     row["status"] = json!(if warnings.is_empty() {
         "COMPLETE"
     } else {

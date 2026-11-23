@@ -1,5 +1,6 @@
 use crate::input::{Document, Identity, Reader};
 use crate::{ocr, resources, text};
+use crate::{offline::Snapshots, summary::Progress};
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -144,12 +145,16 @@ pub(crate) fn render(report: &Value) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn compare_documents(
-    old: &BTreeMap<Identity, Document>,
-    new: &BTreeMap<Identity, Document>,
-    order: &[Identity],
+    snapshots: &Snapshots,
     opts: &text::Options,
     reader: &mut Reader,
+    progress: &Progress,
 ) -> Result<Value> {
+    let Snapshots {
+        baseline: old,
+        incoming: new,
+        order,
+    } = snapshots;
     let mut errors = BTreeSet::new();
     let mut results = Vec::new();
     for id in order.iter().filter(|id| new.contains_key(*id)) {
@@ -192,6 +197,7 @@ pub(crate) fn compare_documents(
                 "metadata":metadata,"text":text,"resources":resources,"ocr":ocr,
                 "action":action,"reason_codes":codes}),
         ));
+        progress.update("compare", results.len(), new.len(), 0, 0);
     }
 
     ensure!(reader.changed_paths().is_empty(), "input_drift");

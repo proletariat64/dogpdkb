@@ -92,6 +92,7 @@ pub fn read(path: &Path, limit: u64) -> Result<(Vec<u8>, Stamp), &'static str> {
 
 pub struct Reader {
     frozen: Option<BTreeMap<PathBuf, crate::workspace::InputWitness>>,
+    presence: BTreeMap<PathBuf, bool>,
     drifted: bool,
     limit: u64,
     stamps: HashMap<PathBuf, Stamp>,
@@ -103,6 +104,7 @@ impl Reader {
     pub fn new(limit: u64) -> Self {
         Self {
             frozen: None,
+            presence: BTreeMap::new(),
             drifted: false,
             limit,
             stamps: HashMap::new(),
@@ -114,9 +116,11 @@ impl Reader {
     pub fn new_frozen(
         limit: u64,
         inputs: &BTreeMap<PathBuf, crate::workspace::InputWitness>,
+        presence: &BTreeMap<PathBuf, bool>,
     ) -> Self {
         Self {
             frozen: Some(inputs.clone()),
+            presence: presence.clone(),
             ..Self::new(limit)
         }
     }
@@ -125,16 +129,13 @@ impl Reader {
         self.drifted
     }
 
-    pub fn local_file_exists(&mut self, path: &Path) -> Result<bool> {
-        let exists = path.is_file();
-        if let Some(inputs) = &self.frozen {
-            let key = resolved(path)?;
-            ensure!(
-                matches!(inputs.get(&key), Some(crate::workspace::InputWitness::Presence { exists: expected }) if *expected == exists),
-                "input_drift"
-            );
+    pub fn local_file(&self, path: &Path) -> Result<(PathBuf, bool)> {
+        let target = resolved(path).context("input_drift")?;
+        let exists = target.is_file();
+        if self.frozen.is_some() {
+            ensure!(self.presence.get(&target) == Some(&exists), "input_drift");
         }
-        Ok(exists)
+        Ok((target, exists))
     }
 
     pub fn begin_document(&mut self) {
