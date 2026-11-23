@@ -203,10 +203,11 @@ def verify_semantic_commit(witness):
     root = marker.parent
     data = _bound_file(root, marker.name)
     commit = _object(json.loads(data))
+    frozen_bytes = _bound_file(root, "plan.json")
     if (
         _digest(data) != witness["sha256"]
         or commit.get("schema_version") != "mdcompare-commit-1"
-        or commit.get("plan_sha256") != _digest(_bound_file(root, "plan.json"))
+        or commit.get("plan_sha256") != _digest(frozen_bytes)
     ):
         raise ValueError("frozen mdcompare comparison changed")
     hashes = commit.get("artifacts")
@@ -229,7 +230,7 @@ def verify_semantic_commit(witness):
     result = _object(json.loads(contents["result.json"]))
     state = result.get("state")
     plan = root.with_suffix(".json")
-    frozen = _object(json.loads(_bound_file(root, "plan.json")))
+    frozen = _object(json.loads(frozen_bytes))
     if (
         frozen.get("source") != str(plan)
         or frozen.get("source_sha256") != _digest(_bound_file(root.parent, plan.name))
@@ -281,7 +282,9 @@ def score(settings, run, plan, comparison, book_key, identifiers, *, recover=Fal
     root = plan.with_suffix(".mdcompare")
     result = root / "result.json"
     if recover:
-        _, summary = _invoke(settings, run, "status", plan, configured=False)
+        status_code, summary = _invoke(settings, run, "status", plan, configured=False)
+        if status_code != 0:
+            raise ValueError("invalid mdcompare status exit code")
         code = 2 if summary["state"] == "partial" else 0
     else:
         code, summary = _invoke(settings, run, "score", plan)
