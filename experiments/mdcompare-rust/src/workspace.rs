@@ -385,7 +385,9 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .context("publish_failed")
 }
 
-fn fields(value: &Value, declarations: &[(&str, fn(&Value) -> bool)]) -> Result<()> {
+type FieldValidator = (&'static str, fn(&Value) -> bool);
+
+fn fields(value: &Value, declarations: &[FieldValidator]) -> Result<()> {
     let object = value.as_object().context("invalid_input")?;
     ensure!(
         object.iter().all(|(key, value)| declarations
@@ -937,7 +939,7 @@ mod tests {
         fs::write(&incoming, "incoming")?;
         symlink(&base, &alias)?;
         draft(&base, &incoming, &plan)?;
-        let mut value = read_json(&plan)?;
+        let mut value = parse_json(&fs::read(&plan)?)?;
         value["documents"][0]["baseline"]["path"] = json!(alias);
         fs::write(&plan, input::json_bytes(&value)?)?;
         let (_, accepted) = accept(&plan, None)?;
