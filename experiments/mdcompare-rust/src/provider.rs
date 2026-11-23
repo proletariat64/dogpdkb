@@ -1,9 +1,9 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use reqwest::{Proxy, blocking::Client, redirect};
+use reqwest::{Certificate, Proxy, Url, blocking::Client, redirect};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    env, fs,
+    fs,
     io::{BufRead, BufReader, Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -107,16 +107,43 @@ fn model<'a>(name: &'a str, effort: &'a str) -> Result<Model<'a>, &'static str> 
     })
 }
 
-fn auth_path() -> Result<PathBuf, &'static str> {
-    let directory = env::var_os("PI_CODING_AGENT_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".pi/agent")))
-        .ok_or("oauth_required")?;
-    directory
-        .join("auth.json")
-        .canonicalize()
-        .map_err(|_| "oauth_required")
+#[derive(Default)]
+pub struct Connection {
+    pub oauth_file: Option<PathBuf>,
+    pub proxy: Option<String>,
+    pub ca_file: Option<PathBuf>,
+    pub endpoint: Option<String>,
+}
+
+impl Connection {
+    fn auth_path(&self) -> Result<PathBuf, &'static str> {
+        self.oauth_file
+            .as_deref()
+            .ok_or("oauth_required")?
+            .canonicalize()
+            .map_err(|_| "oauth_required")
+    }
+
+    fn endpoint(&self) -> Result<Option<Url>, &'static str> {
+        let Some(url) = &self.endpoint else {
+            return Ok(None);
+        };
+        let url = Url::parse(url).map_err(|_| "unsupported_transport")?;
+        let loopback = url.host_str().is_some_and(|host| {
+            host.trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+        });
+        if url.scheme() != "http"
+            || !loopback
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || self.proxy.is_some()
+        {
+            return Err("unsupported_transport");
+        }
+        Ok(Some(url))
+    }
 }
 
 fn auth_json(path: &Path) -> Result<Value, &'static str> {
@@ -155,26 +182,40 @@ fn expired(cred: &Value) -> bool {
         .is_some_and(|stamp| stamp <= now_millis())
 }
 
-fn connection() -> Result<Client, &'static str> {
+fn connection(settings: &Connection) -> Result<Client, &'static str> {
+    settings.endpoint()?;
     let mut builder = Client::builder()
         .redirect(redirect::Policy::none())
         .retry(reqwest::retry::never())
         .timeout(Duration::from_secs(170))
         .no_proxy();
-    if let Some(proxy) = env::var_os("HTTPS_PROXY")
-        .filter(|value| !value.is_empty())
-        .or_else(|| env::var_os("https_proxy").filter(|value| !value.is_empty()))
-    {
-        let value = proxy.to_str().ok_or("proxy_unavailable")?;
-        builder = builder.proxy(Proxy::https(value).map_err(|_| "proxy_unavailable")?);
+    if let Some(proxy) = &settings.proxy {
+        builder = builder.proxy(Proxy::https(proxy).map_err(|_| "proxy_unavailable")?);
+    }
+    if let Some(path) = &settings.ca_file {
+        let (bytes, _) = crate::input::read(path, 1024 * 1024).map_err(|_| "ca_unavailable")?;
+        let certificates = Certificate::from_pem_bundle(&bytes).map_err(|_| "ca_unavailable")?;
+        if certificates.is_empty() {
+            return Err("ca_unavailable");
+        }
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
     }
     builder.build().map_err(|_| "proxy_unavailable")
 }
 
-pub fn check_oauth(name: &str, effort: &str) -> Result<bool, &'static str> {
+pub fn check_oauth_settings(
+    name: &str,
+    effort: &str,
+    settings: &Connection,
+) -> Result<bool, &'static str> {
     let model = model(name, effort)?;
-    let _client = connection()?;
-    let auth = auth_json(&auth_path()?)?;
+    let _client = connection(settings)?;
+    if settings.endpoint()?.is_some() {
+        return Ok(false);
+    }
+    let auth = auth_json(&settings.auth_path()?)?;
     Ok(expired(credential(&auth, model.backend)?))
 }
 
@@ -298,8 +339,7 @@ fn refresh(client: &Client, backend: Backend, cred: &Value) -> Result<Value, &'s
     Ok(next)
 }
 
-fn access(client: &Client, backend: Backend) -> Result<String, &'static str> {
-    let path = auth_path()?;
+fn access(client: &Client, backend: Backend, path: &Path) -> Result<String, &'static str> {
     let auth = auth_json(&path)?;
     let cred = credential(&auth, backend)?;
     if !expired(cred) {
@@ -451,9 +491,14 @@ fn parse_stream(mut reader: impl BufRead) -> Result<(String, Option<u64>), &'sta
     }
 }
 
-fn request(model: Model<'_>, packet: &str) -> Result<Outcome, &'static str> {
-    let client = connection()?;
-    let token = access(&client, model.backend)?;
+fn request(model: Model<'_>, packet: &str, settings: &Connection) -> Result<Outcome, &'static str> {
+    let client = connection(settings)?;
+    let endpoint = settings.endpoint()?;
+    let token = if endpoint.is_some() {
+        None
+    } else {
+        Some(access(&client, model.backend, &settings.auth_path()?)?)
+    };
     let format: Value = serde_json::from_str(FORMAT).expect("valid embedded score format");
     let mut input = vec![json!({"role": "developer", "content": PROMPT})];
     input.push(json!({
@@ -476,26 +521,30 @@ fn request(model: Model<'_>, packet: &str) -> Result<Outcome, &'static str> {
         "include": ["reasoning.encrypted_content"],
         "text": {"format": format},
     });
-    let mut request = match model.backend {
-        Backend::OpenAi => client.post(OPENAI_RESPONSES),
-        Backend::Codex => {
-            body["text"]["verbosity"] = json!("low");
-            body["tool_choice"] = json!("auto");
-            body["parallel_tool_calls"] = json!(true);
-            client
-                .post(CODEX_RESPONSES)
-                .header(
-                    "chatgpt-account-id",
-                    jwt_account(&token).ok_or("auth_error")?,
-                )
-                .header("originator", "pi")
-                .header("openai-beta", "responses=experimental")
+    let mut request = if let Some(endpoint) = endpoint {
+        client.post(endpoint)
+    } else {
+        match model.backend {
+            Backend::OpenAi => client.post(OPENAI_RESPONSES),
+            Backend::Codex => {
+                body["text"]["verbosity"] = json!("low");
+                body["tool_choice"] = json!("auto");
+                body["parallel_tool_calls"] = json!(true);
+                client
+                    .post(CODEX_RESPONSES)
+                    .header(
+                        "chatgpt-account-id",
+                        jwt_account(token.as_deref().ok_or("auth_error")?).ok_or("auth_error")?,
+                    )
+                    .header("originator", "pi")
+                    .header("openai-beta", "responses=experimental")
+            }
         }
     };
-    request = request
-        .bearer_auth(token)
-        .header("accept", "text/event-stream")
-        .json(&body);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    request = request.header("accept", "text/event-stream").json(&body);
     let response = request.send().map_err(|_| "unknown_outcome")?;
     let status = response.status().as_u16();
     let reason = match status {
@@ -521,9 +570,14 @@ fn request(model: Model<'_>, packet: &str) -> Result<Outcome, &'static str> {
     )
 }
 
-pub fn assess(name: &str, effort: &str, packet: &str) -> Outcome {
+pub fn assess_with_connection(
+    name: &str,
+    effort: &str,
+    packet: &str,
+    settings: &Connection,
+) -> Outcome {
     model(name, effort)
-        .and_then(|model| request(model, packet))
+        .and_then(|model| request(model, packet, settings))
         .unwrap_or_else(|reason| Outcome::error(reason, None))
 }
 
@@ -531,6 +585,16 @@ pub fn assess(name: &str, effort: &str, packet: &str) -> Outcome {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn provider_rejects_remote_override_without_connecting() {
+        let cfg = Connection {
+            endpoint: Some("https://example.invalid/v1/responses".to_owned()),
+            ..Connection::default()
+        };
+        let outcome = assess_with_connection("openai/gpt-6.1-terra", "medium", "packet", &cfg);
+        assert_eq!(outcome.reason, Some("unsupported_transport"));
+    }
 
     #[test]
     fn native_responses_requires_a_completed_stream() {
