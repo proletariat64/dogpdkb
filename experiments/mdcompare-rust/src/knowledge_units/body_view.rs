@@ -171,34 +171,6 @@ fn generated_ranges(text: &str, code: &[Span], spans: &mut Vec<Span>) -> Result<
     if open.is_some() {
         return Err(UNCLOSED);
     }
-    let legacy_comments: Vec<_> = rx!(r"(?is)<!--\s*这是一张图片[，,]\s*ocr\s*内容为[：:].*?-->")
-        .find_iter(text)
-        .filter(|m| outside(m.start(), code))
-        .collect();
-    let complete_starts: HashSet<_> = legacy_comments.iter().map(|m| m.start()).collect();
-    spans.extend(legacy_comments.iter().map(|m| m.range()));
-    if rx!(r"(?i)<!--\s*这是一张图片[，,]\s*ocr\s*内容为[：:]")
-        .find_iter(text)
-        .any(|m| outside(m.start(), code) && !complete_starts.contains(&m.start()))
-    {
-        return Err(UNCLOSED);
-    }
-    let legacy_blocks: Vec<_> = rx!(r"(?m)^\s*>\s*\*\*图片转写[：:]\*\*[^\n]*")
-        .find_iter(text)
-        .collect();
-    for (index, begin) in legacy_blocks.iter().enumerate() {
-        if !outside(begin.start(), code) {
-            continue;
-        }
-        let limit = legacy_blocks
-            .get(index + 1)
-            .map_or(text.len(), |m| m.start());
-        let end = rx!(r"(?m)^\s*>\s*(?:\*\*)?转写说明[：:](?:\*\*)?[^\n]*")
-            .find_at(text, begin.end())
-            .filter(|m| m.end() <= limit)
-            .ok_or(UNCLOSED)?;
-        spans.push(begin.start()..end.end());
-    }
     Ok(())
 }
 
