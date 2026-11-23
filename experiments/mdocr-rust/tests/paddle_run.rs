@@ -205,10 +205,13 @@ fn paddle_run_publishes_bound_evidence_and_recovers_result_without_resubmitting(
         let log = fs::read_to_string(&log_path).unwrap();
         assert!(
             log.lines().any(|line| {
-                line.contains("event=admitted ")
-                    && line.contains("documents=0/1 in_flight=1 requests=1/4")
+                line.contains("event=admitted ") && line.contains("in_flight=1 requests=1/4")
             }),
             "the admission must be visible before the provider responds: {log}"
+        );
+        assert!(
+            log.lines()
+                .any(|line| { line.contains("event=started ") && line.contains("documents=0/1") })
         );
     });
     assert_exit(&child.wait_with_output().unwrap(), 0);
@@ -432,4 +435,78 @@ fn cancellation_settles_in_flight_work_and_requires_explicit_resume() {
     assert_eq!(read_json(&report_path)["status"], "completed");
     assert_eq!(read_json(&report_path)["budget"]["requests"], 2);
     assert!(root.join("out/second/in.md").is_file());
+}
+
+#[test]
+fn retry_failed_retries_a_paddle_job_with_a_terminal_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    source(root, [12, 34, 56]);
+    let (listener, base) = listener();
+    let plan_hash = plan(
+        root,
+        &format!("{base}/jobs"),
+        ".",
+        json!([{"path": "in.md", "output": "out.md"}]),
+    );
+
+    let child = cli(root, RUN_ARGS)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stream = accept(&listener);
+    assert_eq!(read_request(&mut stream).0, "POST /jobs HTTP/1.1");
+    assert_admission(root, &plan_hash, 1, &root.join("image.png"));
+    respond(stream, &json!({"data":{"jobId":"one"}}));
+    let mut stream = accept(&listener);
+    assert_eq!(read_request(&mut stream).0, "GET /jobs/one HTTP/1.1");
+    respond(stream, &json!({"data":{"state":"failed"}}));
+    assert_exit(&child.wait_with_output().unwrap(), 2);
+    let result = read_json(&root.join("work.mdocr/result.json"));
+    assert_eq!(result["documents"][0]["resources"][0]["status"], "failed");
+    assert!(!root.join("out.md").exists());
+
+    let child = cli(root, RUN_ARGS)
+        .arg("--retry-failed")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serve_success(&listener, &base, || {
+        assert_admission(root, &plan_hash, 2, &root.join("image.png"));
+    });
+    assert_exit(&child.wait_with_output().unwrap(), 0);
+    assert!(root.join("out.md").exists());
+}
+
+#[test]
+fn ocr_in_a_list_preserves_the_original_list_and_nested_blocks() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    source(root, [12, 34, 56]);
+    let list = "- First ![seed](image.png) and its continuation\n  on the next line.\n  - Nested list content\n- Second item\n";
+    fs::write(root.join("in.md"), format!("{list}\nOutside the list.\n")).unwrap();
+    let (listener, base) = listener();
+    plan(
+        root,
+        &format!("{base}/jobs"),
+        ".",
+        json!([{"path": "in.md", "output": "out.md"}]),
+    );
+    let child = cli(root, RUN_ARGS)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serve_success(&listener, &base, || {});
+    assert_exit(&child.wait_with_output().unwrap(), 0);
+    let output = fs::read_to_string(root.join("out.md")).unwrap();
+    assert!(output.starts_with(list), "{output}");
+    assert!(output[list.len()..].contains("Recognized."), "{output}");
+    let original_visible: Vec<_> = pulldown_cmark::Parser::new(list).collect();
+    let actual_visible: Vec<_> = pulldown_cmark::Parser::new(&output)
+        .take(original_visible.len())
+        .collect();
+    assert_eq!(actual_visible, original_visible);
 }

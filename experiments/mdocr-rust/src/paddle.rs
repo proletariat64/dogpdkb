@@ -154,6 +154,7 @@ fn poll(http: &Client, job_url: Url, auth: &HeaderValue) -> Result<String, Failu
                     .map(|markdown| text_only(&markdown))
                     .ok_or_else(|| Failure::unknown("OCR_OUTCOME_UNKNOWN"));
             }
+            Some("failed") => return Err(Failure::known("OCR_PROVIDER_FAILED")),
             Some("pending" | "running") => sleep(POLL_INTERVAL),
             _ => return Err(Failure::unknown("OCR_OUTCOME_UNKNOWN")),
         }

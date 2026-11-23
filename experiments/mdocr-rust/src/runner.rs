@@ -531,7 +531,7 @@ impl<'a> Execution<'a> {
         }
     }
 
-    fn progress(&self, event: &str, active: usize, reason: Option<&str>) {
+    fn progress_snapshot(&self, event: &str, active: usize) {
         let ready = self
             .plan
             .documents
@@ -544,10 +544,29 @@ impl<'a> Execution<'a> {
                             .as_deref()
                             .and_then(|key| self.last(key))
                             .and_then(Attempt::patch)
-                            .is_some_and(|patch| patch["kind"] != "hold")
+                            .is_some_and(|patch| {
+                                patch["kind"] != "hold" && patch.get("warnings").is_none()
+                            })
                 })
             })
             .count();
+        self.emit_progress(event, active, None, Some(ready));
+    }
+
+    fn progress(&self, event: &str, active: usize, reason: Option<&str>) {
+        self.emit_progress(event, active, reason, None);
+    }
+
+    fn emit_progress(
+        &self,
+        event: &str,
+        active: usize,
+        reason: Option<&str>,
+        ready: Option<usize>,
+    ) {
+        let documents = ready
+            .map(|ready| format!(" documents={ready}/{}", self.plan.documents.len()))
+            .unwrap_or_default();
         let request_limit = self
             .state
             .budget
@@ -557,8 +576,7 @@ impl<'a> Execution<'a> {
         progress::emit(
             event,
             format_args!(
-                "phase=ocr documents={ready}/{} in_flight={active} requests={}/{request_limit} concurrency={} reason_code={}",
-                self.plan.documents.len(),
+                "phase=ocr{documents} in_flight={active} requests={}/{request_limit} concurrency={} reason_code={}",
                 self.state.budget.requests,
                 self.state.concurrency.current,
                 reason.or(self.stop).unwrap_or("none"),
@@ -791,7 +809,7 @@ impl<'a> Execution<'a> {
         self.state.documents = self.document_rows(None)?;
         self.save_journal()?;
         self.save_result()?;
-        self.progress("started", 0, None);
+        self.progress_snapshot("started", 0);
         self.dispatch_pass(engine, pending, Pass::Initial)?;
         while self.stop.is_none() {
             let limit = rounds(&self.plan.settings, "retry_rounds");
@@ -881,6 +899,7 @@ impl<'a> Execution<'a> {
             let (sender, receiver) = mpsc::channel();
             let mut active = HashMap::<String, usize>::new();
             let mut slots: Vec<VecDeque<String>> = Vec::new();
+            let mut last_snapshot = Instant::now();
             loop {
                 self.observe_cancel()?;
                 let tier = self.state.concurrency.current;
@@ -935,7 +954,8 @@ impl<'a> Execution<'a> {
                 let (key, index, tier, result) = match receiver.recv_timeout(HEARTBEAT) {
                     Ok(settled) => settled,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        self.progress("waiting", active.len(), None);
+                        self.progress_snapshot("waiting", active.len());
+                        last_snapshot = Instant::now();
                         continue;
                     }
                     Err(error) => return Err(error.into()),
@@ -954,6 +974,10 @@ impl<'a> Execution<'a> {
                 );
                 if self.state.concurrency.current != concurrency {
                     self.progress("throttled", active.len(), None);
+                }
+                if last_snapshot.elapsed() >= HEARTBEAT {
+                    self.progress_snapshot("progress", active.len());
+                    last_snapshot = Instant::now();
                 }
             }
             Ok(())
@@ -980,11 +1004,12 @@ impl<'a> Execution<'a> {
                                 record["status"] = json!("held");
                                 record["reason_code"] = json!("IMAGE_CONVERSION_HELD");
                                 record["uncertainty"] = value["uncertainty"].clone();
+                            } else if let Some(warnings) = value.get("warnings") {
+                                record["status"] = json!("failed");
+                                record["reason_code"] = json!("response_mermaid_syntax_invalid");
+                                record["warnings"] = warnings.clone();
                             } else {
                                 patch = Some(value);
-                                if let Some(warnings) = value.get("warnings") {
-                                    record["warnings"] = warnings.clone();
-                                }
                             }
                         } else if let Some(reason) = &attempt.reason {
                             record["reason_code"] = json!(reason);
@@ -1043,14 +1068,13 @@ impl<'a> Execution<'a> {
         self.state.status = status.into();
         self.save_journal()?;
         self.save_result()?;
-        self.progress(
+        self.progress_snapshot(
             if status == "canceled" {
                 "canceled"
             } else {
                 "published"
             },
             0,
-            None,
         );
         Ok((
             code,
@@ -1253,4 +1277,74 @@ pub(crate) fn assemble(workspace: &Workspace, output_dir: PathBuf) -> Result<(u8
     });
     atomic(&path, &json_bytes(&report)?, true)?;
     Ok((code, summary))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_mermaid_patch_can_be_repaired_but_cannot_be_published() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::write(root.join("source.md"), "![workflow](image.png)\n")?;
+        image::RgbImage::from_pixel(1, 1, image::Rgb([10, 20, 30])).save(root.join("image.png"))?;
+        let work = root.join("work.json");
+        fs::write(
+            &work,
+            json_bytes(&json!({
+                "schema_version": "mdocr-work-1",
+                "output_dir": "out",
+                "documents": [{"path": "source.md"}],
+            }))?,
+        )?;
+        let workspace = Workspace::new(&work)?;
+        let settings = crate::config::load(None, None)?;
+        crate::plan::accept(
+            &workspace.work,
+            &workspace.plan,
+            &workspace.images,
+            Some(&settings),
+            None,
+            None,
+        )?;
+        let plan = load_workspace(&workspace)?;
+        let state = journal_for(&plan, &workspace.result, &workspace.journal)?;
+        let mut execution = Execution::new(&plan, &workspace, state, false)?;
+        let (key, image) = execution
+            .layout
+            .jobs
+            .iter()
+            .next()
+            .context("fixture image")?;
+        let mut admitted = Attempt::new(key.clone(), Status::Admitted);
+        admitted.source_sha256.clone_from(&image.sha256);
+        execution.state.requests.push(admitted);
+        execution.state.budget.requests = 1;
+        let patch = json!({
+            "kind": "mermaid", "markdown": "```mermaid\nnot-a-real-diagram\n```",
+            "uncertainty": "", "warnings": ["response_mermaid_syntax_invalid"],
+        });
+        let errors = crate::llm::mermaid_diagnostics(&patch)
+            .map_err(|failure| anyhow::anyhow!(failure.reason))?;
+        assert!(!errors.is_empty());
+        execution.settle(
+            0,
+            3,
+            Ok(Conversion {
+                patch,
+                mermaid_errors: errors,
+                usage_tokens: None,
+            }),
+        )?;
+        assert_eq!(execution.pending_repairs()?.len(), 1);
+
+        let rows = execution.document_rows(Some(&workspace.evidence))?;
+        assert_eq!(rows[0]["status"], "partial");
+        let resource = &rows[0]["resources"][0];
+        assert_eq!(resource["status"], "failed");
+        assert_eq!(resource["reason_code"], "response_mermaid_syntax_invalid");
+        assert!(!plan.documents[0].output.exists());
+        Ok(())
+    }
 }

@@ -186,11 +186,87 @@ fn account_id(access: &str) -> Option<String> {
     .map(str::to_owned)
 }
 
-struct AuthLock(PathBuf);
+const AUTH_LOCK_STALE: Duration = Duration::from_secs(30);
+
+struct AuthLock {
+    path: PathBuf,
+    #[cfg(unix)]
+    guard: fs::File,
+    #[cfg(not(unix))]
+    directory: fs::Metadata,
+}
+
+fn same_lock(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    if !left.is_dir() || !right.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    #[cfg(not(unix))]
+    left.created()
+        .is_ok_and(|time| right.created().ok() == Some(time))
+}
 
 impl Drop for AuthLock {
     fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.0);
+        #[cfg(unix)]
+        let Ok(directory) = self.guard.metadata() else {
+            return;
+        };
+        #[cfg(not(unix))]
+        let directory = &self.directory;
+        if fs::symlink_metadata(&self.path).is_ok_and(|entry| same_lock(&directory, &entry)) {
+            let _ = fs::remove_dir(&self.path);
+        }
+    }
+}
+
+fn reclaim_expired_lock(path: &Path) -> std::io::Result<bool> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if !before.is_dir() {
+        return Ok(false);
+    }
+    let modified = before.modified()?;
+    if modified.elapsed().unwrap_or_default() < AUTH_LOCK_STALE {
+        return Ok(false);
+    }
+    // Pi coordinates through the directory mtime. The additional advisory
+    // lock protects any live mdocr holder even if its process is suspended.
+    #[cfg(unix)]
+    let _guard = {
+        let guard = match fs::File::open(path) {
+            Ok(guard) => guard,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        if !same_lock(&before, &guard.metadata()?) {
+            return Ok(false);
+        }
+        match guard.try_lock() {
+            Ok(()) => guard,
+            Err(fs::TryLockError::WouldBlock) => return Ok(false),
+            Err(fs::TryLockError::Error(error)) => return Err(error),
+        }
+    };
+    let current = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if !same_lock(&before, &current) || current.modified()? != modified {
+        return Ok(false);
+    }
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
     }
 }
 
@@ -199,14 +275,35 @@ fn lock_credentials(path: &Path) -> Result<AuthLock, Failure> {
     let mut lock = path.as_os_str().to_owned();
     lock.push(".lock");
     let lock = PathBuf::from(lock);
+    let unavailable = |_| Failure::known("oauth_store_unavailable");
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         match fs::create_dir(&lock) {
-            Ok(()) => return Ok(AuthLock(lock)),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists && Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(50));
+            Ok(()) => {
+                #[cfg(unix)]
+                let guard = {
+                    let guard = fs::File::open(&lock).map_err(unavailable)?;
+                    guard
+                        .try_lock()
+                        .map_err(|_| Failure::known("oauth_store_unavailable"))?;
+                    guard
+                };
+                #[cfg(not(unix))]
+                let directory = fs::symlink_metadata(&lock).map_err(unavailable)?;
+                return Ok(AuthLock {
+                    path: lock,
+                    #[cfg(unix)]
+                    guard,
+                    #[cfg(not(unix))]
+                    directory,
+                });
             }
-            Err(_) => return Err(Failure::known("oauth_store_unavailable")),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists && Instant::now() < deadline => {
+                if !reclaim_expired_lock(&lock).map_err(unavailable)? {
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+            Err(error) => return Err(unavailable(error)),
         }
     }
 }
@@ -294,6 +391,10 @@ fn access_token(client: &Client, route: Route, path: &Path) -> Result<Bearer, Fa
         .and_then(|_| file.as_file().sync_all())
         .map_err(|_| store_failure())?;
     file.persist(path).map_err(|_| store_failure())?;
+    #[cfg(unix)]
+    fs::File::open(directory)
+        .and_then(|parent| parent.sync_all())
+        .map_err(|_| store_failure())?;
     Bearer::from_credential(route, &auth[route.key()])
 }
 
@@ -880,6 +981,42 @@ fn verify_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn active_credential_lock_cannot_be_recovered_as_stale() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let lock = directory.path().join("auth.json.lock");
+        let held = lock_credentials(&path).unwrap();
+        held.guard
+            .set_modified(SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        assert!(!reclaim_expired_lock(&lock).unwrap());
+        assert!(lock.is_dir());
+        drop(held);
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn expired_credential_lock_is_recovered() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let lock = directory.path().join("auth.json.lock");
+        fs::create_dir(&lock).unwrap();
+        fs::File::open(&lock)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+
+        {
+            let held = lock_credentials(&path).expect("expired lock is recoverable");
+            assert!(lock.is_dir());
+            drop(held);
+        }
+        assert!(!lock.exists());
+    }
+
     use std::io::{Read, Write};
     use std::net::TcpListener;
 

@@ -631,7 +631,7 @@ mod tests {
                 json!({
                     "id": format!("image-{}", index + 1), "resource_id": "img(1).png",
                     "original_link": image_path, "source_path": image_path, "sha256": image_sha,
-                    "span": [start, start + raw.len()], "edit":[start, start + raw.len()], "selected": true, "error": null,
+                    "span": [start, start + raw.len()], "edit":[text.len(), text.len()], "selected": true, "error": null,
                 })
             })
             .collect::<Vec<_>>();
@@ -661,10 +661,10 @@ mod tests {
         )?;
         let actual = fs::read_to_string(&output)?;
         assert_eq!(row["output_sha256"], sha(actual.as_bytes()));
-        assert!(actual.starts_with("资金 \n\n<!-- mdocr:ocr-begin v=2 id=image-1 -->\n"));
-        assert!(actual.contains(" 对账 \n\n<!-- mdocr:ocr-begin v=2 id=image-2 -->\n"));
+        assert!(actual.starts_with(text));
+        assert!(actual.contains("<!-- mdocr:ocr-begin v=2 id=image-1 -->\n"));
+        assert!(actual.contains("<!-- mdocr:ocr-begin v=2 id=image-2 -->\n"));
         assert!(actual.contains("img%281%29.png>)\n\n可见文字\n\n> 字迹较淡\n> 复核第二行\n"));
-        assert!(actual.ends_with(" 完成\n"));
         let image_evidence = row["ocr"]["images"].as_array().context("image evidence")?;
         assert_eq!(image_evidence.len(), 1);
         let first_block = fs::read(evidence.join("0/image-1.md"))?;

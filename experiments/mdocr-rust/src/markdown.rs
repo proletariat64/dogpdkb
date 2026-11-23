@@ -115,13 +115,28 @@ pub(crate) fn occurrences(text: &str) -> Vec<Occurrence> {
     let mut output = Vec::new();
     let mut image_depth = 0;
     let mut link_ends = Vec::new();
-    let mut block_ends = Vec::new();
+    let mut blocks = Vec::new();
+    let mut containers = Vec::new();
     let mut html_block = false;
     for (event, mut span) in Parser::new(text).into_offset_iter() {
         match event {
-            Event::Start(Tag::Paragraph | Tag::Heading { .. }) => block_ends.push(span.end),
+            Event::Start(Tag::Paragraph) => blocks.push((span, true)),
+            Event::Start(Tag::Heading { .. }) => blocks.push((span, false)),
             Event::End(TagEnd::Paragraph | TagEnd::Heading(_)) => {
-                block_ends.pop();
+                blocks.pop();
+            }
+            Event::Start(
+                Tag::List(_) | Tag::BlockQuote(_) | Tag::FootnoteDefinition(_) | Tag::Table(_),
+            ) => {
+                containers.push(span.end);
+            }
+            Event::End(
+                TagEnd::List(_)
+                | TagEnd::BlockQuote(_)
+                | TagEnd::FootnoteDefinition
+                | TagEnd::Table,
+            ) => {
+                containers.pop();
             }
             Event::Start(Tag::Link { .. }) => link_ends.push(span.end),
             Event::End(TagEnd::Link) => {
@@ -141,8 +156,19 @@ pub(crate) fn occurrences(text: &str) -> Vec<Occurrence> {
                 if link_type == LinkType::Collapsed && text[span.end..].starts_with("[]") {
                     span.end += 2;
                 }
-                let edit = if let Some(&end) = link_ends.first() {
-                    let end = block_ends.last().copied().unwrap_or(end).max(span.end);
+                let edit = if let Some(&end) = containers.first() {
+                    // Keep list and quote continuations attached to their block.
+                    end..end
+                } else if let Some((block, paragraph)) = blocks.last() {
+                    if *paragraph
+                        && link_ends.is_empty()
+                        && text[block.clone()].trim() == &text[span.clone()]
+                    {
+                        span.clone()
+                    } else {
+                        block.end..block.end
+                    }
+                } else if let Some(&end) = link_ends.first() {
                     end..end
                 } else {
                     span.clone()
@@ -156,7 +182,8 @@ pub(crate) fn occurrences(text: &str) -> Vec<Occurrence> {
             Event::End(TagEnd::Image) => image_depth -= 1,
             Event::Start(Tag::HtmlBlock) => {
                 html_block = true;
-                add_html(text, &mut output, span.clone(), span.end);
+                let end = containers.first().copied().unwrap_or(span.end);
+                add_html(text, &mut output, span, end);
             }
             Event::End(TagEnd::HtmlBlock) => html_block = false,
             Event::InlineHtml(html) | Event::Html(html) => {
@@ -172,7 +199,11 @@ pub(crate) fn occurrences(text: &str) -> Vec<Occurrence> {
                     generated.push(open..span.end);
                 }
                 if !html_block && image_depth == 0 {
-                    let end = block_ends.last().copied().unwrap_or(span.end);
+                    let end = containers
+                        .first()
+                        .copied()
+                        .or_else(|| blocks.last().map(|(block, _)| block.end))
+                        .unwrap_or(span.end);
                     add_html(text, &mut output, span, end);
                 }
             }
