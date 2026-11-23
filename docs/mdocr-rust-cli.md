@@ -6,17 +6,25 @@ request journal, and results. Single-file and batch jobs use the same workflow.
 
 ## Build
 
-Build on x86-64 Linux with Rust 1.95 or later. The release command produces one
+Build on x86-64 Linux with Rust 1.95 or later. The build target produces one
 statically linked executable with its Markdown parser, image processing,
 embedded fonts, TLS roots, Mermaid checker, and help.
 
 ```sh
-RUSTFLAGS="-C target-feature=+crt-static" cargo build --locked --release \
-  --target x86_64-unknown-linux-gnu --manifest-path experiments/mdocr-rust/Cargo.toml
+make checkr
+make buildr
+make smoker
 ```
 
-The executable is at
+`checkr` uses `rustfmt` and Clippy with warnings denied, then runs Rust tests.
+`smoker` runs `buildr`, checks static linkage with `readelf`, and exercises a
+relocated binary with a cleared environment. It uses a credential fixture and
+submits zero OCR requests. GitHub Actions runs `checkr` and `smoker` in the Rust
+job.
+
+By default, the executable is at
 `experiments/mdocr-rust/target/x86_64-unknown-linux-gnu/release/mdocr`.
+Set `CARGO_TARGET_DIR` to use a different build directory.
 
 ## Run one document
 
