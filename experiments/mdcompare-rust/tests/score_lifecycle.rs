@@ -132,6 +132,12 @@ fn request(listener: &TcpListener, child: &mut Child, dir: &Path) -> (TcpStream,
         }
         thread::sleep(Duration::from_millis(10));
     };
+    let journal = read_json(dir, "score.mdcompare/journal.json");
+    assert_eq!(
+        journal["attempts"].as_array().unwrap().last().unwrap()["state"],
+        "admitted",
+        "journal must record admission at the first provider connection"
+    );
     socket
         .set_read_timeout(Some(Duration::from_secs(4)))
         .unwrap();
