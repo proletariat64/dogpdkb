@@ -3,6 +3,7 @@
 import json
 import re
 from pathlib import Path
+from typing import cast
 
 from .plan import read_plan
 from .runner import (
@@ -145,7 +146,7 @@ def assemble_command(args):
     ):
         raise ValueError("original plan or journal changed during validation")
     output.mkdir(mode=0o700)
-    execution.ledger = None
+    execution.ledger = cast(Path | None, None)
     execution.result = output / "assembly.json"
     execution.artifacts = output / "evidence"
     execution.state["result_path"] = str(execution.result)

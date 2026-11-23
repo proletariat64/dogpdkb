@@ -19,12 +19,15 @@ native Graphify output are used in place.
 Every extract passes `--no-gitignore`, so `.gitignore`, `.git/info/exclude` and
 Git's user-wide excludes cannot remove published Corpus sources from the scan.
 Graphify's own `.graphifyignore` rules remain active. Before dispatch inside a
-Git worktree, dogpdkb selects the nearest existing `.graphifyignore` in the
-worktree-to-Corpus directory chain, defaulting to the worktree root. It inserts
-any missing anchored negations for the configured Corpus path and its parent
-directories before that file's existing rules. Existing lines remain unchanged
-and retain their last-match priority, and a complete existing whitelist is not
-duplicated. This
+Git worktree with active local Git ignore rules, dogpdkb selects the nearest
+existing `.graphifyignore` in the worktree-to-Corpus directory chain, defaulting
+to the worktree root. It inserts any missing anchored negations for the
+configured Corpus path and its parent directories before that file's existing
+rules. Existing lines remain unchanged and retain their last-match priority, and
+a complete existing whitelist is not duplicated. No Git rules means no write or
+new permission requirement. A per-file lock serializes concurrent books, and
+updates use a same-directory temporary file plus atomic replacement. Corpus
+paths containing pattern syntax or line breaks are rejected before modification. This
 small scope guard is orchestrator-owned input selection; Graphify still owns
 pattern evaluation and scanning.
 

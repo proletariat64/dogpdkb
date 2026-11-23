@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -85,6 +86,16 @@ _NATIVE_ENV = {
 }
 
 
+def _active_ignore_rules(path):
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    return any(
+        line.strip() and not line.lstrip().startswith("#") for line in text.splitlines()
+    )
+
+
 def _ensure_corpus_whitelist(corpus):
     """Keep Git excludes from hiding a configured Corpus from Graphify."""
     corpus = corpus.resolve()
@@ -100,12 +111,17 @@ def _ensure_corpus_whitelist(corpus):
         return
 
     relative = corpus.relative_to(root)
-    anchor = root
     current_path = root
     chain = [root]
     for part in relative.parts:
         current_path /= part
         chain.append(current_path)
+    if not _active_ignore_rules(root / ".git/info/exclude") and not any(
+        _active_ignore_rules(directory / ".gitignore") for directory in chain
+    ):
+        return
+
+    anchor = root
     for directory in reversed(chain):
         if (directory / ".graphifyignore").is_file():
             anchor = directory
@@ -115,23 +131,44 @@ def _ensure_corpus_whitelist(corpus):
     rules = []
     current = ""
     for part in relative.parts:
+        if any(character in part for character in "\0\r\n*?[]\\"):
+            raise ValueError("Corpus path cannot be represented in .graphifyignore")
         current += f"/{part}"
         rules.append(f"!{current}/")
     rules.append(f"!{current}/**" if current else "!/**")
 
-    path = anchor / ".graphifyignore"
-    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    path = (anchor / ".graphifyignore").resolve()
+    lock_path = path.with_name(path.name + ".lock")
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
 
-    def key(line):
-        line = line.strip()
-        return "!/" + line[1:].lstrip("/") if line.startswith("!") else line
+        def key(line):
+            line = line.strip()
+            return "!/" + line[1:].lstrip("/") if line.startswith("!") else line
 
-    present = {key(line) for line in existing.splitlines()}
-    missing = [rule for rule in rules if key(rule) not in present]
-    if not missing:
-        return
-    # Existing Graphify rules come later and retain their last-match priority.
-    path.write_text("\n".join(missing) + "\n" + existing, encoding="utf-8")
+        present = {key(line) for line in existing.splitlines()}
+        missing = [rule for rule in rules if key(rule) not in present]
+        if not missing:
+            return
+        # Existing Graphify rules come later and retain their last-match priority.
+        content = "\n".join(missing) + "\n" + existing
+        mode = path.stat().st_mode if path.exists() else None
+        fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if mode is not None:
+                os.chmod(temporary, mode)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    finally:
+        os.close(descriptor)
 
 
 def _native_extract(command, corpus, token_budget, model, concurrency):

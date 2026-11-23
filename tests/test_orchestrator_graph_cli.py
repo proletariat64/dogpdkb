@@ -196,6 +196,7 @@ def cli(config, manifest, environment=None, *, retry_graph=False):
 
 def test_corpus_whitelist_uses_configured_nested_path(tmp_path):
     subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
     corpus = tmp_path / "published/custom-book"
     corpus.mkdir(parents=True)
     ignore_file = tmp_path / ".graphifyignore"
@@ -214,6 +215,7 @@ def test_corpus_whitelist_uses_configured_nested_path(tmp_path):
 
 def test_corpus_whitelist_uses_existing_corpus_ignore_file(tmp_path):
     subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
     corpus = tmp_path / "published/custom-book"
     corpus.mkdir(parents=True)
     ignore_file = corpus / ".graphifyignore"
@@ -224,6 +226,79 @@ def test_corpus_whitelist_uses_existing_corpus_ignore_file(tmp_path):
 
     assert ignore_file.read_bytes() == b"!/**\n# Corpus-local rules\nignored.md\n"
     assert not (tmp_path / ".graphifyignore").exists()
+
+
+def test_corpus_whitelist_skips_writes_without_git_rules(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+
+    _ensure_corpus_whitelist(corpus)
+
+    assert not (tmp_path / ".graphifyignore").exists()
+    assert not (tmp_path / ".graphifyignore.lock").exists()
+
+
+def test_corpus_whitelist_atomic_failure_preserves_existing_rules(
+    tmp_path, monkeypatch
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Existing rules\nignored.md\n"
+    ignore_file.write_bytes(original)
+
+    def fail_replace(source, destination):
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr("dogpdkb.graph.os.replace", fail_replace)
+    with pytest.raises(OSError, match="injected replace failure"):
+        _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == original
+    assert not [
+        path
+        for path in tmp_path.glob(".graphifyignore.*")
+        if path.name != ".graphifyignore.lock"
+    ]
+
+
+def test_corpus_whitelist_rejects_pattern_syntax_before_writing(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "published/bad*book"
+    corpus.mkdir(parents=True)
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Existing rules\nignored.md\n"
+    ignore_file.write_bytes(original)
+
+    with pytest.raises(ValueError, match="cannot be represented"):
+        _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == original
+    assert not (tmp_path / ".graphifyignore.lock").exists()
+
+
+def test_corpus_whitelist_serializes_concurrent_books(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpora = []
+    for index in range(8):
+        corpus = tmp_path / f"corpus/book-{index}"
+        corpus.mkdir(parents=True)
+        corpora.append(corpus)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(_ensure_corpus_whitelist, corpora))
+
+    rules = (tmp_path / ".graphifyignore").read_text().splitlines()
+    for index in range(8):
+        assert rules.count(f"!/corpus/book-{index}/") == 1
+        assert rules.count(f"!/corpus/book-{index}/**") == 1
 
 
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):
