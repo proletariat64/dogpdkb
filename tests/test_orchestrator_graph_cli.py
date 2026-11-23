@@ -568,6 +568,7 @@ def test_corpus_whitelist_preserves_ownership_and_xattrs(tmp_path, monkeypatch):
     corpus.mkdir()
     ignore_file = tmp_path / ".graphifyignore"
     ignore_file.write_bytes(b"# Original\nignored.md\n")
+    ignore_file.chmod(0o444)
     copied = []
     real_chown = os.chown
 
@@ -579,6 +580,7 @@ def test_corpus_whitelist_preserves_ownership_and_xattrs(tmp_path, monkeypatch):
         return b"attribute-value"
 
     def write_attribute(path, name, value, *, follow_symlinks):
+        assert Path(path).stat().st_mode & 0o777 == 0o600
         copied.append((Path(path).name, name, value))
 
     def change_owner(path, uid, gid):
@@ -602,6 +604,7 @@ def test_corpus_whitelist_preserves_ownership_and_xattrs(tmp_path, monkeypatch):
         for _, name, value in copied
         if name == "user.fixture"
     )
+    assert ignore_file.stat().st_mode & 0o777 == 0o444
 
 
 def test_corpus_whitelist_clears_inherited_acl(tmp_path, monkeypatch):
@@ -740,6 +743,49 @@ def test_corpus_whitelist_without_xattr_support_preserves_original(
 
     assert ignore_file.read_bytes() == original
     assert "extended-attribute preservation is unavailable" in capsys.readouterr().err
+
+
+def test_unreadable_git_ignore_warns_and_skips_maintenance(
+    tmp_path, monkeypatch, capsys
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".gitignore"
+    ignore_file.write_text("*\n")
+    real_read = Path.read_bytes
+
+    def denied(path):
+        if path == ignore_file:
+            raise PermissionError("EPERM")
+        return real_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", denied)
+    _ensure_corpus_whitelist(corpus)
+
+    assert not (tmp_path / ".graphifyignore").exists()
+    assert "cannot read Git ignore source" in capsys.readouterr().err
+
+
+def test_corpus_whitelist_update_permission_failure_preserves_original(
+    tmp_path, monkeypatch, capsys
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Original\nignored.md\n"
+    ignore_file.write_bytes(original)
+
+    def denied(*args, **kwargs):
+        raise PermissionError("EPERM")
+
+    monkeypatch.setattr("dogpdkb.graph.tempfile.mkstemp", denied)
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == original
+    assert "continuing with --no-gitignore" in capsys.readouterr().err
 
 
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):

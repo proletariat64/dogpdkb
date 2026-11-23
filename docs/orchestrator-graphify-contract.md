@@ -28,8 +28,9 @@ a complete existing whitelist is not duplicated. No Git rules means no write or
 new permission requirement. A per-file lock serializes concurrent books, and
 updates use a same-directory temporary file plus atomic replacement after a
 last-moment type, identity, and byte comparison. Existing ownership and extended
-attributes, including POSIX ACLs, are copied before replacement; inherited ACLs
-are cleared when the original has none. Permission failures and platforms without
+attributes, including POSIX ACLs, are copied while the replacement remains writable, before
+final mode restoration; inherited ACLs are cleared when the original has none.
+Permission failures and platforms without
 extended-attribute support preserve the original and emit a warning while
 `--no-gitignore` keeps extraction usable. Metadata comparison includes ctime so
 permission-only edits abort replacement. Complete whitelists require no lock or

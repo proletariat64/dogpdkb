@@ -96,6 +96,9 @@ def _active_ignore_rules(path):
         content = path.read_bytes()
     except FileNotFoundError:
         return False
+    except PermissionError:
+        _warn_ignore_preserved(f"cannot read Git ignore source {path}")
+        return False
     content = content.removeprefix(b"\xef\xbb\xbf")
     return any(
         line.removesuffix(b"\r").strip(b" ") and not line.startswith(b"#")
@@ -271,10 +274,10 @@ def _ensure_corpus_whitelist(corpus):
                 except PermissionError:
                     _warn_ignore_preserved("cannot preserve ignore ownership")
                     return
-                os.chmod(temporary, metadata.st_mode)
                 for attribute in attributes:
                     value = os.getxattr(path, attribute, follow_symlinks=False)
                     os.setxattr(temporary, attribute, value, follow_symlinks=False)
+                os.chmod(temporary, metadata.st_mode)
             if _regular_identity(path) != identity:
                 raise ValueError(".graphifyignore changed during Corpus update")
             current = path.read_bytes() if path.exists() else b""
@@ -283,6 +286,14 @@ def _ensure_corpus_whitelist(corpus):
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
+    except PermissionError:
+        _warn_ignore_preserved("cannot update the whitelist without permission")
+        return
+    except OSError as error:
+        if error.errno != errno.EROFS:
+            raise
+        _warn_ignore_preserved("the whitelist update is read-only")
+        return
     finally:
         os.close(descriptor)
 
