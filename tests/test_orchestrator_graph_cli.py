@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -700,6 +701,44 @@ def test_new_graphifyignore_publish_never_overwrites_concurrent_file(
 
     assert ignore_file.read_bytes() == user_content
     assert "created concurrently" in capsys.readouterr().err
+
+
+def test_disappearing_graphifyignore_warns_and_continues(tmp_path, monkeypatch, capsys):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    ignore_file.write_text("# Existing\n")
+    real_read = Path.read_bytes
+
+    def disappear(path):
+        if path == ignore_file:
+            raise FileNotFoundError("removed")
+        return real_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", disappear)
+    _ensure_corpus_whitelist(corpus)
+    monkeypatch.undo()
+
+    assert ignore_file.read_bytes() == b"# Existing\n"
+    assert "disappeared during inspection" in capsys.readouterr().err
+
+
+def test_graphifyignore_full_disk_preserves_extraction(tmp_path, monkeypatch, capsys):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+
+    def full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "full")
+
+    monkeypatch.setattr("dogpdkb.graph.tempfile.mkstemp", full)
+    _ensure_corpus_whitelist(corpus)
+
+    assert not (tmp_path / ".graphifyignore").exists()
+    assert "insufficient resources" in capsys.readouterr().err
 
 
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):

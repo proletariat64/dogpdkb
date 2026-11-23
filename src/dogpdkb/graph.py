@@ -141,7 +141,11 @@ def _missing_whitelist(path, rules):
             raise ValueError(".graphifyignore symlink must resolve to a regular file")
     elif path.exists() and not path.is_file():
         raise ValueError(".graphifyignore must be a regular file")
-    existing = path.read_bytes() if path.exists() else b""
+    try:
+        existing = path.read_bytes() if path.exists() else b""
+    except FileNotFoundError:
+        _warn_ignore_preserved("the ignore file disappeared during inspection")
+        return []
 
     def key(line):
         line = line.strip()
@@ -235,9 +239,14 @@ def _ensure_corpus_whitelist(corpus):
     except PermissionError:
         _warn_ignore_preserved("cannot create the Corpus whitelist")
     except OSError as error:
-        if error.errno not in {errno.EROFS, errno.ENOTSUP}:
+        if error.errno not in {
+            errno.EROFS,
+            errno.ENOTSUP,
+            errno.ENOSPC,
+            errno.EDQUOT,
+        }:
             raise
-        _warn_ignore_preserved("the whitelist location is read-only")
+        _warn_ignore_preserved("the whitelist location has insufficient resources")
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)

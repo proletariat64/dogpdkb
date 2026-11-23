@@ -28,9 +28,10 @@ operator edits, ownership, ACLs, symlinks, and hard links.
 
 A previously absent destination is written to a same-directory temporary file,
 fsynced, and published with atomic no-overwrite link creation. Concurrent creators
-preserve the winning destination and warn. Permission failures, unavailable Git
-exclude lookup, and unsupported or read-only locations preserve the original and
-emit a warning while `--no-gitignore` keeps extraction usable.
+preserve the winning destination and warn. Disappearing files, permission
+failures, unavailable Git exclude lookup, resource exhaustion, and unsupported or
+read-only locations preserve the original and emit a warning while
+`--no-gitignore` keeps extraction usable.
 
 Linked worktrees resolve `info/exclude` through `git rev-parse --git-path`, with
 relative filesystem-decoded output resolved against the selected worktree. Git
