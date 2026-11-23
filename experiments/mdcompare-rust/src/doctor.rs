@@ -3,18 +3,20 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::{
-    config::Config,
+    config::{Config, Scope},
     provider,
     summary::{Outcome, Summary},
 };
 
 pub(crate) fn run(config: Option<&Path>) -> Result<Outcome> {
-    let settings = Config::load(None, config).context("invalid_config")?;
+    let settings = Config::load(None, config, Scope::Doctor).context("invalid_config")?;
     let score = &settings.score;
     let verify_credentials =
         score.oauth_file.is_some() || score.request_budget.is_some_and(|budget| budget > 0);
     let mut summary = Summary::new("doctor", "complete").count("checks", 1);
-    if !verify_credentials {
+    let verify_transport =
+        score.endpoint.is_some() || score.proxy.is_some() || score.ca_file.is_some();
+    if !verify_credentials && !verify_transport {
         return Ok(summary.exit(0));
     }
 
@@ -24,7 +26,12 @@ pub(crate) fn run(config: Option<&Path>) -> Result<Outcome> {
         ca_file: score.ca_file.clone(),
         endpoint: score.endpoint.clone(),
     };
-    match provider::check_oauth_settings(&score.model, &score.effort, &connection) {
+    let check = if verify_credentials {
+        provider::check_oauth_settings(&score.model, &score.effort, &connection)
+    } else {
+        provider::check_transport_settings(&connection).map(|()| false)
+    };
+    match check {
         Ok(expired) => {
             summary = summary.count("checks", 2);
             if expired {

@@ -87,3 +87,15 @@ fn invalid_doctor_configuration_does_not_leak_contents() {
     assert!(!String::from_utf8(output.stdout).unwrap().contains("SECRET"));
     assert!(!String::from_utf8(output.stderr).unwrap().contains("SECRET"));
 }
+
+#[test]
+fn doctor_checks_explicit_transport_without_a_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("transport.toml");
+    std::fs::write(&config, "[score]\nendpoint = \"https://invalid.example\"\n").unwrap();
+    let output = run(&["doctor", "--config", config.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["state"], "partial");
+    assert_eq!(summary["reason_code"], "unsupported_transport");
+}

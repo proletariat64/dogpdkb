@@ -1,4 +1,4 @@
-use crate::config::{CompareSettings, Config};
+use crate::config::{CompareSettings, Config, Scope};
 use crate::input::{self, Document, Identity, MANIFEST_LIMIT};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -327,11 +327,6 @@ pub fn parse_json(bytes: &[u8]) -> Result<Value> {
     input::parse_utf8_json(bytes)
 }
 
-pub fn read_json(path: &Path) -> Result<Value> {
-    let (bytes, _) = input::read(path, u64::MAX).map_err(anyhow::Error::msg)?;
-    parse_json(&bytes)
-}
-
 pub fn artifact_path(root: &Path, relative: &str) -> Result<PathBuf> {
     let mut path = root.to_owned();
     let parts: Vec<_> = Path::new(relative).components().collect();
@@ -390,27 +385,98 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .context("publish_failed")
 }
 
+fn fields(value: &Value, declarations: &[(&str, fn(&Value) -> bool)]) -> Result<()> {
+    let object = value.as_object().context("invalid_input")?;
+    ensure!(
+        object.iter().all(|(key, value)| declarations
+            .iter()
+            .any(|(name, verify)| *name == key && verify(value))),
+        "invalid_input"
+    );
+    Ok(())
+}
+
 fn validate_snapshot(snapshot: &Snapshot, operation: Operation) -> Result<()> {
     ensure!(!snapshot.path.as_os_str().is_empty(), "invalid_input");
     ensure!(
         matches!(snapshot.content_kind.as_str(), "raw" | "enriched"),
         "invalid_input"
     );
-    ensure!(
-        snapshot.body_scope.as_ref().is_none_or(Value::is_object),
-        "invalid_input"
-    );
-    ensure!(
-        snapshot.ocr.as_ref().is_none_or(Value::is_object),
-        "invalid_input"
-    );
-    ensure!(
-        snapshot
-            .resources
-            .as_ref()
-            .is_none_or(|r| r.iter().all(Value::is_object)),
-        "invalid_input"
-    );
+    if let Some(scope) = &snapshot.body_scope {
+        fields(
+            scope,
+            &[("version", Value::is_string), ("regions", Value::is_array)],
+        )?;
+        if let Some(regions) = scope["regions"].as_array() {
+            for region in regions {
+                fields(
+                    region,
+                    &[
+                        ("kind", Value::is_string),
+                        ("start_line", Value::is_u64),
+                        ("end_line", Value::is_u64),
+                    ],
+                )?;
+            }
+        }
+    }
+    for resource in snapshot.resources.iter().flatten() {
+        fields(
+            resource,
+            &[
+                ("resource_id", Value::is_string),
+                ("kind", Value::is_string),
+                ("url", Value::is_string),
+                ("path", Value::is_string),
+                ("immutable", Value::is_object),
+            ],
+        )?;
+        if let Some(immutable) = resource.get("immutable") {
+            fields(
+                immutable,
+                &[
+                    ("contract", Value::is_string),
+                    ("captured", Value::is_boolean),
+                    ("bucket", Value::is_string),
+                    ("key", Value::is_string),
+                    ("version_id", Value::is_string),
+                ],
+            )?;
+        }
+    }
+    if let Some(ocr) = &snapshot.ocr {
+        fields(
+            ocr,
+            &[
+                ("contract", Value::is_string),
+                ("configuration", Value::is_object),
+                ("context_sha256", Value::is_string),
+                ("images", Value::is_array),
+            ],
+        )?;
+        // Engine configuration is opaque provenance; only mode is interpreted.
+        ensure!(
+            ocr["configuration"]
+                .get("mode")
+                .is_none_or(Value::is_string),
+            "invalid_input"
+        );
+        if let Some(images) = ocr["images"].as_array() {
+            for image in images {
+                fields(
+                    image,
+                    &[
+                        ("resource_id", Value::is_string),
+                        ("status", Value::is_string),
+                        ("source_path", Value::is_string),
+                        ("source_sha256", Value::is_string),
+                        ("artifact", Value::is_string),
+                        ("artifact_sha256", Value::is_string),
+                    ],
+                )?;
+            }
+        }
+    }
     ensure!(
         operation != Operation::Strict || snapshot.resources.is_some(),
         "invalid_input"
@@ -528,14 +594,6 @@ fn add_recovery(frozen: &mut FrozenPlan, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_settings(operation: Operation, settings: &CompareSettings) -> Result<()> {
-    ensure!(
-        !settings.compare.normalize_line_endings || operation == Operation::Strict,
-        "invalid_config"
-    );
-    Ok(())
-}
-
 fn create_plan(workspace: &Workspace, explicit: Option<&Path>) -> Result<FrozenPlan> {
     let mut work = validate_work(parse_json(&workspace.source_bytes)?)?;
     let directory = workspace.source.parent().context("invalid_input")?;
@@ -547,10 +605,9 @@ fn create_plan(workspace: &Workspace, explicit: Option<&Path>) -> Result<FrozenP
     } else {
         None
     };
-    let config = Config::load(Some(&workspace.source), explicit)?;
+    let config = Config::load(Some(&workspace.source), explicit, Scope::Comparison)?;
     let config_source = config.source.clone();
-    let settings = config.comparison();
-    validate_settings(work.operation, &settings)?;
+    let settings = config.comparison(work.operation == Operation::Strict);
     let mut frozen = FrozenPlan {
         schema_version: "mdcompare-frozen-work-1".into(),
         source: workspace.source.clone(),
@@ -663,8 +720,11 @@ fn check_explicit_config(
     explicit: Option<&Path>,
 ) -> Result<()> {
     if let Some(explicit) = explicit {
-        let config = Config::load(Some(&workspace.source), Some(explicit))?;
-        ensure!(config.comparison() == frozen.settings, "invalid_config");
+        let config = Config::load(Some(&workspace.source), Some(explicit), Scope::Comparison)?;
+        ensure!(
+            config.comparison(frozen.work.operation == Operation::Strict) == frozen.settings,
+            "invalid_config"
+        );
     }
     Ok(())
 }

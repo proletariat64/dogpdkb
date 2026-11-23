@@ -715,13 +715,32 @@ def compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=F
 def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=False):
     workspace = workspace or run.directory
     run.stage("compare", total=len(rows), phase="prepare")
+    pinned = (
+        run.data.get("native_score_job")
+        if rust_mdcompare.selected(settings) and not replan
+        else None
+    )
+    if pinned:
+        # A recorded comparison from this same run can be recovered after the
+        # outer process died, even if generic compare retry is suppressed.
+        current = {
+            row["document_id"]: [row["version"], row.get("raw_sha256")] for row in rows
+        }
+        if any(
+            current.get(key) != inputs for key, inputs in pinned["compared"].items()
+        ):
+            pinned = None
+
     active = []
     for row in rows:
         if "resources" not in row:
             row["resources"] = (
                 store.document(row["document_id"]).get("raw", {}).get("resources")
             )
-        if replan or not store.suppressed(
+        if pinned:
+            if row["document_id"] in pinned["compared"]:
+                active.append(row)
+        elif replan or not store.suppressed(
             row["document_id"], "compare", row["version"]
         ):
             active.append(row)
@@ -770,7 +789,16 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
     run.stage("compare", total=len(active), phase="tools")
     if rust_mdcompare.selected(settings):
         reports, semantic, code, inputs = _rust_compare_tools(
-            settings, book, store, run, active, baseline, incoming, workspace, replan
+            settings,
+            book,
+            store,
+            run,
+            active,
+            baseline,
+            incoming,
+            workspace,
+            replan,
+            pinned=pinned,
         )
     else:
         reports, semantic, code, inputs = _legacy_compare_tools(
@@ -955,7 +983,7 @@ def _legacy_compare_tools(
 
 
 def _rust_compare_tools(
-    settings, book, store, run, active, baseline, incoming, workspace, replan
+    settings, book, store, run, active, baseline, incoming, workspace, replan, *, pinned
 ):
     reports = []
     inputs = []
@@ -990,26 +1018,61 @@ def _rust_compare_tools(
 
     semantic_root = store.path.parent / "semantic" / run.id
     semantic_root.mkdir(parents=True, exist_ok=True)
-    recovery = freeze_recovery(settings.body_recovery, semantic_root / "recovery")
-    semantic_dir = Path(tempfile.mkdtemp(prefix="comparison-", dir=semantic_root))
-    comparison = rust_mdcompare.compare(
-        settings,
-        run,
-        semantic_dir / "work.json",
-        "semantic",
-        baseline,
-        incoming,
-        recovery=recovery,
-    )
+    comparison = None
+    recovery = None
+    if pinned:
+        try:
+            comparison = rust_mdcompare.verify_semantic_commit(pinned["comparison"])
+            if not comparison.plan.is_relative_to(semantic_root):
+                raise ValueError("mdcompare comparison belongs to another run")
+            selected = read_json(comparison.plan).get("body_recovery")
+            recovery = Path(selected) if selected else None
+            semantic = read_semantic_artifacts(
+                comparison.code,
+                comparison.result,
+                comparison.index,
+                active,
+                book.key,
+                native_artifacts=comparison.artifacts,
+            )
+        except (OSError, ValueError) as error:
+            run.failure(
+                step="compare",
+                reason="SEMANTIC_SCORE_COMPARISON_UNVERIFIABLE",
+                message=str(error),
+            )
+            pinned = comparison = None
+
+    if comparison is None:
+        semantic_dir = Path(tempfile.mkdtemp(prefix="comparison-", dir=semantic_root))
+        scope = {
+            (document["knowledge_base"], document["document_id"], side)
+            for side, documents in (("baseline", baseline), ("incoming", incoming))
+            for document in documents
+        }
+        recovery = freeze_recovery(
+            settings.body_recovery,
+            semantic_dir / "recovery",
+            scope=scope,
+        )
+        comparison = rust_mdcompare.compare(
+            settings,
+            run,
+            semantic_dir / "work.json",
+            "semantic",
+            baseline,
+            incoming,
+            recovery=recovery,
+        )
+        semantic = read_semantic_artifacts(
+            comparison.code,
+            comparison.result,
+            comparison.index,
+            active,
+            book.key,
+            native_artifacts=comparison.artifacts,
+        )
     inputs.append(comparison.plan)
-    semantic = read_semantic_artifacts(
-        comparison.code,
-        comparison.result,
-        comparison.index,
-        active,
-        book.key,
-        native_artifacts=comparison.artifacts,
-    )
     run.data["artifacts"]["semantic"] = str(comparison.result)
     run.data["artifacts"]["semantic_diff"] = str(comparison.index)
     run.data["artifacts"]["semantic_commit"] = str(comparison.commit)
@@ -1020,7 +1083,7 @@ def _rust_compare_tools(
     run.data["artifacts"].pop("semantic_scoring", None)
     if recovery is not None:
         run.data["artifacts"]["body_recovery"] = str(recovery)
-    if (
+    if pinned or (
         not replan
         and not run.data.get("semantic_score_started")
         and rust_mdcompare.score_enabled(settings)
@@ -1035,6 +1098,7 @@ def _rust_compare_tools(
             comparison.result,
             comparison.index,
             native=comparison,
+            pinned=pinned,
         )
     for name, operation in (("knowledge", "knowledge"), ("compare", "strict")):
         plan = workspace / f"{operation}-work.json"
@@ -1062,7 +1126,17 @@ def _rust_compare_tools(
 
 
 def _score_inputs(
-    settings, book, store, run, rows, semantic, report, diff_index, *, native=None
+    settings,
+    book,
+    store,
+    run,
+    rows,
+    semantic,
+    report,
+    diff_index,
+    *,
+    native=None,
+    pinned=None,
 ):
     eligible = {
         row["document_id"] for row in semantic["results"] if score_eligible(row)
@@ -1074,47 +1148,79 @@ def _score_inputs(
         else report.with_name("scores.json")
     )
     route_path = report.with_name("score-route.json")
-    records = {}
-    for row in rows:
-        identifier, version = row["document_id"], row["version"]
-        previous = store.step(identifier, "semantic_score")
-        if (
-            identifier not in eligible
-            or store.suppressed(identifier, "semantic_score", version)
-            or (
-                previous
-                and previous["status"] == "completed"
-                and same_version(previous["version"], version)
+    if pinned:
+        records = pinned["reserved"]
+        if not (
+            str(score_work) == pinned["score_work"]
+            and records
+            and set(records) <= eligible
+            and all(
+                (previous := store.step(key, "semantic_score"))
+                and previous.get("run_id") == run.id
+                and same_version(previous.get("version"), record["version"])
+                and previous.get("input_sha256") == record.get("input_sha256")
+                and previous.get("report") == str(score_path)
+                for key, record in records.items()
             )
         ):
-            continue
-        records[identifier] = {
-            "doc_id": identifier,
-            "name": "semantic_score",
-            "version": version,
-            "run_id": run.id,
-            "report": str(score_path),
-            "input_sha256": row.get("raw_sha256"),
-        }
-    if not records:
-        return semantic
-    if native is not None:
-        rust_mdcompare.score_plan(score_work, native, book.key, records)
-        run.data["artifacts"]["semantic_score_plan"] = str(score_work)
-    run.data["semantic_score_started"] = str(score_work or score_path)
-    run.save(durable=True)
-    store.complete_batch(
-        (
-            dict(record, status="running", send_state="unknown")
-            for record in records.values()
-        ),
-        durable=True,
-    )
+            return semantic
+    else:
+        records = {}
+        for row in rows:
+            identifier, version = row["document_id"], row["version"]
+            previous = store.step(identifier, "semantic_score")
+            if (
+                identifier not in eligible
+                or store.suppressed(identifier, "semantic_score", version)
+                or (
+                    previous
+                    and previous["status"] == "completed"
+                    and same_version(previous["version"], version)
+                )
+            ):
+                continue
+            records[identifier] = {
+                "doc_id": identifier,
+                "name": "semantic_score",
+                "version": version,
+                "run_id": run.id,
+                "report": str(score_path),
+                "input_sha256": row.get("raw_sha256"),
+            }
+        if not records:
+            return semantic
+        if native is not None:
+            rust_mdcompare.score_plan(score_work, native, book.key, records)
+            run.data["artifacts"]["semantic_score_plan"] = str(score_work)
+            run.data["native_score_job"] = {
+                "score_work": str(score_work),
+                "comparison": run.data["artifacts"]["semantic_generation"],
+                "compared": {
+                    row["document_id"]: [row["version"], row.get("raw_sha256")]
+                    for row in rows
+                },
+                "reserved": records,
+            }
+        run.data["semantic_score_started"] = str(score_work or score_path)
+        run.save(durable=True)
+        store.complete_batch(
+            (
+                dict(record, status="running", send_state="unknown")
+                for record in records.values()
+            ),
+            durable=True,
+        )
     code = None
     try:
         if native is not None:
             score_path, outcomes, native_scores = rust_mdcompare.score(
-                settings, run, score_work, native, book.key, records
+                settings,
+                run,
+                score_work,
+                native,
+                book.key,
+                records,
+                recover=pinned is not None,
             )
         else:
             common = ["--report", report, "--diff-index", diff_index]

@@ -179,6 +179,8 @@ classification and reason codes. See the tool's schema for complete reports.
 
 ## Rust mdcompare work-plan CLI
 
+See the [Rust mdcompare build and usage guide](mdcompare-rust-cli.md).
+
 Configure `[tools].mdcompare_rust` with the installed native executable. The
 directory inventory, comparison, score and route calls use the commands
 documented by `mdcompare help all`. To select Rust configuration, set
@@ -198,7 +200,9 @@ The caller durably reserves eligible document versions before launching score.
 A `mdcompare-score-work-1` plan binds only those identities and the exact
 comparison generation. The caller releases a reservation only when the score
 result, frozen score plan and complete journal establish zero admissions for
-that document. An unverifiable result keeps all reserved outcomes unknown.
-The offline route must bind the same comparison and score bytes and preserve
+that document. The run durably records the comparison generation and score
+work plan. After an interruption, resume queries the same scoring workspace for
+its terminal result. An unverifiable or missing result keeps reserved outcomes
+unknown. The offline route must bind the same comparison and score bytes and preserve
 all unscored deterministic decisions. The caller records the resulting
 artifact hashes in its plan for resume validation.
