@@ -6,7 +6,7 @@ use crate::help;
 
 #[derive(Parser)]
 #[command(
-    name = "mdcompare",
+    name = "mdcomparer",
     version,
     about = "Compare captured Markdown and route authored-body changes.",
     disable_help_subcommand = true,

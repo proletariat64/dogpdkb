@@ -18,7 +18,7 @@ from scripts.smoke_install import REMOTE_CLI
 def binary():
     configured = os.environ.get("MDCOMPARE_RUST_BINARY")
     if not configured:
-        pytest.skip("set MDCOMPARE_RUST_BINARY to a freshly built mdcompare")
+        pytest.skip("set MDCOMPARE_RUST_BINARY to a freshly built mdcomparer")
     executable = Path(configured).resolve(strict=True)
     assert executable.is_file()
     return executable

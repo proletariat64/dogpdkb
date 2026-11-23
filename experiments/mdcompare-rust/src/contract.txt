@@ -1,9 +1,9 @@
-mdcompare offline contract
+mdcomparer offline contract
 
 QUICK START
-  mdcompare draft before.md after.md --plan work.json
-  mdcompare run --plan work.json > summary.json 2>> progress.log
-  mdcompare status --plan work.json
+  mdcomparer draft before.md after.md --plan work.json
+  mdcomparer run --plan work.json > summary.json 2>> progress.log
+  mdcomparer status --plan work.json
 
 COMMANDS
   draft OLD.md NEW.md --plan FILE
@@ -16,7 +16,7 @@ COMMANDS
   doctor [--config FILE]
   help all
 
-Use mdcompare COMMAND --help for the default behavior and exit codes of one
+Use mdcomparer COMMAND --help for the default behavior and exit codes of one
 command. Help and version are embedded and work without network, configuration
 or a work directory.
 

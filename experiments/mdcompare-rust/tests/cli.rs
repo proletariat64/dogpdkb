@@ -1,11 +1,11 @@
 use std::process::{Command, Output};
 
 fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_mdcompare"))
+    Command::new(env!("CARGO_BIN_EXE_mdcomparer"))
         .env_clear()
         .args(args)
         .output()
-        .expect("execute mdcompare")
+        .expect("execute mdcomparer")
 }
 
 #[test]
@@ -20,8 +20,8 @@ fn help_grows_from_workflow_to_command_to_full_contract() {
     let root = String::from_utf8(root.stdout).unwrap();
     let run_help = String::from_utf8(run_help.stdout).unwrap();
     let full = String::from_utf8(full.stdout).unwrap();
-    assert!(root.contains("mdcompare draft"));
-    assert!(root.contains("mdcompare run --plan"));
+    assert!(root.contains("mdcomparer draft"));
+    assert!(root.contains("mdcomparer run --plan"));
     assert!(run_help.contains("--config"));
     assert!(run_help.contains("Exit codes"));
     assert!(full.contains("mdcompare-work-1"));
@@ -53,7 +53,7 @@ fn removed_commands_and_options_are_usage_errors() {
         assert_eq!(output.status.code(), Some(64), "{args:?} {output:?}");
         assert!(output.stdout.is_empty(), "{args:?}");
         let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(stderr.contains("mdcompare --help"), "{args:?}");
+        assert!(stderr.contains("mdcomparer --help"), "{args:?}");
         assert!(!stderr.contains("PRIVATE-MARKDOWN"));
     }
 }

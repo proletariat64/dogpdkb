@@ -1,10 +1,10 @@
-# Rust mdcompare CLI 规格
+# mdcomparer CLI 规格
 
 Status: resolved
 
 ## 目标和职责
 
-上游提交工作单，mdcompare 冻结输入和规则、离线比较、发布可验证的结果和证据。上游拥有文档身份、业务版本、批次选取、跨批去重、Graphify 编译、基线推进和最终发布。mdcompare 负责单次比较与评分任务内的快照完整性、证据绑定和请求预算。
+上游提交工作单，mdcomparer 冻结输入和规则、离线比较、发布可验证的结果和证据。上游拥有文档身份、业务版本、批次选取、跨批去重、Graphify 编译、基线推进和最终发布。mdcomparer 负责单次比较与评分任务内的快照完整性、证据绑定和请求预算。
 
 借鉴 [Rust mdocr CLI 规格](/home/ubuntu/.herdr/worktrees/dogpdkb/experiment-mdocr-rust/.scratch/mdocr-rust-cli/spec.md) 的工作单、配置解析、工作目录、离线帮助和输出流。正文比较可以在无凭据、无网络、无环境变量的系统上完成。付费评分是独立动作，且运行前需要明确的请求预算。
 
@@ -14,25 +14,25 @@ Rust 是独立的原生重写，本规格定义完整公开契约。所有命令
 
 | 命令 | 行为 |
 | --- | --- |
-| `mdcompare draft OLD.md NEW.md --plan work.json` | 写一份可编辑的单对比工作单，默认 `semantic`。两侧按同一临时本地身份配对。目标已存在时失败。 |
-| `mdcompare accept --plan work.json [--config FILE]` | 验证并冻结比较工作单、依赖和有效配置，返回已接受的范围和计数。评分工作单由 score 自行接受。 |
-| `mdcompare run --plan work.json [--config FILE]` | 首次自动接受，再离线执行。已完成的工作单返回原结果。 |
-| `mdcompare score --plan score.json [--config FILE] [--resume]` | 根据独立评分工作单验证指定文档、记录请求并评分。显式取消后用 `--resume` 继续。 |
-| `mdcompare route --plan work.json --scores FILE [--config FILE]` | 基于已完成的正文比较和已绑定评分生成离线路由。支持本工具评分及符合契约的外部评分。 |
-| `mdcompare status --plan FILE` | 只读查询比较或评分工作区状态及已发布产物。 |
-| `mdcompare cancel --plan score.json` | 记录评分取消意图，停止新请求，允许已发请求在原期限内结算。 |
-| `mdcompare doctor [--config FILE]` | 检查配置、本地能力及配置指定的评分凭据。 |
-| `mdcompare --help`、`mdcompare COMMAND --help`、`mdcompare help all`、`mdcompare --version` | 内嵌英文帮助和版本，不访问配置、工作区或网络。 |
+| `mdcomparer draft OLD.md NEW.md --plan work.json` | 写一份可编辑的单对比工作单，默认 `semantic`。两侧按同一临时本地身份配对。目标已存在时失败。 |
+| `mdcomparer accept --plan work.json [--config FILE]` | 验证并冻结比较工作单、依赖和有效配置，返回已接受的范围和计数。评分工作单由 score 自行接受。 |
+| `mdcomparer run --plan work.json [--config FILE]` | 首次自动接受，再离线执行。已完成的工作单返回原结果。 |
+| `mdcomparer score --plan score.json [--config FILE] [--resume]` | 根据独立评分工作单验证指定文档、记录请求并评分。显式取消后用 `--resume` 继续。 |
+| `mdcomparer route --plan work.json --scores FILE [--config FILE]` | 基于已完成的正文比较和已绑定评分生成离线路由。支持本工具评分及符合契约的外部评分。 |
+| `mdcomparer status --plan FILE` | 只读查询比较或评分工作区状态及已发布产物。 |
+| `mdcomparer cancel --plan score.json` | 记录评分取消意图，停止新请求，允许已发请求在原期限内结算。 |
+| `mdcomparer doctor [--config FILE]` | 检查配置、本地能力及配置指定的评分凭据。 |
+| `mdcomparer --help`、`mdcomparer COMMAND --help`、`mdcomparer help all`、`mdcomparer --version` | 内嵌英文帮助和版本，不访问配置、工作区或网络。 |
 
 表中命令和参数构成新 Rust 二进制的完整公开接口。旧命令 `compare`、`knowledge`、`catalog`、`semantic` 迁移为 `run --plan` 配合工作单的 `operation`，`semantic-score` 和 `semantic-route` 分别迁移为 `score` 和 `route`。新二进制拒绝旧命令、旧参数和兼容别名，返回用法错误 64。
 
-英文帮助随新接口重写，按三层渐进披露。`mdcompare --help` 列出命令及最短调用流程。`mdcompare COMMAND --help` 说明该命令的参数、默认值、示例和退出码。`mdcompare help all` 提供完整的工作单、配置、产物、输出流、恢复及评分契约，可离线阅读。帮助全部内嵌于二进制。
+英文帮助随新接口重写，按三层渐进披露。`mdcomparer --help` 列出命令及最短调用流程。`mdcomparer COMMAND --help` 说明该命令的参数、默认值、示例和退出码。`mdcomparer help all` 提供完整的工作单、配置、产物、输出流、恢复及评分契约，可离线阅读。帮助全部内嵌于二进制。
 
 人手操作时只需两条命令。批量调用者直接生成同一种工作单，可直接 `run`，也可先 `accept` 检查计数。
 
 ```sh
-mdcompare draft before.md after.md --plan work.json
-mdcompare run --plan work.json >summary.json 2>>mdcompare.log
+mdcomparer draft before.md after.md --plan work.json
+mdcomparer run --plan work.json >summary.json 2>>mdcompare.log
 ```
 
 ## 比较工作单
@@ -154,8 +154,8 @@ compile_ambiguous = false
 - 首版提供取消与只读状态，便于控制线上请求。离线比较可安全重算。若后续出现需要从已结算 journal 单独恢复评分报告的操作场景，再设计 `assemble`。工作区清理由调用方的保留策略管理，Rust CLI 当前提案不提供 `purge`，以保护计划仍引用的证据。
 
 ```sh
-mdcompare score --plan score.json --config scoring.toml
-mdcompare route --plan work.json --scores score.mdcompare/result.json
+mdcomparer score --plan score.json --config scoring.toml
+mdcomparer route --plan work.json --scores score.mdcompare/result.json
 ```
 
 ## 进程契约和交付
@@ -174,7 +174,7 @@ mdcompare route --plan work.json --scores score.mdcompare/result.json
 
 业务调用 stdout 的公共字段为 `schema_version="mdcompare-summary-1"`、`command`、`state`、`artifacts`（名称到绝对路径）、`counts`（名称到非负整数）和 `reason_code`（正常时 null）。有比较绑定时同时返回 `comparison_sha256`。未产生的产物不列出。工作区查询以外的成功动作可用 complete 表示动作完成；accept 返回 accepted，cancel 返回当前任务状态。评分和评分状态计数分别公开 `selected`、`admitted`、`scored`、`in_flight`，避免把授权数当作已发送数。受控业务失败退出 1 时返回 state=error 及原因，至少区分 `invalid_input`、`invalid_config`、`input_drift`、`binding_invalid`、`workspace_busy`、`publish_failed`、`workspace_missing`。参数解析失败退出 64、stdout 为空。进程被强杀时允许没有最终 JSON，调用方用 status 和已提交产物恢复事实。
 
-单个静态 Linux x86-64 文件，内嵌英语帮助、默认提示词和评分 schema。目录、代理、证书和凭据显式解析，离线执行与诊断在清空环境下可运行。保持 strict 对已支持资源证据的验证范围。mdocr 首版的图片解析边界不直接成为 mdcompare 的资源相等规则，新型资料以可验证证据契约为准。
+单个静态 Linux x86-64 文件，内嵌英语帮助、默认提示词和评分 schema。目录、代理、证书和凭据显式解析，离线执行与诊断在清空环境下可运行。保持 strict 对已支持资源证据的验证范围。mdocr 首版的图片解析边界不直接成为 mdcomparer 的资源相等规则，新型资料以可验证证据契约为准。
 
 ## 实现和验收
 

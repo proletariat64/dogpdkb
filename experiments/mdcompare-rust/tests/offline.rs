@@ -26,7 +26,7 @@ fn semantic_batch_publishes_ordered_scoped_results_and_pinned_evidence() {
     let plan = dir.path().join("work.json");
     fs::write(&plan, work.to_string()).unwrap();
     let run = || {
-        Command::new(env!("CARGO_BIN_EXE_mdcompare"))
+        Command::new(env!("CARGO_BIN_EXE_mdcomparer"))
             .args(["run", "--plan"])
             .arg(&plan)
             .env_clear()
@@ -62,7 +62,7 @@ fn semantic_batch_publishes_ordered_scoped_results_and_pinned_evidence() {
 }
 
 fn invoke(plan: &std::path::Path, command: &str, extra: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_mdcompare"))
+    Command::new(env!("CARGO_BIN_EXE_mdcomparer"))
         .args([command, "--plan"])
         .arg(plan)
         .args(extra)
@@ -88,7 +88,7 @@ fn route_reuses_pinned_scores_and_rejects_tampered_evidence() {
     fs::write(root.join("old.md"), "# Limits\n\nSet a limit of 10.\n").unwrap();
     fs::write(root.join("new.md"), "# Limits\n\nSet a limit of 20.\n").unwrap();
     let plan = root.join("work.json");
-    let draft = Command::new(env!("CARGO_BIN_EXE_mdcompare"))
+    let draft = Command::new(env!("CARGO_BIN_EXE_mdcomparer"))
         .current_dir(root)
         .args(["draft", "old.md", "new.md", "--plan", "work.json"])
         .output()
@@ -153,7 +153,7 @@ fn accepted_input_drift_prevents_a_new_commit() {
     fs::write(path.join("old.md"), "original").unwrap();
     fs::write(path.join("new.md"), "new").unwrap();
     let plan = path.join("work.json");
-    let draft = Command::new(env!("CARGO_BIN_EXE_mdcompare"))
+    let draft = Command::new(env!("CARGO_BIN_EXE_mdcomparer"))
         .current_dir(path)
         .args(["draft", "old.md", "new.md", "--plan", "work.json"])
         .output()

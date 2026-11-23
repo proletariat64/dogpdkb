@@ -1,10 +1,10 @@
 [package]
-name = "mdcompare"
+name = "mdcomparer"
 version = "1.0.0"
 edition = "2024"
 
 [[bin]]
-name = "mdcompare"
+name = "mdcomparer"
 path = "src/main.rs"
 
 [dependencies]

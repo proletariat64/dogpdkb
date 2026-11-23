@@ -12,7 +12,7 @@ use std::{
 use tempfile::TempDir;
 
 fn command(dir: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mdcompare"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mdcomparer"));
     command.current_dir(dir).env_clear().args(args);
     command
 }

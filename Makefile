@@ -33,7 +33,7 @@ buildr:
 	$(CARGO) build --locked --release --manifest-path "$(MDCOMPARE_RUST_DIR)/Cargo.toml" --target "$(MDCOMPARE_RUST_TARGET)" --target-dir "$(CARGO_TARGET_DIR)"
 
 smoker: buildr
-	bash scripts/smoke_mdcompare_rust.sh "$(CARGO_TARGET_DIR)/$(MDCOMPARE_RUST_TARGET)/release/mdcompare"
+	bash scripts/smoke_mdcompare_rust.sh "$(CARGO_TARGET_DIR)/$(MDCOMPARE_RUST_TARGET)/release/mdcomparer"
 
 doctor:
 	$(DEV_PYTHON) -m dogpdkb doctor $(DOCTOR_ARGS)

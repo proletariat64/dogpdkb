@@ -97,7 +97,7 @@ fn main() -> ExitCode {
     std::panic::set_hook(Box::new(|_| {
         let _ = writeln!(
             io::stderr(),
-            "mdcompare stopped after an unexpected internal failure."
+            "mdcomparer stopped after an unexpected internal failure."
         );
     }));
     let args: Vec<_> = std::env::args_os().collect();
@@ -117,7 +117,7 @@ fn main() -> ExitCode {
             // accidentally pasted credential or Markdown never reaches logs.
             let _ = writeln!(
                 io::stderr(),
-                "Invalid command or arguments. Run mdcompare --help for usage."
+                "Invalid command or arguments. Run mdcomparer --help for usage."
             );
             return ExitCode::from(64);
         }

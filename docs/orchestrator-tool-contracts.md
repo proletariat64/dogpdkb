@@ -177,13 +177,19 @@ for human Markdown. Exit 0 is a resolved report, 2 is an unresolved report, and 
 is an invalid invocation/input. Reports, not exit 2 alone, carry per-document
 classification and reason codes. See the tool's schema for complete reports.
 
-## Rust mdcompare work-plan CLI
+## mdcomparer work-plan CLI
 
-See the [Rust mdcompare build and usage guide](mdcompare-rust-cli.md).
+See the [mdcomparer build and usage guide](mdcompare-rust-cli.md).
 
-Configure `[tools].mdcompare_rust` with the installed native executable. The
-directory inventory, comparison, score and route calls use the commands
-documented by `mdcompare help all`. To select Rust configuration, set
+Point dogpdkb at the installed executable.
+
+```toml
+[tools]
+mdcompare_rust = "/path/to/mdcomparer"
+```
+
+The directory inventory, comparison, score and route calls use the commands
+documented by `mdcomparer help all`. To select Rust configuration, set
 `[paths].mdcompare_config` to the TOML file for the tool. Its
 `[score].request_budget` enables scoring when positive. Credential, proxy and
 certificate settings belong to the tool configuration. The orchestrator
