@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import hashlib
 import json
 import os
 import re
-import stat as stat_module
 import subprocess
 import sys
 import tempfile
@@ -153,25 +151,6 @@ def _missing_whitelist(path, rules):
     return [rule for rule in rules if key(rule.encode()) not in present]
 
 
-def _regular_identity(path):
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        return None
-    if not stat_module.S_ISREG(metadata.st_mode):
-        raise ValueError(".graphifyignore must remain a regular file")
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        metadata.st_mode,
-        metadata.st_uid,
-        metadata.st_gid,
-        metadata.st_size,
-        metadata.st_ctime_ns,
-        metadata.st_nlink,
-    )
-
-
 def _warn_ignore_preserved(reason):
     print(
         f"dogpdkb: {reason}; keeping .graphifyignore unchanged and "
@@ -181,7 +160,7 @@ def _warn_ignore_preserved(reason):
 
 
 def _ensure_corpus_whitelist(corpus):
-    """Keep Git excludes from hiding a configured Corpus from Graphify."""
+    """Provision a new Corpus whitelist without replacing operator files."""
     corpus = corpus.resolve()
     root = None
     home = Path.home()
@@ -237,89 +216,31 @@ def _ensure_corpus_whitelist(corpus):
         return
     if not missing:
         return
-    if path.is_symlink():
-        raise ValueError("provision Corpus whitelist in the symlinked .graphifyignore")
-    lock_path = path.with_name(path.name + ".lock")
-    try:
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    except PermissionError:
-        _warn_ignore_preserved("cannot create the whitelist lock")
+    if path.is_symlink() or path.exists():
+        _warn_ignore_preserved("the existing whitelist needs operator provisioning")
         return
-    except OSError as error:
-        if error.errno != errno.EROFS:
-            raise
-        _warn_ignore_preserved("the whitelist location is read-only")
-        return
+
+    temporary = None
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        identity = _regular_identity(path)
-        if identity is not None and identity[-1] > 1:
-            _warn_ignore_preserved("the whitelist is hard-linked")
-            return
-        missing = _missing_whitelist(path, rules)
-        if not missing:
-            return
-        existing = path.read_bytes() if path.exists() else b""
-        # Existing Graphify rules come later and retain their bytes and priority.
-        content = "\n".join(missing).encode() + b"\n" + existing
-        metadata = path.stat() if path.exists() else None
         fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         temporary = Path(temporary_name)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write("\n".join(missing).encode() + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
         try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            if metadata is not None:
-                if not hasattr(os, "listxattr"):
-                    _warn_ignore_preserved(
-                        "extended-attribute preservation is unavailable"
-                    )
-                    return
-                attributes = os.listxattr(path, follow_symlinks=False)
-                acl = "system.posix_acl_access"
-                if acl not in attributes:
-                    try:
-                        os.removexattr(temporary, acl, follow_symlinks=False)
-                    except OSError as error:
-                        if error.errno not in {errno.ENODATA, errno.ENOTSUP}:
-                            raise
-                try:
-                    os.chown(temporary, metadata.st_uid, metadata.st_gid)
-                except PermissionError:
-                    _warn_ignore_preserved("cannot preserve ignore ownership")
-                    return
-                for attribute in attributes:
-                    value = os.getxattr(path, attribute, follow_symlinks=False)
-                    os.setxattr(temporary, attribute, value, follow_symlinks=False)
-                os.chmod(temporary, metadata.st_mode)
-            if _regular_identity(path) != identity:
-                raise ValueError(".graphifyignore changed during Corpus update")
-            current = path.read_bytes() if path.exists() else b""
-            if current != existing:
-                raise ValueError(".graphifyignore changed during Corpus update")
-            if _regular_identity(path) != identity:
-                raise ValueError(".graphifyignore changed during Corpus update")
-            if identity is None:
-                try:
-                    os.link(temporary, path)
-                except FileExistsError:
-                    _warn_ignore_preserved("the whitelist was created concurrently")
-                    return
-            else:
-                os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+            os.link(temporary, path)
+        except FileExistsError:
+            _warn_ignore_preserved("the whitelist was created concurrently")
     except PermissionError:
-        _warn_ignore_preserved("cannot update the whitelist without permission")
-        return
+        _warn_ignore_preserved("cannot create the Corpus whitelist")
     except OSError as error:
         if error.errno not in {errno.EROFS, errno.ENOTSUP}:
             raise
-        _warn_ignore_preserved("the whitelist update is unsupported or read-only")
-        return
+        _warn_ignore_preserved("the whitelist location is read-only")
     finally:
-        os.close(descriptor)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _native_extract(command, corpus, token_budget, model, concurrency):

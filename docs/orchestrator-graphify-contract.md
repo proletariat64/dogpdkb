@@ -21,31 +21,23 @@ Git's user-wide excludes cannot remove published Corpus sources from the scan.
 Graphify's own `.graphifyignore` rules remain active. Before dispatch inside a
 Git worktree with active local Git ignore rules, dogpdkb selects the nearest
 existing `.graphifyignore` in the worktree-to-Corpus directory chain, defaulting
-to the worktree root. It inserts any missing anchored negations for the
-configured Corpus path and its parent directories before that file's existing
-rules. Existing lines remain unchanged and retain their last-match priority, and
-a complete existing whitelist is not duplicated. No Git rules means no write or
-new permission requirement. A per-file lock serializes concurrent books, and
-updates use a same-directory temporary file plus atomic replacement after a
-last-moment type, identity, and byte comparison. A previously absent destination
-is published with atomic no-overwrite link creation. Identity is checked again
-after the final byte read. Hard-linked ignore files remain unchanged with a
-warning rather than splitting shared configuration. Existing ownership and
-extended attributes, including POSIX ACLs, are copied while the replacement
-remains writable, before final mode restoration; inherited ACLs are cleared when
-the original has none.
-Permission failures, unavailable Git exclude lookup, and platforms or mounts
-without extended-attribute support preserve the original and emit a warning while
-`--no-gitignore` keeps extraction usable. Metadata comparison includes ctime so
-permission-only edits abort replacement. Complete whitelists require no lock or
-write. Linked worktrees resolve `info/exclude`
-through the long-supported `git rev-parse --git-path` form, resolving relative
-output against the selected worktree. Git ignore probes handle BOMs and
-first-column comments, skip non-regular or symlinked sources, preserve non-UTF-8
-path bytes, and clear repository-selection environment overrides. Non-regular
-`.graphifyignore` destinations are rejected before reading. Corpus paths
-containing pattern syntax or line breaks are rejected before modification, as are
-symlinked ignore files that require an update. This small scope guard is
+to the worktree root. Existing complete whitelists require no write. An existing
+incomplete whitelist remains byte-identical and produces an operator-provisioning
+warning; dogpdkb never replaces an existing policy file. This preserves concurrent
+operator edits, ownership, ACLs, symlinks, and hard links.
+
+A previously absent destination is written to a same-directory temporary file,
+fsynced, and published with atomic no-overwrite link creation. Concurrent creators
+preserve the winning destination and warn. Permission failures, unavailable Git
+exclude lookup, and unsupported or read-only locations preserve the original and
+emit a warning while `--no-gitignore` keeps extraction usable.
+
+Linked worktrees resolve `info/exclude` through `git rev-parse --git-path`, with
+relative filesystem-decoded output resolved against the selected worktree. Git
+probes handle BOMs and first-column comments, skip non-regular or symlinked
+sources, preserve non-UTF-8 bytes, and clear repository-selection environment
+overrides. Non-regular destinations and Corpus paths containing pattern syntax or
+line breaks are rejected before modification. This small scope guard is
 orchestrator-owned input selection; Graphify still owns pattern evaluation and
 scanning.
 

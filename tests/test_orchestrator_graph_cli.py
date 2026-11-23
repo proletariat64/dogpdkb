@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import json
 import os
@@ -201,16 +200,12 @@ def test_corpus_whitelist_uses_configured_nested_path(tmp_path):
     corpus = tmp_path / "published/custom-book"
     corpus.mkdir(parents=True)
     ignore_file = tmp_path / ".graphifyignore"
-    ignore_file.write_text("# Existing rule\nbuild/\n")
 
     _ensure_corpus_whitelist(corpus)
     _ensure_corpus_whitelist(corpus)
 
     assert ignore_file.read_bytes() == (
-        b"!/published/\n"
-        b"!/published/custom-book/\n"
-        b"!/published/custom-book/**\n"
-        b"# Existing rule\nbuild/\n"
+        b"!/published/\n!/published/custom-book/\n!/published/custom-book/**\n"
     )
 
 
@@ -220,12 +215,13 @@ def test_corpus_whitelist_uses_existing_corpus_ignore_file(tmp_path):
     corpus = tmp_path / "published/custom-book"
     corpus.mkdir(parents=True)
     ignore_file = corpus / ".graphifyignore"
-    ignore_file.write_text("# Corpus-local rules\nignored.md\n")
+    original = b"!/**\n# Corpus-local rules\nignored.md\n"
+    ignore_file.write_bytes(original)
 
     _ensure_corpus_whitelist(corpus)
     _ensure_corpus_whitelist(corpus)
 
-    assert ignore_file.read_bytes() == b"!/**\n# Corpus-local rules\nignored.md\n"
+    assert ignore_file.read_bytes() == original
     assert not (tmp_path / ".graphifyignore").exists()
 
 
@@ -238,32 +234,6 @@ def test_corpus_whitelist_skips_writes_without_git_rules(tmp_path):
 
     assert not (tmp_path / ".graphifyignore").exists()
     assert not (tmp_path / ".graphifyignore.lock").exists()
-
-
-def test_corpus_whitelist_atomic_failure_preserves_existing_rules(
-    tmp_path, monkeypatch
-):
-    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
-    (tmp_path / ".gitignore").write_text("*\n")
-    corpus = tmp_path / "corpus"
-    corpus.mkdir()
-    ignore_file = tmp_path / ".graphifyignore"
-    original = b"# Existing rules\nignored.md\n"
-    ignore_file.write_bytes(original)
-
-    def fail_replace(source, destination):
-        raise OSError("injected replace failure")
-
-    monkeypatch.setattr("dogpdkb.graph.os.replace", fail_replace)
-    with pytest.raises(OSError, match="injected replace failure"):
-        _ensure_corpus_whitelist(corpus)
-
-    assert ignore_file.read_bytes() == original
-    assert not [
-        path
-        for path in tmp_path.glob(".graphifyignore.*")
-        if path.name != ".graphifyignore.lock"
-    ]
 
 
 def test_corpus_whitelist_rejects_pattern_syntax_before_writing(tmp_path):
@@ -297,9 +267,11 @@ def test_corpus_whitelist_serializes_concurrent_books(tmp_path):
         list(pool.map(_ensure_corpus_whitelist, corpora))
 
     rules = (tmp_path / ".graphifyignore").read_text().splitlines()
+    winners = [index for index in range(8) if f"!/corpus/book-{index}/" in rules]
+    assert len(winners) == 1
     for index in range(8):
-        assert rules.count(f"!/corpus/book-{index}/") == 1
-        assert rules.count(f"!/corpus/book-{index}/**") == 1
+        assert rules.count(f"!/corpus/book-{index}/") <= 1
+        assert rules.count(f"!/corpus/book-{index}/**") <= 1
 
 
 def test_corpus_whitelist_supports_linked_worktree_exclude_file(tmp_path, monkeypatch):
@@ -369,7 +341,7 @@ def test_complete_corpus_whitelist_needs_no_lock_or_write(tmp_path):
     assert not (tmp_path / ".graphifyignore.lock").exists()
 
 
-def test_corpus_whitelist_rejects_symlink_update(tmp_path):
+def test_corpus_whitelist_preserves_symlink_for_operator(tmp_path, capsys):
     subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
     (tmp_path / ".gitignore").write_text("*\n")
     corpus = tmp_path / "corpus"
@@ -379,10 +351,10 @@ def test_corpus_whitelist_rejects_symlink_update(tmp_path):
     target.write_bytes(original)
     (tmp_path / ".graphifyignore").symlink_to(target)
 
-    with pytest.raises(ValueError, match="symlinked"):
-        _ensure_corpus_whitelist(corpus)
+    _ensure_corpus_whitelist(corpus)
 
     assert target.read_bytes() == original
+    assert "operator provisioning" in capsys.readouterr().err
     assert not (tmp_path / ".graphifyignore.lock").exists()
 
 
@@ -412,7 +384,7 @@ def test_corpus_whitelist_preserves_crlf_and_existing_bytes(tmp_path):
 
     _ensure_corpus_whitelist(corpus)
 
-    assert ignore_file.read_bytes() == b"!/corpus/\n!/corpus/**\n" + original
+    assert ignore_file.read_bytes() == original
 
 
 def test_git_ignore_probe_handles_bom_and_first_column_comments(tmp_path):
@@ -542,143 +514,6 @@ def test_git_exclude_relative_output_uses_worktree_root(tmp_path, monkeypatch):
     assert "--path-format=absolute" not in calls[0]
 
 
-def test_corpus_whitelist_aborts_replace_after_external_edit(tmp_path, monkeypatch):
-    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
-    (tmp_path / ".gitignore").write_text("*\n")
-    corpus = tmp_path / "corpus"
-    corpus.mkdir()
-    ignore_file = tmp_path / ".graphifyignore"
-    ignore_file.write_bytes(b"# Original\nignored.md\n")
-    external = b"# Operator edit\nnew-exclusion.md\n"
-    real_fsync = os.fsync
-
-    def edit_before_replace(fd):
-        ignore_file.write_bytes(external)
-        real_fsync(fd)
-
-    monkeypatch.setattr("dogpdkb.graph.os.fsync", edit_before_replace)
-    with pytest.raises(ValueError, match="changed during"):
-        _ensure_corpus_whitelist(corpus)
-
-    assert ignore_file.read_bytes() == external
-
-
-def test_corpus_whitelist_preserves_ownership_and_xattrs(tmp_path, monkeypatch):
-    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
-    (tmp_path / ".gitignore").write_text("*\n")
-    corpus = tmp_path / "corpus"
-    corpus.mkdir()
-    ignore_file = tmp_path / ".graphifyignore"
-    ignore_file.write_bytes(b"# Original\nignored.md\n")
-    ignore_file.chmod(0o444)
-    copied = []
-    real_chown = os.chown
-
-    def attributes(path, *, follow_symlinks):
-        return ["user.fixture"] if Path(path) == ignore_file else []
-
-    def read_attribute(path, name, *, follow_symlinks):
-        assert (Path(path), name) == (ignore_file, "user.fixture")
-        return b"attribute-value"
-
-    def write_attribute(path, name, value, *, follow_symlinks):
-        assert Path(path).stat().st_mode & 0o777 == 0o600
-        copied.append((Path(path).name, name, value))
-
-    def change_owner(path, uid, gid):
-        copied.append((Path(path).name, uid, gid))
-        real_chown(path, uid, gid)
-
-    monkeypatch.setattr("dogpdkb.graph.os.listxattr", attributes)
-    monkeypatch.setattr("dogpdkb.graph.os.getxattr", read_attribute)
-    monkeypatch.setattr("dogpdkb.graph.os.setxattr", write_attribute)
-    monkeypatch.setattr("dogpdkb.graph.os.chown", change_owner)
-    _ensure_corpus_whitelist(corpus)
-
-    stat = ignore_file.stat()
-    assert any(
-        entry[1:] == (stat.st_uid, stat.st_gid)
-        for entry in copied
-        if entry[0] != "user.fixture"
-    )
-    assert any(
-        name == "user.fixture" and value == b"attribute-value"
-        for _, name, value in copied
-        if name == "user.fixture"
-    )
-    assert ignore_file.stat().st_mode & 0o777 == 0o444
-
-
-def test_corpus_whitelist_clears_inherited_acl(tmp_path, monkeypatch):
-    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
-    (tmp_path / ".gitignore").write_text("*\n")
-    corpus = tmp_path / "corpus"
-    corpus.mkdir()
-    ignore_file = tmp_path / ".graphifyignore"
-    ignore_file.write_bytes(b"# Original\nignored.md\n")
-    removed = []
-
-    def attributes(path, *, follow_symlinks):
-        return [] if Path(path) == ignore_file else ["system.posix_acl_access"]
-
-    def remove_attribute(path, name, *, follow_symlinks):
-        removed.append((Path(path).name, name))
-
-    monkeypatch.setattr("dogpdkb.graph.os.listxattr", attributes)
-    monkeypatch.setattr("dogpdkb.graph.os.removexattr", remove_attribute)
-    _ensure_corpus_whitelist(corpus)
-
-    assert removed and all(name == "system.posix_acl_access" for _, name in removed)
-
-
-def test_corpus_whitelist_chown_denied_preserves_original(
-    tmp_path, monkeypatch, capsys
-):
-    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
-    (tmp_path / ".gitignore").write_text("*\n")
-    corpus = tmp_path / "corpus"
-    corpus.mkdir()
-    ignore_file = tmp_path / ".graphifyignore"
-    original = b"# Original\nignored.md\n"
-    ignore_file.write_bytes(original)
-
-    def denied(path, uid, gid):
-        raise PermissionError("EPERM")
-
-    monkeypatch.setattr("dogpdkb.graph.os.chown", denied)
-    _ensure_corpus_whitelist(corpus)
-
-    assert ignore_file.read_bytes() == original
-    assert "continuing with --no-gitignore" in capsys.readouterr().err
-
-
-def test_corpus_whitelist_rejects_symlink_added_at_lock(tmp_path, monkeypatch):
-    import fcntl
-
-    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
-    (tmp_path / ".gitignore").write_text("*\n")
-    corpus = tmp_path / "corpus"
-    corpus.mkdir()
-    ignore_file = tmp_path / ".graphifyignore"
-    ignore_file.write_bytes(b"# Original\nignored.md\n")
-    target = tmp_path / "shared-rules"
-    original_target = b"# Shared\nother.md\n"
-    target.write_bytes(original_target)
-    real_flock = fcntl.flock
-
-    def replace_with_symlink(fd, operation):
-        real_flock(fd, operation)
-        ignore_file.unlink()
-        ignore_file.symlink_to(target)
-
-    monkeypatch.setattr("dogpdkb.graph.fcntl.flock", replace_with_symlink)
-    with pytest.raises(ValueError, match="regular file"):
-        _ensure_corpus_whitelist(corpus)
-
-    assert ignore_file.is_symlink()
-    assert target.read_bytes() == original_target
-
-
 def test_corpus_whitelist_lock_denied_preserves_original(tmp_path, monkeypatch, capsys):
     subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
     (tmp_path / ".gitignore").write_text("*\n")
@@ -696,55 +531,6 @@ def test_corpus_whitelist_lock_denied_preserves_original(tmp_path, monkeypatch, 
 
     assert ignore_file.read_bytes() == original
     assert "continuing with --no-gitignore" in capsys.readouterr().err
-
-
-def test_corpus_whitelist_detects_permission_change_before_replace(
-    tmp_path, monkeypatch
-):
-    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
-    (tmp_path / ".gitignore").write_text("*\n")
-    corpus = tmp_path / "corpus"
-    corpus.mkdir()
-    ignore_file = tmp_path / ".graphifyignore"
-    original = b"# Original\nignored.md\n"
-    ignore_file.write_bytes(original)
-    ignore_file.chmod(0o644)
-    real_fsync = os.fsync
-
-    def chmod_before_replace(fd):
-        ignore_file.chmod(0o600)
-        real_fsync(fd)
-
-    monkeypatch.setattr("dogpdkb.graph.os.fsync", chmod_before_replace)
-    with pytest.raises(ValueError, match="changed during"):
-        _ensure_corpus_whitelist(corpus)
-
-    assert ignore_file.stat().st_mode & 0o777 == 0o600
-    assert ignore_file.read_bytes() == original
-
-
-def test_corpus_whitelist_without_xattr_support_preserves_original(
-    tmp_path, monkeypatch, capsys
-):
-    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
-    (tmp_path / ".gitignore").write_text("*\n")
-    corpus = tmp_path / "corpus"
-    corpus.mkdir()
-    ignore_file = tmp_path / ".graphifyignore"
-    original = b"# Original\nignored.md\n"
-    ignore_file.write_bytes(original)
-
-    class WithoutXattrs:
-        def __getattr__(self, name):
-            if name == "listxattr":
-                raise AttributeError(name)
-            return getattr(os, name)
-
-    monkeypatch.setattr("dogpdkb.graph.os", WithoutXattrs())
-    _ensure_corpus_whitelist(corpus)
-
-    assert ignore_file.read_bytes() == original
-    assert "extended-attribute preservation is unavailable" in capsys.readouterr().err
 
 
 def test_unreadable_git_ignore_warns_and_skips_maintenance(
@@ -807,25 +593,6 @@ def test_unavailable_git_exclude_lookup_preserves_extraction(
     assert "cannot resolve the Git exclude source" in capsys.readouterr().err
 
 
-def test_unsupported_xattr_mount_preserves_original(tmp_path, monkeypatch, capsys):
-    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
-    (tmp_path / ".gitignore").write_text("*\n")
-    corpus = tmp_path / "corpus"
-    corpus.mkdir()
-    ignore_file = tmp_path / ".graphifyignore"
-    original = b"# Original\nignored.md\n"
-    ignore_file.write_bytes(original)
-
-    def unsupported(path, *, follow_symlinks):
-        raise OSError(errno.ENOTSUP, "unsupported")
-
-    monkeypatch.setattr("dogpdkb.graph.os.listxattr", unsupported)
-    _ensure_corpus_whitelist(corpus)
-
-    assert ignore_file.read_bytes() == original
-    assert "continuing with --no-gitignore" in capsys.readouterr().err
-
-
 def test_initial_whitelist_permission_failure_preserves_original(
     tmp_path, monkeypatch, capsys
 ):
@@ -872,37 +639,6 @@ def test_git_ignore_predicate_permission_warns_and_continues(
     assert "cannot read Git ignore source" in capsys.readouterr().err
 
 
-def test_corpus_whitelist_detects_permission_change_during_final_read(
-    tmp_path, monkeypatch
-):
-    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
-    (tmp_path / ".gitignore").write_text("*\n")
-    corpus = tmp_path / "corpus"
-    corpus.mkdir()
-    ignore_file = tmp_path / ".graphifyignore"
-    original = b"# Original\nignored.md\n"
-    ignore_file.write_bytes(original)
-    ignore_file.chmod(0o644)
-    real_read = Path.read_bytes
-    reads = 0
-
-    def chmod_during_final_read(path):
-        nonlocal reads
-        if path == ignore_file:
-            reads += 1
-            if reads == 4:
-                ignore_file.chmod(0o600)
-        return real_read(path)
-
-    monkeypatch.setattr(Path, "read_bytes", chmod_during_final_read)
-    with pytest.raises(ValueError, match="changed during"):
-        _ensure_corpus_whitelist(corpus)
-    monkeypatch.undo()
-
-    assert ignore_file.stat().st_mode & 0o777 == 0o600
-    assert ignore_file.read_bytes() == original
-
-
 def test_hardlinked_graphifyignore_is_preserved(tmp_path, capsys):
     subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
     (tmp_path / ".gitignore").write_text("*\n")
@@ -919,7 +655,7 @@ def test_hardlinked_graphifyignore_is_preserved(tmp_path, capsys):
     assert ignore_file.read_bytes() == original
     assert linked.read_bytes() == original
     assert ignore_file.stat().st_nlink == 2
-    assert "hard-linked" in capsys.readouterr().err
+    assert "operator provisioning" in capsys.readouterr().err
 
 
 def test_corpus_symlink_is_selected_before_exists(tmp_path, monkeypatch):
@@ -1595,48 +1331,42 @@ def test_original_graphify_incremental_directory_preserves_other_sources(tmp_pat
 
 
 @pytest.mark.parametrize(
-    ("git_exclude", "git_pattern", "corpus_path", "whitelist"),
+    ("git_exclude", "git_pattern", "corpus_path"),
     [
         (
             ".gitignore",
             "*",
             "corpus",
-            "!/corpus/\n!/corpus/**\n",
         ),
         (
             ".git/info/exclude",
             "*",
             "corpus",
-            "!/corpus/\n!/corpus/**\n",
         ),
         (
             ".gitignore",
             "published/custom-book/",
             "published/custom-book",
-            "!/published/\n!/published/custom-book/\n!/published/custom-book/**\n",
         ),
         (
             ".git/info/exclude",
             "published/",
             "published/custom-book",
-            "!/published/\n!/published/custom-book/\n!/published/custom-book/**\n",
         ),
         (
             ".git/info/exclude",
             "published/custom-*/",
             "published/custom-book",
-            "!/published/\n!/published/custom-book/\n!/published/custom-book/**\n",
         ),
         (
             ".gitignore",
             "published/custom-book/Title*",
             "published/custom-book",
-            "!/published/\n!/published/custom-book/\n!/published/custom-book/**\n",
         ),
     ],
 )
 def test_installed_graphify_bypasses_git_exclusions_and_preserves_ignore_rules(
-    tmp_path, git_exclude, git_pattern, corpus_path, whitelist
+    tmp_path, git_exclude, git_pattern, corpus_path
 ):
     import shutil
     import threading
@@ -1697,7 +1427,7 @@ def test_installed_graphify_bypasses_git_exclusions_and_preserves_ignore_rules(
         graph = json.loads((source.parent / "graphify-out/graph.json").read_text())
         assert source.name in {n.get("source_file") for n in graph["nodes"]}
         assert ignored.name not in {n.get("source_file") for n in graph["nodes"]}
-        expected = (whitelist + "# Retain user rules\nignored.md\n").encode()
+        expected = b"# Retain user rules\nignored.md\n"
         assert ignore_file.read_bytes() == expected
 
         # A real second dispatch preserves existing rules and adds no duplicate.
