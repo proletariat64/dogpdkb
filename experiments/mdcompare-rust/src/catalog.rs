@@ -1,5 +1,6 @@
-use crate::input::{Document, Identity, Reader, resolved};
+use crate::input::{Document, Reader, resolved};
 use crate::resources::{decoded, entries, split_url, uses};
+use crate::{offline::Snapshots, summary::Progress};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -164,10 +165,15 @@ fn catalog_document(doc: &Document, data: &[u8], reader: &mut Reader) -> Result<
 }
 
 pub(crate) fn catalog_documents(
-    documents: &BTreeMap<Identity, Document>,
-    order: &[Identity],
+    snapshots: &Snapshots,
     reader: &mut Reader,
+    progress: &Progress,
 ) -> Result<Value> {
+    let Snapshots {
+        incoming: documents,
+        order,
+        ..
+    } = snapshots;
     let mut rows = Vec::new();
     let mut unresolved = 0;
     for identity in order {
@@ -190,6 +196,7 @@ pub(crate) fn catalog_documents(
                 .is_some_and(|items| !items.is_empty()),
         );
         rows.push(row);
+        progress.update("catalog", rows.len(), documents.len(), 0, 0);
     }
     Ok(json!({
         "schema_version":"mdcompare-catalog-result-1",
