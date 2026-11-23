@@ -157,7 +157,23 @@ def _regular_identity(path):
         return None
     if not stat_module.S_ISREG(metadata.st_mode):
         raise ValueError(".graphifyignore must remain a regular file")
-    return metadata.st_dev, metadata.st_ino
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_ctime_ns,
+    )
+
+
+def _warn_ignore_preserved(reason):
+    print(
+        f"dogpdkb: {reason}; keeping .graphifyignore unchanged and "
+        "continuing with --no-gitignore",
+        file=sys.stderr,
+    )
 
 
 def _ensure_corpus_whitelist(corpus):
@@ -209,7 +225,16 @@ def _ensure_corpus_whitelist(corpus):
     if path.is_symlink():
         raise ValueError("provision Corpus whitelist in the symlinked .graphifyignore")
     lock_path = path.with_name(path.name + ".lock")
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except PermissionError:
+        _warn_ignore_preserved("cannot create the whitelist lock")
+        return
+    except OSError as error:
+        if error.errno != errno.EROFS:
+            raise
+        _warn_ignore_preserved("the whitelist location is read-only")
+        return
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         identity = _regular_identity(path)
@@ -228,6 +253,11 @@ def _ensure_corpus_whitelist(corpus):
                 stream.flush()
                 os.fsync(stream.fileno())
             if metadata is not None:
+                if not hasattr(os, "listxattr"):
+                    _warn_ignore_preserved(
+                        "extended-attribute preservation is unavailable"
+                    )
+                    return
                 attributes = os.listxattr(path, follow_symlinks=False)
                 acl = "system.posix_acl_access"
                 if acl not in attributes:
@@ -239,11 +269,7 @@ def _ensure_corpus_whitelist(corpus):
                 try:
                     os.chown(temporary, metadata.st_uid, metadata.st_gid)
                 except PermissionError:
-                    print(
-                        "dogpdkb: cannot preserve .graphifyignore ownership; "
-                        "keeping the original and continuing with --no-gitignore",
-                        file=sys.stderr,
-                    )
+                    _warn_ignore_preserved("cannot preserve ignore ownership")
                     return
                 os.chmod(temporary, metadata.st_mode)
                 for attribute in attributes:

@@ -674,6 +674,74 @@ def test_corpus_whitelist_rejects_symlink_added_at_lock(tmp_path, monkeypatch):
     assert target.read_bytes() == original_target
 
 
+def test_corpus_whitelist_lock_denied_preserves_original(tmp_path, monkeypatch, capsys):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Original\nignored.md\n"
+    ignore_file.write_bytes(original)
+
+    def denied(*args, **kwargs):
+        raise PermissionError("EPERM")
+
+    monkeypatch.setattr("dogpdkb.graph.os.open", denied)
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == original
+    assert "continuing with --no-gitignore" in capsys.readouterr().err
+
+
+def test_corpus_whitelist_detects_permission_change_before_replace(
+    tmp_path, monkeypatch
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Original\nignored.md\n"
+    ignore_file.write_bytes(original)
+    ignore_file.chmod(0o644)
+    real_fsync = os.fsync
+
+    def chmod_before_replace(fd):
+        ignore_file.chmod(0o600)
+        real_fsync(fd)
+
+    monkeypatch.setattr("dogpdkb.graph.os.fsync", chmod_before_replace)
+    with pytest.raises(ValueError, match="changed during"):
+        _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.stat().st_mode & 0o777 == 0o600
+    assert ignore_file.read_bytes() == original
+
+
+def test_corpus_whitelist_without_xattr_support_preserves_original(
+    tmp_path, monkeypatch, capsys
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Original\nignored.md\n"
+    ignore_file.write_bytes(original)
+
+    class WithoutXattrs:
+        def __getattr__(self, name):
+            if name == "listxattr":
+                raise AttributeError(name)
+            return getattr(os, name)
+
+    monkeypatch.setattr("dogpdkb.graph.os", WithoutXattrs())
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == original
+    assert "extended-attribute preservation is unavailable" in capsys.readouterr().err
+
+
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):
     config, manifest, source = fixture(tmp_path, title="Cafe\u0301")
     result = cli(config, manifest)

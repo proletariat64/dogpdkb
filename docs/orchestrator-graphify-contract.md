@@ -29,9 +29,11 @@ new permission requirement. A per-file lock serializes concurrent books, and
 updates use a same-directory temporary file plus atomic replacement after a
 last-moment type, identity, and byte comparison. Existing ownership and extended
 attributes, including POSIX ACLs, are copied before replacement; inherited ACLs
-are cleared when the original has none. An ownership-permission failure preserves
-the original and emits a warning while `--no-gitignore` keeps extraction usable.
-Complete whitelists require no lock or write. Linked worktrees resolve `info/exclude`
+are cleared when the original has none. Permission failures and platforms without
+extended-attribute support preserve the original and emit a warning while
+`--no-gitignore` keeps extraction usable. Metadata comparison includes ctime so
+permission-only edits abort replacement. Complete whitelists require no lock or
+write. Linked worktrees resolve `info/exclude`
 through the long-supported `git rev-parse --git-path` form, resolving relative
 output against the selected worktree. Git ignore probes handle BOMs and
 first-column comments, skip non-regular or symlinked sources, preserve non-UTF-8
