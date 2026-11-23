@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
+    os::fd::AsRawFd,
     path::Path,
     process::{Child, Command, Output, Stdio},
     thread,
@@ -105,7 +106,7 @@ fn listener(dir: &Path, budget: usize) -> TcpListener {
     listener
 }
 
-fn request(listener: &TcpListener, child: &mut Child) -> (TcpStream, Value) {
+fn request(listener: &TcpListener, child: &mut Child, dir: &Path) -> (TcpStream, Value) {
     let start = Instant::now();
     let mut socket = loop {
         if let Ok((stream, _)) = listener.accept() {
@@ -199,9 +200,7 @@ fn admitted_request_is_not_replayed_after_interruption() {
     let dir = fixtures();
     let listener = listener(dir.path(), 1);
     let mut child = start(dir.path(), false);
-    let (_socket, _) = request(&listener, &mut child);
-    let journal = read_json(dir.path(), "score.mdcompare/journal.json");
-    assert_eq!(journal["attempts"][0]["state"], "admitted");
+    let (_socket, _) = request(&listener, &mut child, dir.path());
     child.kill().unwrap();
     child.wait().unwrap();
 
@@ -233,7 +232,7 @@ fn cancellation_waits_for_in_flight_work_and_explicit_resume_only_sends_pending(
     let dir = fixtures();
     let listener = listener(dir.path(), 2);
     let mut child = start(dir.path(), false);
-    let (mut socket, body) = request(&listener, &mut child);
+    let (mut socket, body) = request(&listener, &mut child, dir.path());
     let state = invoke(dir.path(), &["cancel", "--plan", "score.json"], 0);
     assert_eq!(state["state"], "cancel_requested");
     respond(&mut socket, &body);
@@ -248,7 +247,7 @@ fn cancellation_waits_for_in_flight_work_and_explicit_resume_only_sends_pending(
     );
 
     let mut child = start(dir.path(), true);
-    let (mut socket, body) = request(&listener, &mut child);
+    let (mut socket, body) = request(&listener, &mut child, dir.path());
     respond(&mut socket, &body);
     let summary = outcome(child.wait_with_output().unwrap(), 0);
     assert_eq!(summary["counts"]["admitted"], 2);
@@ -301,7 +300,7 @@ fn rate_limit_at_minimum_concurrency_leaves_pending_documents_unsent() {
     let dir = fixtures();
     let listener = listener(dir.path(), 2);
     let mut child = start(dir.path(), false);
-    let (mut socket, _) = request(&listener, &mut child);
+    let (mut socket, _) = request(&listener, &mut child, dir.path());
     socket
         .write_all(
             b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -318,4 +317,65 @@ fn rate_limit_at_minimum_concurrency_leaves_pending_documents_unsent() {
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
+}
+
+#[test]
+fn interruption_after_admission_before_connection_does_not_replay() {
+    let dir = fixtures();
+    let listener = listener(dir.path(), 1);
+    // Linux retains one pending connection for backlog zero. Fill that slot
+    // before launching the scorer, so no scoring HTTP bytes can be sent yet.
+    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+    let mut blocker = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    blocker.write_all(b"occupied").unwrap();
+
+    let mut child = start(dir.path(), false);
+    let journal_path = dir.path().join("score.mdcompare/journal.json");
+    let started = Instant::now();
+    loop {
+        if let Ok(bytes) = fs::read(&journal_path) {
+            let journal: Value = serde_json::from_slice(&bytes).unwrap();
+            if journal["attempts"][0]["state"] == "admitted" {
+                break;
+            }
+        }
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(child.try_wait().unwrap().is_none());
+        thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let (mut occupant, _) = listener.accept().unwrap();
+    let mut marker = [0u8; 8];
+    occupant.read_exact(&mut marker).unwrap();
+    assert_eq!(&marker, b"occupied");
+
+    invoke(dir.path(), &["score", "--plan", "score.json"], 2);
+    let report = read_json(dir.path(), "score.mdcompare/result.json");
+    assert_eq!(report["rows"][0]["state"], "unknown");
+    assert_eq!(report["rows"][1]["state"], "not_sent");
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn removing_the_score_workspace_cannot_reset_an_initialized_request_budget() {
+    let dir = fixtures();
+    let listener = listener(dir.path(), 1);
+    let mut child = start(dir.path(), false);
+    let (_socket, _) = request(&listener, &mut child, dir.path());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    fs::rename(
+        dir.path().join("score.mdcompare"),
+        dir.path().join("removed-score"),
+    )
+    .unwrap();
+
+    drop(listener);
+    let failure = invoke(dir.path(), &["score", "--plan", "score.json"], 1);
+    assert_eq!(failure["reason_code"], "binding_invalid");
+    assert!(!dir.path().join("score.mdcompare").exists());
 }

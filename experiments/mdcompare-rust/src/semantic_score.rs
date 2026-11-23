@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io,
+    io::{self, Write},
     os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::mpsc,
@@ -60,6 +60,7 @@ struct Frozen {
     comparison_sha256: String,
     documents: Vec<Binding>,
     config: ScoreConfig,
+    config_source: Option<PathBuf>,
     prompt_sha256: String,
     format_sha256: String,
 }
@@ -236,21 +237,82 @@ fn settings(config: &ScoreConfig) -> Connection {
     }
 }
 
-fn score_config(workspace: &Workspace, explicit: Option<&Path>) -> Result<ScoreConfig> {
-    let config = Config::load(Some(&workspace.source), explicit)
-        .context("invalid_config")?
-        .score;
-    ensure!(config.request_budget.is_some(), "invalid_config");
+fn score_config(workspace: &Workspace, explicit: Option<&Path>) -> Result<Config> {
+    let config = Config::load(Some(&workspace.source), explicit).context("invalid_config")?;
+    ensure!(config.score.request_budget.is_some(), "invalid_config");
     Ok(config)
+}
+
+fn seal_path(workspace: &Workspace) -> PathBuf {
+    workspace.source.with_extension("mdcompare.score-seal")
+}
+
+fn exists(path: &Path) -> Result<bool> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("binding_invalid"),
+    }
+}
+
+fn protect_score_destinations(
+    workspace: &Workspace,
+    comparison: &Workspace,
+    config: &Config,
+) -> Result<()> {
+    let plan = workspace::load_frozen(comparison)?;
+    let protected = || {
+        plan.inputs
+            .keys()
+            .map(PathBuf::as_path)
+            .chain([
+                workspace.source.as_path(),
+                comparison.root.as_path(),
+                comparison.source.as_path(),
+            ])
+            .chain(config.source.as_deref())
+            .chain(config.score.oauth_file.as_deref())
+            .chain(config.score.ca_file.as_deref())
+    };
+    crate::input::check_output(&workspace.root, protected()).context("binding_invalid")?;
+    crate::input::check_output(&seal_path(workspace), protected()).context("binding_invalid")
+}
+
+fn ensure_seal(task: &Task, path: &Path) -> Result<()> {
+    let parent = path.parent().context("binding_invalid")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("binding_invalid")?;
+    let path = workspace::artifact_path(parent, name)?;
+    let seal = format!("{}\n", task.plan_sha256);
+    if exists(&path)? {
+        let (existing, _) = crate::input::read(&path, 65)
+            .map_err(anyhow::Error::msg)
+            .context("binding_invalid")?;
+        ensure!(existing == seal.as_bytes(), "binding_invalid");
+    } else {
+        // Adoption is only safe for an accepted workspace that never began
+        // execution. A spent journal without its ownership seal is damaged.
+        let (journal, _) = task.journal()?;
+        ensure!(
+            !journal.started && journal.attempts.is_empty(),
+            "binding_invalid"
+        );
+        let mut temp = tempfile::NamedTempFile::new_in(parent).context("publish_failed")?;
+        temp.write_all(seal.as_bytes()).context("publish_failed")?;
+        temp.as_file().sync_all().context("publish_failed")?;
+        temp.persist_noclobber(&path).context("publish_failed")?;
+    }
+    File::open(parent)?.sync_all().context("publish_failed")?;
+    Ok(())
 }
 
 fn prepare_task(workspace: Workspace, explicit: Option<&Path>) -> Result<Task> {
     let _creation = workspace.creation_lock()?;
-    if workspace
-        .root
-        .symlink_metadata()
-        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-    {
+    let seal = seal_path(&workspace);
+    if !exists(&workspace.root)? {
+        ensure!(!exists(&seal)?, "binding_invalid");
         let work = work(&workspace)?;
         let pair = workspace
             .source
@@ -264,6 +326,9 @@ fn prepare_task(workspace: Workspace, explicit: Option<&Path>) -> Result<Task> {
             .iter()
             .map(|id| eligible.get(id).cloned().context("invalid_input"))
             .collect::<Result<_>>()?;
+        let config = score_config(&workspace, explicit)?;
+        let pair_workspace = Workspace::locate(&pair)?;
+        protect_score_destinations(&workspace, &pair_workspace, &config)?;
         let frozen = Frozen {
             schema_version: PLAN.to_owned(),
             source: workspace.source.clone(),
@@ -271,7 +336,8 @@ fn prepare_task(workspace: Workspace, explicit: Option<&Path>) -> Result<Task> {
             comparison_plan: pair,
             comparison_sha256: work.comparison_sha256,
             documents,
-            config: score_config(&workspace, explicit)?,
+            config: config.score,
+            config_source: config.source,
             prompt_sha256: digest(PROMPT.as_bytes()),
             format_sha256: digest(FORMAT.as_bytes()),
         };
@@ -285,9 +351,10 @@ fn prepare_task(workspace: Workspace, explicit: Option<&Path>) -> Result<Task> {
         ])?;
     }
     let task = Task::open(workspace)?;
+    ensure_seal(&task, &seal)?;
     if explicit.is_some() {
         ensure!(
-            score_config(&task.workspace, explicit)? == task.frozen.config,
+            score_config(&task.workspace, explicit)?.score == task.frozen.config,
             "invalid_config"
         );
     }
@@ -363,6 +430,35 @@ impl Task {
             "binding_invalid"
         );
         Ok(directory)
+    }
+
+    fn protect_oauth_file(&self) -> Result<()> {
+        let Some(oauth) = self.frozen.config.oauth_file.as_deref() else {
+            return Ok(());
+        };
+        if self.frozen.config.endpoint.is_some() {
+            return Ok(());
+        }
+        let pair = Workspace::locate(&self.frozen.comparison_plan)?;
+        let pair_plan = workspace::load_frozen(&pair)?;
+        let seal = seal_path(&self.workspace);
+        crate::input::check_output(
+            oauth,
+            pair_plan
+                .inputs
+                .keys()
+                .map(PathBuf::as_path)
+                .chain([
+                    pair.root.as_path(),
+                    pair.source.as_path(),
+                    self.workspace.root.as_path(),
+                    self.workspace.source.as_path(),
+                    seal.as_path(),
+                ])
+                .chain(self.frozen.config_source.as_deref())
+                .chain(self.frozen.config.ca_file.as_deref()),
+        )
+        .context("binding_invalid")
     }
 
     fn result(&self, journal: &Journal, journal_sha256: String) -> Result<ScoreResult> {
@@ -658,10 +754,7 @@ fn observe(plan: &Path, cancel: bool) -> Result<Outcome> {
     };
     let command = if cancel { "cancel" } else { "status" };
     let mut summary = task.summary(command, state, &journal, running, published);
-    if state == "accepted"
-        && !running
-        && (!journal.attempts.is_empty() || journal.terminal.is_some())
-    {
+    if state == "accepted" && !running && journal.started {
         summary = summary.reason("interrupted");
     }
     Ok(summary.exit(0))
@@ -834,6 +927,7 @@ fn run_pending(task: &Task, directory: &Path, progress: &Progress) -> Result<()>
                         Ok(prepared) => {
                             // Only load scoring prerequisites for a sendable packet.
                             if !checked {
+                                task.protect_oauth_file()?;
                                 provider::check_oauth_settings(
                                     &config.model,
                                     &config.effort,
