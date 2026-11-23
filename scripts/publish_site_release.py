@@ -4,98 +4,100 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import os
 import re
-import shlex
 import subprocess
 import tempfile
-import uuid
 from pathlib import Path
-from urllib.request import urlopen
+from urllib import request
 
 PROJECT = "pd.pt/dogpdkb"
 RELEASE_URL = f"https://code.alipay.com/{PROJECT}/releases"
 SITE = "/home/admin/webserver/site/releases"
 SITE_URL = "http://poolab-iys595a7znqgza1e.inc.alipay.net/releases/dogpdkb.json"
-STAGING = "/home/admin/workspace/.dogpdkb-release-site"
 TAG_PATTERN = r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+
 
 # This program runs on the host. Only dogpdkb.json is replaced; existing HTML,
 # catalogs and server configuration remain untouched. The lock also serializes
 # competing publishers so an older release cannot win a concurrent update.
-REMOTE_UPDATE = r"""
-import fcntl
-import json
-import os
-from pathlib import Path
-import re
-import sys
-import tempfile
-from urllib.request import urlopen
+def update_local(payload: bytes, destination: Path, public_url: str) -> None:
 
-source, destination, public_url = sys.argv[1:]
-source = Path(source)
-destination = Path(destination)
-temporary = None
-try:
-    payload = source.read_bytes()
-    expected = json.loads(payload)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(destination.parent, 0o755)
-    with (destination.parent / ".dogpdkb.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        previous = destination.read_bytes() if destination.exists() else None
-        previous_mode = destination.stat().st_mode & 0o7777 if previous is not None else 0o644
-        current = None
-        if previous is not None:
-            try:
-                current = json.loads(previous)
-            except (ValueError, UnicodeError):
-                pass  # Preserve raw bytes for rollback, but allow metadata repair.
-        if isinstance(current, dict):
-            version = current.get("version", "")
-            if (current.get("schema_version") == 1
+    destination = Path(destination)
+    temporary = None
+    try:
+        expected = json.loads(payload)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(destination.parent, 0o755)
+        with (destination.parent / ".dogpdkb.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            previous = destination.read_bytes() if destination.exists() else None
+            previous_mode = (
+                destination.stat().st_mode & 0o7777 if previous is not None else 0o644
+            )
+            current = None
+            if previous is not None:
+                try:
+                    current = json.loads(previous)
+                except (ValueError, UnicodeError):
+                    pass  # Preserve raw bytes for rollback, but allow metadata repair.
+            if isinstance(current, dict):
+                version = current.get("version", "")
+                if (
+                    current.get("schema_version") == 1
                     and current.get("channel") == "stable"
                     and isinstance(version, str)
-                    and re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version)
+                    and re.fullmatch(
+                        r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version
+                    )
                     and current.get("tag") == "v" + version
-                    and tuple(map(int, version.split("."))) > tuple(map(int, expected["version"].split(".")))):
-                raise ValueError("refusing stable homepage downgrade")
-        with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".release-", delete=False) as stream:
-            temporary = stream.name
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-            os.fchmod(stream.fileno(), 0o644)
-        os.replace(temporary, destination)
-        temporary = None
-        try:
-            if destination.read_bytes() != payload:
-                raise ValueError("homepage metadata readback failed")
-            with urlopen(public_url + "?release=" + expected["tag"], timeout=20) as response:
-                if response.status != 200 or json.loads(response.read(65537)) != expected:
-                    raise ValueError("homepage HTTP verification failed")
-        except (OSError, ValueError):
-            # Verification and rollback stay inside the publisher lock. Only
-            # roll back after our replacement succeeded, never before it.
-            if previous is None:
-                destination.unlink()
-            else:
-                with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".release-", delete=False) as stream:
-                    temporary = stream.name
-                    stream.write(previous)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                    os.fchmod(stream.fileno(), previous_mode)
-                os.replace(temporary, destination)
-                temporary = None
-            raise
-finally:
-    if temporary is not None:
-        os.unlink(temporary)
-    source.unlink(missing_ok=True)
-    source.parent.rmdir()
-"""
+                    and tuple(map(int, version.split(".")))
+                    > tuple(map(int, expected["version"].split(".")))
+                ):
+                    raise ValueError("refusing stable homepage downgrade")
+            with tempfile.NamedTemporaryFile(
+                dir=destination.parent, prefix=".release-", delete=False
+            ) as stream:
+                temporary = stream.name
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+                os.fchmod(stream.fileno(), 0o644)
+            os.replace(temporary, destination)
+            temporary = None
+            try:
+                if destination.read_bytes() != payload:
+                    raise ValueError("homepage metadata readback failed")
+                with request.urlopen(
+                    public_url + "?release=" + expected["tag"], timeout=20
+                ) as response:
+                    if (
+                        response.status != 200
+                        or json.loads(response.read(65537)) != expected
+                    ):
+                        raise ValueError("homepage HTTP verification failed")
+            except (OSError, ValueError):
+                # Verification and rollback stay inside the publisher lock. Only
+                # roll back after our replacement succeeded, never before it.
+                if previous is None:
+                    destination.unlink()
+                else:
+                    with tempfile.NamedTemporaryFile(
+                        dir=destination.parent, prefix=".release-", delete=False
+                    ) as stream:
+                        temporary = stream.name
+                        stream.write(previous)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                        os.fchmod(stream.fileno(), previous_mode)
+                    os.replace(temporary, destination)
+                    temporary = None
+                raise
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)
 
 
 class SitePublishError(Exception):
@@ -118,7 +120,7 @@ def command(arguments: list[str]) -> str:
 
 def fetch(url: str) -> bytes:
     try:
-        with urlopen(url, timeout=20) as response:
+        with request.urlopen(url, timeout=20) as response:
             body = response.read(1024 * 1024 + 1)
             if response.status != 200 or len(body) > 1024 * 1024:
                 raise SitePublishError("Installer HTTP response is invalid")
@@ -188,21 +190,6 @@ def metadata(tag: str, release: object, installer: bytes) -> dict:
     }
 
 
-def remote_python(program: str, *arguments: str) -> str:
-    return command(
-        [
-            "poolab",
-            "terminal",
-            "execute",
-            "--alias",
-            "default",
-            "--timeout",
-            "30s",
-            shlex.join(["python3", "-c", program, *arguments]),
-        ]
-    )
-
-
 def publish(tag: str) -> None:
     if re.fullmatch(TAG_PATTERN, tag) is None:
         raise SitePublishError("Tag must be canonical vMAJOR.MINOR.PATCH")
@@ -213,41 +200,12 @@ def publish(tag: str) -> None:
         release = json.loads(output)
     except (ValueError, TypeError):
         raise SitePublishError("Invalid AntCode Release JSON") from None
-    # Validate all Release fields before performing any remote write.
+    # Validate all Release fields before performing any local write.
     installer = fetch(f"{RELEASE_URL}/download/{tag}/install.sh")
     data = metadata(tag, release, installer)
-    stage = f"{STAGING}/{uuid.uuid4().hex}"
-    staged_file = f"{stage}/release.json"
-    remote_python(
-        "from pathlib import Path; import sys; Path(sys.argv[1]).mkdir(parents=True)",
-        stage,
-    )
-    try:
-        with tempfile.TemporaryDirectory(prefix="dogpdkb-site-") as directory:
-            local = Path(directory) / "release.json"
-            local.write_text(
-                json.dumps(data, ensure_ascii=False) + "\n", encoding="utf-8"
-            )
-            command(
-                [
-                    "poolab",
-                    "sync",
-                    "--instance",
-                    "default",
-                    str(local),
-                    f":{staged_file}",
-                ]
-            )
-            remote_python(REMOTE_UPDATE, staged_file, f"{SITE}/dogpdkb.json", SITE_URL)
-    finally:
-        # Only the unique staging directory owned by this invocation is removed.
-        try:
-            remote_python(
-                "import shutil, sys; shutil.rmtree(sys.argv[1], ignore_errors=True)",
-                stage,
-            )
-        except SitePublishError:
-            pass
+    # Validate all Release fields before performing any local write.
+    payload = (json.dumps(data, ensure_ascii=False) + "\n").encode("utf-8")
+    update_local(payload, Path(SITE) / "dogpdkb.json", SITE_URL)
     print(f"Homepage updated to {tag}: {SITE_URL}")
 
 

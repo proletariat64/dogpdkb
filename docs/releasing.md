@@ -34,13 +34,13 @@ credentials. The command:
 5. Creates an annotated `v<project.version>` tag and pushes only that tag to GitHub.
 6. Publishes anonymous installation attachments through the local AntCode CLI.
 7. Verifies the published installer and updates the homepage's `dogpdkb.json`
-   through `poolab`.
+   directly in the local Nginx site directory.
 
 Dry run reports the current version and planned checks without fetching,
 running checks or performing network writes. Actual release requires GitHub
 tag-write permission, AntCode Release-write permission, Python 3.12, uv, Git,
-and a working `poolab` default connection with homepage write access. There is
-no cloud publishing job or separate publishing token requirement.
+and write access to the local homepage directory. There is no cloud publishing
+job or separate publishing token requirement.
 
 Bootstrap also runs on `RETRY=1`, so pulling a version bump cannot leave the
 development environment reporting the previous `dogpdkb`/`mdocr` version during
@@ -94,9 +94,9 @@ GitHub installations are upgraded by rerunning the target version's GitHub
 uses AntCode only and cannot fetch GitHub-only versions; see the
 [GitHub upgrade command](installing.md#upgrade-and-retry).
 
-The homepage helper is AntCode-specific. GitHub releases skip that step and
-need neither AntCode CLI nor `poolab`; the existing AntCode homepage remains
-managed by the default release flow. Retry with the same `TARGET` to resume
+The homepage helper is AntCode-specific. GitHub releases skip that step and the
+AntCode CLI; the existing AntCode homepage remains managed by the default release
+flow. Retry with the same `TARGET` to resume
 that provider. To publish the same source version to the other provider, use
 its target together with `RETRY=1`, since the source tag already exists.
 
