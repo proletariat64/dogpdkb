@@ -19,6 +19,8 @@ pub(crate) struct Summary {
     reason_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     comparison_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<serde_json::Value>,
 }
 
 pub(crate) struct Outcome {
@@ -36,6 +38,7 @@ impl Summary {
             counts: BTreeMap::new(),
             reason_code: None,
             comparison_sha256: None,
+            diagnostics: None,
         }
     }
 
@@ -60,6 +63,11 @@ impl Summary {
         self
     }
 
+    pub(crate) fn diagnostics(mut self, details: serde_json::Value) -> Self {
+        self.diagnostics = Some(details);
+        self
+    }
+
     pub(crate) fn exit(self, code: u8) -> Outcome {
         Outcome {
             summary: self,
@@ -75,9 +83,13 @@ impl Summary {
         self.reason_code.as_deref()
     }
 
-    pub(crate) fn print(&self) -> io::Result<()> {
+    pub(crate) fn print(&self, pretty: bool) -> io::Result<()> {
         let mut stdout = io::stdout().lock();
-        serde_json::to_writer(&mut stdout, self)?;
+        if pretty {
+            serde_json::to_writer_pretty(&mut stdout, self)?;
+        } else {
+            serde_json::to_writer(&mut stdout, self)?;
+        }
         stdout.write_all(b"\n")?;
         stdout.flush()
     }

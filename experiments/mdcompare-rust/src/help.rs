@@ -73,10 +73,12 @@ Exit codes
   64 usage error.";
 
 pub(crate) const DOCTOR: &str = "Example
-  mdcomparer doctor --config scoring.toml
+  mdcomparer doctor --config scoring.toml --pretty
 
 Checks the local runtime and explicitly configured scoring prerequisites.
 Without --config it checks built-in defaults and requires no credentials.
+Reports the semantic scoring model, budget, transport and saved OAuth state.
+Runs offline. Use --pretty for indented JSON.
 
 Exit codes
   0 capabilities available, 1 invalid configuration, 2 capability unavailable,

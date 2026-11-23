@@ -67,11 +67,55 @@ fn doctor_reports_summary_and_progress_under_an_empty_environment() {
     assert_eq!(summary["command"], "doctor");
     assert_eq!(summary["state"], "complete");
     assert!(summary["reason_code"].is_null());
+    assert_eq!(summary["counts"]["checks"], 3);
+    assert_eq!(summary["diagnostics"]["llm"]["status"], "not_configured");
+    assert_eq!(summary["diagnostics"]["llm"]["provider"], "openai");
+    assert_eq!(summary["diagnostics"]["llm"]["inference"], "not_checked");
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("timestamp_ms="));
     assert!(stderr.contains("command=doctor event=progress"));
     assert!(stderr.contains("command=doctor event=finish"));
     assert!(stderr.contains("reason=complete"));
+}
+
+#[test]
+fn pretty_doctor_indents_the_same_json_and_reports_saved_oauth_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("scoring.toml");
+    std::fs::write(
+        &config,
+        "[score]\nrequest_budget = 2\noauth_file = 'oauth.json'\n",
+    )
+    .unwrap();
+    let oauth = directory.path().join("oauth.json");
+    std::fs::write(&oauth, r#"{"openai":{"type":"oauth","access":"PRIVATE-TOKEN","refresh":"PRIVATE-REFRESH","expires":1}}"#).unwrap();
+    let args = ["doctor", "--config", config.to_str().unwrap()];
+    let compact = run(&args);
+    let pretty = run(&[args[0], args[1], args[2], "--pretty"]);
+    assert!(compact.status.success());
+    assert!(pretty.status.success());
+    let pretty_text = String::from_utf8(pretty.stdout).unwrap();
+    assert!(pretty_text.starts_with("{\n  \"schema_version\""));
+    assert!(!pretty_text.contains("PRIVATE"));
+    let summary: serde_json::Value = serde_json::from_str(&pretty_text).unwrap();
+    assert_eq!(
+        summary,
+        serde_json::from_slice::<serde_json::Value>(&compact.stdout).unwrap()
+    );
+    assert_eq!(summary["reason_code"], "oauth_expired");
+    assert_eq!(summary["diagnostics"]["llm"]["status"], "refresh_required");
+    assert_eq!(summary["diagnostics"]["llm"]["request_budget"], 2);
+    assert_eq!(summary["diagnostics"]["llm"]["inference"], "not_checked");
+
+    std::fs::remove_file(&oauth).unwrap();
+    let missing = run(&args);
+    assert_eq!(missing.status.code(), Some(2));
+    let summary: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(
+        summary["diagnostics"]["llm"]["status"],
+        "prerequisites_failed"
+    );
+    assert_eq!(summary["reason_code"], "oauth_required");
 }
 
 #[test]

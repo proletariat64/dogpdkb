@@ -44,4 +44,16 @@ By default, the executable is at
 `experiments/mdcompare-rust/target/x86_64-unknown-linux-musl/release/mdcomparer`.
 Set `CARGO_TARGET_DIR` to use a different build directory. The binary embeds
 help, the scoring prompt, and the scoring schema. For a local runtime check,
-run `mdcomparer doctor`.
+run `mdcomparer doctor --pretty`.
+
+## Diagnose semantic scoring
+
+```sh
+mdcomparer doctor --config scoring.toml --pretty
+```
+
+The JSON report includes the runtime, configuration source and individual checks.
+The LLM section shows the provider, model, reasoning effort, request budget,
+concurrency and local readiness. Doctor validates transport settings and the
+saved OAuth credential locally. Provider access and inference remain
+`not_checked`. Use `--pretty` to indent the JSON.

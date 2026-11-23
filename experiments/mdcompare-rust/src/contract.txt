@@ -13,7 +13,7 @@ COMMANDS
   route --plan FILE --scores FILE [--config FILE]
   status --plan FILE
   cancel --plan FILE
-  doctor [--config FILE]
+  doctor [--config FILE] [--pretty]
   help all
 
 Use mdcomparer COMMAND --help for the default behavior and exit codes of one
@@ -130,6 +130,11 @@ the plan, then built-ins. Unset fields use built-ins. Paths inside TOML resolve
 from that TOML file. Accepted plans retain the effective settings they consume.
 Explicit settings supplied again must agree with the frozen settings. Route
 selects the current policy on each invocation. Bare doctor checks built-ins.
+Doctor reports its configuration source, runtime, named checks and local LLM
+readiness. It validates model support, transport configuration and any required
+or explicitly configured saved OAuth credential. It sends no provider requests
+and never refreshes credentials. Inference is reported as not_checked.
+Doctor --pretty indents the same JSON object.
 
   [compare]
   max_file_bytes = 16777216

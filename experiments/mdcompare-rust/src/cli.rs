@@ -106,6 +106,9 @@ pub(crate) enum Command {
     Doctor {
         #[command(flatten)]
         settings: Config,
+        /// Indent the diagnostic JSON for reading in a terminal.
+        #[arg(long)]
+        pretty: bool,
     },
     /// Read the complete offline contract.
     #[command(after_help = help::HELP)]

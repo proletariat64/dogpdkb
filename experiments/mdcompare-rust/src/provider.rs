@@ -219,8 +219,24 @@ pub fn check_oauth_settings(
     if settings.endpoint()?.is_some() {
         return Ok(false);
     }
+    oauth_expired(settings, model.backend)
+}
+
+pub(crate) fn check_model(name: &str, effort: &str) -> Result<&'static str, &'static str> {
+    model(name, effort).map(|model| model.backend.name())
+}
+
+pub(crate) fn check_saved_oauth(
+    name: &str,
+    effort: &str,
+    settings: &Connection,
+) -> Result<bool, &'static str> {
+    oauth_expired(settings, model(name, effort)?.backend)
+}
+
+fn oauth_expired(settings: &Connection, backend: Backend) -> Result<bool, &'static str> {
     let auth = auth_json(&settings.auth_path()?)?;
-    Ok(expired(credential(&auth, model.backend)?))
+    Ok(expired(credential(&auth, backend)?))
 }
 
 struct AuthLock {

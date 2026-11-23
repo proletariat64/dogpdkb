@@ -88,7 +88,7 @@ fn run(command: Command, progress: &Progress) -> Result<Outcome> {
         } => semantic_route::run(&work.plan, &scores, settings.config.as_deref()),
         Command::Status { work } => status(&work.plan).context("read work status"),
         Command::Cancel { work } => semantic_score::cancel(&work.plan),
-        Command::Doctor { settings } => doctor::run(settings.config.as_deref()),
+        Command::Doctor { settings, .. } => Ok(doctor::run(settings.config.as_deref())),
         Command::Help { .. } => unreachable!("help was dispatched before business commands"),
     }
 }
@@ -134,12 +134,13 @@ fn main() -> ExitCode {
     }
 
     let name = cli.command.name();
+    let pretty = matches!(cli.command, Command::Doctor { pretty: true, .. });
     let (progress, heartbeat) = Progress::start(name);
     let outcome =
         run(cli.command, &progress).unwrap_or_else(|error| summary::failure(name, &error));
     drop(heartbeat);
     progress.finish(&outcome.summary);
-    if outcome.summary.print().is_err() {
+    if outcome.summary.print(pretty).is_err() {
         let _ = writeln!(io::stderr(), "Failed to write the final summary.");
         return ExitCode::FAILURE;
     }

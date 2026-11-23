@@ -21,7 +21,7 @@ Rust 是独立的原生重写，本规格定义完整公开契约。所有命令
 | `mdcomparer route --plan work.json --scores FILE [--config FILE]` | 基于已完成的正文比较和已绑定评分生成离线路由。支持本工具评分及符合契约的外部评分。 |
 | `mdcomparer status --plan FILE` | 只读查询比较或评分工作区状态及已发布产物。 |
 | `mdcomparer cancel --plan score.json` | 记录评分取消意图，停止新请求，允许已发请求在原期限内结算。 |
-| `mdcomparer doctor [--config FILE]` | 检查配置、本地能力及配置指定的评分凭据。 |
+| `mdcomparer doctor [--config FILE] [--pretty]` | 报告运行环境和本地诊断明细，包含语义评分模型、预算、并发、传输和已保存的 OAuth 状态。在线推理标为 `not_checked`。`--pretty` 缩进输出同一 JSON 对象。 |
 | `mdcomparer --help`、`mdcomparer COMMAND --help`、`mdcomparer help all`、`mdcomparer --version` | 内嵌英文帮助和版本，不访问配置、工作区或网络。 |
 
 表中命令和参数构成新 Rust 二进制的完整公开接口。旧命令 `compare`、`knowledge`、`catalog`、`semantic` 迁移为 `run --plan` 配合工作单的 `operation`，`semantic-score` 和 `semantic-route` 分别迁移为 `score` 和 `route`。新二进制拒绝旧命令、旧参数和兼容别名，返回用法错误 64。
