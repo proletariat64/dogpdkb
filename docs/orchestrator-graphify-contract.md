@@ -28,14 +28,15 @@ a complete existing whitelist is not duplicated. No Git rules means no write or
 new permission requirement. A per-file lock serializes concurrent books, and
 updates use a same-directory temporary file plus atomic replacement. Complete
 whitelists require no lock or write. Linked worktrees resolve `info/exclude`
-through Git. Git ignore probes handle BOMs and first-column comments, skip
-non-regular or symlinked sources, preserve non-UTF-8 path bytes, and clear
-repository-selection environment overrides. Non-regular `.graphifyignore`
-destinations are rejected before reading. Corpus paths containing pattern syntax
-or line breaks are rejected before modification, as
-are symlinked ignore files that require an update. This
-small scope guard is orchestrator-owned input selection; Graphify still owns
-pattern evaluation and scanning.
+through the long-supported `git rev-parse --git-path` form, resolving relative
+output against the selected worktree. Git ignore probes handle BOMs and
+first-column comments, skip non-regular or symlinked sources, preserve non-UTF-8
+path bytes, and clear repository-selection environment overrides. Non-regular
+`.graphifyignore` destinations are rejected before reading. Corpus paths
+containing pattern syntax or line breaks are rejected before modification, as are
+symlinked ignore files that require an update. This small scope guard is
+orchestrator-owned input selection; Graphify still owns pattern evaluation and
+scanning.
 
 Graphify's manifest and cache decide which sources need work. The orchestrator
 uses its workflow state to suppress a new directory dispatch when it would

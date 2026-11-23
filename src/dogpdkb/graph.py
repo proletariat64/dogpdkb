@@ -111,7 +111,6 @@ def _git_info_exclude(root):
                 "-C",
                 str(root),
                 "rev-parse",
-                "--path-format=absolute",
                 "--git-path",
                 "info/exclude",
             ],
@@ -129,7 +128,8 @@ def _git_info_exclude(root):
     if result.returncode:
         raise ValueError("cannot resolve the Git worktree exclude file")
     output = result.stdout.removesuffix(b"\n").removesuffix(b"\r")
-    return Path(os.fsdecode(output))
+    path = Path(os.fsdecode(output))
+    return path if path.is_absolute() else root / path
 
 
 def _missing_whitelist(path, rules):

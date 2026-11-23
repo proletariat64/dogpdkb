@@ -524,6 +524,22 @@ def test_git_ignore_probe_uses_lf_and_significant_whitespace(tmp_path):
     assert (tmp_path / ".graphifyignore").is_file()
 
 
+def test_git_exclude_relative_output_uses_worktree_root(tmp_path, monkeypatch):
+    (tmp_path / ".git").write_text("gitdir: /unused\n")
+    calls = []
+
+    def resolved(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            command, 0, stdout=b"../shared/info/exclude\n"
+        )
+
+    monkeypatch.setattr("dogpdkb.graph.subprocess.run", resolved)
+    result = _git_info_exclude(tmp_path)
+    assert result == tmp_path / "../shared/info/exclude"
+    assert "--path-format=absolute" not in calls[0]
+
+
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):
     config, manifest, source = fixture(tmp_path, title="Cafe\u0301")
     result = cli(config, manifest)
