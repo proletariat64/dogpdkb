@@ -94,8 +94,16 @@ impl Default for RouteConfig {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum Scope {
+    Comparison,
+    Score,
+    Route,
+    Doctor,
+}
+
 impl Config {
-    pub fn load(plan: Option<&Path>, explicit: Option<&Path>) -> Result<Self> {
+    pub fn load(plan: Option<&Path>, explicit: Option<&Path>, scope: Scope) -> Result<Self> {
         let fallback = plan.and_then(Path::parent).map(|p| p.join("default.toml"));
         let Some(path) = explicit.or(fallback.as_deref()) else {
             return Ok(Self::default());
@@ -110,50 +118,58 @@ impl Config {
         let mut config: Self =
             toml::from_str(&raw).map_err(|_| anyhow::anyhow!("invalid_config"))?;
         let absolute = std::path::absolute(path).context("invalid_config")?;
-        let directory = absolute.parent().context("invalid_config")?;
-        for path in [&mut config.score.oauth_file, &mut config.score.ca_file]
-            .into_iter()
-            .flatten()
-        {
-            ensure!(!path.as_os_str().is_empty(), "invalid_config");
-            *path = directory.join(&*path);
-            // Resolve existing parents for equivalent relative paths; keep the
-            // credential filename stable so replacement is allowed.
-            let parent = path.parent().context("invalid_config")?;
-            let name = path.file_name().context("invalid_config")?;
-            *path = crate::input::resolved(parent)?.join(name);
+        if matches!(scope, Scope::Score | Scope::Doctor) {
+            let directory = absolute.parent().context("invalid_config")?;
+            for path in [&mut config.score.oauth_file, &mut config.score.ca_file]
+                .into_iter()
+                .flatten()
+            {
+                ensure!(!path.as_os_str().is_empty(), "invalid_config");
+                *path = directory.join(&*path);
+                // Keep the credential filename stable so rotation is allowed.
+                let parent = path.parent().context("invalid_config")?;
+                let name = path.file_name().context("invalid_config")?;
+                *path = crate::input::resolved(parent)
+                    .context("invalid_config")?
+                    .join(name);
+            }
+            ensure!(
+                (1..=3).contains(&config.score.concurrency),
+                "invalid_config"
+            );
+            ensure!(config.score.max_evidence_bytes > 0, "invalid_config");
+            ensure!(!config.score.model.trim().is_empty(), "invalid_config");
+            ensure!(
+                matches!(
+                    config.score.effort.as_str(),
+                    "low" | "medium" | "high" | "xhigh"
+                ),
+                "invalid_config"
+            );
+        }
+        if matches!(scope, Scope::Comparison | Scope::Doctor) {
+            ensure!(config.compare.max_file_bytes > 0, "invalid_config");
+            ensure!(
+                !config.report.include_body_excerpts || config.report.markdown,
+                "invalid_config"
+            );
+            ensure!(
+                config.report.include_body_excerpts || config.report.max_excerpt_chars.is_none(),
+                "invalid_config"
+            );
+        }
+        if matches!(scope, Scope::Route | Scope::Doctor) {
+            ensure!(
+                (1..=5).contains(&config.route.compile_above),
+                "invalid_config"
+            );
         }
         config.source = Some(absolute);
-        ensure!(config.compare.max_file_bytes > 0, "invalid_config");
-        ensure!(
-            !config.report.include_body_excerpts || config.report.markdown,
-            "invalid_config"
-        );
-        ensure!(
-            config.report.include_body_excerpts || config.report.max_excerpt_chars.is_none(),
-            "invalid_config"
-        );
-        ensure!(
-            (1..=5).contains(&config.route.compile_above),
-            "invalid_config"
-        );
-        ensure!(
-            (1..=3).contains(&config.score.concurrency),
-            "invalid_config"
-        );
-        ensure!(config.score.max_evidence_bytes > 0, "invalid_config");
-        ensure!(!config.score.model.trim().is_empty(), "invalid_config");
-        ensure!(
-            matches!(
-                config.score.effort.as_str(),
-                "low" | "medium" | "high" | "xhigh"
-            ),
-            "invalid_config"
-        );
         Ok(config)
     }
 
-    pub fn comparison(self) -> CompareSettings {
+    pub fn comparison(mut self, strict: bool) -> CompareSettings {
+        self.compare.normalize_line_endings &= strict;
         let mut report = self.report;
         if report.include_body_excerpts {
             report.max_excerpt_chars = Some(report.max_excerpt_chars.unwrap_or(8000));

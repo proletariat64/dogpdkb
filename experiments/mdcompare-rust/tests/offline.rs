@@ -246,3 +246,50 @@ fn catalog_accepts_shared_snapshot_paths_and_rejects_candidate_alias_drift() {
         "input_drift"
     );
 }
+
+#[test]
+fn invalid_nested_snapshot_fields_fail_before_acceptance() {
+    let dir = tempfile::tempdir().unwrap();
+    for (key, value) in [
+        (
+            "resources",
+            json!([{"resource_id":"r","url":123,"unknown_member":true}]),
+        ),
+        (
+            "body_scope",
+            json!({"version":"generated-regions-v1","regions":[{"kind":"mdocr_ocr","start_line":"2","end_line":4}]}),
+        ),
+        (
+            "ocr",
+            json!({"images":[{"resource_id":"r","source_sha256":123}]}),
+        ),
+    ] {
+        let mut incoming = json!({"path":"snapshot.md","content_kind":"raw",
+            "metadata":{"name":"Notes","logical_path":"Notes","source_ref":"notes"}});
+        incoming[key] = value;
+        let plan = dir.path().join("work.json");
+        fs::write(&plan, json!({"schema_version":"mdcompare-work-1","operation":"semantic",
+            "documents":[{"knowledge_base":"book","document_id":"note","baseline":null,"incoming":incoming}]}).to_string()).unwrap();
+        let result = stdout(&invoke(&plan, "accept", &[]), 1);
+        assert_eq!(result["reason_code"], "invalid_input", "{key}");
+        assert!(!dir.path().join("work.mdcompare").exists());
+    }
+}
+
+#[test]
+fn semantic_accepts_shared_strict_configuration_without_using_score() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan = dir.path().join("work.json");
+    fs::write(
+        &plan,
+        r#"{"schema_version":"mdcompare-work-1","operation":"semantic","documents":[]}"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("default.toml"),
+        "[compare]\nnormalize_line_endings=true\n[score]\nconcurrency=7\noauth_file=\"\"\n",
+    )
+    .unwrap();
+    let result = stdout(&invoke(&plan, "run", &[]), 0);
+    assert_eq!(result["state"], "complete");
+}

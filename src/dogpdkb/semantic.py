@@ -12,7 +12,7 @@ class SemanticArtifactError(ValueError):
     """The public semantic evidence cannot authorize a product decision."""
 
 
-def freeze_recovery(source, directory):
+def freeze_recovery(source, directory, *, scope=None):
     """Freeze the explicit contract once; resumed plans never read live config."""
     target = directory / "recovery.json"
     if target.exists():
@@ -30,12 +30,23 @@ def freeze_recovery(source, directory):
         raise SemanticArtifactError("invalid body recovery manifest")
     directory.mkdir(parents=True, exist_ok=True)
     documents, dependencies = [], []
-    for index, record in enumerate(payload["documents"]):
-        if (
-            not isinstance(record, dict)
-            or not isinstance(record.get("source_copy"), str)
-            or not record["source_copy"]
-        ):
+    for record in payload["documents"]:
+        if not isinstance(record, dict):
+            raise SemanticArtifactError("invalid body recovery document")
+        identity = (
+            record.get("knowledge_base"),
+            record.get("document_id"),
+            record.get("side"),
+        )
+        if scope is not None:
+            if any(
+                not isinstance(field, str) or not field for field in identity
+            ) or identity[2] not in {"baseline", "incoming"}:
+                raise SemanticArtifactError("invalid body recovery identity or side")
+            if identity not in scope:
+                continue
+        index = len(documents)
+        if not isinstance(record.get("source_copy"), str) or not record["source_copy"]:
             raise SemanticArtifactError("invalid body recovery source_copy")
         original = source.parent / record["source_copy"]
         frozen, witness = (
@@ -50,6 +61,8 @@ def freeze_recovery(source, directory):
         dependencies.append(
             {"path": frozen.name, "witness": witness.name, "available": available}
         )
+    if scope is not None and not documents:
+        return None
     atomic_json(target, {**payload, "documents": documents})
     shutil.copyfile(target, directory / "recovery.witness.json")
     atomic_json(directory / "dependencies.json", dependencies)

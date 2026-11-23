@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, Scope};
 use crate::input::{check_output, json_bytes, parse_utf8_json};
 use crate::summary::{Outcome, Summary};
 use crate::workspace::{self, Workspace, checksum};
@@ -218,7 +218,7 @@ fn owned_dir(path: &Path) -> Result<()> {
 pub fn run(plan: &Path, score_path: &Path, config: Option<&Path>) -> Result<Outcome> {
     let workspace = Workspace::locate(plan)?;
     let frozen = workspace::load_frozen(&workspace)?;
-    let config = Config::load(Some(&workspace.source), config)?;
+    let config = Config::load(Some(&workspace.source), config, Scope::Route)?;
     let generation = load(&workspace)?;
     let (bytes, stamp) = crate::input::read(score_path, 16 * 1024 * 1024)
         .map_err(anyhow::Error::msg)

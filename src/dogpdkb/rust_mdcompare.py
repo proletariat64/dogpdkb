@@ -69,7 +69,11 @@ def _invoke(settings, run, command, plan, *arguments, configured=True):
         not isinstance(summary, dict)
         or summary.get("schema_version") != "mdcompare-summary-1"
         or summary.get("command") != command
-        or summary.get("state") != ("partial" if code == 2 else "complete")
+        or (
+            summary.get("state") not in {"partial", "complete"}
+            if command == "status"
+            else summary.get("state") != ("partial" if code == 2 else "complete")
+        )
         or not isinstance(summary.get("artifacts"), dict)
     ):
         raise ValueError("invalid mdcompare final summary")
@@ -205,7 +209,8 @@ def verify_semantic_commit(witness):
         or commit.get("plan_sha256") != _digest(_bound_file(root, "plan.json"))
     ):
         raise ValueError("frozen mdcompare comparison changed")
-    contents = _comparison_files(root, commit.get("artifacts"), semantic=True)
+    hashes = commit.get("artifacts")
+    contents = _comparison_files(root, hashes, semantic=True)
     index = _object(json.loads(contents["diff-index.json"]))
     if (
         index.get("schema_version") != "mdcompare-diff-index-1"
@@ -220,6 +225,28 @@ def verify_semantic_commit(witness):
             raise ValueError("invalid frozen mdcompare evidence path")
         if _digest(_bound_file(root, relative)) != document.get("sha256"):
             raise ValueError("frozen mdcompare evidence changed")
+
+    result = _object(json.loads(contents["result.json"]))
+    state = result.get("state")
+    plan = root.with_suffix(".json")
+    frozen = _object(json.loads(_bound_file(root, "plan.json")))
+    if (
+        frozen.get("source") != str(plan)
+        or frozen.get("source_sha256") != _digest(_bound_file(root.parent, plan.name))
+        or result.get("schema_version") != "mdcompare-semantic-result-1"
+        or state not in {"complete", "partial"}
+    ):
+        raise ValueError("invalid frozen mdcompare comparison")
+    return Comparison(
+        plan,
+        marker,
+        root / "result.json",
+        root / "diff-index.json",
+        witness["sha256"],
+        hashes,
+        2 if state == "partial" else 0,
+        result,
+    )
 
 
 def score_enabled(settings):
@@ -250,10 +277,14 @@ def score_plan(path, comparison, book_key, identifiers):
     )
 
 
-def score(settings, run, plan, comparison, book_key, identifiers):
+def score(settings, run, plan, comparison, book_key, identifiers, *, recover=False):
     root = plan.with_suffix(".mdcompare")
     result = root / "result.json"
-    code, summary = _invoke(settings, run, "score", plan)
+    if recover:
+        _, summary = _invoke(settings, run, "status", plan, configured=False)
+        code = 2 if summary["state"] == "partial" else 0
+    else:
+        code, summary = _invoke(settings, run, "score", plan)
     _artifact(summary, result, "result")
     result_bytes = _bound_file(root, "result.json")
     journal_bytes = _bound_file(root, "journal.json")
@@ -399,23 +430,22 @@ def route(settings, run, comparison, score_result, expected_scores):
     ).encode()
     if path.parent.name != _digest(binding):
         raise ValueError("mdcompare route policy digest mismatch")
-    for old, new in zip(comparison.payload["results"], route["results"]):
+    for old, row in zip(comparison.payload["results"], route["results"]):
+        new = _object(row)
         score, ambiguous = expected_scores.get(old["document_id"], (None, None))
-        action, reason = old["action"], "DETERMINISTIC_ROUTE"
-        if score is not None:
-            if score > threshold:
-                reason = "SCORE_ABOVE_THRESHOLD"
-            elif ambiguous and intercept:
-                reason = "SCORE_SKIP_AMBIGUITY_INTERCEPTED"
-            else:
-                action, reason = "SKIP", "SCORE_AT_OR_BELOW_THRESHOLD"
-        if new != {
-            **old,
-            "action": action,
-            "original_action": old["action"],
-            "routing_reason": reason,
-            "score": score,
-            "ambiguous": ambiguous,
-        }:
+        scored = score is not None
+        allowed_to_skip = (
+            scored and score <= threshold and not (ambiguous and intercept)
+        )
+        expected_action = "SKIP" if allowed_to_skip else old["action"]
+        if (
+            any(new.get(key) != value for key, value in old.items() if key != "action")
+            or new.get("original_action") != old["action"]
+            or new.get("score") != score
+            or new.get("ambiguous") != ambiguous
+            or new.get("action") != expected_action
+            or not isinstance(new.get("routing_reason"), str)
+            or not new["routing_reason"]
+        ):
             raise ValueError("mdcompare route changed deterministic evidence")
     return path, {**comparison.payload, "results": route["results"]}

@@ -205,6 +205,10 @@ fn connection(settings: &Connection) -> Result<Client, &'static str> {
     builder.build().map_err(|_| "proxy_unavailable")
 }
 
+pub fn check_transport_settings(settings: &Connection) -> Result<(), &'static str> {
+    connection(settings).map(drop)
+}
+
 pub fn check_oauth_settings(
     name: &str,
     effort: &str,

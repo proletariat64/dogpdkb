@@ -1,5 +1,5 @@
 use crate::{
-    config::{Config, ScoreConfig},
+    config::{Config, Scope, ScoreConfig},
     provider::{self, Connection, FORMAT, Outcome as ProviderOutcome, PROMPT},
     score_context::{self, Packet},
     semantic_route,
@@ -238,7 +238,8 @@ fn settings(config: &ScoreConfig) -> Connection {
 }
 
 fn score_config(workspace: &Workspace, explicit: Option<&Path>) -> Result<Config> {
-    let config = Config::load(Some(&workspace.source), explicit).context("invalid_config")?;
+    let config =
+        Config::load(Some(&workspace.source), explicit, Scope::Score).context("invalid_config")?;
     ensure!(config.score.request_budget.is_some(), "invalid_config");
     Ok(config)
 }
