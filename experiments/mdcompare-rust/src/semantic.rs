@@ -1,7 +1,8 @@
+use crate::{offline::Snapshots, summary::Progress};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf, absolute};
 
 use anyhow::{Context, Result, ensure};
@@ -9,10 +10,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::input::{
-    Document, Identity, MANIFEST_LIMIT, Reader, check_output, json_bytes, load, parse_json,
-    publish, referenced_paths,
-};
+use crate::input::{Document, Identity, MANIFEST_LIMIT, Reader, json_bytes, parse_utf8_json};
 use crate::knowledge::extract_document_units;
 use crate::knowledge_units::{Alignment, Unit, align_units, source_lines};
 use crate::text::Options;
@@ -62,7 +60,7 @@ fn load_recovery(path: Option<&Path>, reader: &mut Reader) -> Result<Recovery> {
     let bytes = reader
         .read_with_limit(path, MANIFEST_LIMIT)
         .map_err(|_| anyhow::anyhow!(INVALID))?;
-    let value = parse_json(&bytes).map_err(|_| anyhow::anyhow!(INVALID))?;
+    let value = parse_utf8_json(&bytes).map_err(|_| anyhow::anyhow!(INVALID))?;
     ensure!(
         value["schema_version"] == "mdcompare-body-recovery-1",
         INVALID
@@ -134,11 +132,7 @@ fn repair<'a>(
             || !source_lines(text, false).all(|line| {
                 matches!(
                     line,
-                    "" | "<!-- mdocr:ocr-begin -->"
-                        | "<!-- mdocr:ocr-end -->"
-                        | "> 转写说明："
-                        | "> **转写说明：**"
-                        | "-->"
+                    "" | "<!-- mdocr:ocr-begin -->" | "<!-- mdocr:ocr-end -->"
                 )
             })
         {
@@ -347,11 +341,12 @@ fn document(
     let mut outcome =
         json!({"knowledge_base":identity.knowledge_base, "document_id":identity.document_id});
     let mut evidence = json!({
+        "schema_version":"mdcompare-diff-evidence-1",
         "knowledge_base": identity.knowledge_base, "document_id": identity.document_id,
         "source_inputs": {"baseline":source(old)?, "incoming":source(Some(new))?},
         "old_units": [], "new_units": [], "changes": [], "recovery": [],
     });
-    reader.begin_document(identity);
+    reader.begin_document();
     let units = (|| {
         let mut before = Vec::new();
         let mut after = Vec::new();
@@ -442,50 +437,34 @@ fn emit(directory: &Path, diff_root: &Path, count: usize, evidence: &Value) -> R
     }))
 }
 
-pub fn run(
-    baseline: &Path,
-    incoming: &Path,
-    output: &Path,
-    diff_output: &Path,
+pub(crate) fn compare_documents(
+    snapshots: &Snapshots,
+    staging: &Path,
     recovery_path: Option<&Path>,
     options: &Options,
-) -> Result<bool> {
-    let mut reader = Reader::new(options.file_bytes);
-    let old = load(baseline, &mut reader, true)?;
-    let new = load(incoming, &mut reader, true)?;
-    let recovery = load_recovery(recovery_path, &mut reader)?;
-    let mut protected = reader.paths().clone();
-    protected.extend([baseline.to_path_buf(), incoming.to_path_buf()]);
-    protected.extend(recovery.values().map(|entry| entry.source_copy.clone()));
-    protected.extend(old.values().chain(new.values()).flat_map(referenced_paths));
-    check_output(output, protected.iter().map(PathBuf::as_path))?;
-    check_output(diff_output, protected.iter().map(PathBuf::as_path))?;
-    check_output(diff_output, [output])?;
-
-    let diff_path = absolute(diff_output)?;
-    let diff_root = diff_path.parent().context("REPORT_WRITE_FAILED")?;
-    let stem = diff_output
-        .file_stem()
-        .context("REPORT_WRITE_FAILED")?
-        .to_string_lossy();
-    let directory = tempfile::Builder::new()
-        .prefix(&format!("{stem}-evidence-"))
-        .tempdir_in(diff_root)
-        .context("REPORT_WRITE_FAILED")?;
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-        .context("REPORT_WRITE_FAILED")?;
-
+    reader: &mut Reader,
+    progress: &Progress,
+) -> Result<()> {
+    let Snapshots {
+        baseline: old,
+        incoming: new,
+        order,
+    } = snapshots;
+    let recovery = load_recovery(recovery_path, reader)?;
+    let directory = staging.join("evidence");
+    fs::DirBuilder::new().mode(0o700).create(&directory)?;
     let (mut results, mut documents) = (Vec::new(), Vec::new());
     let mut statuses = BTreeMap::<String, usize>::new();
     let mut actions = BTreeMap::<String, usize>::new();
-    for (identity, incoming_doc) in &new {
+    for identity in order.iter().filter(|id| new.contains_key(*id)) {
+        let incoming_doc = &new[identity];
         let (outcome, evidence) = document(
             identity,
             old.get(identity),
             incoming_doc,
             &recovery,
             options,
-            &mut reader,
+            reader,
         )?;
         *statuses
             .entry(
@@ -504,24 +483,12 @@ pub fn run(
             )
             .or_default() += 1;
         results.push(outcome);
-        documents.push(emit(
-            directory.path(),
-            diff_root,
-            documents.len(),
-            &evidence,
-        )?);
+        documents.push(emit(&directory, staging, documents.len(), &evidence)?);
+        progress.update("compare", results.len(), new.len(), 0, 0);
     }
-    ensure!(reader.changed_paths().is_empty(), "INPUT_CHANGED");
-    protected.extend(reader.paths().iter().cloned());
-    let protected: BTreeSet<_> = protected
-        .into_iter()
-        .map(absolute)
-        .collect::<std::io::Result<_>>()?;
-    // Validate the expanded set as semantic body reads may resolve aliases.
-    check_output(output, protected.iter().map(PathBuf::as_path))?;
-    check_output(diff_output, protected.iter().map(PathBuf::as_path))?;
-    let baseline_only: Vec<_> = old
-        .keys()
+    ensure!(reader.changed_paths().is_empty(), "input_drift");
+    let baseline_only: Vec<_> = order
+        .iter()
         .filter(|identity| !new.contains_key(*identity))
         .map(|identity| {
             json!({
@@ -531,33 +498,21 @@ pub fn run(
         .collect();
     let complete = !actions.contains_key("DEFER");
     let report = json!({
-        "schema_version":"semantic-1.0", "scope":"authored_body", "results":results,
+        "schema_version":"mdcompare-semantic-result-1", "scope":"authored_body", "results":results,
+        "state":if complete {"complete"} else {"partial"}, "baseline_only":baseline_only,
         "rules":{
             "version":"authored-body-v1", "equivalence":"paired_contextual_sequence_equality",
             "uncertainty":"COMPILE", "images_and_ocr":"ADVISORY_ONLY", "model":"NONE",
         },
-        "summary":{
-            "total":results.len(), "statuses":statuses, "actions":actions,
-            "baseline_only_advisory":baseline_only,
-        },
+        "counts":{"total":results.len(), "statuses":statuses, "actions":actions},
     });
-    let mut sources = json!({
-        "baseline_manifest":absolute(baseline)?, "incoming_manifest":absolute(incoming)?,
-    });
-    if let Some(path) = recovery_path {
-        sources["recovery_manifest"] = json!(absolute(path)?);
-    }
     let report_bytes = json_bytes(&report)?;
     let index = json!({
-        "schema_version":"mdcompare-semantic-diff-1","sources":sources,
+        "schema_version":"mdcompare-diff-index-1",
         "evidence_complete":complete,"coordinate_system":"original_source_lines",
-        "documents":documents, "evidence_directory":directory.path().file_name().expect("generated directory").to_string_lossy(),
-        "protected_inputs":protected, "report_sha256":format!("{:x}", Sha256::digest(&report_bytes)),
+        "documents":documents, "evidence_directory":"evidence",
+        "report_sha256":format!("{:x}", Sha256::digest(&report_bytes)),
     });
-    publish(&[
-        (output.to_owned(), report_bytes),
-        (diff_output.to_owned(), json_bytes(&index)?),
-    ])?;
-    let _ = directory.keep();
-    Ok(complete)
+    crate::workspace::atomic_write(&staging.join("result.json"), &report_bytes)?;
+    crate::workspace::atomic_write(&staging.join("diff-index.json"), &json_bytes(&index)?)
 }

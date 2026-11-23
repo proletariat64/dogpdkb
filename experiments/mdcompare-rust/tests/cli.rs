@@ -1,0 +1,89 @@
+use std::process::{Command, Output};
+
+fn run(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_mdcompare"))
+        .env_clear()
+        .args(args)
+        .output()
+        .expect("execute mdcompare")
+}
+
+#[test]
+fn help_grows_from_workflow_to_command_to_full_contract() {
+    let root = run(&["--help"]);
+    let run_help = run(&["run", "--help"]);
+    let full = run(&["help", "all"]);
+    for output in [&root, &run_help, &full] {
+        assert!(output.status.success(), "{:?}", output);
+        assert!(output.stderr.is_empty());
+    }
+    let root = String::from_utf8(root.stdout).unwrap();
+    let run_help = String::from_utf8(run_help.stdout).unwrap();
+    let full = String::from_utf8(full.stdout).unwrap();
+    assert!(root.contains("mdcompare draft"));
+    assert!(root.contains("mdcompare run --plan"));
+    assert!(run_help.contains("--config"));
+    assert!(run_help.contains("Exit codes"));
+    assert!(full.contains("mdcompare-work-1"));
+    assert!(full.contains("mdcompare-summary-1"));
+    assert!(full.contains("mdcompare-score-work-1"));
+    assert!(!root.contains("mdcompare-score-work-1"));
+}
+
+#[test]
+fn removed_commands_and_options_are_usage_errors() {
+    for args in [
+        vec!["compare"],
+        vec!["knowledge"],
+        vec!["semantic"],
+        vec!["catalog"],
+        vec!["semantic-score"],
+        vec!["semantic-route"],
+        vec![
+            "run",
+            "--plan",
+            "work.json",
+            "--baseline",
+            "PRIVATE-MARKDOWN",
+        ],
+        vec!["run", "--help", "--full"],
+        vec!["doctor", "--mode", "offline"],
+    ] {
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(64), "{args:?} {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("mdcompare --help"), "{args:?}");
+        assert!(!stderr.contains("PRIVATE-MARKDOWN"));
+    }
+}
+
+#[test]
+fn doctor_reports_summary_and_progress_under_an_empty_environment() {
+    let output = run(&["doctor"]);
+    assert!(output.status.success(), "{output:?}");
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["schema_version"], "mdcompare-summary-1");
+    assert_eq!(summary["command"], "doctor");
+    assert_eq!(summary["state"], "complete");
+    assert!(summary["reason_code"].is_null());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("timestamp_ms="));
+    assert!(stderr.contains("command=doctor event=progress"));
+    assert!(stderr.contains("command=doctor event=finish"));
+    assert!(stderr.contains("reason=complete"));
+}
+
+#[test]
+fn invalid_doctor_configuration_does_not_leak_contents() {
+    let directory = tempfile::tempdir().unwrap();
+    let bad_config = directory.path().join("bad.toml");
+    std::fs::write(&bad_config, "private_token = SECRET-MUST-NOT-LEAK").unwrap();
+    let output = run(&["doctor", "--config", bad_config.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["state"], "error");
+    assert_eq!(summary["reason_code"], "invalid_config");
+    assert!(!String::from_utf8(output.stdout).unwrap().contains("SECRET"));
+    assert!(!String::from_utf8(output.stderr).unwrap().contains("SECRET"));
+}

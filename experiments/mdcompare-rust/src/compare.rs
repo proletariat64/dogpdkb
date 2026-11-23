@@ -1,9 +1,9 @@
-use crate::input::{self, Document, Identity, Reader};
+use crate::input::{Document, Identity, Reader};
 use crate::{ocr, resources, text};
+use crate::{offline::Snapshots, summary::Progress};
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
 
 const ACTIONS: [&str; 6] = [
     "SKIP_VERIFIED",
@@ -15,7 +15,7 @@ const ACTIONS: [&str; 6] = [
 ];
 
 fn metadata(old: Option<&Document>, new: &Document) -> Value {
-    let fields: Vec<_> = input::METADATA_KEYS
+    let fields: Vec<_> = crate::input::METADATA_KEYS
         .into_iter()
         .filter(|k| old.is_some_and(|old| old.metadata[*k] != new.metadata[*k]))
         .collect();
@@ -101,11 +101,11 @@ fn reasons(value: &Value) -> impl Iterator<Item = &str> {
         .filter_map(Value::as_str)
 }
 
-fn render(report: &Value) -> Result<Vec<u8>> {
+pub(crate) fn render(report: &Value) -> Result<Vec<u8>> {
     use std::fmt::Write;
     let mut output = format!(
         "# mdcompare report\n\nDocuments: {}\n\n",
-        report["summary"]["total"]
+        report["counts"]["total"]
     );
     for row in report["results"].as_array().expect("report rows") {
         let string = |key: &str| row[key].as_str().expect("report string");
@@ -144,20 +144,22 @@ fn render(report: &Value) -> Result<Vec<u8>> {
     Ok(output.into_bytes())
 }
 
-pub fn run(
-    baseline: &Path,
-    incoming: &Path,
-    output: &Path,
-    report_path: Option<&Path>,
+pub(crate) fn compare_documents(
+    snapshots: &Snapshots,
     opts: &text::Options,
-) -> Result<bool> {
-    let mut reader = Reader::new(opts.file_bytes);
-    let old = input::load(baseline, &mut reader, false)?;
-    let new = input::load(incoming, &mut reader, false)?;
+    reader: &mut Reader,
+    progress: &Progress,
+) -> Result<Value> {
+    let Snapshots {
+        baseline: old,
+        incoming: new,
+        order,
+    } = snapshots;
     let mut errors = BTreeSet::new();
     let mut results = Vec::new();
-    for (id, right) in &new {
-        reader.begin_document(id);
+    for id in order.iter().filter(|id| new.contains_key(*id)) {
+        let right = &new[id];
+        reader.begin_document();
         let left = old.get(id);
         let metadata = metadata(left, right);
         let mut resources = json!({"status":"UNKNOWN","reason_codes":[],"items":[],
@@ -179,8 +181,8 @@ pub fn run(
                 let before = before.as_deref();
                 let mut value = text::compare(before, &after, opts);
                 historical(&mut value, left, right, before, &after);
-                resources = resources::compare(left, right, before, Some(&after), &mut reader);
-                ocr = ocr::compare(left, right, &resources, &mut reader);
+                resources = resources::compare(left, right, before, Some(&after), reader);
+                ocr = ocr::compare(left, right, &resources, reader);
                 value
             }
         };
@@ -195,27 +197,13 @@ pub fn run(
                 "metadata":metadata,"text":text,"resources":resources,"ocr":ocr,
                 "action":action,"reason_codes":codes}),
         ));
+        progress.update("compare", results.len(), new.len(), 0, 0);
     }
 
-    let changed = reader.changed_paths();
-    ensure!(
-        !changed.contains(&std::path::absolute(baseline)?)
-            && !changed.contains(&std::path::absolute(incoming)?),
-        "MANIFEST_CHANGED"
-    );
-    let affected = reader.affected_documents(&changed);
-    let mut actions = BTreeMap::from(ACTIONS.map(|a| (a, 0usize)));
+    ensure!(reader.changed_paths().is_empty(), "input_drift");
+    let mut actions = BTreeMap::from(ACTIONS.map(|action| (action, 0usize)));
     let mut rows = Vec::with_capacity(results.len());
-    for (id, mut row) in results {
-        if affected.contains(id) {
-            row["action"] = json!("UNKNOWN");
-            row["reason_codes"] = json!(
-                reasons(&row)
-                    .chain(["INPUT_CHANGED"])
-                    .collect::<BTreeSet<_>>()
-            );
-            errors.insert((id, "INPUT_CHANGED"));
-        }
+    for (_, row) in results {
         *actions
             .get_mut(row["action"].as_str().expect("action string"))
             .expect("known action") += 1;
@@ -227,8 +215,8 @@ pub fn run(
     } else {
         json!([{"name":"identity","version":"1"}])
     };
-    let absent: Vec<_> = old
-        .keys()
+    let absent: Vec<_> = order
+        .iter()
         .filter(|id| !new.contains_key(*id))
         .map(identity)
         .collect();
@@ -240,28 +228,9 @@ pub fn run(
             })
         })
         .collect();
-    let report = json!({"schema_version":"1.0","rules":rules,"results":rows,"baseline_only":absent,
-        "summary":{"total":rows.len(),"actions":actions},"errors":errors});
-    let protected: Vec<PathBuf> = old
-        .values()
-        .chain(new.values())
-        .flat_map(input::referenced_paths)
-        .collect();
-    let mut outputs = Vec::new();
-    if let Some(path) = report_path {
-        outputs.push((path.to_owned(), render(&report)?));
-    }
-    outputs.push((output.to_owned(), input::json_bytes(&report)?));
-    for (path, _) in &outputs {
-        input::check_output(
-            path,
-            reader
-                .paths()
-                .iter()
-                .chain(&protected)
-                .map(PathBuf::as_path),
-        )?;
-    }
-    input::publish(&outputs)?;
-    Ok(complete)
+    Ok(json!({
+        "schema_version":"mdcompare-strict-result-1","rules":rules,"results":rows,
+        "state":if complete {"complete"} else {"partial"},
+        "baseline_only":absent,"counts":{"total":rows.len(),"actions":actions},"errors":errors,
+    }))
 }

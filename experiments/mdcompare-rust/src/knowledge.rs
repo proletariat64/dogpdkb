@@ -1,10 +1,10 @@
+use crate::{offline::Snapshots, summary::Progress};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::{Path, PathBuf};
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::input::{Document, Identity, Reader, check_output, load, publish, referenced_paths};
+use crate::input::{Document, Identity, Reader};
 use crate::knowledge_units::{
     KINDS, Unit, align_units, extract_units, prose_key, source_lines, table_key,
 };
@@ -54,7 +54,7 @@ pub fn extract_document_units(document: &Document, text: &str) -> Result<Vec<Uni
 }
 
 fn read_units(document: &Document, reader: &mut Reader) -> Result<Vec<Unit>, &'static str> {
-    reader.begin_document(&document.identity);
+    reader.begin_document();
     let data = reader.read(&document.path)?;
     let text = std::str::from_utf8(&data).map_err(|_| "TEXT_ENCODING_UNSUPPORTED")?;
     extract_document_units(document, text)
@@ -371,12 +371,17 @@ fn excerpt(text: &str, limit: usize) -> (&str, usize) {
     (text, length)
 }
 
-fn compare_documents(
-    baseline: &BTreeMap<Identity, Document>,
-    incoming: &BTreeMap<Identity, Document>,
+pub(crate) fn compare_documents(
+    snapshots: &Snapshots,
     options: &Options,
     reader: &mut Reader,
+    progress: &Progress,
 ) -> Value {
+    let Snapshots {
+        baseline,
+        incoming,
+        order,
+    } = snapshots;
     let mut old_units = BTreeMap::new();
     let mut failed = BTreeMap::new();
     let mut index = UnitIndex::new();
@@ -404,8 +409,8 @@ fn compare_documents(
     let mut results = Vec::new();
     for (identity, document) in incoming {
         let old = baseline.get(identity);
-        let historical = document.content_kind() == "historical_enriched"
-            || old.is_some_and(|doc| doc.content_kind() == "historical_enriched");
+        let historical = document.content_kind() == "enriched"
+            || old.is_some_and(|doc| doc.content_kind() == "enriched");
         let mut row = json!({
             "knowledge_base": identity.knowledge_base, "document_id": identity.document_id,
             "status":"UNKNOWN","counts":zero_counts(&KINDS),"units":[],"reason_codes":[],
@@ -441,6 +446,7 @@ fn compare_documents(
             }
         }
         results.push(row);
+        progress.update("compare", results.len(), incoming.len(), 0, 0);
     }
     if !reader.changed_paths().is_empty() {
         for row in &mut results {
@@ -503,13 +509,34 @@ fn compare_documents(
         );
         row["graphify_plan"] = plan;
     }
-    let baseline_only: Vec<_> = baseline
-        .keys()
+    let positions: HashMap<_, _> = order
+        .iter()
+        .enumerate()
+        .map(|(position, identity)| {
+            (
+                (
+                    identity.knowledge_base.as_str(),
+                    identity.document_id.as_str(),
+                ),
+                position,
+            )
+        })
+        .collect();
+    results.sort_by_key(|row| {
+        positions[&(
+            row["knowledge_base"].as_str().unwrap(),
+            row["document_id"].as_str().unwrap(),
+        )]
+    });
+    let complete = statuses["UNKNOWN"] == 0 && statuses["REVIEW"] == 0 && errors.is_empty();
+    let baseline_only: Vec<_> = order
+        .iter()
         .filter(|id| !incoming.contains_key(*id))
         .map(identity_json)
         .collect();
     json!({
-        "schema_version": "knowledge-1.0", "scope":"body_only", "errors":errors,
+        "schema_version": "mdcompare-knowledge-result-1", "scope":"body_only", "errors":errors,
+        "state":if complete {"complete"} else {"partial"},
         "rules":{
             "version": "body-units-v5",
             "reuse": "contextual_normalized_body_equality",
@@ -521,7 +548,7 @@ fn compare_documents(
             "graphify_execution": "plan_only_no_full_document_fallback",
         },
         "results":results, "baseline_only":baseline_only,
-        "summary":{
+        "counts":{
             "total":results.len(),"statuses":statuses,"units":units,
             "graphify_plan":{
                 "actions":actions,"candidate_body_chars":candidate_chars,
@@ -532,39 +559,11 @@ fn compare_documents(
     })
 }
 
-fn compact_evidence(value: &Value) -> String {
-    match value {
-        Value::Object(fields) => format!(
-            "{{{}}}",
-            fields
-                .iter()
-                .map(|(key, value)| format!("'{key}': {}", compact_evidence(value)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Value::Array(items) => format!(
-            "[{}]",
-            items
-                .iter()
-                .map(compact_evidence)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Value::String(value) => format!("'{value}'"),
-        Value::Bool(true) => "True".to_owned(),
-        Value::Bool(false) => "False".to_owned(),
-        Value::Null => "None".to_owned(),
-        Value::Number(number) => number.to_string(),
-    }
-}
-
-fn render(report: &Value) -> Result<Vec<u8>> {
+pub(crate) fn render(report: &Value) -> Result<Vec<u8>> {
     use std::fmt::Write;
     let mut text = format!(
         "# mdcompare body knowledge report\n\nScope: body_only. Images and OCR are excluded; no production writes.\n\nDocuments: {}\n\nUnit counts: {}\n\nGraphify plan (not an extraction queue): {}\n\nCandidates require confirmation. No automatic extraction or full-document fallback; the current Graphify source-replacement API cannot execute these as patches.\n\n",
-        report["summary"]["total"],
-        compact_evidence(&report["summary"]["units"]),
-        compact_evidence(&report["summary"]["graphify_plan"]),
+        report["counts"]["total"], report["counts"]["units"], report["counts"]["graphify_plan"],
     );
     for row in report["results"].as_array().expect("knowledge rows") {
         writeln!(
@@ -573,47 +572,10 @@ fn render(report: &Value) -> Result<Vec<u8>> {
             row["knowledge_base"].as_str().unwrap_or_default(),
             row["document_id"].as_str().unwrap_or_default(),
             row["status"].as_str().unwrap_or_default(),
-            compact_evidence(&row["counts"]),
-            compact_evidence(&row["graphify_plan"]),
+            row["counts"],
+            row["graphify_plan"],
             serde_json::to_string_pretty(&row["units"])?,
         )?;
     }
     Ok(text.into_bytes())
-}
-
-pub fn run(
-    baseline: &Path,
-    incoming: &Path,
-    output: &Path,
-    human: Option<&Path>,
-    options: &Options,
-) -> Result<bool> {
-    let mut reader = Reader::new(options.file_bytes);
-    let old = load(baseline, &mut reader, true)?;
-    let new = load(incoming, &mut reader, true)?;
-    let report = compare_documents(&old, &new, options, &mut reader);
-    let changed = reader.changed_paths();
-    ensure!(
-        !changed.contains(&std::path::absolute(baseline)?)
-            && !changed.contains(&std::path::absolute(incoming)?),
-        "MANIFEST_CHANGED"
-    );
-    let mut protected: HashSet<PathBuf> = reader.paths().clone();
-    protected.extend([baseline.to_owned(), incoming.to_owned()]);
-    protected.extend(old.values().chain(new.values()).flat_map(referenced_paths));
-    check_output(output, protected.iter().map(PathBuf::as_path))?;
-    let mut outputs = Vec::new();
-    if let Some(path) = human {
-        check_output(path, protected.iter().map(PathBuf::as_path))?;
-        check_output(path, [output])?;
-        outputs.push((path.to_owned(), render(&report)?));
-    }
-    let mut encoded = serde_json::to_vec_pretty(&report)?;
-    encoded.push(b'\n');
-    outputs.push((output.to_owned(), encoded));
-    publish(&outputs)?;
-    let summary = &report["summary"]["statuses"];
-    Ok(summary["UNKNOWN"] == 0
-        && summary["REVIEW"] == 0
-        && report["errors"].as_array().is_some_and(Vec::is_empty))
 }
