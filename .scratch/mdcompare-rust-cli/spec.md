@@ -21,7 +21,7 @@ Rust 是独立的原生重写，本规格定义完整公开契约。所有命令
 | `mdcomparer route --plan work.json --scores FILE [--config FILE]` | 基于已完成的正文比较和已绑定评分生成离线路由。支持本工具评分及符合契约的外部评分。 |
 | `mdcomparer status --plan FILE` | 只读查询比较或评分工作区状态及已发布产物。 |
 | `mdcomparer cancel --plan score.json` | 记录评分取消意图，停止新请求，允许已发请求在原期限内结算。 |
-| `mdcomparer doctor [--config FILE] [--pretty]` | 报告运行环境和本地诊断明细，包含语义评分模型、预算、并发、传输和已保存的 OAuth 状态。在线推理标为 `not_checked`。`--pretty` 缩进输出同一 JSON 对象。 |
+| `mdcomparer doctor [--config FILE] [--pretty]` | 报告运行环境、语义评分配置和诊断明细。凭据可用时发一次在线探针，分别报告 provider、OAuth 和模型状态。`--pretty` 缩进输出同一 JSON 对象。 |
 | `mdcomparer --help`、`mdcomparer COMMAND --help`、`mdcomparer help all`、`mdcomparer --version` | 内嵌英文帮助和版本，不访问配置、工作区或网络。 |
 
 表中命令和参数构成新 Rust 二进制的完整公开接口。旧命令 `compare`、`knowledge`、`catalog`、`semantic` 迁移为 `run --plan` 配合工作单的 `operation`，`semantic-score` 和 `semantic-route` 分别迁移为 `score` 和 `route`。新二进制拒绝旧命令、旧参数和兼容别名，返回用法错误 64。
@@ -170,7 +170,7 @@ mdcomparer route --plan work.json --scores score.mdcompare/result.json
 | 3 | 评分处于显式取消状态，继续执行需要 `--resume`。成功写入取消意图的 cancel 本身返回 0。 |
 | 64 | CLI 用法错误。 |
 
-成功读取 status 一律退出 0，所查任务的状态置于 `state`。它不创建目录、不修复 journal、不读取凭据。状态为 `accepted|running|cancel_requested|cancelled|complete|partial`；工作区不存在或绑定无效退出 1。running 以在用执行锁为准，失锁且未终态的任务显示 accepted，并报告 `reason_code=interrupted`；持久取消意图优先。score 终态只要有任一授权行未获有效分数即为 partial、退出 2；空授权为 complete。semantic 有 DEFER 即 partial；可用正文的 UNCERTAIN/COMPILE 本身不导致退出 2。route 成功发布返回 0，逐行保留 DEFER。doctor 仅做本地诊断，发现已配置能力不可用返回 2。
+成功读取 status 一律退出 0，所查任务的状态置于 `state`。它不创建目录、不修复 journal、不读取凭据。状态为 `accepted|running|cancel_requested|cancelled|complete|partial`；工作区不存在或绑定无效退出 1。running 以在用执行锁为准，失锁且未终态的任务显示 accepted，并报告 `reason_code=interrupted`；持久取消意图优先。score 终态只要有任一授权行未获有效分数即为 partial、退出 2；空授权为 complete。semantic 有 DEFER 即 partial；可用正文的 UNCERTAIN/COMPILE 本身不导致退出 2。route 成功发布返回 0，逐行保留 DEFER。doctor 发现已配置能力不可用或探针失败时返回 2。详见 [doctor 在线探针规格](../mdcomparer-doctor-ping/spec.md)。
 
 业务调用 stdout 的公共字段为 `schema_version="mdcompare-summary-1"`、`command`、`state`、`artifacts`（名称到绝对路径）、`counts`（名称到非负整数）和 `reason_code`（正常时 null）。有比较绑定时同时返回 `comparison_sha256`。未产生的产物不列出。工作区查询以外的成功动作可用 complete 表示动作完成；accept 返回 accepted，cancel 返回当前任务状态。评分和评分状态计数分别公开 `selected`、`admitted`、`scored`、`in_flight`，避免把授权数当作已发送数。受控业务失败退出 1 时返回 state=error 及原因，至少区分 `invalid_input`、`invalid_config`、`input_drift`、`binding_invalid`、`workspace_busy`、`publish_failed`、`workspace_missing`。参数解析失败退出 64、stdout 为空。进程被强杀时允许没有最终 JSON，调用方用 status 和已提交产物恢复事实。
 

@@ -5,14 +5,14 @@ use serde_json::{Value, json};
 use crate::{
     config::{Config, Scope},
     provider,
-    summary::{Outcome, Summary},
+    summary::{Outcome, Progress, Summary},
 };
 
 fn check(name: &str, status: &str, reason_code: Option<&str>, hint: Option<&str>) -> Value {
     json!({"name": name, "status": status, "reason_code": reason_code, "hint": hint})
 }
 
-pub(crate) fn run(config: Option<&Path>) -> Outcome {
+pub(crate) fn run(config: Option<&Path>, progress: &Progress) -> Outcome {
     let runtime = json!({
         "version": env!("CARGO_PKG_VERSION"),
         "os": std::env::consts::OS,
@@ -33,7 +33,9 @@ pub(crate) fn run(config: Option<&Path>) -> Outcome {
                 "configuration": configuration,
                 "checks": [check("config", "failed", Some("invalid_config"),
                     Some("Check the TOML file path, syntax, and options."))],
-                "llm": {"status": "not_checked", "inference": "not_checked"},
+                "llm": {"status": "not_checked", "inference": "not_checked",
+                    "provider_status": "not_checked", "oauth_remote_status": "not_checked",
+                    "model_status": "not_checked"},
             }))
             .exit(1);
     };
@@ -83,27 +85,110 @@ pub(crate) fn run(config: Option<&Path>) -> Outcome {
             Ok(false) => check("llm_oauth", "passed", None, None),
             Ok(true) => check(
                 "llm_oauth",
-                "warning",
+                "failed",
                 Some("oauth_expired"),
-                Some("The saved access token has expired. Refresh is only attempted by score."),
+                Some("Refresh the saved OAuth credential before checking the model."),
             ),
             Err(code) => check(
                 "llm_oauth",
                 "failed",
                 Some(code),
-                Some(
-                    "Set [score].oauth_file to a readable credential file with an OAuth entry for this provider.",
-                ),
+                Some(match code {
+                    "oauth_file_unreadable" => {
+                        "Check the path and permissions of [score].oauth_file."
+                    }
+                    "oauth_file_invalid" => "Use a valid OAuth credentials JSON file.",
+                    "oauth_provider_missing" => {
+                        "Log in to the configured provider and set [score].oauth_file to its credential file."
+                    }
+                    "oauth_credential_invalid" => {
+                        "Log in again to replace the invalid credential for this provider."
+                    }
+                    _ => "Set [score].oauth_file to a readable OAuth credentials file.",
+                }),
             ),
         }
     };
     checks.push(oauth);
-    checks.push(check(
-        "llm_inference",
-        "skipped",
-        Some("offline_doctor"),
-        None,
-    ));
+    let skip = if score.request_budget == Some(0) {
+        Some("request_budget_zero")
+    } else if checks.iter().any(|check| check["status"] == "failed") {
+        Some("prerequisites_failed")
+    } else if connection.endpoint.is_none() && connection.oauth_file.is_none() {
+        Some("oauth_not_configured")
+    } else {
+        None
+    };
+    let probe = skip.is_none().then(|| {
+        progress.update("probe", 0, 0, 1, 1);
+        let outcome = provider::probe(&score.model, &score.effort, &connection);
+        progress.update("probe", 0, 0, 1, 0);
+        outcome
+    });
+    let http_status = probe.as_ref().and_then(|outcome| outcome.http_status);
+    let failure = probe.as_ref().and_then(|outcome| {
+        outcome.reason.or_else(|| {
+            outcome
+                .reply
+                .as_deref()
+                .is_none_or(|reply| reply.trim().is_empty())
+                .then_some("incomplete_model_response")
+        })
+    });
+    let inference = if let Some(reason) = skip {
+        checks.push(check("llm_inference", "skipped", Some(reason), None));
+        "not_checked"
+    } else if let Some(reason) = failure {
+        checks.push(check(
+            "llm_inference",
+            "failed",
+            Some(reason),
+            Some(match reason {
+                "oauth_rejected" => "Log in again to the configured provider.",
+                "provider_access_denied" => {
+                    "Check the provider account permissions for this model."
+                }
+                "model_rejected" => "Check model availability for this provider and account.",
+                "rate_limited" => "Check the provider rate limit or quota.",
+                "provider_unavailable" => {
+                    "The endpoint returned a server error. Check the provider status."
+                }
+                "probe_timeout" => {
+                    "The online probe exceeded 20 seconds. Check connectivity and provider latency."
+                }
+                "provider_unreachable" => "Check connectivity, TLS and proxy settings.",
+                "incomplete_model_response" => {
+                    "The model did not finish a nonempty text reply within the probe limits."
+                }
+                _ => "Review the provider, model and local OAuth configuration.",
+            }),
+        ));
+        "failed"
+    } else {
+        checks.push(check("llm_inference", "passed", None, None));
+        "passed"
+    };
+    let provider_status = match (http_status, failure) {
+        (Some(_), _) => "responded",
+        (_, Some("probe_timeout")) => "timeout",
+        (_, Some("provider_unreachable")) => "unreachable",
+        _ => "not_checked",
+    };
+    let oauth_remote_status = if connection.endpoint.is_some() {
+        "not_applicable"
+    } else {
+        match http_status {
+            Some(401) => "rejected",
+            Some(200..=299) => "accepted",
+            _ => "not_verified",
+        }
+    };
+    let model_status = match (inference, failure) {
+        ("passed", _) => "passed",
+        (_, Some("model_rejected")) => "rejected",
+        ("not_checked", _) => "not_checked",
+        _ => "not_verified",
+    };
     let failed = checks
         .iter()
         .filter(|check| check["status"] == "failed")
@@ -122,7 +207,11 @@ pub(crate) fn run(config: Option<&Path>) -> Outcome {
             .find(|check| check["status"] == status)
             .and_then(|check| check["reason_code"].as_str())
     });
-    let status = if failed > 0 {
+    let status = if inference == "passed" {
+        "online"
+    } else if inference == "failed" {
+        "probe_failed"
+    } else if failed > 0 {
         "prerequisites_failed"
     } else if !scoring_enabled {
         if score.request_budget.is_some() {
@@ -139,7 +228,8 @@ pub(crate) fn run(config: Option<&Path>) -> Outcome {
         .count("checks", checks.len() - skipped)
         .count("failed", failed)
         .count("warnings", warnings)
-        .count("skipped", skipped);
+        .count("skipped", skipped)
+        .count("probe_attempts", usize::from(probe.is_some()));
     if let Some(reason) = reason {
         summary = summary.reason(reason);
     }
@@ -159,7 +249,11 @@ pub(crate) fn run(config: Option<&Path>) -> Outcome {
             "oauth_file_configured": connection.oauth_file.is_some(),
             "proxy_configured": connection.proxy.is_some(),
             "ca_file_configured": connection.ca_file.is_some(),
-            "inference": "not_checked",
+            "inference": inference,
+            "provider_status": provider_status,
+            "http_status": http_status,
+            "oauth_remote_status": oauth_remote_status,
+            "model_status": model_status,
         },
         "checks": checks,
     })).exit(if failed == 0 { 0 } else { 2 })

@@ -8,7 +8,7 @@ use std::{
     os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const OPENAI_RESPONSES: &str = "https://api.openai.com/v1/responses";
@@ -231,7 +231,26 @@ pub(crate) fn check_saved_oauth(
     effort: &str,
     settings: &Connection,
 ) -> Result<bool, &'static str> {
-    oauth_expired(settings, model(name, effort)?.backend)
+    Ok(expired(&saved_credential(
+        settings,
+        model(name, effort)?.backend,
+    )?))
+}
+
+fn saved_credential(settings: &Connection, backend: Backend) -> Result<Value, &'static str> {
+    let path = settings.oauth_file.as_deref().ok_or("oauth_required")?;
+    let (bytes, _) = crate::input::read(path, 1024 * 1024).map_err(|_| "oauth_file_unreadable")?;
+    let auth: Value = serde_json::from_slice(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes))
+        .map_err(|_| "oauth_file_invalid")?;
+    if !auth.is_object() {
+        return Err("oauth_file_invalid");
+    }
+    if auth.get(backend.name()).is_none() {
+        return Err("oauth_provider_missing");
+    }
+    credential(&auth, backend)
+        .cloned()
+        .map_err(|_| "oauth_credential_invalid")
 }
 
 fn oauth_expired(settings: &Connection, backend: Backend) -> Result<bool, &'static str> {
@@ -475,7 +494,10 @@ fn completed(
     Ok((reply, tokens))
 }
 
-fn parse_stream(mut reader: impl BufRead) -> Result<(String, Option<u64>), &'static str> {
+fn parse_stream(
+    mut reader: impl BufRead,
+    diagnose: bool,
+) -> Result<(String, Option<u64>), &'static str> {
     let mut line = String::new();
     let mut data = String::new();
     let mut items = BTreeMap::new();
@@ -497,7 +519,20 @@ fn parse_stream(mut reader: impl BufRead) -> Result<(String, Option<u64>), &'sta
                 Some("response.completed" | "response.done" | "response.incomplete") => {
                     return completed(&value, items);
                 }
-                Some("response.failed" | "error") => return Err("unknown_outcome"),
+                Some("response.failed" | "error") => {
+                    if diagnose
+                        && [
+                            &value["code"],
+                            &value["error"]["code"],
+                            &value["response"]["error"]["code"],
+                        ]
+                        .into_iter()
+                        .any(is_model_rejection)
+                    {
+                        return Err("model_rejected");
+                    }
+                    return Err("unknown_outcome");
+                }
                 Some("response.output_item.done") => {
                     let index = value["output_index"].as_u64().ok_or("invalid_response")?;
                     if items.insert(index, value["item"].clone()).is_some() {
@@ -511,16 +546,40 @@ fn parse_stream(mut reader: impl BufRead) -> Result<(String, Option<u64>), &'sta
     }
 }
 
-fn request(model: Model<'_>, packet: &str, settings: &Connection) -> Result<Outcome, &'static str> {
+#[derive(Clone, Copy)]
+enum Purpose<'a> {
+    Score(&'a str),
+    Probe(Duration),
+}
+
+fn request(
+    model: Model<'_>,
+    purpose: Purpose<'_>,
+    settings: &Connection,
+) -> Result<Outcome, &'static str> {
     let client = connection(settings)?;
     let endpoint = settings.endpoint()?;
     let token = if endpoint.is_some() {
         None
     } else {
-        Some(access(&client, model.backend, &settings.auth_path()?)?)
+        Some(match purpose {
+            Purpose::Score(_) => access(&client, model.backend, &settings.auth_path()?)?,
+            Purpose::Probe(_) => {
+                let saved = saved_credential(settings, model.backend)?;
+                if expired(&saved) {
+                    return Err("oauth_expired");
+                }
+                nonempty(&saved["access"])
+                    .ok_or("oauth_credential_invalid")?
+                    .to_owned()
+            }
+        })
     };
-    let format: Value = serde_json::from_str(FORMAT).expect("valid embedded score format");
-    let mut input = vec![json!({"role": "developer", "content": PROMPT})];
+    let (prompt, packet, max_output_tokens) = match purpose {
+        Purpose::Score(packet) => (PROMPT, packet, 4096),
+        Purpose::Probe(_) => ("Reply briefly in plain text.", "PING", 256),
+    };
+    let mut input = vec![json!({"role": "developer", "content": prompt})];
     input.push(json!({
         "role": "user",
         "content": [{"type": "input_text", "text": packet}],
@@ -533,14 +592,16 @@ fn request(model: Model<'_>, packet: &str, settings: &Connection) -> Result<Outc
         "store": false,
         "stream": true,
         "input": input,
-        "max_output_tokens": 4096,
+        "max_output_tokens": max_output_tokens,
         "reasoning": {
             "effort": if model.codex_effort_item { "medium" } else { model.effort },
             "summary": "auto",
         },
         "include": ["reasoning.encrypted_content"],
-        "text": {"format": format},
     });
+    if matches!(purpose, Purpose::Score(_)) {
+        body["text"] = json!({"format": serde_json::from_str::<Value>(FORMAT).expect("valid embedded score format")});
+    }
     let mut request = if let Some(endpoint) = endpoint {
         client.post(endpoint)
     } else {
@@ -565,8 +626,20 @@ fn request(model: Model<'_>, packet: &str, settings: &Connection) -> Result<Outc
         request = request.bearer_auth(token);
     }
     request = request.header("accept", "text/event-stream").json(&body);
-    let response = request.send().map_err(|_| "unknown_outcome")?;
+    let started = Instant::now();
+    if let Purpose::Probe(timeout) = purpose {
+        request = request.timeout(timeout);
+    }
+    let response = request.send().map_err(|error| match purpose {
+        Purpose::Probe(_) if error.is_timeout() => "probe_timeout",
+        Purpose::Probe(_) => "provider_unreachable",
+        Purpose::Score(_) => "unknown_outcome",
+    })?;
     let status = response.status().as_u16();
+    if matches!(purpose, Purpose::Probe(_)) && !(200..=299).contains(&status) {
+        let reason = probe_http_error(status, response);
+        return Ok(Outcome::error(reason, Some(status)));
+    }
     let reason = match status {
         200..=299 => None,
         401 | 403 => Some("auth_error"),
@@ -578,14 +651,25 @@ fn request(model: Model<'_>, packet: &str, settings: &Connection) -> Result<Outc
         return Ok(Outcome::error(reason, Some(status)));
     }
     Ok(
-        match parse_stream(BufReader::new(response.take(RESPONSE_LIMIT))) {
+        match parse_stream(
+            BufReader::new(response.take(RESPONSE_LIMIT)),
+            matches!(purpose, Purpose::Probe(_)),
+        ) {
             Ok((reply, usage)) => Outcome {
                 reply: Some(reply),
                 usage,
-                http_status: None,
+                http_status: Some(status),
                 reason: None,
             },
-            Err(reason) => Outcome::error(reason, Some(status)),
+            Err(reason) => {
+                let reason = match purpose {
+                    Purpose::Probe(timeout) if started.elapsed() >= timeout => "probe_timeout",
+                    Purpose::Probe(_) if reason != "model_rejected" => "incomplete_model_response",
+                    Purpose::Probe(_) => reason,
+                    Purpose::Score(_) => reason,
+                };
+                Outcome::error(reason, Some(status))
+            }
         },
     )
 }
@@ -597,7 +681,37 @@ pub fn assess_with_connection(
     settings: &Connection,
 ) -> Outcome {
     model(name, effort)
-        .and_then(|model| request(model, packet, settings))
+        .and_then(|model| request(model, Purpose::Score(packet), settings))
+        .unwrap_or_else(|reason| Outcome::error(reason, None))
+}
+
+fn probe_http_error(status: u16, response: reqwest::blocking::Response) -> &'static str {
+    match status {
+        401 => "oauth_rejected",
+        403 => "provider_access_denied",
+        429 => "rate_limited",
+        500..=599 => "provider_unavailable",
+        _ => {
+            let error = serde_json::from_reader::<_, Value>(response.take(16 * 1024));
+            if error.is_ok_and(|value| is_model_rejection(&value["error"]["code"])) {
+                "model_rejected"
+            } else {
+                "provider_request_rejected"
+            }
+        }
+    }
+}
+
+fn is_model_rejection(code: &Value) -> bool {
+    matches!(
+        code.as_str(),
+        Some("model_not_found" | "model_not_available" | "unsupported_model")
+    )
+}
+
+pub(crate) fn probe(name: &str, effort: &str, settings: &Connection) -> Outcome {
+    model(name, effort)
+        .and_then(|model| request(model, Purpose::Probe(Duration::from_secs(20)), settings))
         .unwrap_or_else(|reason| Outcome::error(reason, None))
 }
 
@@ -630,10 +744,13 @@ mod tests {
         let first = format!("data: {item}\r\n\r\n");
         let full = format!("{first}data: {done}\r\n\r\n");
         assert_eq!(
-            parse_stream(Cursor::new(full)),
+            parse_stream(Cursor::new(full), false),
             Ok(("verified result".to_owned(), Some(12)))
         );
-        assert_eq!(parse_stream(Cursor::new(first)), Err("unknown_outcome"));
+        assert_eq!(
+            parse_stream(Cursor::new(first), false),
+            Err("unknown_outcome")
+        );
     }
 
     #[test]
@@ -643,6 +760,25 @@ mod tests {
             "response": {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}},
         });
         let stream = format!("data: {event}\n\n");
-        assert_eq!(parse_stream(Cursor::new(stream)), Err("invalid_response"));
+        assert_eq!(
+            parse_stream(Cursor::new(stream), false),
+            Err("invalid_response")
+        );
+    }
+
+    #[test]
+    fn probe_times_out_before_receiving_headers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = Connection {
+            endpoint: Some(format!(
+                "http://{}/responses",
+                listener.local_addr().unwrap()
+            )),
+            ..Connection::default()
+        };
+        let selected = model("openai/gpt-6.1-terra", "medium").unwrap();
+        // The listening socket stays open without sending a reply.
+        let error = request(selected, Purpose::Probe(Duration::from_millis(80)), &cfg).err();
+        assert_eq!(error, Some("probe_timeout"));
     }
 }

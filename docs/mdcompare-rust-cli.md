@@ -54,6 +54,8 @@ mdcomparer doctor --config scoring.toml --pretty
 
 The JSON report includes the runtime, configuration source and individual checks.
 The LLM section shows the provider, model, reasoning effort, request budget,
-concurrency and local readiness. Doctor validates transport settings and the
-saved OAuth credential locally. Provider access and inference remain
-`not_checked`. Use `--pretty` to indent the JSON.
+concurrency and readiness. With a usable saved credential or a test endpoint,
+doctor sends one fixed PING to the configured model. Any completed, nonempty
+text reply passes. The report distinguishes provider reachability, remote OAuth
+acceptance and model response. Unconfigured credentials and a zero request
+budget skip the probe. Use `--pretty` to indent the JSON.

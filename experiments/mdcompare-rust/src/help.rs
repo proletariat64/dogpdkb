@@ -75,10 +75,11 @@ Exit codes
 pub(crate) const DOCTOR: &str = "Example
   mdcomparer doctor --config scoring.toml --pretty
 
-Checks the local runtime and explicitly configured scoring prerequisites.
-Without --config it checks built-in defaults and requires no credentials.
-Reports the semantic scoring model, budget, transport and saved OAuth state.
-Runs offline. Use --pretty for indented JSON.
+Checks the local runtime and configured scoring prerequisites. With usable
+credentials or a test endpoint it sends one short PING to the selected model.
+A complete text reply passes. The report separates provider, OAuth and model
+status. Built-in defaults and a zero request budget skip the online check.
+Use --pretty for indented JSON.
 
 Exit codes
   0 capabilities available, 1 invalid configuration, 2 capability unavailable,

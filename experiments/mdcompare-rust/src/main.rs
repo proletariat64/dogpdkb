@@ -88,7 +88,7 @@ fn run(command: Command, progress: &Progress) -> Result<Outcome> {
         } => semantic_route::run(&work.plan, &scores, settings.config.as_deref()),
         Command::Status { work } => status(&work.plan).context("read work status"),
         Command::Cancel { work } => semantic_score::cancel(&work.plan),
-        Command::Doctor { settings, .. } => Ok(doctor::run(settings.config.as_deref())),
+        Command::Doctor { settings, .. } => Ok(doctor::run(settings.config.as_deref(), progress)),
         Command::Help { .. } => unreachable!("help was dispatched before business commands"),
     }
 }

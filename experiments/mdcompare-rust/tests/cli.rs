@@ -92,8 +92,8 @@ fn pretty_doctor_indents_the_same_json_and_reports_saved_oauth_state() {
     let args = ["doctor", "--config", config.to_str().unwrap()];
     let compact = run(&args);
     let pretty = run(&[args[0], args[1], args[2], "--pretty"]);
-    assert!(compact.status.success());
-    assert!(pretty.status.success());
+    assert_eq!(compact.status.code(), Some(2));
+    assert_eq!(pretty.status.code(), Some(2));
     let pretty_text = String::from_utf8(pretty.stdout).unwrap();
     assert!(pretty_text.starts_with("{\n  \"schema_version\""));
     assert!(!pretty_text.contains("PRIVATE"));
@@ -103,7 +103,10 @@ fn pretty_doctor_indents_the_same_json_and_reports_saved_oauth_state() {
         serde_json::from_slice::<serde_json::Value>(&compact.stdout).unwrap()
     );
     assert_eq!(summary["reason_code"], "oauth_expired");
-    assert_eq!(summary["diagnostics"]["llm"]["status"], "refresh_required");
+    assert_eq!(
+        summary["diagnostics"]["llm"]["status"],
+        "prerequisites_failed"
+    );
     assert_eq!(summary["diagnostics"]["llm"]["request_budget"], 2);
     assert_eq!(summary["diagnostics"]["llm"]["inference"], "not_checked");
 
@@ -115,7 +118,7 @@ fn pretty_doctor_indents_the_same_json_and_reports_saved_oauth_state() {
         summary["diagnostics"]["llm"]["status"],
         "prerequisites_failed"
     );
-    assert_eq!(summary["reason_code"], "oauth_required");
+    assert_eq!(summary["reason_code"], "oauth_file_unreadable");
 }
 
 #[test]
