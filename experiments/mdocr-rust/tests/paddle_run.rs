@@ -10,15 +10,11 @@ use std::time::{Duration, Instant};
 
 const SOURCE: &str = "# OCR 示例\r\n\r\n![seed](image.png)\r\n\r\nEnd.\r\n";
 const TOKEN: &str = "synthetic-fixture-only";
-const RUN_ARGS: &[&str] = &["run", "--plan", "plan.json", "--result", "result.json"];
+const RUN_ARGS: &[&str] = &["run", "--plan", "work.json"];
 
 fn cli(root: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mdocr"));
-    command
-        .current_dir(root)
-        .env_clear()
-        .env("PADDLEOCR_TOKEN", TOKEN)
-        .args(args);
+    command.current_dir(root).env_clear().args(args);
     command
 }
 
@@ -48,28 +44,29 @@ fn source(root: &Path, color: [u8; 3]) {
         .unwrap();
 }
 
-fn plan(root: &Path, endpoint: &str, inputs: &[&str]) -> String {
-    let output = cli(
-        root,
-        &[
-            "plan",
-            "--mode",
-            "paddle",
-            "--plan",
-            "plan.json",
-            "--endpoint",
-            endpoint,
-            "--request-budget",
-            "4",
-            "--concurrency",
-            "1",
-        ],
+fn plan(root: &Path, endpoint: &str, output_dir: &str, documents: Value) -> String {
+    fs::write(
+        root.join("work.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "mdocr-work-1",
+            "output_dir": output_dir,
+            "documents": documents,
+        }))
+        .unwrap(),
     )
-    .args(inputs)
-    .output()
     .unwrap();
+    fs::write(root.join("token"), TOKEN).unwrap();
+    fs::write(
+        root.join("default.toml"),
+        format!(
+            "mode = \"paddle\"\nendpoint = \"{endpoint}\"\nrequest_budget = 4\nconcurrency = 1\ntoken_file = \"token\"\n"
+        ),
+    ).unwrap();
+    let output = cli(root, &["accept", "--plan", "work.json"])
+        .output()
+        .unwrap();
     assert_exit(&output, 0);
-    sha(&fs::read(root.join("plan.json")).unwrap())
+    sha(&fs::read(root.join("work.mdocr/plan.json")).unwrap())
 }
 
 fn accept(listener: &TcpListener) -> TcpStream {
@@ -135,7 +132,7 @@ fn respond(mut stream: TcpStream, body: &Value) {
 }
 
 fn assert_admission(root: &Path, plan_hash: &str, count: usize, image: &Path) -> Value {
-    let journal = read_json(&root.join("plan.json.execution.json"));
+    let journal = read_json(&root.join("work.mdocr/journal.json"));
     assert_eq!(journal["plan_sha256"], plan_hash);
     assert_eq!(journal["budget"]["requests"], count);
     let requests = journal["requests"].as_array().unwrap();
@@ -194,26 +191,40 @@ fn paddle_run_publishes_bound_evidence_and_recovers_result_without_resubmitting(
     let plan_hash = plan(
         root,
         &format!("{base}/jobs"),
-        &["--input", "in.md", "--output", "out.md"],
+        ".",
+        json!([{"path": "in.md", "output": "out.md"}]),
     );
+    let log_path = root.join("mdocr.log");
     let child = cli(root, RUN_ARGS)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(fs::File::create(&log_path).unwrap())
         .spawn()
         .unwrap();
     serve_success(&listener, &base, || {
         assert_admission(root, &plan_hash, 1, &root.join("image.png"));
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(
+            log.lines().any(|line| {
+                line.contains("event=admitted ")
+                    && line.contains("documents=0/1 in_flight=1 requests=1/4")
+            }),
+            "the admission must be visible before the provider responds: {log}"
+        );
     });
     assert_exit(&child.wait_with_output().unwrap(), 0);
     drop(listener);
 
-    let mirror = root.join("result.json");
+    let mirror = root.join("work.mdocr/result.json");
     let result = read_json(&mirror);
-    assert_eq!(result["schema_version"], "mdocr-result-2");
+    assert_eq!(result["schema_version"], "mdocr-batch-result-1");
     assert_eq!(result["status"], "completed");
     assert_eq!(result["plan_sha256"], plan_hash);
     assert_eq!(result["budget"]["requests"], 1);
-    assert_eq!(result["requests"][0]["status"], "success");
+    assert_eq!(result["budget"]["request_limit"], 4);
+    assert_eq!(
+        read_json(&root.join("work.mdocr/journal.json"))["requests"][0]["status"],
+        "success"
+    );
     let document = &result["documents"][0];
     assert_eq!(document["status"], "completed");
     assert_eq!(document["ocr"]["contract"], "mdocr-ocr-2");
@@ -257,7 +268,11 @@ fn paddle_run_assembles_accepted_work_without_replaying_a_crash_admission() {
     let plan_hash = plan(
         root,
         &format!("{base}/jobs"),
-        &["--directory", "source", "--output-dir", "out"],
+        "out",
+        json!([
+            {"path": "source/first/in.md", "output": "first/in.md"},
+            {"path": "source/second/in.md", "output": "second/in.md"},
+        ]),
     );
     let mut child = cli(root, RUN_ARGS)
         .stdout(Stdio::piped())
@@ -278,25 +293,21 @@ fn paddle_run_assembles_accepted_work_without_replaying_a_crash_admission() {
     drop(stream);
     drop(listener);
 
-    let journal_path = root.join("plan.json.execution.json");
-    let mirror_path = root.join("result.json");
+    let journal_path = root.join("work.mdocr/journal.json");
+    let mirror_path = root.join("work.mdocr/result.json");
     let journal = fs::read(&journal_path).unwrap();
     let mirror = fs::read(&mirror_path).unwrap();
+    fs::remove_file(root.join("token")).unwrap();
     let assembled = cli(
         root,
         &[
             "assemble",
             "--plan",
-            "plan.json",
-            "--journal",
-            "plan.json.execution.json",
-            "--execution-version",
-            env!("CARGO_PKG_VERSION"),
+            "work.json",
             "--output-dir",
             "assembly",
         ],
     )
-    .env_remove("PADDLEOCR_TOKEN")
     .output()
     .unwrap();
     assert_exit(&assembled, 2);
@@ -305,7 +316,7 @@ fn paddle_run_assembles_accepted_work_without_replaying_a_crash_admission() {
     let assembly = read_json(&root.join("assembly/assembly.json"));
     assert_eq!(assembly["recovery"]["journal_sha256"], sha(&journal));
     assert_eq!(assembly["plan_sha256"], plan_hash);
-    assert_eq!(assembly["requests"][1]["status"], "unknown");
+    assert_eq!(assembly["schema_version"], "mdocr-assembly-1");
     assert_eq!(assembly["documents"][0]["status"], "completed");
     assert_eq!(
         assembly["documents"][1]["resources"][0]["status"],
@@ -319,7 +330,8 @@ fn paddle_run_assembles_accepted_work_without_replaying_a_crash_admission() {
     assert_exit(&resume.arg("--retry-failed").output().unwrap(), 2);
     let report = read_json(&mirror_path);
     assert_eq!(report["status"], "partial");
-    let requests = report["requests"].as_array().unwrap();
+    let history = read_json(&journal_path);
+    let requests = history["requests"].as_array().unwrap();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0]["status"], "success");
     assert_eq!(requests[1]["status"], "unknown");
@@ -328,4 +340,88 @@ fn paddle_run_assembles_accepted_work_without_replaying_a_crash_admission() {
     assert!(report["documents"][1]["output"].is_null());
     assert_eq!(fs::read(root.join("out/first/in.md")).unwrap(), recovered);
     assert!(!root.join("out/second/in.md").exists());
+}
+
+#[test]
+fn cancellation_settles_in_flight_work_and_requires_explicit_resume() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let first = root.join("source/first");
+    let second = root.join("source/second");
+    source(&first, [12, 34, 56]);
+    source(&second, [12, 34, 57]);
+    let (listener, base) = listener();
+    let plan_hash = plan(
+        root,
+        &format!("{base}/jobs"),
+        "out",
+        json!([
+            {"path": "source/first/in.md", "output": "first/in.md"},
+            {"path": "source/second/in.md", "output": "second/in.md"},
+        ]),
+    );
+    let child = cli(root, RUN_ARGS)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serve_success(&listener, &base, || {
+        assert_admission(root, &plan_hash, 1, &first.join("image.png"));
+        let cancel = cli(root, &["cancel", "--plan", "work.json"])
+            .output()
+            .unwrap();
+        assert_exit(&cancel, 0);
+        let report: Value = serde_json::from_slice(&cancel.stdout).unwrap();
+        assert_eq!(report["status"], "cancel_requested");
+    });
+
+    let output = child.wait_with_output().unwrap();
+    assert_exit(&output, 3);
+    let logs = String::from_utf8(output.stderr).unwrap();
+    assert!(logs.contains("event=admitted"));
+    assert!(logs.contains("event=settled"));
+    assert!(logs.contains("event=canceled"));
+    assert!(!logs.contains(TOKEN));
+
+    let report_path = root.join("work.mdocr/result.json");
+    let report = read_json(&report_path);
+    assert_eq!(report["status"], "canceled");
+    assert_eq!(report["budget"]["requests"], 1);
+    assert_eq!(report["documents"][0]["status"], "completed");
+    assert_eq!(
+        report["documents"][1]["resources"][0]["status"],
+        "unattempted"
+    );
+    assert_eq!(
+        report["documents"][1]["resources"][0]["reason_code"],
+        "BATCH_CANCELED"
+    );
+    assert!(root.join("out/first/in.md").is_file());
+    assert!(!root.join("out/second/in.md").exists());
+    assert!(
+        listener
+            .accept()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+
+    let duplicate_cancel = cli(root, &["cancel", "--plan", "work.json"])
+        .output()
+        .unwrap();
+    assert_exit(&duplicate_cancel, 0);
+    assert_exit(&cli(root, RUN_ARGS).output().unwrap(), 3);
+    assert_eq!(read_json(&report_path), report);
+
+    let resumed = cli(root, RUN_ARGS)
+        .arg("--resume")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serve_success(&listener, &base, || {
+        assert_admission(root, &plan_hash, 2, &second.join("image.png"));
+    });
+    assert_exit(&resumed.wait_with_output().unwrap(), 0);
+    assert_eq!(read_json(&report_path)["status"], "completed");
+    assert_eq!(read_json(&report_path)["budget"]["requests"], 2);
+    assert!(root.join("out/second/in.md").is_file());
 }

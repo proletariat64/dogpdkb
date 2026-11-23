@@ -1,38 +1,24 @@
 use crate::artifacts::{self, Image, Plan, atomic, json_bytes, read_bound, sha, validate_patch};
+use crate::progress;
 use crate::provider::{self, Failure};
+use crate::workspace::{Workspace, lock_control, try_lock};
 use anyhow::{Context, Result, ensure};
-use clap::Args as ClapArgs;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[derive(ClapArgs)]
-pub(crate) struct Args {
-    #[arg(long)]
-    plan: PathBuf,
-    #[arg(long)]
-    result: PathBuf,
-    #[arg(long)]
-    retry_failed: bool,
-}
-
-#[derive(ClapArgs)]
-pub(crate) struct AssembleArgs {
-    #[arg(long)]
-    plan: PathBuf,
-    #[arg(long)]
-    journal: PathBuf,
-    #[arg(long)]
-    execution_version: String,
-    #[arg(long)]
-    output_dir: PathBuf,
-}
+const JOURNAL_SCHEMA: &str = "mdocr-journal-1";
+const RESULT_SCHEMA: &str = "mdocr-batch-result-1";
+const ASSEMBLY_SCHEMA: &str = "mdocr-assembly-1";
+const CANCEL_SCHEMA: &str = "mdocr-cancel-1";
+const CANCELED: &str = "BATCH_CANCELED";
+const HEARTBEAT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,13 +37,11 @@ struct Attempt {
     source_sha256: Option<String>,
     status: Status,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reserved_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     usage_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    fix_round: Option<u64>,
+    retry_round: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     repair_round: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,10 +56,9 @@ impl Attempt {
             key,
             status,
             source_sha256: None,
-            reserved_tokens: None,
             usage_tokens: None,
             reason: None,
-            fix_round: None,
+            retry_round: None,
             repair_round: None,
             patches: None,
             warnings: None,
@@ -91,7 +74,7 @@ impl Attempt {
 struct Budget {
     requests: u64,
     tokens: u64,
-    reserved_tokens: u64,
+    request_limit: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -106,7 +89,7 @@ struct Concurrency {
 struct Journal {
     schema_version: String,
     plan_sha256: String,
-    result_path: PathBuf,
+    runtime_version: String,
     status: String,
     causes: Vec<String>,
     concurrency: Concurrency,
@@ -115,10 +98,6 @@ struct Journal {
     #[serde(default)]
     reused: BTreeMap<String, Attempt>,
     documents: Vec<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    recovery: Option<Value>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    legacy_request_sources: BTreeMap<String, String>,
 }
 
 struct Layout<'a> {
@@ -177,7 +156,7 @@ impl<'a> Layout<'a> {
 struct Engine<'a> {
     settings: &'a Value,
     http: Client,
-    paddle_token: Option<String>,
+    paddle_token: std::sync::OnceLock<String>,
     llm_auth: std::sync::OnceLock<crate::llm::Auth>,
 }
 
@@ -196,8 +175,11 @@ impl Engine<'_> {
                     .set(auth)
                     .unwrap_or_else(|_| unreachable!("preflight runs on the scheduler"));
             }
-        } else if self.paddle_token.is_none() {
-            return Err(Failure::known("OCR_AUTH_UNAVAILABLE"));
+        } else if self.paddle_token.get().is_none() {
+            let token = crate::config::paddle_token(self.settings)?;
+            self.paddle_token
+                .set(token)
+                .unwrap_or_else(|_| unreachable!("preflight runs on the scheduler"));
         }
         Ok(())
     }
@@ -232,7 +214,7 @@ impl Engine<'_> {
             .map_err(|_| Failure::known("IMAGE_PROCESSING_FAILED"))?;
         let token = self
             .paddle_token
-            .as_deref()
+            .get()
             .ok_or_else(|| Failure::known("OCR_AUTH_UNAVAILABLE"))?;
         let text = crate::paddle::convert(
             &self.http,
@@ -255,9 +237,7 @@ struct Execution<'a> {
     layout: Layout<'a>,
     config: Value,
     state: Journal,
-    ledger: Option<PathBuf>,
-    result: PathBuf,
-    evidence: PathBuf,
+    workspace: &'a Workspace,
     stop: Option<&'static str>,
     latest: HashMap<String, usize>,
     repairs: HashMap<String, usize>,
@@ -291,29 +271,6 @@ fn configuration(settings: &Value, version: &str) -> Value {
     }
 }
 
-fn sibling(path: &Path, suffix: &str) -> Result<PathBuf> {
-    let mut name = path
-        .file_name()
-        .context("execution path has no basename")?
-        .to_os_string();
-    name.push(suffix);
-    Ok(path.with_file_name(name))
-}
-
-fn lock(path: &Path) -> Result<File> {
-    artifacts::owned_path(path)?;
-    fs::create_dir_all(path.parent().context("lock has no parent")?)?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)?;
-    file.try_lock()
-        .with_context(|| format!("cannot lock {}", path.display()))?;
-    Ok(file)
-}
-
 fn read_journal(path: &Path) -> Result<Journal> {
     serde_json::from_slice(&fs::read(path)?)
         .with_context(|| format!("invalid journal {}", path.display()))
@@ -338,9 +295,9 @@ fn journal_for(plan: &Plan, result: &Path, ledger: &Path) -> Result<Journal> {
         .as_u64()
         .context("missing concurrency")? as usize;
     Ok(Journal {
-        schema_version: "mdocr-result-2".into(),
+        schema_version: JOURNAL_SCHEMA.into(),
         plan_sha256: plan.digest.clone(),
-        result_path: result.into(),
+        runtime_version: env!("CARGO_PKG_VERSION").into(),
         status: "running".into(),
         causes: Vec::new(),
         concurrency: Concurrency {
@@ -348,12 +305,13 @@ fn journal_for(plan: &Plan, result: &Path, ledger: &Path) -> Result<Journal> {
             current: limit,
             transitions: Vec::new(),
         },
-        budget: Budget::default(),
+        budget: Budget {
+            request_limit: plan.settings["request_budget"].as_u64(),
+            ..Budget::default()
+        },
         requests: Vec::new(),
         reused: BTreeMap::new(),
         documents: Vec::new(),
-        recovery: None,
-        legacy_request_sources: BTreeMap::new(),
     })
 }
 
@@ -362,7 +320,7 @@ fn validate_mirror(plan: &Plan, result: &Path) -> Result<()> {
     if result.try_exists()? {
         let mirror: Value = serde_json::from_slice(&fs::read(result)?)?;
         ensure!(
-            mirror["plan_sha256"] == plan.digest,
+            mirror["schema_version"] == RESULT_SCHEMA && mirror["plan_sha256"] == plan.digest,
             "result is owned by another plan"
         );
     }
@@ -372,55 +330,26 @@ fn validate_mirror(plan: &Plan, result: &Path) -> Result<()> {
 impl<'a> Execution<'a> {
     fn new(
         plan: &'a Plan,
-        ledger: PathBuf,
-        result: PathBuf,
-        evidence: PathBuf,
+        workspace: &'a Workspace,
+        state: Journal,
         retry_failed: bool,
     ) -> Result<Self> {
-        let config = configuration(&plan.settings, env!("CARGO_PKG_VERSION"));
-        let layout = Layout::new(plan, &config, &evidence)?;
-        let state = journal_for(plan, &result, &ledger)?;
+        let config = configuration(&plan.settings, &state.runtime_version);
+        let layout = Layout::new(plan, &config, &workspace.evidence)?;
         let timeout = Duration::try_from_secs_f64(
-            plan.settings["max_seconds"]
+            plan.settings["admission_seconds"]
                 .as_f64()
-                .context("missing deadline")?,
+                .context("missing admission window")?,
         )?;
         let deadline = Instant::now()
             .checked_add(timeout)
-            .context("deadline too large")?;
-        Self::from_journal(
-            plan,
-            layout,
-            config,
-            Some(ledger),
-            result,
-            evidence,
-            state,
-            deadline,
-            retry_failed,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn from_journal(
-        plan: &'a Plan,
-        layout: Layout<'a>,
-        config: Value,
-        ledger: Option<PathBuf>,
-        result: PathBuf,
-        evidence: PathBuf,
-        state: Journal,
-        deadline: Instant,
-        retry_failed: bool,
-    ) -> Result<Self> {
+            .context("admission window too large")?;
         let mut execution = Self {
             plan,
             layout,
             config,
             state,
-            ledger,
-            result,
-            evidence,
+            workspace,
             stop: None,
             latest: HashMap::new(),
             repairs: HashMap::new(),
@@ -435,18 +364,19 @@ impl<'a> Execution<'a> {
         let settings = &self.plan.settings;
         let state = &mut self.state;
         ensure!(
-            state.schema_version == "mdocr-result-2"
+            state.schema_version == JOURNAL_SCHEMA
                 && state.plan_sha256 == self.plan.digest
-                && state.result_path == self.result
-                && state.recovery.is_none()
-                && matches!(state.status.as_str(), "running" | "partial" | "completed"),
-            "execution is bound to a different plan or result path"
+                && matches!(
+                    state.status.as_str(),
+                    "running" | "partial" | "completed" | "canceled"
+                ),
+            "execution journal schema or plan binding is invalid"
         );
         ensure!(
             state.concurrency.initial as u64 == rounds(settings, "concurrency")
                 && (1..=state.concurrency.initial).contains(&state.concurrency.current)
                 && state.budget.requests == state.requests.len() as u64
-                && state.budget.reserved_tokens == 0
+                && state.budget.request_limit == settings["request_budget"].as_u64()
                 && settings["request_budget"]
                     .as_u64()
                     .is_none_or(|n| state.budget.requests <= n),
@@ -455,15 +385,6 @@ impl<'a> Execution<'a> {
         self.validate_history()?;
         let state = &mut self.state;
         for (i, attempt) in state.requests.iter_mut().enumerate() {
-            if attempt.source_sha256.is_none() {
-                let digest = self.layout.jobs[&attempt.key]
-                    .sha256
-                    .as_ref()
-                    .expect("validated job digest");
-                state
-                    .legacy_request_sources
-                    .insert(attempt.key.clone(), digest.clone());
-            }
             if attempt.status == Status::Admitted {
                 attempt.status = Status::Unknown;
                 attempt.reason = Some("OCR_OUTCOME_UNKNOWN".into());
@@ -499,8 +420,7 @@ impl<'a> Execution<'a> {
                 "saved OCR request identities do not match this runtime; no requests sent",
             )?;
             ensure!(
-                (attempt.source_sha256.is_none() || attempt.source_sha256 == image.sha256)
-                    && attempt.reserved_tokens == Some(0)
+                attempt.source_sha256 == image.sha256
                     && attempt.status != Status::Reused
                     && (attempt.status == Status::Success) == attempt.patches.is_some(),
                 "invalid journal attempt"
@@ -520,13 +440,13 @@ impl<'a> Execution<'a> {
                 .checked_add(attempt.usage_tokens.unwrap_or(0))
                 .context("token usage overflow")?;
             let last = latest.get(key).copied();
-            let bounded = match (attempt.fix_round, attempt.repair_round) {
+            let bounded = match (attempt.retry_round, attempt.repair_round) {
                 (None, None) => last.is_none_or(|last| {
                     last.status == Status::Failed && last.repair_round.is_none()
                 }),
                 (Some(round), None) => {
                     let previous = fixes.insert(key, round).unwrap_or(0u64);
-                    round <= rounds(&self.plan.settings, "fix")
+                    round <= rounds(&self.plan.settings, "retry_rounds")
                         && previous.checked_add(1) == Some(round)
                         && last.is_some_and(|last| {
                             last.repair_round.is_none() && Self::is_fixable(last)
@@ -552,12 +472,98 @@ impl<'a> Execution<'a> {
         Ok(())
     }
 
-    fn save(&self) -> Result<()> {
-        let data = json_bytes(&self.state)?;
-        if let Some(ledger) = &self.ledger {
-            atomic(ledger, &data, false)?;
+    fn save_journal(&self) -> Result<()> {
+        atomic(&self.workspace.journal, &json_bytes(&self.state)?, false)
+    }
+
+    fn report(&self, schema: &str, status: &str, rows: Vec<Value>) -> Value {
+        json!({
+            "schema_version": schema,
+            "plan_sha256": self.plan.digest,
+            "status": status,
+            "causes": self.state.causes,
+            "budget": self.state.budget,
+            "concurrency": self.state.concurrency,
+            "documents": rows,
+        })
+    }
+
+    fn save_result(&self) -> Result<()> {
+        let report = self.report(
+            RESULT_SCHEMA,
+            &self.state.status,
+            self.state.documents.clone(),
+        );
+        atomic(&self.workspace.result, &json_bytes(&report)?, false)
+    }
+
+    fn summary(&self, artifact_key: &str, path: &Path, status: &str, rows: &[Value]) -> Value {
+        let complete = rows
+            .iter()
+            .filter(|row| row["status"] == "completed")
+            .count();
+        let mut summary = json!({
+            "status": status,
+            "counts": {
+                "documents_total": self.plan.documents.len(),
+                "documents_completed": complete,
+                "requests": self.state.budget.requests,
+            },
+        });
+        summary[artifact_key] = json!(path);
+        if let Some(reason) = self.stop {
+            summary["reason_code"] = json!(reason);
         }
-        atomic(&self.result, &data, false)
+        summary
+    }
+
+    fn observe_cancel(&mut self) -> Result<()> {
+        if cancel_requested(self.workspace, &self.plan.digest)? {
+            self.set_stop(CANCELED);
+        }
+        Ok(())
+    }
+
+    fn set_stop(&mut self, reason: &'static str) {
+        self.stop = Some(reason);
+        if !self.state.causes.iter().any(|cause| cause == reason) {
+            self.state.causes.push(reason.into());
+        }
+    }
+
+    fn progress(&self, event: &str, active: usize, reason: Option<&str>) {
+        let ready = self
+            .plan
+            .documents
+            .iter()
+            .zip(&self.layout.bindings)
+            .filter(|(doc, keys)| {
+                doc.images.iter().zip(*keys).all(|(image, key)| {
+                    !image.selected
+                        || key
+                            .as_deref()
+                            .and_then(|key| self.last(key))
+                            .and_then(Attempt::patch)
+                            .is_some_and(|patch| patch["kind"] != "hold")
+                })
+            })
+            .count();
+        let request_limit = self
+            .state
+            .budget
+            .request_limit
+            .map(|limit| limit.to_string())
+            .unwrap_or_else(|| "unlimited".into());
+        progress::emit(
+            event,
+            format_args!(
+                "phase=ocr documents={ready}/{} in_flight={active} requests={}/{request_limit} concurrency={} reason_code={}",
+                self.plan.documents.len(),
+                self.state.budget.requests,
+                self.state.concurrency.current,
+                reason.or(self.stop).unwrap_or("none"),
+            ),
+        );
     }
 
     fn last(&self, key: &str) -> Option<&Attempt> {
@@ -582,7 +588,6 @@ impl<'a> Execution<'a> {
                         | "response_schema_invalid"
                         | "response_table_invalid"
                         | "response_unexpected_stop"
-                        | "svg_profile_cleanup_failed"
                 )
             ) | (Status::Unknown, Some("connection_outcome_unknown"))
         )
@@ -616,40 +621,40 @@ impl<'a> Execution<'a> {
     }
 
     fn admit(&mut self, engine: &Engine<'_>, key: &str, pass: Pass) -> Result<Option<usize>> {
+        self.observe_cancel()?;
         if self.stop.is_some() {
-            return Ok(None);
-        }
-        let settings = &self.plan.settings;
-        self.stop = if Instant::now() >= self.deadline {
-            Some("BATCH_DEADLINE_EXCEEDED")
-        } else if settings["request_budget"]
-            .as_u64()
-            .is_some_and(|n| self.state.budget.requests >= n)
-        {
-            Some("OCR_REQUEST_BUDGET_EXHAUSTED")
-        } else {
-            match settings["token_budget"].as_u64() {
-                Some(0) => Some("OCR_TOKEN_BUDGET_EXHAUSTED"),
-                Some(_) => Some("OCR_TOKEN_BOUND_UNAVAILABLE"),
-                None => None,
-            }
-        };
-        if self.stop.is_some() {
-            return Ok(None);
-        }
-        if let Err(failure) = engine.preflight() {
-            self.stop = Some(failure.reason);
             return Ok(None);
         }
         if Instant::now() >= self.deadline {
-            self.stop = Some("BATCH_DEADLINE_EXCEEDED");
+            self.set_stop("BATCH_DEADLINE_EXCEEDED");
+            return Ok(None);
+        }
+        if self
+            .state
+            .budget
+            .request_limit
+            .is_some_and(|limit| self.state.budget.requests >= limit)
+        {
+            self.set_stop("OCR_REQUEST_BUDGET_EXHAUSTED");
+            return Ok(None);
+        }
+        if let Err(failure) = engine.preflight() {
+            self.set_stop(failure.reason);
+            return Ok(None);
+        }
+        let _control = lock_control(&self.workspace.control)?;
+        self.observe_cancel()?;
+        if self.stop.is_some() {
+            return Ok(None);
+        }
+        if Instant::now() >= self.deadline {
+            self.set_stop("BATCH_DEADLINE_EXCEEDED");
             return Ok(None);
         }
         let mut attempt = Attempt::new(key.into(), Status::Admitted);
         attempt
             .source_sha256
             .clone_from(&self.layout.jobs[key].sha256);
-        attempt.reserved_tokens = Some(0);
         let index = self.state.requests.len();
         match pass {
             Pass::Repair => {
@@ -665,23 +670,23 @@ impl<'a> Execution<'a> {
             Pass::Fix | Pass::Initial => {
                 // Explicit retries still inherit earlier fix rounds for this image.
                 if pass == Pass::Fix {
-                    attempt.fix_round = Some(self.fix_round(key) + 1);
+                    attempt.retry_round = Some(self.retry_round(key) + 1);
                 }
                 self.latest.insert(key.into(), index);
             }
         }
         self.state.requests.push(attempt);
         self.state.budget.requests += 1;
-        self.save()?;
+        self.save_journal()?;
         Ok(Some(index))
     }
 
-    fn fix_round(&self, key: &str) -> u64 {
+    fn retry_round(&self, key: &str) -> u64 {
         self.state
             .requests
             .iter()
             .rev()
-            .find_map(|r| (r.key == key).then_some(r.fix_round).flatten())
+            .find_map(|r| (r.key == key).then_some(r.retry_round).flatten())
             .unwrap_or(0)
     }
 
@@ -755,7 +760,10 @@ impl<'a> Execution<'a> {
         } else {
             None
         };
-        self.save()?;
+        if let Some(reason) = self.stop {
+            self.set_stop(reason);
+        }
+        self.save_journal()?;
         if let Some((path, data)) = cache_record {
             atomic(&path, &data, false)?;
         }
@@ -763,7 +771,6 @@ impl<'a> Execution<'a> {
     }
 
     fn dispatch(&mut self, engine: &Engine<'_>) -> Result<()> {
-        self.state.documents.clear();
         self.state.status = "running".into();
         let mut pending = HashMap::new();
         for key in self.layout.jobs.keys() {
@@ -781,10 +788,13 @@ impl<'a> Execution<'a> {
                 pending.insert(key.clone(), None);
             }
         }
-        self.save()?;
+        self.state.documents = self.document_rows(None)?;
+        self.save_journal()?;
+        self.save_result()?;
+        self.progress("started", 0, None);
         self.dispatch_pass(engine, pending, Pass::Initial)?;
         while self.stop.is_none() {
-            let limit = rounds(&self.plan.settings, "fix");
+            let limit = rounds(&self.plan.settings, "retry_rounds");
             let pending = self
                 .layout
                 .jobs
@@ -792,7 +802,7 @@ impl<'a> Execution<'a> {
                 .filter(|key| {
                     !self.layout.published.contains(*key)
                         && self.last(key).is_some_and(Self::is_fixable)
-                        && self.fix_round(key) < limit
+                        && self.retry_round(key) < limit
                 })
                 .map(|key| (key.clone(), None))
                 .collect::<HashMap<_, _>>();
@@ -872,6 +882,7 @@ impl<'a> Execution<'a> {
             let mut active = HashMap::<String, usize>::new();
             let mut slots: Vec<VecDeque<String>> = Vec::new();
             loop {
+                self.observe_cancel()?;
                 let tier = self.state.concurrency.current;
                 if self.stop.is_none() && active.values().all(|&old| old <= tier) {
                     for slot in &mut slots {
@@ -896,11 +907,18 @@ impl<'a> Execution<'a> {
                             continue;
                         };
                         let Some(index) = self.admit(engine, key, pass)? else {
+                            self.progress("admission_stopped", active.len(), None);
                             break;
                         };
                         let image = self.layout.jobs[key];
                         let key = key.clone();
                         active.insert(key.clone(), tier);
+                        let event = match pass {
+                            Pass::Initial => "admitted",
+                            Pass::Fix => "retry_admitted",
+                            Pass::Repair => "repair_admitted",
+                        };
+                        self.progress(event, active.len(), None);
                         let sender = sender.clone();
                         scope.spawn(move || {
                             let result =
@@ -914,19 +932,35 @@ impl<'a> Execution<'a> {
                 if active.is_empty() {
                     break;
                 }
-                let (key, index, tier, result) = receiver.recv()?;
+                let (key, index, tier, result) = match receiver.recv_timeout(HEARTBEAT) {
+                    Ok(settled) => settled,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        self.progress("waiting", active.len(), None);
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 active.remove(&key);
+                let concurrency = self.state.concurrency.current;
                 self.settle(
                     index,
                     tier,
                     result.map_err(|_| anyhow::anyhow!("OCR worker panicked after admission"))?,
                 )?;
+                self.progress(
+                    "settled",
+                    active.len(),
+                    self.state.requests[index].reason.as_deref(),
+                );
+                if self.state.concurrency.current != concurrency {
+                    self.progress("throttled", active.len(), None);
+                }
             }
             Ok(())
         })
     }
 
-    fn publish(&mut self) -> Result<u8> {
+    fn document_rows(&self, evidence: Option<&Path>) -> Result<Vec<Value>> {
         let mut rows = Vec::with_capacity(self.plan.documents.len());
         for (index, document) in self.plan.documents.iter().enumerate() {
             let bindings = &self.layout.bindings[index];
@@ -938,13 +972,13 @@ impl<'a> Execution<'a> {
                 if image.selected {
                     if let Some(error) = &image.error {
                         record["status"] = json!("failed");
-                        record["reason"] = json!(error);
+                        record["reason_code"] = json!(error);
                     } else if let Some(attempt) = key.as_deref().and_then(|key| self.last(key)) {
                         record["status"] = json!(attempt.status);
                         if let Some(value) = attempt.patch() {
                             if value["kind"] == "hold" {
                                 record["status"] = json!("held");
-                                record["reason"] = json!("IMAGE_CONVERSION_HELD");
+                                record["reason_code"] = json!("IMAGE_CONVERSION_HELD");
                                 record["uncertainty"] = value["uncertainty"].clone();
                             } else {
                                 patch = Some(value);
@@ -952,35 +986,81 @@ impl<'a> Execution<'a> {
                                     record["warnings"] = warnings.clone();
                                 }
                             }
-                        } else {
-                            record["reason"] = json!(attempt.reason);
+                        } else if let Some(reason) = &attempt.reason {
+                            record["reason_code"] = json!(reason);
                         }
                     } else {
                         record["status"] = json!("unattempted");
-                        record["reason"] = json!(self.stop);
+                        if let Some(reason) = self.stop {
+                            record["reason_code"] = json!(reason);
+                        }
                     }
                 }
                 patches.push(patch);
                 records.push(record);
             }
-            rows.push(artifacts::publish_document(
-                document,
-                &self.evidence.join(index.to_string()),
-                &self.config,
-                records,
-                &patches,
-            )?);
+            let row = if let Some(dir) = evidence {
+                artifacts::publish_document(
+                    document,
+                    &dir.join(index.to_string()),
+                    &self.config,
+                    records,
+                    &patches,
+                )?
+            } else if let Some(row) = self.state.documents.get(index).filter(|row| {
+                row["status"] == "completed" && row["document_id"] == document.document_id
+            }) {
+                row.clone()
+            } else {
+                json!({
+                    "document_id": document.document_id,
+                    "path": document.path,
+                    "status": "partial",
+                    "output": null,
+                    "resources": records,
+                })
+            };
+            rows.push(row);
         }
-        let complete = rows.iter().all(|row| row["status"] == "completed");
-        self.state.documents = rows;
-        if let Some(stop) = self.stop
-            && !self.state.causes.iter().any(|cause| cause == stop)
+        Ok(rows)
+    }
+
+    fn finish(&mut self, publish: bool) -> Result<(u8, Value)> {
+        self.state.documents =
+            self.document_rows(publish.then_some(self.workspace.evidence.as_path()))?;
+        let (code, status) = if self.stop == Some(CANCELED) {
+            (3, "canceled")
+        } else if self
+            .state
+            .documents
+            .iter()
+            .all(|doc| doc["status"] == "completed")
         {
-            self.state.causes.push(stop.into());
-        }
-        self.state.status = if complete { "completed" } else { "partial" }.into();
-        self.save()?;
-        Ok(if complete { 0 } else { 2 })
+            (0, "completed")
+        } else {
+            (2, "partial")
+        };
+        self.state.status = status.into();
+        self.save_journal()?;
+        self.save_result()?;
+        self.progress(
+            if status == "canceled" {
+                "canceled"
+            } else {
+                "published"
+            },
+            0,
+            None,
+        );
+        Ok((
+            code,
+            self.summary(
+                "result_path",
+                &self.workspace.result,
+                status,
+                &self.state.documents,
+            ),
+        ))
     }
 }
 
@@ -997,71 +1077,152 @@ fn discard_finished(
     }
 }
 
-pub(crate) fn run(args: Args) -> Result<u8> {
-    let plan_path = args.plan.canonicalize()?;
-    let result = artifacts::resolve(&args.result)?;
-    let ledger = sibling(&plan_path, ".execution.json")?;
-    let evidence = sibling(&plan_path, ".evidence")?;
-    let locks = [sibling(&plan_path, ".lock")?, sibling(&result, ".lock")?];
-    let plan = artifacts::load_plan(&plan_path, &result, &ledger, &evidence, &locks)?;
-    let _plan_lock = lock(&locks[0])?;
-    let _result_lock = lock(&locks[1])?;
-    read_bound(&plan_path, &plan.digest, "PLAN_DRIFT")?;
-    let mut execution = Execution::new(&plan, ledger, result, evidence, args.retry_failed)?;
+fn load_workspace(workspace: &Workspace) -> Result<Plan> {
+    let locks = [workspace.lock.clone(), workspace.control.clone()];
+    let plan = artifacts::load_plan(
+        &workspace.plan,
+        &workspace.result,
+        &workspace.journal,
+        &workspace.evidence,
+        &locks,
+    )?;
+    read_bound(&workspace.plan, &plan.digest, "PLAN_DRIFT")?;
+    Ok(plan)
+}
+
+fn cancel_requested(workspace: &Workspace, digest: &str) -> Result<bool> {
+    artifacts::owned_path(&workspace.cancel)?;
+    let data = match fs::read(&workspace.cancel) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let marker: Value = serde_json::from_slice(&data)?;
+    ensure!(
+        marker["schema_version"] == CANCEL_SCHEMA && marker["plan_sha256"] == digest,
+        "cancel marker is bound to a different frozen plan"
+    );
+    marker["requested"]
+        .as_bool()
+        .context("invalid cancel marker state")
+}
+
+fn write_cancel(workspace: &Workspace, digest: &str, requested: bool) -> Result<()> {
+    let marker = json!({
+        "schema_version": CANCEL_SCHEMA,
+        "plan_sha256": digest,
+        "requested": requested,
+    });
+    atomic(&workspace.cancel, &json_bytes(&marker)?, false)
+}
+
+pub(crate) fn run(workspace: &Workspace, resume: bool, retry_failed: bool) -> Result<(u8, Value)> {
+    let plan = load_workspace(workspace)?;
+    let state = journal_for(&plan, &workspace.result, &workspace.journal)?;
+    let mut execution = Execution::new(&plan, workspace, state, retry_failed)?;
+    {
+        let _control = lock_control(&workspace.control)?;
+        if execution.state.status == "completed" {
+            return execution.finish(true);
+        }
+        let requested = cancel_requested(workspace, &plan.digest)?;
+        if requested || execution.state.status == "canceled" {
+            if !resume {
+                execution.set_stop(CANCELED);
+                return execution.finish(false);
+            }
+            write_cancel(workspace, &plan.digest, false)?;
+            execution.state.status = "running".into();
+            execution.save_journal()?;
+        }
+    }
     let engine = Engine {
         settings: &plan.settings,
-        http: provider::client()?,
-        paddle_token: std::env::var("PADDLEOCR_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty()),
+        http: provider::client_for(&plan.settings)?,
+        paddle_token: std::sync::OnceLock::new(),
         llm_auth: std::sync::OnceLock::new(),
     };
     execution.dispatch(&engine)?;
-    execution.publish()
+    let _control = lock_control(&workspace.control)?;
+    execution.observe_cancel()?;
+    execution.finish(true)
 }
 
-pub(crate) fn assemble(args: AssembleArgs) -> Result<u8> {
-    let parts = args.execution_version.split('.').collect::<Vec<_>>();
+pub(crate) fn cancel(workspace: &Workspace) -> Result<(u8, Value)> {
+    ensure!(workspace.plan.is_file(), "work plan has not been accepted");
+    workspace.ensure_owner()?;
+    let execution_lock = match try_lock(&workspace.lock) {
+        Ok(lock) => Some(lock),
+        Err(error)
+            if matches!(
+                error.downcast_ref::<TryLockError>(),
+                Some(TryLockError::WouldBlock)
+            ) =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let _control = lock_control(&workspace.control)?;
+    workspace.ensure_live()?;
+    workspace.ensure_owner()?;
+
+    // Request cancellation even if the source document or a bound image
+    // changed while an active scheduler owns the workspace.
+    artifacts::owned_path(&workspace.plan)?;
+    let raw = fs::read(&workspace.plan)?;
+    let digest = sha(&raw);
+    let frozen: Value = serde_json::from_slice(&raw)?;
     ensure!(
-        parts.len() == 3
-            && parts
-                .iter()
-                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
-        "execution version must be MAJOR.MINOR.PATCH"
+        frozen["schema_version"] == "mdocr-frozen-plan-1",
+        "invalid frozen plan for cancellation"
     );
-    let plan_path = args.plan.canonicalize()?;
-    let journal = args.journal.canonicalize()?;
-    ensure!(
-        journal == sibling(&plan_path, ".execution.json")?,
-        "journal is not the plan's native execution journal"
-    );
-    let raw = fs::read(&journal)?;
+    if workspace.journal.try_exists()? {
+        artifacts::owned_path(&workspace.journal)?;
+        let state = read_journal(&workspace.journal)?;
+        ensure!(
+            state.schema_version == JOURNAL_SCHEMA && state.plan_sha256 == digest,
+            "execution journal schema or plan binding is invalid"
+        );
+        if state.status == "completed" {
+            return Ok((
+                0,
+                json!({"status":"completed", "result_path":workspace.result}),
+            ));
+        }
+    }
+    if !cancel_requested(workspace, &digest)? {
+        write_cancel(workspace, &digest, true)?;
+    }
+    if execution_lock.is_some() {
+        let plan = load_workspace(workspace)?;
+        let state = journal_for(&plan, &workspace.result, &workspace.journal)?;
+        let mut execution = Execution::new(&plan, workspace, state, false)?;
+        execution.set_stop(CANCELED);
+        let (_, summary) = execution.finish(false)?;
+        Ok((0, summary))
+    } else {
+        progress::emit("cancel_requested", format_args!("phase=ocr"));
+        Ok((
+            0,
+            json!({"status":"cancel_requested", "result_path":workspace.result}),
+        ))
+    }
+}
+
+pub(crate) fn assemble(workspace: &Workspace, output_dir: PathBuf) -> Result<(u8, Value)> {
+    let mut plan = load_workspace(workspace)?;
+    validate_mirror(&plan, &workspace.result)?;
+    let raw = fs::read(&workspace.journal)?;
     let digest = sha(&raw);
     let state: Journal = serde_json::from_slice(&raw)?;
-    ensure!(
-        state.status == "running" && state.documents.is_empty(),
-        "journal is not an incomplete admission history"
-    );
-    let result = state.result_path.clone();
-    ensure!(
-        result.parent() == plan_path.parent(),
-        "original result must be a canonical sibling path"
-    );
-    let output = std::path::absolute(args.output_dir)?;
-    artifacts::owned_path(&output)?;
+    let output = artifacts::resolve(&output_dir)?;
     ensure!(!output.try_exists()?, "assembly directory must be new");
-    let evidence = sibling(&plan_path, ".evidence")?;
-    let locks = [sibling(&plan_path, ".lock")?, sibling(&result, ".lock")?];
-    let mut plan = artifacts::load_plan(&plan_path, &result, &journal, &evidence, &locks)?;
-    validate_mirror(&plan, &result)?;
-    let controls = [
-        &plan_path, &journal, &result, &evidence, &locks[0], &locks[1],
-    ];
     let cache = plan.settings["cache_dir"].as_str().map(PathBuf::from);
     for path in plan
         .protected
         .iter()
-        .chain(controls)
+        .chain([&workspace.root, &workspace.work])
         .chain(cache.iter())
         .chain(plan.documents.iter().map(|doc| &doc.output))
     {
@@ -1073,26 +1234,23 @@ pub(crate) fn assemble(args: AssembleArgs) -> Result<u8> {
     for (index, doc) in plan.documents.iter_mut().enumerate() {
         doc.output = output.join("documents").join(format!("{index}.md"));
     }
-    let config = configuration(&plan.settings, &args.execution_version);
-    let layout = Layout::new(&plan, &config, &evidence)?;
-    let mut execution = Execution::from_journal(
-        &plan,
-        layout,
-        config,
-        None,
-        result,
-        evidence,
-        state,
-        Instant::now(),
-        false,
-    )?;
-    read_bound(&plan_path, &plan.digest, "PLAN_DRIFT")?;
-    read_bound(&journal, &digest, "JOURNAL_DRIFT")?;
+    let execution = Execution::new(&plan, workspace, state, false)?;
+    read_bound(&workspace.plan, &plan.digest, "PLAN_DRIFT")?;
+    read_bound(&workspace.journal, &digest, "JOURNAL_DRIFT")?;
     fs::create_dir(&output)?;
-    execution.result = output.join("assembly.json");
-    execution.evidence = output.join("evidence");
-    execution.state.result_path = execution.result.clone();
-    execution.state.recovery =
-        Some(json!({"journal_sha256":digest, "execution_version":args.execution_version}));
-    execution.publish()
+    let rows = execution.document_rows(Some(&output.join("evidence")))?;
+    let (code, status) = if rows.iter().all(|row| row["status"] == "completed") {
+        (0, "completed")
+    } else {
+        (2, "partial")
+    };
+    let path = output.join("assembly.json");
+    let summary = execution.summary("assembly_path", &path, status, &rows);
+    let mut report = execution.report(ASSEMBLY_SCHEMA, status, rows);
+    report["recovery"] = json!({
+        "journal_sha256": digest,
+        "execution_version": execution.state.runtime_version,
+    });
+    atomic(&path, &json_bytes(&report)?, true)?;
+    Ok((code, summary))
 }
