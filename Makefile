@@ -3,8 +3,12 @@ export DEV_PYTHON=.venv/bin/python
 UV ?= uv
 DIST_DIR ?= dist
 TARGET ?= antcode
+CARGO ?= cargo
+MDCOMPARE_RUST_DIR := experiments/mdcompare-rust
+MDCOMPARE_RUST_TARGET := x86_64-unknown-linux-musl
+CARGO_TARGET_DIR ?= $(MDCOMPARE_RUST_DIR)/target
 
-.PHONY: bootstrap doc-guard test lint check build smoke doctor release publish-release publish-site-release
+.PHONY: bootstrap doc-guard test lint check build smoke checkr buildr smoker doctor release publish-release publish-site-release
 
 bootstrap:
 	$(PYTHON) -B scripts/bootstrap.py
@@ -19,6 +23,17 @@ build:
 
 smoke: build
 	$(DEV_PYTHON) scripts/smoke_install.py --dist "$(DIST_DIR)"
+
+checkr:
+	$(CARGO) fmt --manifest-path "$(MDCOMPARE_RUST_DIR)/Cargo.toml" --check
+	$(CARGO) clippy --locked --manifest-path "$(MDCOMPARE_RUST_DIR)/Cargo.toml" --target-dir "$(CARGO_TARGET_DIR)" --all-targets -- -D warnings
+	$(CARGO) test --locked --manifest-path "$(MDCOMPARE_RUST_DIR)/Cargo.toml" --target-dir "$(CARGO_TARGET_DIR)" --all-targets
+
+buildr:
+	$(CARGO) build --locked --release --manifest-path "$(MDCOMPARE_RUST_DIR)/Cargo.toml" --target "$(MDCOMPARE_RUST_TARGET)" --target-dir "$(CARGO_TARGET_DIR)"
+
+smoker: buildr
+	bash scripts/smoke_mdcompare_rust.sh "$(CARGO_TARGET_DIR)/$(MDCOMPARE_RUST_TARGET)/release/mdcompare"
 
 doctor:
 	$(DEV_PYTHON) -m dogpdkb doctor $(DOCTOR_ARGS)

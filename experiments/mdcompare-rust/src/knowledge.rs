@@ -219,16 +219,24 @@ fn plan(row: &Value) -> Value {
     })
 }
 
+struct BaselineBody<'a, 'units> {
+    document: Option<&'a Document>,
+    units: &'units [Unit],
+}
+
 fn document_row<'a>(
     document: &'a Document,
-    old: Option<&'a Document>,
-    previous: &[Unit],
+    baseline: BaselineBody<'a, '_>,
     current: &[Unit],
     incomplete_books: &HashSet<&str>,
     index: &UnitIndex<'a>,
     options: &Options,
     row: &mut Value,
 ) {
+    let BaselineBody {
+        document: old,
+        units: previous,
+    } = baseline;
     let previous_ref: Vec<_> = previous.iter().collect();
     let current_ref: Vec<_> = current.iter().collect();
     let aligned = align_units(&previous_ref, &current_ref, options.work);
@@ -425,8 +433,10 @@ pub(crate) fn compare_documents(
                     let previous = old_units.get(identity).map_or(&[][..], Vec::as_slice);
                     document_row(
                         document,
-                        old,
-                        previous,
+                        BaselineBody {
+                            document: old,
+                            units: previous,
+                        },
                         &units,
                         &incomplete_books,
                         &index,

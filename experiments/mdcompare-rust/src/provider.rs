@@ -344,7 +344,7 @@ fn refresh(client: &Client, backend: Backend, cred: &Value) -> Result<Value, &'s
 }
 
 fn access(client: &Client, backend: Backend, path: &Path) -> Result<String, &'static str> {
-    let auth = auth_json(&path)?;
+    let auth = auth_json(path)?;
     let cred = credential(&auth, backend)?;
     if !expired(cred) {
         return nonempty(&cred["access"])
@@ -352,11 +352,11 @@ fn access(client: &Client, backend: Backend, path: &Path) -> Result<String, &'st
             .ok_or("oauth_required");
     }
 
-    let lock = AuthLock::acquire(&path)?;
-    let mut auth = auth_json(&path)?;
+    let lock = AuthLock::acquire(path)?;
+    let mut auth = auth_json(path)?;
     let cred = credential(&auth, backend)?;
     if expired(cred) {
-        let metadata = fs::metadata(&path).map_err(|_| "auth_error")?;
+        let metadata = fs::metadata(path).map_err(|_| "auth_error")?;
         let next = refresh(client, backend, cred)?;
         auth[backend.name()] = next;
         let parent = path.parent().ok_or("auth_error")?;
@@ -372,7 +372,7 @@ fn access(client: &Client, backend: Backend, path: &Path) -> Result<String, &'st
         if !lock.owns_lock() {
             return Err("auth_error");
         }
-        temp.persist(&path).map_err(|_| "auth_error")?;
+        temp.persist(path).map_err(|_| "auth_error")?;
         fs::File::open(parent)
             .and_then(|dir| dir.sync_all())
             .map_err(|_| "auth_error")?;
