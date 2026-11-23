@@ -4,6 +4,10 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 fn doctor(directory: &Path, config: Option<&Path>) -> Output {
+    doctor_with_args(directory, config, &[])
+}
+
+fn doctor_with_args(directory: &Path, config: Option<&Path>, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mdocrr"));
     command
         .env_clear()
@@ -15,7 +19,7 @@ fn doctor(directory: &Path, config: Option<&Path>) -> Output {
     if let Some(config) = config {
         command.arg("--config").arg(config);
     }
-    command.output().unwrap()
+    command.args(args).output().unwrap()
 }
 
 #[test]
@@ -38,6 +42,8 @@ fn doctor_reads_the_selected_toml_and_uses_its_directory_for_paths() {
     assert_eq!(summary["mode"], "paddle");
     assert_eq!(summary["config_source"], config.to_str().unwrap());
     assert_eq!(summary["network_checked"], false);
+    assert_eq!(summary["status"], "local_only");
+    assert_eq!(summary["probe"]["reason_code"], "paddle_ping_unsupported");
     let checks = summary["checks"].as_array().unwrap();
     assert!(
         checks
@@ -60,23 +66,25 @@ fn doctor_reports_expired_oauth_without_refreshing_or_reading_ambient_config() {
     fs::write(root.path().join("default.toml"), "unexpected = true").unwrap();
 
     let builtin = doctor(root.path(), None);
-    assert_eq!(builtin.status.code(), Some(2));
+    assert_eq!(builtin.status.code(), Some(0));
     let builtin: Value = serde_json::from_slice(&builtin.stdout).unwrap();
     assert_eq!(builtin["config_source"], "built-in");
     assert_eq!(builtin["mode"], "llm");
     assert!(builtin["checks"].as_array().unwrap().iter().any(|check| {
-        check["name"] == "credentials" && check["reason_code"] == "credential_file_required"
+        check["name"] == "credentials" && check["reason_code"] == "credential_not_configured"
     }));
+    assert_eq!(builtin["probe"]["reason_code"], "credential_not_configured");
+    assert_eq!(builtin["network_checked"], false);
 
     let config = root.path().join("llm.toml");
     fs::write(&config, "oauth_file = \"auth.json\"\n").unwrap();
     let configured = doctor(root.path(), Some(&config));
-    assert!(configured.status.success());
+    assert_eq!(configured.status.code(), Some(2));
     let output: Value = serde_json::from_slice(&configured.stdout).unwrap();
     assert_eq!(output["network_checked"], false);
     assert!(output["checks"].as_array().unwrap().iter().any(|check| {
         check["name"] == "credentials"
-            && check["status"] == "warn"
+            && check["status"] == "fail"
             && check["reason_code"] == "oauth_credential_expired"
     }));
     assert_eq!(fs::read(auth).unwrap(), credentials);
@@ -86,6 +94,61 @@ fn doctor_reports_expired_oauth_without_refreshing_or_reading_ambient_config() {
             .unwrap()
             .contains("fixture-refresh")
     );
+}
+
+#[test]
+fn pretty_preserves_json_and_exit_status_for_local_results() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config.toml");
+    for (contents, code) in [
+        (r#"mode = "llm""#, 0),
+        (r#"oauth_file = "missing.txt""#, 2),
+        ("concurency = 3", 1),
+    ] {
+        fs::write(&config, contents).unwrap();
+        let compact = doctor(root.path(), Some(&config));
+        let pretty = doctor_with_args(root.path(), Some(&config), &["--pretty"]);
+        assert_eq!(compact.status.code(), Some(code));
+        assert_eq!(pretty.status.code(), Some(code));
+        assert_eq!(compact.stderr, pretty.stderr);
+        assert_eq!(String::from_utf8_lossy(&compact.stdout).lines().count(), 1);
+        assert!(String::from_utf8_lossy(&pretty.stdout).lines().count() > 1);
+        let compact: Value = serde_json::from_slice(&compact.stdout).unwrap();
+        let pretty: Value = serde_json::from_slice(&pretty.stdout).unwrap();
+        assert_eq!(compact, pretty);
+        assert_eq!(pretty["network_checked"], false);
+    }
+}
+
+#[test]
+fn explicit_zero_budget_skips_usable_oauth_without_a_connection_or_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "request_budget = 0\noauth_file = \"auth.json\"\nproxy_url = \"http://{}\"\ncache_dir = \"cache\"\n",
+            listener.local_addr().unwrap()
+        ),
+    )
+    .unwrap();
+    let credentials = br#"{"openai":{"type":"oauth","access":"fixture-access","refresh":"fixture-refresh","expires":9999999999999}}"#;
+    let auth = root.path().join("auth.json");
+    fs::write(&auth, credentials).unwrap();
+    let output = doctor(root.path(), Some(&config));
+    assert_eq!(output.status.code(), Some(0));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["probe"]["reason_code"], "request_budget_zero");
+    assert_eq!(report["network_checked"], false);
+    assert_eq!(report["probe"]["remote_credentials"], "unverified");
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(fs::read(auth).unwrap(), credentials);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
 }
 
 #[test]

@@ -33,7 +33,7 @@ workspaces and caches under the Rust contract.
 | `mdocrr cancel --plan FILE` | Record a cancellation and stop new request admission for that batch. |
 | `mdocrr assemble --plan FILE --output-dir DIR` | Recover publishable Markdown from accepted OCR patches offline into a new directory. |
 | `mdocrr purge --plan FILE [-Y]` | Explicitly remove the named batch's workspace artifacts. |
-| `mdocrr doctor [--config FILE]` | Diagnose local readiness with the built-in defaults or an explicit TOML file. |
+| `mdocrr doctor [--config FILE] [--pretty]` | Diagnose local readiness and probe a configured LLM once. |
 | `mdocrr check-mermaid FILE` | Check Mermaid fences in a Markdown file. Use `-` for stdin. |
 | `mdocrr licenses` | Print notices for bundled assets. |
 | `mdocrr --help`, `mdocrr COMMAND --help`, `mdocrr help all`, `mdocrr --version` | Discover the interface and identify the binary offline. |
@@ -131,8 +131,8 @@ provider mode. Changing a compiled default takes a rebuild. Editing a local
 `default.toml` changes defaults for future batches.
 
 `doctor` has no work plan directory. Bare `doctor` checks compiled defaults.
-`doctor --config FILE` loads and checks the specified file with the same parser
-and validation as `accept` and `run`.
+`doctor --config FILE` loads the specified file with the same parser and
+validation as `accept` and `run`.
 
 ### LLM example
 
@@ -394,19 +394,23 @@ purge. Direct filesystem removal remains possible for the operator.
 
 ```sh
 mdocrr doctor
-mdocrr doctor --config paddle.toml
+mdocrr doctor --config provider.toml --pretty
 ```
 
-`doctor` is a read-only local diagnosis. Report effective config source and
-provider mode, valid parameter values, prompt and CA readability, credential
-file presence and readability, and local OAuth expiry when available. Verify
-embedded Markdown, image and Mermaid capabilities with local checks. Avoid
-printing secrets and avoid networking, OAuth refresh, inference, or workspace
-creation. A successful local check does not certify service connectivity or
-provider-side credential acceptance.
-Its JSON summary includes `config_source`, `mode`, `network_checked: false`,
-and a `checks` array. Each check reports its name, a `pass`, `warn`, or `fail`
-status, and a stable reason code when applicable.
+`doctor` checks configuration, prompt and CA readability, credentials, and
+embedded Markdown, image, and Mermaid capabilities. Bare doctor and Paddle
+mode perform local checks only. LLM mode with usable OAuth and a nonzero or
+omitted request budget sends one text-only PING through the configured route,
+model, and effort. A completed response with nonempty assistant text passes.
+The probe uses a 20-second deadline and does not retry, refresh OAuth, create
+a workspace, or consume batch budget. The provider may meter the request.
+
+The JSON summary includes `config_source`, `mode`, `checks`, and
+`network_checked`. The `probe` reports HTTP, remote credential acceptance,
+and model results separately. `--pretty` indents the same JSON object. Exit
+`0` means the probe passed or local checks passed with an intentional skip.
+Exit `1` means invalid configuration, and `2` means a local check or the
+attempted probe failed.
 
 Help is progressive, embedded, offline, and English-only. Root `-h` and
 `--help` explain purpose, list commands, and provide a first-use example.

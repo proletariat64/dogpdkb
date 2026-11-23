@@ -115,14 +115,17 @@ enum Command {
         yes: bool,
     },
 
-    /// Check local runtime readiness without network access.
+    /// Check local readiness and probe a configured LLM once.
     #[command(
-        after_help = "Examples:\n  mdocrr doctor\n  mdocrr doctor --config provider.toml\nExit 2 means one or more local checks failed."
+        after_help = "Examples:\n  mdocrr doctor\n  mdocrr doctor --config provider.toml --pretty\nPaddle checks are local. LLM mode can send one short request if credentials are usable and the budget allows it. Exit 1 means invalid configuration. Exit 2 means a local check or the probe failed."
     )]
     Doctor {
         /// TOML file to check. Omission checks the built-in defaults.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Indent the final JSON summary.
+        #[arg(long)]
+        pretty: bool,
     },
 
     /// Check Mermaid fences in one Markdown file and report JSON diagnostics.
@@ -234,7 +237,7 @@ fn execute(command: Command) -> Outcome {
             runner::assemble(&ws, output_dir)
         }
         Command::Purge { batch, yes } => workspace::purge(&Workspace::new(&batch.plan)?, yes),
-        Command::Doctor { config } => config::doctor(config.as_deref()),
+        Command::Doctor { config, .. } => config::doctor(config.as_deref()),
         Command::CheckMermaid { input } => check_mermaid(input),
         Command::Help { .. } | Command::Licenses => unreachable!("text commands handled in main"),
     }
@@ -309,11 +312,15 @@ fn check_mermaid(input: PathBuf) -> Outcome {
     ))
 }
 
-fn write_summary(command: &str, mut summary: Value) -> Result<()> {
+fn write_summary(command: &str, mut summary: Value, pretty: bool) -> Result<()> {
     summary["schema_version"] = json!("mdocr-summary-1");
     summary["command"] = json!(command);
     let mut stdout = io::stdout().lock();
-    serde_json::to_writer(&mut stdout, &summary)?;
+    if pretty {
+        serde_json::to_writer_pretty(&mut stdout, &summary)?;
+    } else {
+        serde_json::to_writer(&mut stdout, &summary)?;
+    }
     writeln!(stdout)?;
     stdout.flush()?;
     Ok(())
@@ -343,6 +350,7 @@ fn main() -> ExitCode {
     }
 
     let name = command.name();
+    let pretty = matches!(command, Command::Doctor { pretty: true, .. });
     let (code, summary) = match execute(command) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -360,10 +368,24 @@ fn main() -> ExitCode {
             let message = format!("{error:#}");
             let message = message.replace(char::is_control, " ");
             let _ = writeln!(io::stderr().lock(), "mdocrr: {name}: {message}");
-            (1, json!({"status":status, "reason_code":reason}))
+            if name == "doctor" {
+                (
+                    1,
+                    json!({
+                        "status": status,
+                        "reason_code": "configuration_invalid",
+                        "network_checked": false,
+                        "config_key": "--config",
+                        "hint": "Check the configuration file and its values.",
+                        "detail": message,
+                    }),
+                )
+            } else {
+                (1, json!({"status":status, "reason_code":reason}))
+            }
         }
     };
-    match write_summary(name, summary) {
+    match write_summary(name, summary, pretty) {
         Ok(()) => ExitCode::from(code),
         Err(error) => {
             let _ = writeln!(io::stderr().lock(), "mdocrr: cannot write summary: {error}");

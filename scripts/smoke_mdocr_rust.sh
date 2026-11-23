@@ -35,6 +35,7 @@ check() {
 check 'mdocrr ' --version
 check 'mdocrr help all' --help
 check 'mdocr-work-1' help all
+check '"reason_code": "credential_not_configured"' doctor --pretty
 check '"ok":true' check-mermaid - <<'EOF'
 ```mermaid
 flowchart TD
@@ -45,6 +46,7 @@ EOF
 printf '%s\n' 'smoke-fixture-token' > token.txt
 printf '%s\n' 'mode = "paddle"' 'token_file = "token.txt"' 'request_budget = 0' > default.toml
 check '"network_checked":false' doctor --config default.toml
+check '"reason_code":"paddle_ping_unsupported"' doctor --config default.toml
 printf '%s\n' 'Markdown smoke fixture.' > source.md
 check '"status":"drafted"' draft --input-single source.md --output-single output.md --plan work.json
 check '"status":"completed"' run --plan work.json

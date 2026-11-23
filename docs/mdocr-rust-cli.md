@@ -30,7 +30,7 @@ Set `CARGO_TARGET_DIR` to use a different build directory.
 
 ```sh
 mdocrr draft --input-single source.md --output-single enriched.md --plan work.json
-mdocrr doctor --config provider.toml
+mdocrr doctor --config provider.toml --pretty
 mdocrr run --plan work.json --config provider.toml > summary.json 2>> mdocrr.log
 ```
 
@@ -42,6 +42,11 @@ At first acceptance mdocrr uses the explicit TOML, the `default.toml` next to th
 work plan, or compiled defaults, in that order. Provider credentials are files
 named by the TOML. Provider calls and authorized remote image downloads require
 network access.
+
+Doctor reports local readiness and sends at most one short text request in LLM
+mode with usable OAuth and a nonzero or omitted request budget. Bare doctor
+and Paddle mode only check local readiness. The JSON summary distinguishes
+HTTP, remote credentials, and model results. Use `--pretty` for indented JSON.
 
 ## Inspect, resume, and recover
 

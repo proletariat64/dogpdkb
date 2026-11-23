@@ -298,6 +298,32 @@ fn check(name: &str, status: &str, reason: &str) -> Value {
     json!({"name": name, "status": status, "reason_code": reason})
 }
 
+fn with_hint(mut check: Value, key: &str, hint: &str) -> Value {
+    check["config_key"] = json!(key);
+    check["hint"] = json!(hint);
+    check
+}
+
+fn oauth_check(auth: &Result<llm::DoctorAuth<'_>, &'static str>) -> Value {
+    let Err(reason) = auth else {
+        return check("credentials", "pass", "oauth_credential_readable");
+    };
+    let (status, hint) = match *reason {
+        "credential_not_configured" => ("warn", "Set oauth_file to check the provider live."),
+        "oauth_file_missing" => ("fail", "Check that the configured OAuth file exists."),
+        "oauth_file_unreadable" => ("fail", "Check that the configured OAuth file is readable."),
+        "oauth_credential_expired" => {
+            ("fail", "Renew the selected provider login before retrying.")
+        }
+        "clock_unavailable" => ("fail", "Check the system clock."),
+        _ => (
+            "fail",
+            "Check that the OAuth file contains a valid credential for this provider.",
+        ),
+    };
+    with_hint(check("credentials", status, reason), "oauth_file", hint)
+}
+
 fn embedded_image_check() -> bool {
     let mut data = Cursor::new(Vec::new());
     image::DynamicImage::new_rgb8(2, 2)
@@ -312,23 +338,23 @@ pub(crate) fn doctor(explicit: Option<&Path>) -> Result<(u8, Value)> {
     let mode = settings["mode"]
         .as_str()
         .context("configuration missing provider mode")?;
-    let credential_key = if mode == "paddle" {
-        "token_file"
+    let oauth = (mode == "llm").then(|| llm::DoctorAuth::load(&settings));
+    let credential = if let Some(auth) = &oauth {
+        oauth_check(auth)
+    } else if settings["token_file"].is_null() {
+        with_hint(
+            check("credentials", "fail", "credential_file_required"),
+            "token_file",
+            "Set token_file to a readable Paddle token file.",
+        )
     } else {
-        "oauth_file"
-    };
-    let credential = if settings[credential_key].is_null() {
-        check("credentials", "fail", "credential_file_required")
-    } else if mode == "paddle" {
         match paddle_token(&settings) {
             Ok(_) => check("credentials", "pass", "credential_file_readable"),
-            Err(_) => check("credentials", "fail", "credential_file_invalid"),
-        }
-    } else {
-        match llm::oauth_expired(&settings) {
-            Ok(false) => check("credentials", "pass", "oauth_credential_readable"),
-            Ok(true) => check("credentials", "warn", "oauth_credential_expired"),
-            Err(_) => check("credentials", "fail", "oauth_credential_invalid"),
+            Err(_) => with_hint(
+                check("credentials", "fail", "credential_file_invalid"),
+                "token_file",
+                "Check the path, readability, and token format.",
+            ),
         }
     };
 
@@ -343,7 +369,11 @@ pub(crate) fn doctor(explicit: Option<&Path>) -> Result<(u8, Value)> {
     } else if provider::ca_certificates(&settings).is_ok() {
         check("ca_file", "pass", "ca_file_readable")
     } else {
-        check("ca_file", "fail", "ca_file_invalid")
+        with_hint(
+            check("ca_file", "fail", "ca_file_invalid"),
+            "ca_file",
+            "Check that the CA file contains readable PEM certificates.",
+        )
     };
     let mut checks = vec![
         check("configuration", "pass", "configuration_valid"),
@@ -368,19 +398,59 @@ pub(crate) fn doctor(explicit: Option<&Path>) -> Result<(u8, Value)> {
             check(name, "fail", "embedded_capability_failed")
         });
     }
-    let ready = checks.iter().all(|check| check["status"] != "fail");
+    let local_passed = checks.iter().all(|check| check["status"] != "fail");
+    let probe = match oauth {
+        None => llm::Probe::skipped(
+            "paddle_ping_unsupported",
+            "mode",
+            "Paddle only supports OCR job submission. Use an LLM configuration for PING.",
+        ),
+        Some(_) if settings["request_budget"].as_u64() == Some(0) => llm::Probe::skipped(
+            "request_budget_zero",
+            "request_budget",
+            "Set a positive budget or omit the setting to permit the probe.",
+        ),
+        Some(_) if !local_passed => llm::Probe::skipped(
+            "local_checks_failed",
+            "configuration",
+            "Resolve the failed local checks first.",
+        ),
+        Some(Err(reason)) => llm::Probe::skipped(
+            reason,
+            "oauth_file",
+            "Set oauth_file to check the provider live.",
+        ),
+        Some(Ok(auth)) => auth.ping(&settings),
+    };
+    let passed = local_passed && !probe.failed();
+    let status = if !passed {
+        "unready"
+    } else if !probe.attempted() {
+        "local_only"
+    } else {
+        "ready"
+    };
     let config_source = match source {
         Some(path) => json!(path),
         None => json!("built-in"),
     };
-    Ok((
-        if ready { 0 } else { 2 },
-        json!({
-            "status": if ready { "ready" } else { "unready" },
-            "config_source": config_source,
-            "mode": mode,
-            "network_checked": false,
-            "checks": checks,
-        }),
-    ))
+    let mut report = json!({
+        "status": status,
+        "config_source": config_source,
+        "mode": mode,
+        "network_checked": probe.attempted(),
+        "checks": checks,
+        "probe": probe.report(),
+    });
+    if mode == "llm" {
+        report["model"] = settings["model"].clone();
+        report["effort"] = settings["effort"].clone();
+        report["provider"] = json!(
+            settings["model"]
+                .as_str()
+                .and_then(|model| model.split_once('/'))
+                .map(|(route, _)| route)
+        );
+    }
+    Ok((if passed { 0 } else { 2 }, report))
 }
