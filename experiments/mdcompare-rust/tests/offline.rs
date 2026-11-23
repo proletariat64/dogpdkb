@@ -170,3 +170,40 @@ fn accepted_input_drift_prevents_a_new_commit() {
     );
     assert!(!path.join("work.mdcompare/commit.json").exists());
 }
+
+#[test]
+fn strict_explanation_work_is_independent_of_the_machine_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    fs::write(path.join("old.md"), "# Limit\n\n10 units\n").unwrap();
+    fs::write(path.join("new.md"), "# Limit\n\n20 units\n").unwrap();
+    let snapshot = |file| {
+        json!({"path":file,"content_kind":"raw","resources":[],
+            "metadata":{"name":"Limit","logical_path":"","source_ref":"limit"}})
+    };
+    let work = json!({
+        "schema_version":"mdcompare-work-1","operation":"strict","documents":[{
+            "knowledge_base":"book","document_id":"42",
+            "baseline":snapshot("old.md"),"incoming":snapshot("new.md")
+        }]
+    });
+    let plan = path.join("strict.json");
+    fs::write(&plan, work.to_string()).unwrap();
+    let output = stdout(&invoke(&plan, "run", &[]), 0);
+
+    let report_plan = path.join("strict-report.json");
+    fs::write(&report_plan, work.to_string()).unwrap();
+    let config = path.join("default.toml");
+    fs::write(
+        &config,
+        "[compare]\nmax_diff_work=0\n[report]\nmarkdown=true\ninclude_body_excerpts=true\n",
+    )
+    .unwrap();
+    let with_report = stdout(&invoke(&report_plan, "run", &[]), 0);
+    let machine_report =
+        |summary: &Value| fs::read(summary["artifacts"]["result"].as_str().unwrap()).unwrap();
+    let report: Value = serde_json::from_slice(&machine_report(&output)).unwrap();
+    assert_eq!(report["results"][0]["action"], "UPDATE_TEXT_REUSE_OCR");
+    assert_eq!(machine_report(&output), machine_report(&with_report));
+    assert!(std::path::Path::new(with_report["artifacts"]["review"].as_str().unwrap()).is_file());
+}
