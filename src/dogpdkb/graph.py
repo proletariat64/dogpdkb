@@ -96,7 +96,7 @@ def _active_ignore_rules(path):
         return False
     except PermissionError:
         _warn_ignore_preserved(f"cannot read Git ignore source {path}")
-        return False
+        return None
     content = content.removeprefix(b"\xef\xbb\xbf")
     return any(
         line.removesuffix(b"\r").strip(b" ") and not line.startswith(b"#")
@@ -183,23 +183,29 @@ def _ensure_corpus_whitelist(corpus):
     for part in relative.parts:
         current_path /= part
         chain.append(current_path)
-    local_rules = any(
+    local_statuses = [
         _active_ignore_rules(directory / ".gitignore") for directory in chain
-    )
+    ]
+    if any(status is None for status in local_statuses):
+        return
+    local_rules = any(local_statuses)
     if not local_rules:
         try:
             info_exclude = _git_info_exclude(root)
         except ValueError:
             _warn_ignore_preserved("cannot resolve the Git exclude source")
             return
-        if not _active_ignore_rules(info_exclude):
+        info_status = _active_ignore_rules(info_exclude)
+        if info_status is None or not info_status:
             return
 
     anchor = root
+    observed_existing = False
     for directory in reversed(chain):
         candidate = directory / ".graphifyignore"
         if candidate.is_symlink() or candidate.exists():
             anchor = directory
+            observed_existing = True
             break
 
     relative = corpus.relative_to(anchor)
@@ -222,6 +228,9 @@ def _ensure_corpus_whitelist(corpus):
         return
     if path.is_symlink() or path.exists():
         _warn_ignore_preserved("the existing whitelist needs operator provisioning")
+        return
+    if observed_existing:
+        _warn_ignore_preserved("the existing whitelist disappeared before update")
         return
 
     temporary = None

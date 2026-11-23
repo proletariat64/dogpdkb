@@ -542,6 +542,7 @@ def test_unreadable_git_ignore_warns_and_skips_maintenance(
     corpus.mkdir()
     ignore_file = tmp_path / ".gitignore"
     ignore_file.write_text("*\n")
+    (tmp_path / ".git/info/exclude").write_text("*\n")
     real_read = Path.read_bytes
 
     def denied(path):
@@ -739,6 +740,34 @@ def test_graphifyignore_full_disk_preserves_extraction(tmp_path, monkeypatch, ca
 
     assert not (tmp_path / ".graphifyignore").exists()
     assert "insufficient resources" in capsys.readouterr().err
+
+
+def test_existing_graphifyignore_disappearance_never_recreates_it(
+    tmp_path, monkeypatch, capsys
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Existing rules\nignored.md\n"
+    ignore_file.write_bytes(original)
+    real_exists = Path.exists
+    checks = 0
+
+    def disappear_after_selection(path):
+        nonlocal checks
+        if path != ignore_file:
+            return real_exists(path)
+        checks += 1
+        return checks == 1
+
+    monkeypatch.setattr(Path, "exists", disappear_after_selection)
+    _ensure_corpus_whitelist(corpus)
+    monkeypatch.undo()
+
+    assert ignore_file.read_bytes() == original
+    assert "disappeared before update" in capsys.readouterr().err
 
 
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):
