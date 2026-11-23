@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -385,7 +386,7 @@ def test_corpus_whitelist_rejects_symlink_update(tmp_path):
     assert not (tmp_path / ".graphifyignore.lock").exists()
 
 
-def test_git_exclude_timeout_is_contextual(tmp_path, monkeypatch):
+def test_git_exclude_timeout_preserves_extraction(tmp_path, monkeypatch, capsys):
     (tmp_path / ".git").write_text("gitdir: /invalid\n")
     corpus = tmp_path / "corpus"
     corpus.mkdir()
@@ -394,9 +395,10 @@ def test_git_exclude_timeout_is_contextual(tmp_path, monkeypatch):
         raise subprocess.TimeoutExpired(["git"], 10)
 
     monkeypatch.setattr("dogpdkb.graph.subprocess.run", timeout)
-    with pytest.raises(ValueError, match="Git worktree exclude") as error:
-        _ensure_corpus_whitelist(corpus)
-    assert isinstance(error.value.__cause__, subprocess.TimeoutExpired)
+    _ensure_corpus_whitelist(corpus)
+
+    assert not (tmp_path / ".graphifyignore").exists()
+    assert "continuing with --no-gitignore" in capsys.readouterr().err
 
 
 def test_corpus_whitelist_preserves_crlf_and_existing_bytes(tmp_path):
@@ -786,6 +788,67 @@ def test_corpus_whitelist_update_permission_failure_preserves_original(
 
     assert ignore_file.read_bytes() == original
     assert "continuing with --no-gitignore" in capsys.readouterr().err
+
+
+def test_unavailable_git_exclude_lookup_preserves_extraction(
+    tmp_path, monkeypatch, capsys
+):
+    (tmp_path / ".git").write_text("gitdir: /unused\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+
+    def unavailable(root):
+        raise ValueError("Git unavailable")
+
+    monkeypatch.setattr("dogpdkb.graph._git_info_exclude", unavailable)
+    _ensure_corpus_whitelist(corpus)
+
+    assert not (tmp_path / ".graphifyignore").exists()
+    assert "cannot resolve the Git exclude source" in capsys.readouterr().err
+
+
+def test_unsupported_xattr_mount_preserves_original(tmp_path, monkeypatch, capsys):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Original\nignored.md\n"
+    ignore_file.write_bytes(original)
+
+    def unsupported(path, *, follow_symlinks):
+        raise OSError(errno.ENOTSUP, "unsupported")
+
+    monkeypatch.setattr("dogpdkb.graph.os.listxattr", unsupported)
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == original
+    assert "continuing with --no-gitignore" in capsys.readouterr().err
+
+
+def test_initial_whitelist_permission_failure_preserves_original(
+    tmp_path, monkeypatch, capsys
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Original\nignored.md\n"
+    ignore_file.write_bytes(original)
+    real_read = Path.read_bytes
+
+    def denied(path):
+        if path == ignore_file:
+            raise PermissionError("EPERM")
+        return real_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", denied)
+    _ensure_corpus_whitelist(corpus)
+    monkeypatch.undo()
+
+    assert ignore_file.read_bytes() == original
+    assert "cannot read the current Corpus whitelist" in capsys.readouterr().err
 
 
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):

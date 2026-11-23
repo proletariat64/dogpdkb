@@ -202,8 +202,14 @@ def _ensure_corpus_whitelist(corpus):
     local_rules = any(
         _active_ignore_rules(directory / ".gitignore") for directory in chain
     )
-    if not local_rules and not _active_ignore_rules(_git_info_exclude(root)):
-        return
+    if not local_rules:
+        try:
+            info_exclude = _git_info_exclude(root)
+        except ValueError:
+            _warn_ignore_preserved("cannot resolve the Git exclude source")
+            return
+        if not _active_ignore_rules(info_exclude):
+            return
 
     anchor = root
     for directory in reversed(chain):
@@ -223,7 +229,12 @@ def _ensure_corpus_whitelist(corpus):
     rules.append(f"!{current}/**" if current else "!/**")
 
     path = anchor / ".graphifyignore"
-    if not _missing_whitelist(path, rules):
+    try:
+        missing = _missing_whitelist(path, rules)
+    except PermissionError:
+        _warn_ignore_preserved("cannot read the current Corpus whitelist")
+        return
+    if not missing:
         return
     if path.is_symlink():
         raise ValueError("provision Corpus whitelist in the symlinked .graphifyignore")
@@ -290,9 +301,9 @@ def _ensure_corpus_whitelist(corpus):
         _warn_ignore_preserved("cannot update the whitelist without permission")
         return
     except OSError as error:
-        if error.errno != errno.EROFS:
+        if error.errno not in {errno.EROFS, errno.ENOTSUP}:
             raise
-        _warn_ignore_preserved("the whitelist update is read-only")
+        _warn_ignore_preserved("the whitelist update is unsupported or read-only")
         return
     finally:
         os.close(descriptor)
