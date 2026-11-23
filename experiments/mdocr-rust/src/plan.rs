@@ -1,14 +1,14 @@
+use crate::artifacts::{atomic, json_bytes, resolve, sha};
 use anyhow::{Context, Result, ensure};
 use clap::{Args as ClapArgs, ValueEnum};
 use percent_encoding::percent_decode_str;
 use pulldown_cmark::{Event, Parser, Tag};
 use regex::Regex;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
 enum Mode {
@@ -55,32 +55,10 @@ pub struct Args {
     selection: Option<PathBuf>,
     #[arg(long)]
     cache_dir: Option<PathBuf>,
-}
-
-fn sha(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-fn resolve(path: &Path) -> Result<PathBuf> {
-    let mut result = std::env::current_dir()?;
-    for part in path.components() {
-        match part {
-            Component::RootDir | Component::Prefix(_) => result = part.as_os_str().into(),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                result.pop();
-            }
-            Component::Normal(name) => {
-                result.push(name);
-                match result.canonicalize() {
-                    Ok(resolved) => result = resolved,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(err).with_context(|| result.display().to_string()),
-                }
-            }
-        }
-    }
-    Ok(result)
+    #[arg(long)]
+    download: bool,
+    #[arg(long, requires = "download")]
+    download_list: Option<PathBuf>,
 }
 
 fn markdown_path(path: &Path) -> Result<PathBuf> {
@@ -211,7 +189,10 @@ impl Scanner {
                         digest = Some(sha(&data));
                         None
                     }
-                    Err(_) => Some("IMAGE_NOT_FOUND"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Some("IMAGE_NOT_FOUND")
+                    }
+                    Err(error) => return Err(error).context("cannot read planned local image"),
                 }
             };
             char_offset += text[previous_byte..span.start()].chars().count();
@@ -285,6 +266,17 @@ pub fn write(args: Args) -> Result<()> {
         .map(|(src, _)| src.clone())
         .collect::<HashSet<_>>();
     ensure!(protected.len() == pairs.len(), "duplicate input path");
+    let download_sources: Option<HashSet<PathBuf>> = args
+        .download_list
+        .as_ref()
+        .map(|path| serde_json::from_slice(&fs::read(path)?).context("invalid --download-list"))
+        .transpose()?;
+    if let Some(sources) = &download_sources {
+        ensure!(
+            sources.is_subset(&protected),
+            "download list names an unknown input document"
+        );
+    }
     let selection: Option<HashMap<PathBuf, HashSet<String>>> = args
         .selection
         .as_ref()
@@ -296,9 +288,14 @@ pub fn write(args: Args) -> Result<()> {
             "selection names an unknown input document"
         );
     }
-    for path in [&args.list, &args.prompt_file, &args.selection]
-        .into_iter()
-        .flatten()
+    for path in [
+        &args.list,
+        &args.prompt_file,
+        &args.selection,
+        &args.download_list,
+    ]
+    .into_iter()
+    .flatten()
     {
         protected.insert(resolve(path)?);
     }
@@ -340,15 +337,118 @@ pub fn write(args: Args) -> Result<()> {
             dest.display()
         );
     }
-    let parent = plan.parent().context("plan has no parent directory")?;
-    fs::create_dir_all(parent)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer_pretty(
-        &mut tmp,
-        &json!({"schema_version":"mdocr-plan-2", "settings":settings, "documents": docs}),
+    if args.download {
+        let assets = plan.with_file_name(format!(
+            "{}.images",
+            plan.file_name()
+                .and_then(|name| name.to_str())
+                .context("invalid plan filename")?
+        ));
+        ensure!(
+            protected
+                .iter()
+                .chain(&destinations)
+                .all(|path| !path.starts_with(&assets) && !assets.starts_with(path)),
+            "image staging directory overlaps a planned input or destination"
+        );
+        let images = docs
+            .iter_mut()
+            .filter(|doc| {
+                download_sources.as_ref().is_none_or(|sources| {
+                    doc["path"]
+                        .as_str()
+                        .is_some_and(|path| sources.contains(Path::new(path)))
+                })
+            })
+            .flat_map(|doc| doc["images"].as_array_mut().expect("planned image list"))
+            .filter(|image| {
+                image["selected"] == true && image["error"] == "REMOTE_IMAGE_NOT_DOWNLOADED"
+            })
+            .collect::<Vec<_>>();
+        if !images.is_empty() {
+            bind_downloads(images, &assets, llm)?;
+        }
+    }
+    let mut protected = protected.into_iter().collect::<Vec<_>>();
+    protected.sort();
+    let data = json_bytes(
+        &json!({"schema_version":"mdocr-plan-2", "settings":settings,
+        "documents":docs, "protected_inputs":protected}),
     )?;
-    writeln!(tmp)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist_noclobber(plan)?;
+    atomic(&plan, &data, true)?;
+    Ok(())
+}
+
+fn download_url(url: &reqwest::Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+fn bind_downloads(images: Vec<&mut Value>, assets: &Path, llm: bool) -> Result<()> {
+    use reqwest::{Url, blocking::Client, redirect::Policy};
+
+    fs::create_dir_all(assets.parent().context("missing image staging parent")?)?;
+    fs::create_dir(assets)?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(Policy::custom(|attempt| {
+            if !download_url(attempt.url()) || attempt.previous().len() >= 10 {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()?;
+    let mut downloads: HashMap<String, Value> = HashMap::new();
+    for image in images {
+        let link = image["resource_id"]
+            .as_str()
+            .context("missing remote image URL")?;
+        if !downloads.contains_key(link) {
+            let fields = match Url::parse(link) {
+                Ok(url) if download_url(&url) => {
+                    let extension = Path::new(url.path())
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    if !llm
+                        && !matches!(
+                            extension.as_str(),
+                            "png" | "webp" | "gif" | "jpg" | "jpeg" | "tif" | "tiff"
+                        )
+                    {
+                        json!({"error":"REMOTE_IMAGE_FORMAT_UNSUPPORTED"})
+                    } else {
+                        match client.get(url).send().and_then(|response| {
+                            if response.status().is_success() {
+                                response.bytes().map(Some)
+                            } else {
+                                Ok(None)
+                            }
+                        }) {
+                            Ok(Some(bytes)) => {
+                                let mut name = sha(link.as_bytes());
+                                if !llm {
+                                    name.push('.');
+                                    name.push_str(&extension);
+                                }
+                                let path = assets.join(name);
+                                atomic(&path, &bytes, true)?;
+                                json!({"error":null, "source_path":path, "sha256":sha(&bytes)})
+                            }
+                            Ok(None) | Err(_) => json!({"error":"REMOTE_IMAGE_DOWNLOAD_FAILED"}),
+                        }
+                    }
+                }
+                _ => json!({"error":"REMOTE_IMAGE_DOWNLOAD_FAILED"}),
+            };
+            downloads.insert(link.into(), fields);
+        }
+        for (key, value) in downloads[link].as_object().expect("download fields") {
+            image[key] = value.clone();
+        }
+    }
     Ok(())
 }

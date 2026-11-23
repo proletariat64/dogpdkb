@@ -1,4 +1,9 @@
+mod artifacts;
+mod llm;
+mod paddle;
 mod plan;
+mod provider;
+mod runner;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -17,8 +22,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Freeze a local Markdown OCR plan without inference or downloads.
+    /// Freeze an OCR plan without running inference.
     Plan(Box<plan::Args>),
+    /// Execute a frozen OCR plan and persist its result.
+    Run(runner::Args),
+    /// Assemble already accepted patches into a fresh directory without network access.
+    Assemble(runner::AssembleArgs),
+    /// Print notices for the fonts embedded for SVG rendering.
+    Licenses,
     /// Check Mermaid fences in one Markdown document and print JSON diagnostics.
     CheckMermaid {
         /// Markdown file, or '-' for standard input.
@@ -101,6 +112,28 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             };
+        }
+        Command::Run(args) => {
+            return match runner::run(args) {
+                Ok(code) => ExitCode::from(code),
+                Err(error) => {
+                    eprintln!("mdocr: run: {error:#}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Command::Assemble(args) => {
+            return match runner::assemble(args) {
+                Ok(code) => ExitCode::from(code),
+                Err(error) => {
+                    eprintln!("mdocr: assemble: {error:#}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Command::Licenses => {
+            println!("{}", llm::font_licenses());
+            return ExitCode::SUCCESS;
         }
         Command::CheckMermaid { input } => check_mermaid(input),
     };
