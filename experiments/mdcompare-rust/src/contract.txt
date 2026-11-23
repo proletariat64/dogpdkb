@@ -58,13 +58,57 @@ Each identity is the pair (knowledge_base, document_id). Each row has at least
 one snapshot. Use null for an absent side. Baseline-only rows are advisory.
 Catalog accepts incoming-only rows. Relative paths resolve from the containing
 work plan. Provenance versions trace captured bytes and cannot establish equality.
-A snapshot can declare body_scope, resources and OCR evidence. Strict requires
-an explicit resources array and independently checks the body references.
-Catalog derives declarations from the local Markdown. Only semantic may have a
-body_recovery path. The mdcompare-body-recovery-1 file specifies a scoped
-identity, side, source_copy and ordered insertions with byte_offset and text.
-The witness bytes must match the source and insertions can only restore generated
-region boundaries and line breaks. The source stays read-only.
+Snapshot content_kind is raw or enriched. Metadata name, logical_path and
+source_ref are strings. An optional sync_timestamp change alone does not
+authorize a strict update. Strict reports enriched content as observed text
+with unverified raw equivalence. Semantic and knowledge use the observed body.
+
+SNAPSHOT DECLARATIONS
+A snapshot may declare generated content explicitly:
+  "body_scope": {
+    "version": "generated-regions-v1",
+    "regions": [{"kind":"mdocr_ocr","start_line":4,"end_line":6}]
+  }
+The bounds are inclusive one-based source lines. Each start and end line must
+contain its matching marker exactly once. Regions must not overlap. Complete
+marked OCR blocks outside literal code are excluded automatically. Marker-like
+content in literal code is preserved unless a valid declaration identifies
+it. Invalid or unclosed boundaries leave the body unavailable.
+
+Strict requires an explicit resources array. Each declaration has a distinct
+resource_id, kind (image, attachment or media), and url matching the reference.
+An optional path supplies local bytes captured for that exact target.
+  {"resource_id":"chart","kind":"image","url":"charts/detail.png",
+   "path":"capture/detail.png"}
+Stable IDs pair resources across URL changes. Every detected reference must
+map unambiguously, including repeated occurrences. Catalog inventories references
+from Markdown. Unsupported or ambiguous resource syntax remains visible as an
+unverified reason. No remote URL is fetched.
+
+An optional immutable object can prove equality without local bytes using
+contract = s3-version-id-v1, captured = true, bucket, key and version_id.
+The HTTPS virtual-hosted S3 URL must exactly identify that bucket and decoded
+object key with a single non-null versionId parameter. Both sides must identify
+the same immutable version. A failed local evidence read remains unverified.
+
+For OCR reuse, supply an ocr object on both snapshots with contract equal to
+mdocr-ocr-2, a nonempty configuration object (including mode paddle or llm),
+and an images array of records identified by resource_id. Baseline records need
+status = success. A usable record binds source_path and source_sha256 to the
+original resource bytes, and artifact and artifact_sha256 to a complete v2
+OCR block. The block header must name the mode and source digest, followed by a
+nonempty body and closing marker. The configuration must match, and llm also
+requires matching valid context_sha256 values on both OCR objects. Resource and
+OCR paths are relative to the work plan. Unverified correspondence remains
+UNKNOWN. Confirmed missing or unsuccessful baseline OCR requires processing.
+
+Only semantic may set body_recovery. That path points to a JSON object with
+schema_version = mdcompare-body-recovery-1 and a documents array. Each row has
+knowledge_base, document_id, side (baseline or incoming), source_copy relative
+to the recovery file, and ordered insertions with byte_offset and text.
+The witness bytes must match the source. Insertions only restore generated
+region boundaries or line breaks. Evidence uses original source coordinates.
+The source stays read-only.
 
 OPERATIONS
   semantic   Compare authored bodies. An available, paired, contextually equal
@@ -118,6 +162,8 @@ excerpts. Semantic evidence stores full body text and should be kept private.
 Scoring requires explicit request_budget. Zero or an empty selection runs locally
 without credentials. The budget counts every durable admission across resumes.
 Use an explicit OAuth file, proxy and additional CA as applicable.
+An optional endpoint may target an HTTP server at a literal loopback address
+for integration tests. It receives no OAuth credentials.
 
 WORKSPACE AND COMMIT
 A work plan uses a .json name. Its canonical path work.json binds to
@@ -141,8 +187,32 @@ mdcompare-knowledge-result-1, mdcompare-strict-result-1 and
 mdcompare-catalog-result-1. Results list incoming identities in plan order.
 Semantic publishes diff-index.json (mdcompare-diff-index-1) and per-document
 evidence (mdcompare-diff-evidence-1) with report and evidence SHA-256 bindings.
-Evidence retains full old and new units, context, original locations and
-operation references. Knowledge and strict can also publish review.md.
+The semantic results contain semantic_status, action, reason_codes,
+comparison_complete and extraction.available. Available rows also include
+unit counts and incoming_body_status in extraction. The index binds result.json
+as report_sha256. Each documents row names the scoped identity, its relative
+evidence path, and the sidecar sha256. The sidecar holds source_inputs,
+old_units, new_units, changes, recovery and reason_codes. The zero-based
+old_ref and new_ref in each change address the corresponding unit array and
+are null on the absent side. Human excerpt settings never clip these sidecars.
+
+Knowledge rows report status (REUSE, DELTA, REVIEW, NO_BODY or UNKNOWN),
+comparison_complete, reason_codes, counts, units and graphify_plan.
+Unit entries give kind, basis and source references, with null for absent
+references. graphify_plan is diagnostic and cannot authorize automatic
+extraction. REVIEW and UNKNOWN produce a partial knowledge result.
+
+Strict rows contain text, resources, metadata, ocr, action and reason_codes.
+The actions are UNKNOWN, PROCESS_REQUIRED, PROCESS_CHANGED_RESOURCES,
+UPDATE_TEXT_REUSE_OCR, UPDATE_METADATA_ONLY and SKIP_VERIFIED. Resource items
+report resource_id, kind, status, basis, reason_codes and occurrence indexes.
+The dimensions retain confirmed changes even when the document is UNKNOWN.
+UNKNOWN produces a partial strict result.
+
+Catalog rows report status (COMPLETE or UNKNOWN), resources and
+resource_warnings. UNKNOWN produces a partial catalog result.
+Knowledge and strict can publish human-readable review.md. Optional body
+excerpts appear there. Machine JSON omits those excerpts and clipping metadata.
 
 SCORE WORK PLAN
 {
