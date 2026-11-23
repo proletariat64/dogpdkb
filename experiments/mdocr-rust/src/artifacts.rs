@@ -1,5 +1,6 @@
+use crate::markdown::{self, Destination, Occurrence};
+use crate::plan::FROZEN_SCHEMA;
 use anyhow::{Context, Result, ensure};
-use percent_encoding::percent_decode_str;
 use regex::Regex;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -34,15 +35,9 @@ pub(crate) struct Image {
     pub sha256: Option<String>,
     pub error: Option<String>,
     pub selected: bool,
-    span: Range<usize>,
+    edit: Range<usize>,
 }
 
-static IMAGE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\A!\[[^\]]*\]\((?:<([^>]+)>|([^\s)]+))(?:\s+(?:"[^\n]*?"|'[^\n]*?'))?\)\z"#)
-        .expect("valid image pattern")
-});
-static SCHEME: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[A-Za-z][A-Za-z0-9+.-]*:").expect("valid URI pattern"));
 static RESERVED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)<!--\s*mdocr:").expect("valid OCR delimiter pattern"));
 
@@ -122,7 +117,7 @@ pub(crate) fn atomic(path: &Path, data: &[u8], exclusive: bool) -> Result<()> {
 }
 
 pub(crate) fn verify_immutable(path: &Path, data: &[u8]) -> Result<()> {
-    owned_path(path)?;
+    checked_path(path, false)?;
     match fs::read(path) {
         Ok(existing) => ensure!(
             existing == data,
@@ -179,34 +174,29 @@ fn validate_settings(settings: &Value) -> Result<Option<PathBuf>> {
     ensure!(llm || mode == "paddle", "invalid plan mode");
     let concurrency = integer(settings, "concurrency")?;
     ensure!((1..=100).contains(&concurrency), "invalid plan concurrency");
-    if settings.get("fix").is_some() {
-        integer(settings, "fix")?;
-    }
-    if settings.get("mermaid_repair_rounds").is_some() {
+    integer(settings, "retry_rounds")?;
+    if settings
+        .get("mermaid_repair_rounds")
+        .is_some_and(|n| !n.is_null())
+    {
         ensure!(
             integer(settings, "mermaid_repair_rounds")? == 0 || llm,
             "invalid Mermaid repair mode"
         );
     }
-    for key in ["request_budget", "token_budget"] {
-        if !field(settings, key)?.is_null() {
-            integer(settings, key)?;
-            ensure!(
-                key != "token_budget" || llm,
-                "Paddle does not support a token budget"
-            );
-        }
+    if !field(settings, "request_budget")?.is_null() {
+        integer(settings, "request_budget")?;
     }
-    let deadline = field(settings, "max_seconds")?
+    let deadline = field(settings, "admission_seconds")?
         .as_f64()
         .context("invalid plan deadline")?;
     ensure!(
         deadline.is_finite() && deadline >= 0.0,
         "invalid plan deadline"
     );
-    string(settings, "prompt")?;
     let endpoint = optional_string(settings, "endpoint")?;
     if llm {
+        string(settings, "prompt")?;
         ensure!(
             string(settings, "llm_schema")? == "mdocr-image-content-1",
             "unsupported LLM plan schema"
@@ -226,41 +216,21 @@ fn validate_settings(settings: &Value) -> Result<Option<PathBuf>> {
         .transpose()
 }
 
-fn image_target(text: &str) -> Option<String> {
-    let capture = IMAGE.captures(text)?;
-    let raw = capture.get(1).or_else(|| capture.get(2))?.as_str();
-    let raw = raw.split_once('#').map_or(raw, |(before, _)| before);
-    if raw.starts_with('/') || SCHEME.is_match(raw.trim_start_matches(|c: char| c <= ' ')) {
-        Some(raw.into())
-    } else {
-        Some(percent_decode_str(raw).decode_utf8_lossy().into_owned())
-    }
-}
-
-fn image_value(value: &Value, text: &str, chars: &[usize], last: usize) -> Result<Image> {
-    let id = string(value, "id")?;
+fn image_value(
+    value: &Value,
+    occurrence: &Occurrence,
+    index: usize,
+    document: &Path,
+    images_dir: &Path,
+) -> Result<Image> {
+    let id = format!("image-{}", index + 1);
+    let resource_id = occurrence.resource_id();
     ensure!(
-        !id.is_empty()
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
-        "invalid planned image ID"
-    );
-    let start = chars
-        .get(usize::try_from(integer(value, "start")?)?)
-        .context("invalid image start")?;
-    let end = chars
-        .get(usize::try_from(integer(value, "end")?)?)
-        .context("invalid image end")?;
-    ensure!(
-        last <= *start && start < end,
-        "invalid or overlapping image coordinates"
-    );
-    let span = *start..*end;
-    let resource_id = string(value, "resource_id")?;
-    ensure!(
-        image_target(&text[span.clone()]).as_deref() == Some(resource_id),
-        "image occurrence no longer agrees with plan"
+        value["id"] == id
+            && value["resource_id"] == resource_id
+            && value["span"] == json!([occurrence.span.start, occurrence.span.end])
+            && value["edit"] == json!([occurrence.edit.start, occurrence.edit.end]),
+        "image occurrence no longer agrees with frozen plan"
     );
     let selected = field(value, "selected")?
         .as_bool()
@@ -271,33 +241,49 @@ fn image_value(value: &Value, text: &str, chars: &[usize], last: usize) -> Resul
         .map(|path| absolute(path, "image source"))
         .transpose()?;
     let digest = optional_string(value, "sha256")?;
-    let original_link = string(value, "original_link")?;
+    let original_link = optional_string(value, "original_link")?;
     if selected && error.is_none() {
+        let path = source_path
+            .as_deref()
+            .context("selected image has no source path")?;
+        let digest = digest.context("selected image has no digest")?;
+        let original_link = original_link.context("selected image has no source link")?;
+        let staged = path.parent() == Some(images_dir)
+            && path.file_stem().is_some_and(|stem| stem == digest);
+        let bound = match markdown::destination(&occurrence.target) {
+            Destination::Local(relative) => {
+                let expected = resolve(
+                    &document
+                        .parent()
+                        .context("source has no parent")?
+                        .join(relative),
+                )?;
+                path == expected && path.to_str() == Some(original_link)
+            }
+            Destination::Remote(url) => staged && original_link == url.as_str(),
+            Destination::Inline => staged && path.to_str() == Some(original_link),
+            Destination::Unsupported => false,
+        };
+        ensure!(bound, "image source no longer agrees with frozen plan");
+        read_bound(path, digest, "IMAGE_DRIFT")?;
+    } else {
         ensure!(
-            Path::new(original_link).is_absolute()
-                || original_link
-                    .split_once("://")
-                    .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("http")
-                        || scheme.eq_ignore_ascii_case("https")),
-            "invalid original image destination"
+            source_path.is_none()
+                && digest.is_none()
+                && original_link.is_none()
+                && selected == error.is_some(),
+            "unprocessed image has inconsistent frozen evidence"
         );
-        read_bound(
-            source_path
-                .as_deref()
-                .context("selected image has no source path")?,
-            digest.context("selected image has no digest")?,
-            "IMAGE_DRIFT",
-        )?;
     }
     Ok(Image {
-        id: id.into(),
-        resource_id: resource_id.into(),
-        original_link: original_link.into(),
+        id,
+        resource_id,
+        original_link: original_link.unwrap_or_default().into(),
         selected,
         source_path,
         sha256: digest.map(str::to_owned),
         error: error.map(str::to_owned),
-        span,
+        edit: occurrence.edit.clone(),
     })
 }
 
@@ -338,10 +324,13 @@ pub(crate) fn load_plan(
         );
     }
     checked_path(evidence, true)?;
+    let workspace = plan_path.parent().context("frozen plan has no workspace")?;
+    let images_dir = workspace.join("images");
+    checked_path(&images_dir, true)?;
     let bytes = fs::read(plan_path).with_context(|| format!("read {}", plan_path.display()))?;
     let plan: Value = serde_json::from_slice(&bytes).context("invalid plan JSON")?;
     ensure!(
-        plan["schema_version"] == "mdocr-plan-2",
+        plan["schema_version"] == FROZEN_SCHEMA,
         "unsupported or invalid mdocr plan"
     );
     let settings = field(&plan, "settings")?;
@@ -352,10 +341,12 @@ pub(crate) fn load_plan(
     let mut protected = HashSet::new();
     if let Some(inputs) = plan.get("protected_inputs") {
         for input in inputs.as_array().context("invalid protected input list")? {
-            protected.insert(absolute(
-                input.as_str().context("invalid protected input")?,
-                "protected input",
-            )?);
+            let path = PathBuf::from(input.as_str().context("invalid protected input")?);
+            ensure!(
+                path.is_absolute(),
+                "protected input is not an absolute path"
+            );
+            protected.insert(path);
         }
     }
     let mut sources = HashSet::new();
@@ -378,23 +369,23 @@ pub(crate) fn load_plan(
         protected.insert(path.clone());
         let digest = string(doc, "sha256")?;
         let text = String::from_utf8(read_bound(&path, digest, "SOURCE_DRIFT")?)?;
-        let offsets = text
-            .char_indices()
-            .map(|(offset, _)| offset)
-            .chain([text.len()])
-            .collect::<Vec<_>>();
-        let mut images = Vec::new();
-        let mut ids = HashSet::new();
-        let mut last = 0;
+        ensure!(
+            !path.starts_with(workspace) && !output.starts_with(workspace),
+            "document input or output overlaps the execution workspace"
+        );
+        let occurrences = markdown::occurrences(&text);
+        let frozen = field(doc, "images")?
+            .as_array()
+            .context("invalid plan image list")?;
+        ensure!(
+            frozen.len() == occurrences.len(),
+            "frozen image count does not match the document"
+        );
+        let mut images = Vec::with_capacity(frozen.len());
         let item_dir = evidence.join(position.to_string());
         checked_path(&item_dir, true)?;
-        for value in field(doc, "images")?
-            .as_array()
-            .context("invalid plan image list")?
-        {
-            let image = image_value(value, &text, &offsets, last)?;
-            ensure!(ids.insert(image.id.clone()), "duplicate planned image ID");
-            last = image.span.end;
+        for (index, (value, occurrence)) in frozen.iter().zip(&occurrences).enumerate() {
+            let image = image_value(value, occurrence, index, &path, &images_dir)?;
             if let Some(path) = &image.source_path {
                 protected.insert(path.clone());
             }
@@ -566,7 +557,7 @@ pub(crate) fn publish_document(
                 "artifact_sha256": sha(block.as_bytes()),
             }));
         }
-        replacements.push((image.span.clone(), block));
+        replacements.push((image.edit.clone(), block));
     }
     let mut row = json!({
         "document_id": document.document_id,
@@ -582,6 +573,7 @@ pub(crate) fn publish_document(
         )
     }) {
         let mut content = document.text.clone();
+        replacements.sort_by_key(|(span, _)| span.start);
         for (span, block) in replacements.into_iter().rev() {
             content.replace_range(span, &format!("\n\n{block}\n\n"));
         }
@@ -620,11 +612,13 @@ mod tests {
         let source = root.join("in.md");
         let output = root.join("out.md");
         let image_path = root.join("img(1).png");
-        let plan = root.join("plan.json");
-        let result = root.join("result.json");
-        let journal = root.join("plan.json.execution.json");
-        let evidence = root.join("plan.json.evidence");
-        let locks = [root.join("plan.json.lock"), root.join("result.json.lock")];
+        let ws = root.join("work.mdocr");
+        fs::create_dir(&ws)?;
+        let plan = ws.join("plan.json");
+        let result = ws.join("result.json");
+        let journal = ws.join("journal.json");
+        let evidence = ws.join("evidence");
+        let locks = [ws.join("plan.lock"), ws.join("result.lock")];
         fs::write(&source, text)?;
         fs::write(&image_path, b"exact image bytes")?;
         let image_sha = sha(b"exact image bytes");
@@ -633,20 +627,20 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, raw)| {
-                let start = text[..text.find(raw).expect("known Markdown")].chars().count();
+                let start = text.find(raw).expect("known Markdown");
                 json!({
                     "id": format!("image-{}", index + 1), "resource_id": "img(1).png",
                     "original_link": image_path, "source_path": image_path, "sha256": image_sha,
-                    "start": start, "end": start + raw.chars().count(), "selected": true, "error": null,
+                    "span": [start, start + raw.len()], "edit":[start, start + raw.len()], "selected": true, "error": null,
                 })
             })
             .collect::<Vec<_>>();
         let plan_data = json!({
-            "schema_version": "mdocr-plan-2",
+            "schema_version": FROZEN_SCHEMA,
             "settings": {
                 "mode": "llm", "model": "openai/test", "effort": "low", "llm_schema": "mdocr-image-content-1",
                 "prompt": "Read the image", "concurrency": 3, "endpoint": null,
-                "token_budget": null, "request_budget": null, "max_seconds": 900, "cache_dir": null,
+                "request_budget": null, "admission_seconds": 900, "retry_rounds": 0, "cache_dir": null,
             },
             "documents": [{
                 "document_id": source, "path": source, "output": output,
@@ -690,6 +684,64 @@ mod tests {
                 .to_string()
                 .contains("IMAGE_DRIFT")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn publication_keeps_link_and_html_boundaries() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = resolve(temp.path())?;
+        let source = root.join("in.md");
+        let png = root.join("image.png");
+        let work = root.join("work.json");
+        let workspace = root.join("work.mdocr");
+        let plan = workspace.join("plan.json");
+        let evidence = workspace.join("evidence");
+        let journal = workspace.join("journal.json");
+        let result = workspace.join("result.json");
+        let original_link = "[![linked](image.png)](https://example.invalid/) following";
+        let original_html = "<div><img src='image.png'><img src=\"image.png\"></div>";
+        let text = format!("{}\n\n{}\n", original_link, original_html);
+        fs::write(&source, &text)?;
+        image::RgbImage::from_pixel(1, 1, image::Rgb([10, 20, 30])).save(&png)?;
+        fs::write(
+            &work,
+            json_bytes(&json!({
+                "schema_version":"mdocr-work-1",
+                "output_dir":"out",
+                "documents":[{"path":"in.md"}]
+            }))?,
+        )?;
+        crate::plan::accept(
+            &work,
+            &plan,
+            &workspace.join("images"),
+            Some(&json!({
+                "mode":"paddle", "request_budget":null, "concurrency": 3, "admission_seconds":900,
+                "retry_rounds":0, "cache_dir":null, "endpoint":null,
+            })),
+            None,
+            None,
+        )?;
+        let loaded = load_plan(&plan, &result, &journal, &evidence, &[])?;
+        let document = &loaded.documents[0];
+        let patch = json!({"markdown":"readable text","uncertainty":""});
+        let patches = vec![Some(&patch); 3];
+        let records = vec![json!({"status":"success"}); 3];
+        publish_document(
+            document,
+            &evidence.join("0"),
+            &json!({"mode":"paddle"}),
+            records,
+            &patches,
+        )?;
+        let output = fs::read_to_string(root.join("out/in.md"))?;
+        assert!(output.contains(original_link));
+        assert!(output.contains(original_html));
+        for id in 1..=3 {
+            assert!(output.contains(&format!("id=image-{id} -->")));
+        }
+        assert_eq!(markdown::occurrences(&output).len(), 3);
         Ok(())
     }
 
