@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from dogpdkb.graph import _ensure_corpus_whitelist
+from dogpdkb.graph import _ensure_corpus_whitelist, _git_info_exclude
 from scripts.smoke_install import GRAPHIFY_PREFLIGHT, GRAPHIFY_PROOF
 from tests.source_fixture import graphify_offline_env, graphify_sse, yuque_binding
 
@@ -406,6 +406,56 @@ def test_corpus_whitelist_preserves_crlf_and_existing_bytes(tmp_path):
     _ensure_corpus_whitelist(corpus)
 
     assert ignore_file.read_bytes() == b"!/corpus/\n!/corpus/**\n" + original
+
+
+def test_git_ignore_probe_handles_bom_and_first_column_comments(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".gitignore"
+    ignore_file.write_bytes(b"\xef\xbb\xbf# comment only\n")
+
+    _ensure_corpus_whitelist(corpus)
+    assert not (tmp_path / ".graphifyignore").exists()
+
+    ignore_file.write_bytes(b" #published/\n")
+    _ensure_corpus_whitelist(corpus)
+    assert (tmp_path / ".graphifyignore").is_file()
+
+
+def test_git_ignore_probe_skips_non_regular_and_symlinked_paths(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".gitignore"
+    ignore_file.mkdir()
+
+    _ensure_corpus_whitelist(corpus)
+    assert not (tmp_path / ".graphifyignore").exists()
+
+    ignore_file.rmdir()
+    target = tmp_path / "rules"
+    target.write_text("*\n")
+    ignore_file.symlink_to(target)
+    _ensure_corpus_whitelist(corpus)
+    assert not (tmp_path / ".graphifyignore").exists()
+
+    ignore_file.unlink()
+    os.mkfifo(ignore_file)
+    _ensure_corpus_whitelist(corpus)
+    assert not (tmp_path / ".graphifyignore").exists()
+
+
+def test_git_exclude_path_uses_filesystem_decoding(tmp_path, monkeypatch):
+    (tmp_path / ".git").write_text("gitdir: /unused\n")
+    raw = os.fsencode(str(tmp_path)) + b"/repo-\xff/info/exclude"
+
+    def resolved(*args, **kwargs):
+        return subprocess.CompletedProcess(["git"], 0, stdout=raw + b"\n")
+
+    monkeypatch.setattr("dogpdkb.graph.subprocess.run", resolved)
+    result = _git_info_exclude(tmp_path)
+    assert os.fsencode(result) == raw
 
 
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):

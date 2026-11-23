@@ -88,13 +88,15 @@ _NATIVE_ENV = {
 
 
 def _active_ignore_rules(path):
+    if path.is_symlink() or not path.is_file():
+        return False
     try:
         content = path.read_bytes()
     except FileNotFoundError:
         return False
+    content = content.removeprefix(b"\xef\xbb\xbf")
     return any(
-        line.strip() and not line.lstrip().startswith(b"#")
-        for line in content.splitlines()
+        line.strip() and not line.startswith(b"#") for line in content.splitlines()
     )
 
 
@@ -113,7 +115,6 @@ def _git_info_exclude(root):
                 "info/exclude",
             ],
             capture_output=True,
-            text=True,
             timeout=10,
             check=False,
         )
@@ -121,7 +122,8 @@ def _git_info_exclude(root):
         raise ValueError("cannot resolve the Git worktree exclude file") from error
     if result.returncode:
         raise ValueError("cannot resolve the Git worktree exclude file")
-    return Path(result.stdout.strip())
+    output = result.stdout.removesuffix(b"\n").removesuffix(b"\r")
+    return Path(os.fsdecode(output))
 
 
 def _missing_whitelist(path, rules):

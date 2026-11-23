@@ -28,7 +28,8 @@ a complete existing whitelist is not duplicated. No Git rules means no write or
 new permission requirement. A per-file lock serializes concurrent books, and
 updates use a same-directory temporary file plus atomic replacement. Complete
 whitelists require no lock or write. Linked worktrees resolve `info/exclude`
-through Git, and Git ignore probes tolerate non-UTF-8 bytes. Corpus paths
+through Git. Git ignore probes handle BOMs and first-column comments, skip
+non-regular or symlinked sources, and preserve non-UTF-8 path bytes. Corpus paths
 containing pattern syntax or line breaks are rejected before modification, as
 are symlinked ignore files that require an update. This
 small scope guard is orchestrator-owned input selection; Graphify still owns
