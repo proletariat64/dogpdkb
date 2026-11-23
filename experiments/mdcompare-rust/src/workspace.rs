@@ -76,7 +76,6 @@ pub struct Provenance {
 pub enum InputWitness {
     Bytes { sha256: String },
     Unavailable { reason: String },
-    Presence { exists: bool },
 }
 
 impl InputWitness {
@@ -102,6 +101,7 @@ pub struct FrozenPlan {
     pub work: WorkPlan,
     pub settings: CompareSettings,
     pub inputs: BTreeMap<PathBuf, InputWitness>,
+    pub presence: BTreeMap<PathBuf, bool>,
     // A work plan and body-recovery declaration share the work-plan limit.
     manifest_inputs: BTreeSet<PathBuf>,
     path_targets: BTreeMap<PathBuf, PathBuf>,
@@ -144,13 +144,13 @@ impl FrozenPlan {
             ensure!(input::resolved(path)? == *target, "input_drift");
         }
         for (path, expected) in &self.inputs {
-            let observed = match expected {
-                InputWitness::Presence { .. } => InputWitness::Presence {
-                    exists: path.is_file(),
-                },
-                _ => InputWitness::observe(path, self.limit(path))?,
-            };
-            ensure!(observed == *expected, "input_drift");
+            ensure!(
+                InputWitness::observe(path, self.limit(path))? == *expected,
+                "input_drift"
+            );
+        }
+        for (path, expected) in &self.presence {
+            ensure!(path.is_file() == *expected, "input_drift");
         }
         Ok(())
     }
@@ -558,6 +558,7 @@ fn create_plan(workspace: &Workspace, explicit: Option<&Path>) -> Result<FrozenP
         work,
         settings,
         inputs: BTreeMap::new(),
+        presence: BTreeMap::new(),
         manifest_inputs: BTreeSet::new(),
         path_targets: BTreeMap::new(),
     };
@@ -583,10 +584,7 @@ fn create_plan(workspace: &Workspace, explicit: Option<&Path>) -> Result<FrozenP
                     for candidate in crate::catalog::local_candidates(&document, &bytes)? {
                         let candidate = frozen.bind_path(&candidate)?;
                         let exists = candidate.is_file();
-                        frozen
-                            .inputs
-                            .entry(candidate)
-                            .or_insert(InputWitness::Presence { exists });
+                        frozen.presence.entry(candidate).or_insert(exists);
                     }
                 }
                 Err("INPUT_CHANGED") => bail!("input_drift"),
@@ -614,6 +612,7 @@ fn create_plan(workspace: &Workspace, explicit: Option<&Path>) -> Result<FrozenP
         add_recovery(&mut frozen, &path)?;
     }
     protected.extend(frozen.inputs.keys().cloned());
+    protected.extend(frozen.presence.keys().cloned());
     protected.extend(config_source);
     protected.push(workspace.source.clone());
     input::check_output(&workspace.root, protected.iter().map(PathBuf::as_path))
