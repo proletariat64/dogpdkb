@@ -1,4 +1,4 @@
-# Rust mdocr CLI product specification
+# Rust mdocrr CLI product specification
 
 Status: ready-for-agent
 
@@ -11,11 +11,11 @@ results. An interactive operator uses the same execution contract as automation.
 
 The caller plans the work. It selects and orders documents, selects images, grants
 download permission, chooses output destinations, and owns business versioning
-and downstream publication. It hands mdocr a JSON work plan and optionally a TOML
-file. mdocr accepts the plan, freezes effective inputs and policy, executes OCR,
+and downstream publication. It hands mdocrr a JSON work plan and optionally a TOML
+file. mdocrr accepts the plan, freezes effective inputs and policy, executes OCR,
 assembles outputs, and manages the batch workspace. An upstream orchestrator
 invokes the public CLI and reads its documented artifacts. It delegates OCR
-admission, concurrency, cache reuse, retries, and checkpoints to mdocr.
+admission, concurrency, cache reuse, retries, and checkpoints to mdocrr.
 
 This is the first standalone Rust product contract. Implement the commands,
 flags, configuration keys, and schemas defined here. Reject undocumented
@@ -26,17 +26,17 @@ workspaces and caches under the Rust contract.
 
 | Command | Purpose |
 | --- | --- |
-| `mdocr draft --input-single FILE --output-single FILE --plan FILE` | Write an editable work plan for one Markdown document. |
-| `mdocr draft --input-dir DIR --output-dir DIR --plan FILE` | Write an editable work plan for a recursive directory batch. |
-| `mdocr accept --plan FILE [--config FILE]` | Validate and accept the caller's plan, then return the frozen plan and its counts. |
-| `mdocr run --plan FILE [--config FILE] [--resume] [--retry-failed]` | Accept and execute a new batch or continue an existing batch. |
-| `mdocr cancel --plan FILE` | Record a cancellation and stop new request admission for that batch. |
-| `mdocr assemble --plan FILE --output-dir DIR` | Recover publishable Markdown from accepted OCR patches offline into a new directory. |
-| `mdocr purge --plan FILE [-Y]` | Explicitly remove the named batch's workspace artifacts. |
-| `mdocr doctor [--config FILE]` | Diagnose local readiness with the built-in defaults or an explicit TOML file. |
-| `mdocr check-mermaid FILE` | Check Mermaid fences in a Markdown file. Use `-` for stdin. |
-| `mdocr licenses` | Print notices for bundled assets. |
-| `mdocr --help`, `mdocr COMMAND --help`, `mdocr help all`, `mdocr --version` | Discover the interface and identify the binary offline. |
+| `mdocrr draft --input-single FILE --output-single FILE --plan FILE` | Write an editable work plan for one Markdown document. |
+| `mdocrr draft --input-dir DIR --output-dir DIR --plan FILE` | Write an editable work plan for a recursive directory batch. |
+| `mdocrr accept --plan FILE [--config FILE]` | Validate and accept the caller's plan, then return the frozen plan and its counts. |
+| `mdocrr run --plan FILE [--config FILE] [--resume] [--retry-failed]` | Accept and execute a new batch or continue an existing batch. |
+| `mdocrr cancel --plan FILE` | Record a cancellation and stop new request admission for that batch. |
+| `mdocrr assemble --plan FILE --output-dir DIR` | Recover publishable Markdown from accepted OCR patches offline into a new directory. |
+| `mdocrr purge --plan FILE [-Y]` | Explicitly remove the named batch's workspace artifacts. |
+| `mdocrr doctor [--config FILE]` | Diagnose local readiness with the built-in defaults or an explicit TOML file. |
+| `mdocrr check-mermaid FILE` | Check Mermaid fences in a Markdown file. Use `-` for stdin. |
+| `mdocrr licenses` | Print notices for bundled assets. |
+| `mdocrr --help`, `mdocrr COMMAND --help`, `mdocrr help all`, `mdocrr --version` | Discover the interface and identify the binary offline. |
 
 `--plan` always names the caller's JSON work plan. For `draft` it names the file
 to create. Application commands take paths relative to the caller's working
@@ -46,11 +46,11 @@ An upstream caller can run a whole batch directly or inspect an accepted plan
 before authorizing OCR.
 
 ```sh
-mdocr run --plan work.json
-mdocr run --plan work.json --config paddle.toml
+mdocrr run --plan work.json
+mdocrr run --plan work.json --config paddle.toml
 
-mdocr accept --plan work.json --config paddle.toml
-mdocr run --plan work.json
+mdocrr accept --plan work.json --config paddle.toml
+mdocrr run --plan work.json
 ```
 
 ### Draft
@@ -66,8 +66,8 @@ Single-file mode writes the same one-document schema an upstream caller would
 write. There is one execution workflow for both single and batch use.
 
 ```sh
-mdocr draft --input-single source.md --output-single enriched.md --plan work.json
-mdocr run --plan work.json
+mdocrr draft --input-single source.md --output-single enriched.md --plan work.json
+mdocrr run --plan work.json
 ```
 
 Read `enriched.md` for the OCR content and `work.mdocr/result.json` for its
@@ -274,7 +274,7 @@ requirement applies when a document references an exported flowchart as an image
   before provider submission with `svg_text_renderer_unavailable`. Document
   this limit and raster decoder coverage in help. Add HTML-backed SVG coverage
   once a maintained, embeddable Rust rendering library qualifies. Delegate HTML
-  and CSS layout, text shaping, and painting to the library. Limit mdocr code
+  and CSS layout, text shaping, and painting to the library. Limit mdocrr code
   to integration, resource policy, and evidence binding. Qualify real Mermaid
   exports with CJK text, wrapped node labels, and edge labels. Verify placement,
   clipping, arrow direction and branch readability in the static executable
@@ -347,7 +347,7 @@ unowned destinations.
 ### Assemble
 
 ```sh
-mdocr assemble --plan work.json --output-dir recovered/
+mdocrr assemble --plan work.json --output-dir recovered/
 ```
 
 Use `assemble` to retrieve already completed work without continuing OCR. For
@@ -368,7 +368,7 @@ A crash-only admission remains unknown in the assembly report.
 
 ### Purge
 
-`mdocr purge --plan work.json` is the only CLI operation that removes batch
+`mdocrr purge --plan work.json` is the only CLI operation that removes batch
 workspaces. Normal completion, cancellation, and recovery perform no automatic
 purge. Direct filesystem removal remains possible for the operator.
 
@@ -376,7 +376,7 @@ purge. Direct filesystem removal remains possible for the operator.
 - Any other state gets the same first confirmation and a second `Y/n` after
   a warning that reports the state and the loss of journal, evidence, and resume
   ability. The warning calls out unresolved provider requests if present.
-- `mdocr purge --plan work.json -Y` bypasses all confirmations regardless of
+- `mdocrr purge --plan work.json -Y` bypasses all confirmations regardless of
   batch outcome. Use it for intentional noninteractive deletion. Without it,
   an unavailable interactive input must not imply consent.
 - Obtain exclusive workspace ownership before deleting. A live writer must not
@@ -393,8 +393,8 @@ purge. Direct filesystem removal remains possible for the operator.
 ## Diagnostics and help
 
 ```sh
-mdocr doctor
-mdocr doctor --config paddle.toml
+mdocrr doctor
+mdocrr doctor --config paddle.toml
 ```
 
 `doctor` is a read-only local diagnosis. Report effective config source and
@@ -410,8 +410,8 @@ status, and a stable reason code when applicable.
 
 Help is progressive, embedded, offline, and English-only. Root `-h` and
 `--help` explain purpose, list commands, and provide a first-use example.
-`mdocr COMMAND --help` describes that command's arguments, defaults, path bases,
-effects, exit statuses and typical examples. `mdocr help all` prints the full
+`mdocrr COMMAND --help` describes that command's arguments, defaults, path bases,
+effects, exit statuses and typical examples. `mdocrr help all` prints the full
 English manual, including work plan fields, config schema, artifacts, examples,
 logging and recovery. Help, version, and licenses execute without config,
 credentials, workspace changes, or network access.
@@ -449,8 +449,8 @@ One stderr progress line during that run could read as follows.
 ```
 
 ```sh
-mdocr run --plan work.json > summary.json 2>> mdocr.log
-tail -F mdocr.log
+mdocrr run --plan work.json > summary.json 2>> mdocrr.log
+tail -F mdocrr.log
 ```
 
 Run the two lines in separate terminals for live monitoring. The caller owns the

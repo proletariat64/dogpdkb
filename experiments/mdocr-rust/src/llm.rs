@@ -238,7 +238,7 @@ fn reclaim_expired_lock(path: &Path) -> std::io::Result<bool> {
         return Ok(false);
     }
     // Pi coordinates through the directory mtime. The additional advisory
-    // lock protects any live mdocr holder even if its process is suspended.
+    // lock protects any live mdocrr holder even if its process is suspended.
     #[cfg(unix)]
     let _guard = {
         let guard = match fs::File::open(path) {
@@ -611,7 +611,7 @@ pub(crate) fn convert(
             .post(auth.route.endpoint())
             .bearer_auth(&bearer.access)
             .timeout(Duration::from_secs(230))
-            .header("user-agent", concat!("mdocr/", env!("CARGO_PKG_VERSION")))
+            .header("user-agent", concat!("mdocrr/", env!("CARGO_PKG_VERSION")))
             .header("accept", "text/event-stream");
         if let Some(account_id) = &bearer.account_id {
             request = request

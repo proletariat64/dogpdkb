@@ -331,7 +331,7 @@ pub(crate) fn load_plan(
     let plan: Value = serde_json::from_slice(&bytes).context("invalid plan JSON")?;
     ensure!(
         plan["schema_version"] == FROZEN_SCHEMA,
-        "unsupported or invalid mdocr plan"
+        "unsupported or invalid mdocrr plan"
     );
     let settings = field(&plan, "settings")?;
     let cache = validate_settings(settings)?;

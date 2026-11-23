@@ -4,23 +4,23 @@ set -euo pipefail
 binary=$1
 headers=$(LC_ALL=C readelf --wide --program-headers --dynamic "$binary")
 if [[ $headers == *" INTERP "* || $headers == *"(NEEDED)"* ]]; then
-    printf '%s\n' 'mdocr smoke failed: release binary has dynamic dependencies' >&2
+    printf '%s\n' 'mdocrr smoke failed: release binary has dynamic dependencies' >&2
     exit 1
 fi
 
 workspace=$(mktemp -d)
 trap 'rm -rf -- "$workspace"' EXIT
-cp -- "$binary" "$workspace/mdocr"
+cp -- "$binary" "$workspace/mdocrr"
 cd -- "$workspace"
 
-mdocr() {
-    env -i PATH=/nonexistent ./mdocr "$@"
+mdocrr() {
+    env -i PATH=/nonexistent ./mdocrr "$@"
 }
 
 expect() {
     local output=$1 expected=$2
     if [[ $output != *"$expected"* ]]; then
-        printf 'mdocr smoke expected %s in:\n%s\n' "$expected" "$output" >&2
+        printf 'mdocrr smoke expected %s in:\n%s\n' "$expected" "$output" >&2
         exit 1
     fi
 }
@@ -28,12 +28,12 @@ expect() {
 check() {
     local expected=$1 output
     shift
-    output=$(mdocr "$@")
+    output=$(mdocrr "$@")
     expect "$output" "$expected"
 }
 
-check 'mdocr ' --version
-check 'mdocr help all' --help
+check 'mdocrr ' --version
+check 'mdocrr help all' --help
 check 'mdocr-work-1' help all
 check '"ok":true' check-mermaid - <<'EOF'
 ```mermaid
@@ -51,4 +51,4 @@ check '"status":"completed"' run --plan work.json
 expect "$(<work.mdocr/result.json)" '"mdocr-batch-result-1"'
 cmp -- source.md output.md
 
-printf '%s\n' 'Rust smoke passed: static mdocr ran from an isolated directory with an empty executable search path.'
+printf '%s\n' 'Rust smoke passed: static mdocrr ran from an isolated directory with an empty executable search path.'

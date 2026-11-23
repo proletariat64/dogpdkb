@@ -107,7 +107,7 @@ impl Workspace {
         for entry in fs::read_dir(&self.root)? {
             ensure!(
                 entry?.path() == self.lock,
-                "workspace directory is occupied and has no mdocr ownership record"
+                "workspace directory is occupied and has no mdocrr ownership record"
             );
         }
         Ok(())
@@ -219,7 +219,7 @@ pub(crate) fn purge(workspace: &Workspace, force: bool) -> Result<(u8, Value)> {
             (Some(state), unresolved)
         };
         if !force {
-            if !confirm("Purge this mdocr workspace?")? {
+            if !confirm("Purge this mdocrr workspace?")? {
                 return Ok((
                     2,
                     json!({"status":"declined", "workspace_path": workspace.root}),

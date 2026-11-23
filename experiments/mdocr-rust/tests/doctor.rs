@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 fn doctor(directory: &Path, config: Option<&Path>) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mdocr"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mdocrr"));
     command
         .env_clear()
         .env("HTTPS_PROXY", "http://127.0.0.1:1")

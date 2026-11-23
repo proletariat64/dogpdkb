@@ -6,12 +6,12 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 
 fn command(root: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_mdocr"))
+    Command::new(env!("CARGO_BIN_EXE_mdocrr"))
         .current_dir(root)
         .env_clear()
         .args(args)
         .output()
-        .expect("run mdocr")
+        .expect("run mdocrr")
 }
 
 fn write_png(path: &Path) {

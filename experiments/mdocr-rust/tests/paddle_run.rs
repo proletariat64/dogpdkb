@@ -13,7 +13,7 @@ const TOKEN: &str = "synthetic-fixture-only";
 const RUN_ARGS: &[&str] = &["run", "--plan", "work.json"];
 
 fn cli(root: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mdocr"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mdocrr"));
     command.current_dir(root).env_clear().args(args);
     command
 }
@@ -194,7 +194,7 @@ fn paddle_run_publishes_bound_evidence_and_recovers_result_without_resubmitting(
         ".",
         json!([{"path": "in.md", "output": "out.md"}]),
     );
-    let log_path = root.join("mdocr.log");
+    let log_path = root.join("mdocrr.log");
     let child = cli(root, RUN_ARGS)
         .stdout(Stdio::piped())
         .stderr(fs::File::create(&log_path).unwrap())

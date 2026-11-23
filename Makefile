@@ -33,7 +33,7 @@ buildr:
 	RUSTFLAGS="$(strip $(RUSTFLAGS) -C target-feature=+crt-static)" $(CARGO) build --locked --release --manifest-path "$(MDOCR_RUST_DIR)/Cargo.toml" --target "$(MDOCR_RUST_TARGET)" --target-dir "$(CARGO_TARGET_DIR)"
 
 smoker: buildr
-	bash scripts/smoke_mdocr_rust.sh "$(CARGO_TARGET_DIR)/$(MDOCR_RUST_TARGET)/release/mdocr"
+	bash scripts/smoke_mdocr_rust.sh "$(CARGO_TARGET_DIR)/$(MDOCR_RUST_TARGET)/release/mdocrr"
 
 doctor:
 	$(DEV_PYTHON) -m dogpdkb doctor $(DOCTOR_ARGS)

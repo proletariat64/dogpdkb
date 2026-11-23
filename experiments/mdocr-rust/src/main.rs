@@ -24,11 +24,11 @@ type Outcome = Result<(u8, Value)>;
 
 #[derive(Parser)]
 #[command(
-    name = "mdocr",
+    name = "mdocrr",
     version,
     about = "Extract OCR from Markdown images with durable batch recovery",
     disable_help_subcommand = true,
-    after_help = "First use:\n  mdocr draft --input-single source.md --output-single enriched.md --plan work.json\n  mdocr run --plan work.json --config provider.toml\n\nRun 'mdocr <command> --help' for options or 'mdocr help all' for the complete manual."
+    after_help = "First use:\n  mdocrr draft --input-single source.md --output-single enriched.md --plan work.json\n  mdocrr run --plan work.json --config provider.toml\n\nRun 'mdocrr <command> --help' for options or 'mdocrr help all' for the complete manual."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -60,19 +60,19 @@ enum HelpScope {
 enum Command {
     /// Write an editable JSON work plan without opening an execution workspace.
     #[command(
-        after_help = "Example: mdocr draft --input-dir docs --output-dir enriched --plan work.json"
+        after_help = "Example: mdocrr draft --input-dir docs --output-dir enriched --plan work.json"
     )]
     Draft(Box<plan::DraftArgs>),
 
     /// Validate and freeze a work plan and its authorized image inputs.
     #[command(
-        after_help = "Example: mdocr accept --plan work.json --config provider.toml\nDownloads selected images when authorized. Exit 0 means the work plan was accepted. Check the reported image counts for failures."
+        after_help = "Example: mdocrr accept --plan work.json --config provider.toml\nDownloads selected images when authorized. Exit 0 means the work plan was accepted. Check the reported image counts for failures."
     )]
     Accept(ConfiguredBatch),
 
     /// Execute a work plan or continue its saved batch.
     #[command(
-        after_help = "Example: mdocr run --plan work.json > summary.json 2>> mdocr.log\nThe first run accepts the plan. Repeated runs use the saved policy, budget and journal. Exit 0 means all documents completed, 2 means partial output, and 3 means canceled."
+        after_help = "Example: mdocrr run --plan work.json > summary.json 2>> mdocrr.log\nThe first run accepts the plan. Repeated runs use the saved policy, budget and journal. Exit 0 means all documents completed, 2 means partial output, and 3 means canceled."
     )]
     Run {
         #[command(flatten)]
@@ -87,13 +87,13 @@ enum Command {
 
     /// Stop new requests and save the outcome of in-flight work.
     #[command(
-        after_help = "Example: mdocr cancel --plan work.json\nResume a canceled batch with 'mdocr run --plan work.json --resume'."
+        after_help = "Example: mdocrr cancel --plan work.json\nResume a canceled batch with 'mdocrr run --plan work.json --resume'."
     )]
     Cancel(BatchArgs),
 
     /// Recover publishable Markdown offline from an accepted journal.
     #[command(
-        after_help = "Example: mdocr assemble --plan work.json --output-dir recovered\nThe directory must be new. The original workspace and provider budget are preserved."
+        after_help = "Example: mdocrr assemble --plan work.json --output-dir recovered\nThe directory must be new. The original workspace and provider budget are preserved."
     )]
     Assemble {
         #[command(flatten)]
@@ -105,7 +105,7 @@ enum Command {
 
     /// Delete the named batch's workspace with explicit consent.
     #[command(
-        after_help = "Example: mdocr purge --plan work.json\nIncomplete batches require a second confirmation. Published Markdown and source files survive cleanup."
+        after_help = "Example: mdocrr purge --plan work.json\nIncomplete batches require a second confirmation. Published Markdown and source files survive cleanup."
     )]
     Purge {
         #[command(flatten)]
@@ -117,7 +117,7 @@ enum Command {
 
     /// Check local runtime readiness without network access.
     #[command(
-        after_help = "Examples:\n  mdocr doctor\n  mdocr doctor --config provider.toml\nExit 2 means one or more local checks failed."
+        after_help = "Examples:\n  mdocrr doctor\n  mdocrr doctor --config provider.toml\nExit 2 means one or more local checks failed."
     )]
     Doctor {
         /// TOML file to check. Omission checks the built-in defaults.
@@ -359,14 +359,14 @@ fn main() -> ExitCode {
             };
             let message = format!("{error:#}");
             let message = message.replace(char::is_control, " ");
-            let _ = writeln!(io::stderr().lock(), "mdocr: {name}: {message}");
+            let _ = writeln!(io::stderr().lock(), "mdocrr: {name}: {message}");
             (1, json!({"status":status, "reason_code":reason}))
         }
     };
     match write_summary(name, summary) {
         Ok(()) => ExitCode::from(code),
         Err(error) => {
-            let _ = writeln!(io::stderr().lock(), "mdocr: cannot write summary: {error}");
+            let _ = writeln!(io::stderr().lock(), "mdocrr: cannot write summary: {error}");
             ExitCode::FAILURE
         }
     }

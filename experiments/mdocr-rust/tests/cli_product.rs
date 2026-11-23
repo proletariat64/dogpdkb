@@ -4,10 +4,10 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-const MDOCR: &str = env!("CARGO_BIN_EXE_mdocr");
+const MDOCRR: &str = env!("CARGO_BIN_EXE_mdocrr");
 
 fn command(root: &Path) -> Command {
-    let mut command = Command::new(MDOCR);
+    let mut command = Command::new(MDOCRR);
     command
         .current_dir(root)
         .env_clear()
@@ -62,6 +62,7 @@ fn publishes_english_help_and_rejects_undocumented_command_forms() {
         assert!(output.status.success(), "{:?}", output);
         assert!(output.stderr.is_empty(), "{:?}", output);
         let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("mdocrr"), "{text}");
         assert!(text.contains("plan"), "{text}");
     }
     assert_eq!(run(root, &["plan", "--help"]).status.code(), Some(64));
