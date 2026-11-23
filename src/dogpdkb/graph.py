@@ -96,7 +96,8 @@ def _active_ignore_rules(path):
         return False
     content = content.removeprefix(b"\xef\xbb\xbf")
     return any(
-        line.strip() and not line.startswith(b"#") for line in content.splitlines()
+        line.removesuffix(b"\r").strip(b" ") and not line.startswith(b"#")
+        for line in content.split(b"\n")
     )
 
 
@@ -167,14 +168,16 @@ def _ensure_corpus_whitelist(corpus):
     for part in relative.parts:
         current_path /= part
         chain.append(current_path)
-    if not _active_ignore_rules(_git_info_exclude(root)) and not any(
+    local_rules = any(
         _active_ignore_rules(directory / ".gitignore") for directory in chain
-    ):
+    )
+    if not local_rules and not _active_ignore_rules(_git_info_exclude(root)):
         return
 
     anchor = root
     for directory in reversed(chain):
-        if (directory / ".graphifyignore").is_file():
+        candidate = directory / ".graphifyignore"
+        if candidate.exists() or candidate.is_symlink():
             anchor = directory
             break
 

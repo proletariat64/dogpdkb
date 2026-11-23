@@ -476,6 +476,54 @@ def test_non_regular_graphifyignore_is_rejected_before_read(tmp_path):
     assert not (tmp_path / ".graphifyignore.lock").exists()
 
 
+def test_invalid_corpus_local_ignore_never_falls_back_to_root(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    root_rules = tmp_path / ".graphifyignore"
+    original = b"# Root rules\nignored.md\n"
+    root_rules.write_bytes(original)
+    for kind in ("fifo", "dangling"):
+        corpus = tmp_path / f"corpus-{kind}"
+        corpus.mkdir()
+        candidate = corpus / ".graphifyignore"
+        if kind == "fifo":
+            os.mkfifo(candidate)
+        else:
+            candidate.symlink_to(corpus / "missing")
+        with pytest.raises(ValueError, match="regular file"):
+            _ensure_corpus_whitelist(corpus)
+        assert root_rules.read_bytes() == original
+
+
+def test_local_git_rules_do_not_require_git_executable(tmp_path, monkeypatch):
+    (tmp_path / ".git").write_text("gitdir: /unused\n")
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+
+    def unexpected(root):
+        raise AssertionError("info/exclude lookup is unnecessary")
+
+    monkeypatch.setattr("dogpdkb.graph._git_info_exclude", unexpected)
+    _ensure_corpus_whitelist(corpus)
+    assert (tmp_path / ".graphifyignore").is_file()
+
+
+def test_git_ignore_probe_uses_lf_and_significant_whitespace(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".gitignore"
+    ignore_file.write_bytes(b"# note\r*\n")
+
+    _ensure_corpus_whitelist(corpus)
+    assert not (tmp_path / ".graphifyignore").exists()
+
+    ignore_file.write_bytes(b"\t\n")
+    _ensure_corpus_whitelist(corpus)
+    assert (tmp_path / ".graphifyignore").is_file()
+
+
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):
     config, manifest, source = fixture(tmp_path, title="Cafe\u0301")
     result = cli(config, manifest)
