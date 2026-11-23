@@ -90,9 +90,9 @@ _NATIVE_ENV = {
 
 
 def _active_ignore_rules(path):
-    if path.is_symlink() or not path.is_file():
-        return False
     try:
+        if path.is_symlink() or not path.is_file():
+            return False
         content = path.read_bytes()
     except FileNotFoundError:
         return False
@@ -168,6 +168,7 @@ def _regular_identity(path):
         metadata.st_gid,
         metadata.st_size,
         metadata.st_ctime_ns,
+        metadata.st_nlink,
     )
 
 
@@ -252,6 +253,9 @@ def _ensure_corpus_whitelist(corpus):
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         identity = _regular_identity(path)
+        if identity is not None and identity[-1] > 1:
+            _warn_ignore_preserved("the whitelist is hard-linked")
+            return
         missing = _missing_whitelist(path, rules)
         if not missing:
             return
@@ -293,6 +297,8 @@ def _ensure_corpus_whitelist(corpus):
                 raise ValueError(".graphifyignore changed during Corpus update")
             current = path.read_bytes() if path.exists() else b""
             if current != existing:
+                raise ValueError(".graphifyignore changed during Corpus update")
+            if _regular_identity(path) != identity:
                 raise ValueError(".graphifyignore changed during Corpus update")
             os.replace(temporary, path)
         finally:

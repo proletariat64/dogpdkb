@@ -851,6 +851,77 @@ def test_initial_whitelist_permission_failure_preserves_original(
     assert "cannot read the current Corpus whitelist" in capsys.readouterr().err
 
 
+def test_git_ignore_predicate_permission_warns_and_continues(
+    tmp_path, monkeypatch, capsys
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    target = tmp_path / ".git/info/exclude"
+    real_is_file = Path.is_file
+
+    def denied(path):
+        if path == target:
+            raise PermissionError("EPERM")
+        return real_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", denied)
+    _ensure_corpus_whitelist(corpus)
+
+    assert not (tmp_path / ".graphifyignore").exists()
+    assert "cannot read Git ignore source" in capsys.readouterr().err
+
+
+def test_corpus_whitelist_detects_permission_change_during_final_read(
+    tmp_path, monkeypatch
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Original\nignored.md\n"
+    ignore_file.write_bytes(original)
+    ignore_file.chmod(0o644)
+    real_read = Path.read_bytes
+    reads = 0
+
+    def chmod_during_final_read(path):
+        nonlocal reads
+        if path == ignore_file:
+            reads += 1
+            if reads == 4:
+                ignore_file.chmod(0o600)
+        return real_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", chmod_during_final_read)
+    with pytest.raises(ValueError, match="changed during"):
+        _ensure_corpus_whitelist(corpus)
+    monkeypatch.undo()
+
+    assert ignore_file.stat().st_mode & 0o777 == 0o600
+    assert ignore_file.read_bytes() == original
+
+
+def test_hardlinked_graphifyignore_is_preserved(tmp_path, capsys):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Shared rules\nignored.md\n"
+    ignore_file.write_bytes(original)
+    linked = tmp_path / "linked-rules"
+    os.link(ignore_file, linked)
+
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == original
+    assert linked.read_bytes() == original
+    assert ignore_file.stat().st_nlink == 2
+    assert "hard-linked" in capsys.readouterr().err
+
+
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):
     config, manifest, source = fixture(tmp_path, title="Cafe\u0301")
     result = cli(config, manifest)
