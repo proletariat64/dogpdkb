@@ -2,7 +2,9 @@
 
 The customer-facing homepage is
 `http://poolab-iys595a7znqgza1e.inc.alipay.net/kb/`, served by the existing Nginx
-root at `/home/admin/webserver/site/kb`. `poolab` uses the `default` connection.
+root at `/home/admin/webserver/site/kb`. On the co.bot host, the release helper
+writes directly to the local site directory. Other development hosts use the
+existing `poolab` `default` connection to reach co.bot.
 
 ## UI ownership
 
@@ -30,10 +32,11 @@ The UI reads `/releases/dogpdkb.json` with `cache: no-store`, independently of t
 
 1. Validates exact tag, stable/published/anonymous/unblocked state and attachments.
 2. Fetches the anonymous HTTPS installer and validates its version, wheel and URL.
-3. Sends only small metadata via `poolab` to a unique staging directory.
+3. Writes only small metadata to a local temporary file, using direct local
+   publication on co.bot or `poolab` from another development host.
 4. Holds a lock and atomically replaces `/releases/dogpdkb.json`; refuses stable downgrades.
 5. Confirms file and HTTP readback, rolling back to prior bytes on verification
-   failure, then cleans its own staging directory.
+   failure, then cleans its own temporary file.
 
 A failure is not reported as a successful release workflow. `make release RETRY=1`
 keeps the existing version and retries publication plus homepage update. For a
