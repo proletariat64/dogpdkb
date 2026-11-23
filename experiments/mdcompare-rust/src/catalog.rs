@@ -60,7 +60,7 @@ pub(crate) fn local_candidates(doc: &Document, bytes: &[u8]) -> Result<Vec<PathB
     Ok(paths)
 }
 
-fn catalog_document(doc: &Document, reader: &mut Reader) -> Result<Value> {
+fn catalog_document(doc: &Document, data: &[u8], reader: &mut Reader) -> Result<Value> {
     let mut row = doc.raw.clone();
     ensure!(
         row.get("resources").is_none_or(Value::is_array),
@@ -90,9 +90,8 @@ fn catalog_document(doc: &Document, reader: &mut Reader) -> Result<Value> {
             by_url.entry(url).or_insert(entry);
         }
     }
-    let data = reader.read(&doc.path).map_err(anyhow::Error::msg)?;
     let declared_urls = by_url.keys().copied().collect();
-    let (used, warnings) = uses(&data, &declared_urls);
+    let (used, warnings) = uses(data, &declared_urls);
     let historical = doc.content_kind() == "enriched";
     let mut resources = Vec::new();
     let mut retained = BTreeSet::new();
@@ -135,6 +134,11 @@ fn catalog_document(doc: &Document, reader: &mut Reader) -> Result<Value> {
     row["path"] = json!(resolved(&doc.path)?);
     row["resources"] = json!(resources);
     row["resource_warnings"] = json!(warnings);
+    row["status"] = json!(if warnings.is_empty() {
+        "COMPLETE"
+    } else {
+        "UNKNOWN"
+    });
     Ok(row)
 }
 
@@ -148,7 +152,15 @@ pub(crate) fn catalog_documents(
     for identity in order {
         let document = &documents[identity];
         reader.begin_document();
-        let mut row = catalog_document(document, reader)?;
+        let mut row = match reader.read(&document.path) {
+            Ok(bytes) => catalog_document(document, &bytes, reader)?,
+            Err(reason) => json!({
+                "path": document.path,
+                "resources": [],
+                "resource_warnings": [reason],
+                "status": "UNKNOWN",
+            }),
+        };
         row["knowledge_base"] = json!(identity.knowledge_base);
         row["document_id"] = json!(identity.document_id);
         unresolved += usize::from(

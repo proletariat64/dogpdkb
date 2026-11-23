@@ -3,7 +3,6 @@ use crate::summary::{Outcome, Progress, Summary};
 use crate::text::Options;
 use crate::workspace::{self, Commit, FrozenPlan, Operation, Workspace};
 use anyhow::{Context, Result, ensure};
-use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -94,8 +93,7 @@ pub(crate) fn run(plan: &Path, config: Option<&Path>, progress: &Progress) -> Re
         "input_drift"
     );
     frozen.verify_inputs()?;
-    if let Some(result) = result {
-        workspace::atomic_write(&stage.path().join("result.json"), &json_bytes(&result)?)?;
+    if let Some(mut result) = result {
         if report.markdown {
             let markdown = match operation {
                 Operation::Strict => Some(crate::compare::render(&result)?),
@@ -107,6 +105,33 @@ pub(crate) fn run(plan: &Path, config: Option<&Path>, progress: &Progress) -> Re
                 artifacts.push("review.md");
             }
         }
+        // The optional report is the only output whose excerpts depend on [report].
+        for row in result["results"].as_array_mut().context("publish_failed")? {
+            match operation {
+                Operation::Strict => {
+                    row["text"]
+                        .as_object_mut()
+                        .context("publish_failed")?
+                        .remove("differences");
+                    row["text"]
+                        .as_object_mut()
+                        .context("publish_failed")?
+                        .remove("evidence_truncated");
+                }
+                Operation::Knowledge => {
+                    row.as_object_mut()
+                        .context("publish_failed")?
+                        .remove("evidence_truncated");
+                    for unit in row["units"].as_array_mut().context("publish_failed")? {
+                        unit.as_object_mut()
+                            .context("publish_failed")?
+                            .remove("evidence");
+                    }
+                }
+                _ => {}
+            }
+        }
+        workspace::atomic_write(&stage.path().join("result.json"), &json_bytes(&result)?)?;
     }
     progress.update("publish", new.len(), new.len(), 0, 0);
     for name in artifacts
