@@ -231,10 +231,16 @@ pub(crate) fn check_saved_oauth(
     effort: &str,
     settings: &Connection,
 ) -> Result<bool, &'static str> {
-    Ok(expired(&saved_credential(
-        settings,
-        model(name, effort)?.backend,
-    )?))
+    let backend = model(name, effort)?.backend;
+    let saved = saved_credential(settings, backend)?;
+    let expired = expired(&saved);
+    if !expired
+        && matches!(backend, Backend::Codex)
+        && nonempty(&saved["access"]).and_then(jwt_account).is_none()
+    {
+        return Err("oauth_credential_invalid");
+    }
+    Ok(expired)
 }
 
 fn saved_credential(settings: &Connection, backend: Backend) -> Result<Value, &'static str> {
@@ -258,6 +264,12 @@ fn oauth_expired(settings: &Connection, backend: Backend) -> Result<bool, &'stat
     Ok(expired(credential(&auth, backend)?))
 }
 
+// Pi's proper-lockfile expires an unchanged lock directory after ten
+// seconds. Allow enough time for a stale predecessor and a healthy refresh.
+const AUTH_LOCK_STALE: Duration = Duration::from_secs(10);
+const AUTH_LOCK_WAIT: Duration = Duration::from_secs(17);
+const AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(6);
+
 struct AuthLock {
     path: PathBuf,
     identity: (u64, u64),
@@ -268,7 +280,8 @@ impl AuthLock {
         let mut name = auth_path.file_name().ok_or("auth_error")?.to_owned();
         name.push(".lock");
         let path = auth_path.with_file_name(name);
-        for _ in 0..50 {
+        let deadline = Instant::now() + AUTH_LOCK_WAIT;
+        loop {
             match fs::DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => {
                     let m = fs::symlink_metadata(&path).map_err(|_| "auth_error")?;
@@ -278,12 +291,42 @@ impl AuthLock {
                     });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if Instant::now() >= deadline {
+                        return Err("auth_error");
+                    }
+                    if Self::remove_stale(&path)? {
+                        continue;
+                    }
                     thread::sleep(Duration::from_millis(100));
                 }
                 Err(_) => return Err("auth_error"),
             }
         }
-        Err("auth_error")
+    }
+
+    fn remove_stale(path: &Path) -> Result<bool, &'static str> {
+        use std::io::ErrorKind::NotFound;
+
+        let observe = || match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => Ok(Some((
+                meta.dev(),
+                meta.ino(),
+                meta.modified().map_err(|_| "auth_error")?,
+            ))),
+            Err(err) if err.kind() == NotFound => Ok(None),
+            _ => Err("auth_error"),
+        };
+        let Some(before) = observe()? else {
+            return Ok(true);
+        };
+        if before.2.elapsed().is_ok_and(|age| age > AUTH_LOCK_STALE) && observe()? == Some(before) {
+            return match fs::remove_dir(path) {
+                Ok(()) => Ok(true),
+                Err(err) if err.kind() == NotFound => Ok(true),
+                Err(_) => Err("auth_error"),
+            };
+        }
+        Ok(false)
     }
 
     fn owns_lock(&self) -> bool {
@@ -334,7 +377,7 @@ fn refresh(client: &Client, backend: Backend, cred: &Value) -> Result<Value, &'s
     let response = client
         .post(endpoint)
         .form(&form)
-        .timeout(Duration::from_secs(6))
+        .timeout(AUTH_REFRESH_TIMEOUT)
         .send()
         .map_err(|_| "auth_error")?
         .error_for_status()
@@ -636,8 +679,10 @@ fn request(
         Purpose::Score(_) => "unknown_outcome",
     })?;
     let status = response.status().as_u16();
-    if matches!(purpose, Purpose::Probe(_)) && !(200..=299).contains(&status) {
-        let reason = probe_http_error(status, response);
+    if let Purpose::Probe(timeout) = purpose
+        && !(200..=299).contains(&status)
+    {
+        let reason = probe_http_error(status, response, started, timeout);
         return Ok(Outcome::error(reason, Some(status)));
     }
     let reason = match status {
@@ -685,14 +730,26 @@ pub fn assess_with_connection(
         .unwrap_or_else(|reason| Outcome::error(reason, None))
 }
 
-fn probe_http_error(status: u16, response: reqwest::blocking::Response) -> &'static str {
+fn probe_http_error(
+    status: u16,
+    response: reqwest::blocking::Response,
+    started: Instant,
+    timeout: Duration,
+) -> &'static str {
     match status {
         401 => "oauth_rejected",
         403 => "provider_access_denied",
         429 => "rate_limited",
         500..=599 => "provider_unavailable",
         _ => {
-            let error = serde_json::from_reader::<_, Value>(response.take(16 * 1024));
+            let mut body = Vec::new();
+            if let Err(error) = response.take(16 * 1024).read_to_end(&mut body) {
+                if error.kind() == std::io::ErrorKind::TimedOut || started.elapsed() >= timeout {
+                    return "probe_timeout";
+                }
+                return "provider_request_rejected";
+            }
+            let error = serde_json::from_slice::<Value>(&body);
             if error.is_ok_and(|value| is_model_rejection(&value["error"]["code"])) {
                 "model_rejected"
             } else {
@@ -719,6 +776,29 @@ pub(crate) fn probe(name: &str, effort: &str, settings: &Connection) -> Outcome 
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn oauth_refresh_reclaims_a_stale_lock_and_releases_its_own() {
+        use std::fs::{File, FileTimes};
+
+        let directory = tempfile::tempdir().unwrap();
+        let auth = directory.path().join("auth.json");
+        let lock_path = directory.path().join("auth.json.lock");
+        fs::create_dir(&lock_path).unwrap();
+        File::open(&lock_path)
+            .unwrap()
+            .set_times(
+                FileTimes::new()
+                    .set_modified(SystemTime::now() - AUTH_LOCK_STALE - Duration::from_secs(1)),
+            )
+            .unwrap();
+
+        let lock = AuthLock::acquire(&auth).unwrap();
+        assert!(lock.owns_lock());
+        assert!(!AuthLock::remove_stale(&lock_path).unwrap());
+        drop(lock);
+        assert!(!lock_path.exists());
+    }
 
     #[test]
     fn provider_rejects_remote_override_without_connecting() {
@@ -780,5 +860,47 @@ mod tests {
         // The listening socket stays open without sending a reply.
         let error = request(selected, Purpose::Probe(Duration::from_millis(80)), &cfg).err();
         assert_eq!(error, Some("probe_timeout"));
+    }
+
+    #[test]
+    fn probe_preserves_http_status_when_the_error_body_stalls() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = Connection {
+            endpoint: Some(format!(
+                "http://{}/responses",
+                listener.local_addr().unwrap()
+            )),
+            ..Connection::default()
+        };
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = BufReader::new(&mut stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(request.read_line(&mut line).unwrap(), 0);
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            request.read_exact(&mut vec![0; length]).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 100\r\n\r\n{")
+                .unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let _ = stream.read(&mut [0]);
+        });
+        let selected = model("openai/gpt-6.1-terra", "medium").unwrap();
+        let outcome = request(selected, Purpose::Probe(Duration::from_millis(250)), &cfg)
+            .ok()
+            .unwrap();
+        assert_eq!(outcome.reason, Some("probe_timeout"));
+        assert_eq!(outcome.http_status, Some(404));
+        server.join().unwrap();
     }
 }

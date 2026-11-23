@@ -146,3 +146,24 @@ fn doctor_checks_explicit_transport_without_a_budget() {
     assert_eq!(summary["state"], "partial");
     assert_eq!(summary["reason_code"], "unsupported_transport");
 }
+
+#[test]
+fn doctor_rejects_codex_credentials_without_an_account_claim() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("doctor.toml");
+    std::fs::write(
+        directory.path().join("auth.json"),
+        r#"{"openai-codex":{"type":"oauth","access":"malformed","refresh":"test","expires":9999999999999}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &config,
+        "[score]\nmodel = 'openai-codex/gpt-6.1-terra'\noauth_file = 'auth.json'\n",
+    )
+    .unwrap();
+    let output = run(&["doctor", "--config", config.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["reason_code"], "oauth_credential_invalid");
+    assert_eq!(summary["counts"]["probe_attempts"], 0);
+}

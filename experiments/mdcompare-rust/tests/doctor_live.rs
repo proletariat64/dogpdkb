@@ -131,6 +131,14 @@ fn live_failures_keep_the_http_status_and_actionable_reason() {
         assert_eq!(report["reason_code"], reason);
         assert_eq!(report["diagnostics"]["llm"]["http_status"], status);
         assert_eq!(report["diagnostics"]["llm"]["model_status"], model);
+        if status == 401 {
+            assert!(
+                report["diagnostics"]["checks"][4]["hint"]
+                    .as_str()
+                    .unwrap()
+                    .contains("local test endpoint")
+            );
+        }
         assert!(
             !String::from_utf8(output.stdout)
                 .unwrap()

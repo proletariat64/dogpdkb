@@ -144,6 +144,9 @@ pub(crate) fn run(config: Option<&Path>, progress: &Progress) -> Outcome {
             "failed",
             Some(reason),
             Some(match reason {
+                "oauth_rejected" if connection.endpoint.is_some() => {
+                    "Check the local test endpoint. The probe sends no credentials to it."
+                }
                 "oauth_rejected" => "Log in again to the configured provider.",
                 "provider_access_denied" => {
                     "Check the provider account permissions for this model."
@@ -169,8 +172,8 @@ pub(crate) fn run(config: Option<&Path>, progress: &Progress) -> Outcome {
         "passed"
     };
     let provider_status = match (http_status, failure) {
-        (Some(_), _) => "responded",
         (_, Some("probe_timeout")) => "timeout",
+        (Some(_), _) => "responded",
         (_, Some("provider_unreachable")) => "unreachable",
         _ => "not_checked",
     };

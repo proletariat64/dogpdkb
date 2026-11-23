@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeSet, HashSet},
@@ -144,7 +144,9 @@ pub fn prepare(bytes: &[u8]) -> Result<Result<Packet, &'static str>> {
         }
     }
     for (index, (old, new)) in units[0].iter().zip(units[1]).enumerate() {
-        if !owned[0].contains(&index)
+        if !old.exporter_title
+            && !new.exporter_title
+            && !owned[0].contains(&index)
             && !owned[1].contains(&index)
             && old.same_contextual_content(new)
         {
@@ -305,8 +307,31 @@ struct Claim {
     ambiguity: Option<String>,
 }
 
-pub fn validate_reply(raw: &str, count: usize) -> Result<(u8, bool), &'static str> {
-    let reply: RawReply = serde_json::from_str(raw).map_err(|_| "invalid_response")?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyValidation {
+    Shape,
+    OperationCoverage,
+    Assessment,
+    ClaimOperation,
+    ClaimContent,
+    Ambiguity,
+    InsufficientInput,
+}
+
+impl ReplyValidation {
+    pub fn reason_code(self) -> &'static str {
+        match self {
+            Self::InsufficientInput => "insufficient_input",
+            _ => "invalid_response",
+        }
+    }
+}
+
+pub fn validate_reply(raw: &str, count: usize) -> Result<(u8, bool), ReplyValidation> {
+    use ReplyValidation::*;
+
+    let reply: RawReply = serde_json::from_str(raw).map_err(|_| Shape)?;
     if reply.checked_operations.len() != count
         || reply
             .checked_operations
@@ -315,9 +340,11 @@ pub fn validate_reply(raw: &str, count: usize) -> Result<(u8, bool), &'static st
             .collect::<BTreeSet<_>>()
             .into_iter()
             .ne(0..count)
-        || reply.reason.trim().is_empty()
     {
-        return Err("invalid_response");
+        return Err(OperationCoverage);
+    }
+    if reply.reason.trim().is_empty() {
+        return Err(Assessment);
     }
     if reply.evaluation_status == "insufficient_input" {
         if reply.change_score.is_some()
@@ -328,40 +355,73 @@ pub fn validate_reply(raw: &str, count: usize) -> Result<(u8, bool), &'static st
                 .iter()
                 .any(|item| item.trim().is_empty())
         {
-            return Err("invalid_response");
+            return Err(Assessment);
         }
-        return Err("insufficient_input");
+        return Err(InsufficientInput);
     }
     let score = reply
         .change_score
         .filter(|score| (1..=5).contains(score))
-        .ok_or("invalid_response")?;
+        .ok_or(Assessment)?;
     if reply.evaluation_status != "evaluated"
         || !reply.missing_evidence.is_empty()
         || reply.changes.is_empty() == (score >= 3)
     {
-        return Err("invalid_response");
+        return Err(Assessment);
     }
     let mut seen = HashSet::new();
     let mut ambiguous = false;
     let mut clear = false;
     for claim in reply.changes {
-        if claim.operation_id >= count
-            || !seen.insert(claim.operation_id)
-            || claim.before.trim().is_empty()
+        if claim.operation_id >= count || !seen.insert(claim.operation_id) {
+            return Err(ClaimOperation);
+        }
+        if claim.before.trim().is_empty()
             || claim.after.trim().is_empty()
             || claim
                 .ambiguity
                 .as_deref()
                 .is_some_and(|text| text.trim().is_empty())
         {
-            return Err("invalid_response");
+            return Err(ClaimContent);
         }
         ambiguous |= claim.ambiguity.is_some();
         clear |= claim.ambiguity.is_none();
     }
     if (score == 3 && !ambiguous) || (score >= 4 && !clear) {
-        return Err("invalid_response");
+        return Err(Ambiguity);
     }
     Ok((score, ambiguous))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validation_distinguishes_duplicate_claims_from_missing_operation_coverage() {
+        let mut reply = json!({
+            "evaluation_status": "evaluated",
+            "change_score": 4,
+            "checked_operations": [0, 1],
+            "changes": [
+                {"operation_id": 0, "before": "15 days", "after": "10 days", "ambiguity": null}
+            ],
+            "reason": "The settlement period shortened.",
+            "missing_evidence": []
+        });
+        assert_eq!(validate_reply(&reply.to_string(), 2), Ok((4, false)));
+        let claim = reply["changes"][0].clone();
+        reply["changes"].as_array_mut().unwrap().push(claim);
+        assert_eq!(
+            validate_reply(&reply.to_string(), 2),
+            Err(ReplyValidation::ClaimOperation)
+        );
+
+        reply["checked_operations"] = json!([0, 0]);
+        assert_eq!(
+            validate_reply(&reply.to_string(), 2),
+            Err(ReplyValidation::OperationCoverage)
+        );
+    }
 }

@@ -1,7 +1,7 @@
 use crate::{
     config::{Config, Scope, ScoreConfig},
     provider::{self, Connection, FORMAT, Outcome as ProviderOutcome, PROMPT},
-    score_context::{self, Packet},
+    score_context::{self, Packet, ReplyValidation},
     semantic_route,
     summary::{Outcome, Progress, Summary},
     workspace::{self, Workspace, checksum as digest},
@@ -84,6 +84,8 @@ struct Attempt {
     score: Option<u8>,
     ambiguous: Option<bool>,
     usage_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validation: Option<ReplyValidation>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -528,6 +530,11 @@ impl Journal {
                 attempt.document < frozen.documents.len()
                     && used.insert(attempt.document)
                     && is_digest(&attempt.packet_sha256)
+                    && attempt.validation.is_none_or(|validation| {
+                        attempt.state == AttemptState::Unscored
+                            && attempt.reason_code.as_deref() == Some(validation.reason_code())
+                            && validation != ReplyValidation::InsufficientInput
+                    })
                     && match attempt.state {
                         AttemptState::Admitted =>
                             self.terminal.is_none()
@@ -793,7 +800,13 @@ fn settle(task: &Task, index: usize, operations: usize, outcome: ProviderOutcome
     ensure!(attempt.state == AttemptState::Admitted, "binding_invalid");
     attempt.usage_tokens = outcome.usage;
     let result = if let Some(reply) = outcome.reply {
-        score_context::validate_reply(&reply, operations)
+        score_context::validate_reply(&reply, operations).map_err(|validation| {
+            let reason = validation.reason_code();
+            if reason == "invalid_response" {
+                attempt.validation = Some(validation);
+            }
+            reason
+        })
     } else {
         Err(outcome.reason.unwrap_or("invalid_response"))
     };
@@ -907,6 +920,7 @@ fn run_pending(task: &Task, directory: &Path, progress: &Progress) -> Result<()>
                             score: None,
                             ambiguous: None,
                             usage_tokens: None,
+                            validation: None,
                         });
                         task.save_journal(&journal)?;
                         let sent = sent.clone();
@@ -968,11 +982,13 @@ pub fn run(
     progress: &Progress,
 ) -> Result<Outcome> {
     let task = prepare_task(Workspace::locate(plan)?, config)?;
-    let _execution =
-        open_lock(&task.workspace.root, EXECUTION_LOCK, false)?.context("workspace_busy")?;
     let directory = task.comparison()?;
-    {
+    let _execution = {
         let _lock = journal_lock(&task.workspace.root)?;
+        // Claim execution and clear the previous cancellation together.
+        // Cancel cannot observe this run before the transition is durable.
+        let execution =
+            open_lock(&task.workspace.root, EXECUTION_LOCK, false)?.context("workspace_busy")?;
         let (mut journal, sha) = task.journal()?;
         if let Some(terminal) = journal.terminal {
             let expected = task.result(&journal, sha)?;
@@ -1010,7 +1026,8 @@ pub fn run(
             }
         }
         task.save_journal(&journal)?;
-    }
+        execution
+    };
     run_pending(&task, &directory, progress)?;
     let _lock = journal_lock(&task.workspace.root)?;
     let (mut journal, _) = task.journal()?;
