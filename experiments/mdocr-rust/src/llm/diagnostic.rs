@@ -215,11 +215,11 @@ impl Probe {
         let mut probe = Self::failure(reason, status);
         match reason {
             "authentication_rejected" => probe.remote_credentials = "rejected",
-            "empty_assistant_text" => {
+            "empty_assistant_text" | "response_incomplete" => {
                 probe.remote_credentials = "accepted";
                 probe.model = "fail";
             }
-            "model_rejected" | "response_incomplete" => probe.model = "fail",
+            "model_rejected" => probe.model = "fail",
             _ => {}
         }
         probe
@@ -272,7 +272,7 @@ fn read_reply(response: Response) -> Result<(), &'static str> {
     if reader.get_ref().limit() == 0 && reader.buffer().is_empty() {
         return Err("response_too_large");
     }
-    result?.ok_or("response_incomplete")
+    result?.ok_or("response_truncated")
 }
 
 fn reply_event(data: &str) -> Result<Option<()>, &'static str> {
@@ -460,8 +460,15 @@ mod tests {
             (
                 200,
                 "data: [DONE]\n\n".into(),
-                "response_incomplete",
+                "response_truncated",
                 "unverified",
+                "unverified",
+            ),
+            (
+                200,
+                "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n".into(),
+                "response_incomplete",
+                "accepted",
                 "fail",
             ),
             (
