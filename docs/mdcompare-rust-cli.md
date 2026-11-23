@@ -28,6 +28,7 @@ mdcomparer help all
 
 Install the `x86_64-unknown-linux-musl` Rust target and a musl C compiler.
 Install `rustfmt` and Clippy for `checkr`, and `readelf` for `smoker`.
+CI verifies the locked build with Rust 1.96.0.
 
 ```sh
 make checkr

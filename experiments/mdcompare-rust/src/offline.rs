@@ -61,7 +61,12 @@ pub(crate) fn run(plan: &Path, config: Option<&Path>, progress: &Progress) -> Re
         chars: report.max_excerpt_chars.unwrap_or(8000),
         char_region: 4096,
     };
-    let mut reader = Reader::new_frozen(options.file_bytes, &frozen.inputs, &frozen.presence);
+    let mut reader = Reader::new_frozen(
+        options.file_bytes,
+        &frozen.inputs,
+        &frozen.presence,
+        &frozen.path_targets,
+    );
     progress.update("compare", 0, total, 0, 0);
     let mut artifacts = vec!["result.json"];
     let operation = frozen.work.operation;
@@ -161,7 +166,7 @@ pub(crate) fn run(plan: &Path, config: Option<&Path>, progress: &Progress) -> Re
         }
         fs::rename(stage.path().join(name), destination).context("publish_failed")?;
     }
-    let commit = workspace::publish_commit(&workspace, &artifacts)?;
+    let commit = workspace::publish_commit(&workspace, frozen.digest(), &artifacts)?;
     published("run", &workspace, commit)
 }
 
@@ -212,6 +217,9 @@ pub(crate) fn status(workspace: &Workspace, frozen: &FrozenPlan) -> Result<Outco
     }
     let execution = workspace::execution_state(workspace)?;
     let running = execution == Some(true);
+    if !running && let Some(commit) = workspace::verify_commit(workspace)? {
+        return published("status", workspace, commit);
+    }
     let mut summary = Summary::new("status", if running { "running" } else { "accepted" })
         .artifact("plan", workspace.root.join("plan.json"))
         .count("total", frozen.work.documents.len());

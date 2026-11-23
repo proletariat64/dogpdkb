@@ -4,6 +4,8 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use crate::{input, workspace::Operation};
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -46,6 +48,22 @@ pub struct ReportConfig {
 pub struct CompareSettings {
     pub compare: CompareConfig,
     pub report: ReportConfig,
+}
+
+impl CompareSettings {
+    pub fn for_operation(mut self, operation: Operation) -> Self {
+        self.compare.normalize_line_endings &= operation == Operation::Strict;
+        if operation == Operation::Catalog {
+            self.compare.max_diff_work = CompareConfig::default().max_diff_work;
+        }
+        if operation == Operation::Semantic {
+            self.report = ReportConfig::default();
+        }
+        if self.report.include_body_excerpts {
+            self.report.max_excerpt_chars = Some(self.report.max_excerpt_chars.unwrap_or(8000));
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,15 +126,18 @@ impl Config {
         let Some(path) = explicit.or(fallback.as_deref()) else {
             return Ok(Self::default());
         };
-        let raw = match fs::read_to_string(path) {
-            Ok(raw) => raw,
+        match fs::metadata(path) {
+            Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::NotFound && explicit.is_none() => {
                 return Ok(Self::default());
             }
             Err(_) => anyhow::bail!("invalid_config"),
-        };
+        }
+        let (raw, _) = input::read(path, input::MANIFEST_LIMIT)
+            .map_err(|_| anyhow::anyhow!("invalid_config"))?;
+        let raw = std::str::from_utf8(&raw).context("invalid_config")?;
         let mut config: Self =
-            toml::from_str(&raw).map_err(|_| anyhow::anyhow!("invalid_config"))?;
+            toml::from_str(raw).map_err(|_| anyhow::anyhow!("invalid_config"))?;
         let absolute = std::path::absolute(path).context("invalid_config")?;
         if matches!(scope, Scope::Score | Scope::Doctor) {
             let directory = absolute.parent().context("invalid_config")?;
@@ -168,15 +189,11 @@ impl Config {
         Ok(config)
     }
 
-    pub fn comparison(mut self, strict: bool) -> CompareSettings {
-        self.compare.normalize_line_endings &= strict;
-        let mut report = self.report;
-        if report.include_body_excerpts {
-            report.max_excerpt_chars = Some(report.max_excerpt_chars.unwrap_or(8000));
-        }
+    pub fn comparison(self, operation: Operation) -> CompareSettings {
         CompareSettings {
             compare: self.compare,
-            report,
+            report: self.report,
         }
+        .for_operation(operation)
     }
 }

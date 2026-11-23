@@ -1,4 +1,5 @@
 use crate::{offline::Snapshots, summary::Progress};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -11,8 +12,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::input::{Document, Identity, MANIFEST_LIMIT, Reader, json_bytes, parse_utf8_json};
-use crate::knowledge::extract_document_units;
-use crate::knowledge_units::{Alignment, Unit, align_units, source_lines};
+use crate::knowledge::extract_document_body;
+use crate::knowledge_units::{
+    Alignment, Unit, align_units, declared_marker_positions, is_source_line_end, source_lines,
+};
 use crate::text::Options;
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -104,6 +107,10 @@ fn line_offsets(text: &str) -> Vec<usize> {
         .collect()
 }
 
+fn legacy_closer(line: &str) -> bool {
+    matches!(line, "> 转写说明：" | "> **转写说明：**" | "-->")
+}
+
 fn repair<'a>(
     original: &str,
     record: Option<&'a Record>,
@@ -115,6 +122,10 @@ fn repair<'a>(
     };
     if reader.read(&record.source_copy)? != original.as_bytes() {
         return Err("RECOVERY_SOURCE_DRIFT");
+    }
+    let mut offsets = line_offsets(original);
+    if !original.is_empty() && !original.ends_with(is_source_line_end) {
+        offsets.pop();
     }
     let mut repairs = Vec::new();
     let mut previous = 0;
@@ -133,15 +144,13 @@ fn repair<'a>(
                 matches!(
                     line,
                     "" | "<!-- mdocr:ocr-begin -->" | "<!-- mdocr:ocr-end -->"
-                )
+                ) || legacy_closer(line)
             })
         {
             return Err(INVALID);
         }
         previous = byte_offset;
-        let prefix = &original[..byte_offset];
-        let source_line = source_lines(prefix, false).count()
-            + usize::from(prefix.is_empty() || prefix.ends_with(['\r', '\n']));
+        let source_line = offsets.partition_point(|&offset| offset <= byte_offset);
         repairs.push(Repair {
             byte_offset,
             text,
@@ -157,6 +166,44 @@ fn repair<'a>(
     }
     projected.push_str(&original[position..]);
     Ok((projected, repairs))
+}
+
+fn project_declared_scope<'a>(
+    original: &str,
+    projected: &str,
+    repairs: &[Repair<'_>],
+    scope: &'a Value,
+) -> std::result::Result<Cow<'a, Value>, &'static str> {
+    if repairs.is_empty() || scope.is_null() {
+        return Ok(Cow::Borrowed(scope));
+    }
+    let markers = declared_marker_positions(original, scope)?;
+    if markers.is_empty() {
+        return Ok(Cow::Borrowed(scope));
+    }
+    let mut inserted = 0;
+    let shifts: Vec<_> = repairs
+        .iter()
+        .map(|repair| {
+            inserted += repair.text.len();
+            (repair.byte_offset, inserted)
+        })
+        .collect();
+    let offsets = line_offsets(projected);
+    let locate = |marker| {
+        let count = shifts.partition_point(|&(offset, _)| offset <= marker);
+        let shift = count.checked_sub(1).map_or(0, |index| shifts[index].1);
+        offsets.partition_point(|&offset| offset <= marker + shift)
+    };
+    let mut projection = scope.clone();
+    let regions = projection["regions"]
+        .as_array_mut()
+        .expect("validated scope");
+    for (region, (opening, closing)) in regions.iter_mut().zip(markers) {
+        region["start_line"] = json!(locate(opening));
+        region["end_line"] = json!(locate(closing));
+    }
+    Ok(Cow::Owned(projection))
 }
 
 fn coordinate_map(original: &str, projected: &str, repairs: &[Repair<'_>]) -> Vec<usize> {
@@ -214,17 +261,34 @@ fn changes(
     old_positions: &[usize],
     new_positions: &[usize],
 ) -> Vec<Value> {
-    let reserved: HashSet<_> = aligned
-        .items
-        .iter()
-        .take(after.len())
-        .filter_map(|item| item.old)
-        .collect();
-    let mut used = HashSet::new();
     let mut exact = HashMap::<_, VecDeque<usize>>::new();
-    let mut movable = HashMap::<_, BTreeSet<usize>>::new();
     for (index, unit) in before.iter().enumerate() {
         exact.entry(unit.exact_key()).or_default().push_back(index);
+    }
+    // The aligner may reuse one old unit to describe multiple incoming
+    // occurrences. Diff operations need one old reference per occurrence.
+    let matches: Vec<_> = aligned
+        .items
+        .iter()
+        .zip(after)
+        .map(|(item, current)| {
+            let previous = if item.kind == "reuse" {
+                exact
+                    .get_mut(&current.exact_key())
+                    .and_then(VecDeque::pop_front)
+            } else {
+                item.old
+            };
+            (item, previous)
+        })
+        .collect();
+    let reserved: HashSet<_> = matches
+        .iter()
+        .filter_map(|(_, previous)| *previous)
+        .collect();
+    let mut used = HashSet::new();
+    let mut movable = HashMap::<_, BTreeSet<usize>>::new();
+    for (index, unit) in before.iter().enumerate() {
         if !reserved.contains(&index) {
             movable
                 .entry((unit.kind, unit.key.as_str()))
@@ -233,25 +297,14 @@ fn changes(
         }
     }
     let mut operations = Vec::new();
-    for (index, item) in aligned.items.iter().take(after.len()).enumerate() {
+    for (index, (item, mut previous)) in matches.into_iter().enumerate() {
         let current = after[index];
-        let mut previous = item.old;
         let operation = match item.kind {
-            "reuse" => {
-                let bucket = exact.entry(current.exact_key()).or_default();
-                while bucket
-                    .front()
-                    .is_some_and(|candidate| used.contains(candidate))
-                {
-                    bucket.pop_front();
-                }
-                previous = bucket.pop_front();
-                match previous {
-                    None => "add",
-                    Some(previous) if previous != index => "move",
-                    Some(_) => "equal",
-                }
-            }
+            "reuse" => match previous {
+                None => "add",
+                Some(previous) if previous != index => "move",
+                Some(_) => "equal",
+            },
             other => {
                 if let Some(candidates) = movable
                     .get(&(current.kind, current.key.as_str()))
@@ -319,7 +372,11 @@ fn load_side(
     evidence["recovery"].as_array_mut().expect("recovery evidence").extend(repairs.iter().map(|item| json!({
         "side": side.label(), "byte_offset": item.byte_offset, "text": item.text, "source_line": item.source_line,
     })));
-    let units = extract_document_units(doc, &projected)?;
+    let scope = project_declared_scope(original, &projected, &repairs, &doc.raw["body_scope"])?;
+    let explicit_legacy_repair = repairs
+        .iter()
+        .any(|repair| source_lines(repair.text, false).any(legacy_closer));
+    let units = extract_document_body(doc, &projected, &scope, explicit_legacy_repair)?;
     let coordinates = (!repairs.is_empty()).then(|| coordinate_map(original, &projected, &repairs));
     evidence[side.unit_field()] = json!(
         units

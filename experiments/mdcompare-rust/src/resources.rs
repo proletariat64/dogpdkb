@@ -178,8 +178,9 @@ fn positions<'a>(
     let mut positions: BTreeMap<_, Vec<_>> = BTreeMap::new();
     for (index, usage) in uses.iter().enumerate() {
         let key = (usage.url.as_str(), usage.kind);
-        positions.entry(key).or_default().push(index);
-        if lookup.get(&key) != Some(&1) {
+        if lookup.get(&key) == Some(&1) {
+            positions.entry(key).or_default().push(index);
+        } else {
             reasons.push("RESOURCE_REFERENCE_UNMAPPED");
         }
     }
@@ -314,4 +315,32 @@ pub(crate) fn compare(
         "processing_required": processing,
         "references_changed": before != after,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ambiguous_occurrence_indexes_are_not_expanded_across_declarations() {
+        let declarations: Vec<_> = (0..MAX_REFERENCES)
+            .map(|_| json!({"url":"chart.png","kind":"image"}))
+            .collect();
+        let ids: Vec<_> = (0..MAX_REFERENCES).map(|id| id.to_string()).collect();
+        let entries = ids.iter().map(String::as_str).zip(&declarations).collect();
+        let body = "![chart](chart.png)\n".repeat(MAX_REFERENCES);
+        let (references, mut reasons) = uses(body.as_bytes(), &BTreeSet::from(["chart.png"]));
+        assert_eq!(references.len(), MAX_REFERENCES);
+        assert!(reasons.is_empty());
+
+        let positions = positions(&references, &entries, &mut reasons);
+
+        assert!(positions.is_empty());
+        assert_eq!(reasons.len(), MAX_REFERENCES);
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| *reason == "RESOURCE_REFERENCE_UNMAPPED")
+        );
+    }
 }

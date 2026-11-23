@@ -131,12 +131,44 @@ struct ExternalScore {
     ambiguous: bool,
 }
 
-fn scores(
-    generation: &Generation,
-    path: &Path,
-    bytes: &[u8],
-) -> Result<BTreeMap<Identity, (u8, bool)>> {
-    let input = parse_utf8_json(bytes).context("binding_invalid")?;
+enum ScoreInput {
+    External(ExternalScores),
+    Native(crate::semantic_score::ScoreResult),
+}
+
+fn score_input(path: &Path) -> Result<(ScoreInput, String, crate::input::Stamp)> {
+    let read = crate::input::read(path, crate::input::MANIFEST_LIMIT);
+    let (stamp, digest) = match read {
+        Ok((bytes, stamp)) => {
+            let input = parse_utf8_json(&bytes).context("binding_invalid")?;
+            let digest = checksum(&bytes);
+            if input["schema_version"] == "mdcompare-external-scores-1" {
+                let external = serde_json::from_value(input).context("binding_invalid")?;
+                return Ok((ScoreInput::External(external), digest, stamp));
+            }
+            ensure!(
+                input["schema_version"] == "mdcompare-score-result-1",
+                "binding_invalid"
+            );
+            (stamp, Some(digest))
+        }
+        // Native scores can exceed the external manifest limit. Require the
+        // native journal and validate the exact score result against it.
+        Err("FILE_BUDGET_EXCEEDED") => {
+            (fs::metadata(path).context("binding_invalid")?.into(), None)
+        }
+        Err(reason) => return Err(anyhow::Error::msg(reason)).context("binding_invalid"),
+    };
+    let (local, verified) =
+        crate::semantic_score::verified_result(path).context("binding_invalid")?;
+    ensure!(
+        digest.is_none_or(|digest| digest == verified),
+        "binding_invalid"
+    );
+    Ok((ScoreInput::Native(local), verified, stamp))
+}
+
+fn scores(generation: &Generation, input: ScoreInput) -> Result<BTreeMap<Identity, (u8, bool)>> {
     let mut decisions = BTreeMap::new();
     let eligible: BTreeSet<_> = generation
         .results
@@ -159,10 +191,8 @@ fn scores(
         );
         Ok(())
     };
-    match input["schema_version"].as_str() {
-        Some("mdcompare-external-scores-1") => {
-            let external: ExternalScores =
-                serde_json::from_value(input).context("binding_invalid")?;
+    match input {
+        ScoreInput::External(external) => {
             ensure!(
                 external.schema_version == "mdcompare-external-scores-1"
                     && external.comparison_sha256 == generation.comparison_sha256,
@@ -178,12 +208,9 @@ fn scores(
                 )?;
             }
         }
-        Some("mdcompare-score-result-1") => {
-            let (local, digest) =
-                crate::semantic_score::verified_result(path).context("binding_invalid")?;
+        ScoreInput::Native(local) => {
             ensure!(
                 local.comparison_sha256 == generation.comparison_sha256
-                    && digest == checksum(bytes)
                     && matches!(local.state.as_str(), "complete" | "partial"),
                 "binding_invalid"
             );
@@ -199,7 +226,6 @@ fn scores(
                 }
             }
         }
-        _ => anyhow::bail!("binding_invalid"),
     }
     Ok(decisions)
 }
@@ -220,11 +246,8 @@ pub fn run(plan: &Path, score_path: &Path, config: Option<&Path>) -> Result<Outc
     let frozen = workspace::load_frozen(&workspace)?;
     let config = Config::load(Some(&workspace.source), config, Scope::Route)?;
     let generation = load(&workspace)?;
-    let (bytes, stamp) = crate::input::read(score_path, 16 * 1024 * 1024)
-        .map_err(anyhow::Error::msg)
-        .context("binding_invalid")?;
-    let decisions = scores(&generation, score_path, &bytes)?;
-    let scores_sha256 = checksum(&bytes);
+    let (input, scores_sha256, stamp) = score_input(score_path)?;
+    let decisions = scores(&generation, input)?;
     let policy = config.route;
     let key = checksum(&serde_json::to_vec(&(
         &generation.comparison_sha256,

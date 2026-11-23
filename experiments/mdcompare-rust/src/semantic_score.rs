@@ -786,11 +786,7 @@ fn prepare_packet(
         .map_err(anyhow::Error::msg)
         .context("binding_invalid")?;
     ensure!(digest(&data) == binding.evidence_sha256, "binding_invalid");
-    Ok(match score_context::prepare(&data)? {
-        Ok(packet) if packet.evidence.len() as u64 <= limit => Ok(packet),
-        Ok(_) => Err("oversized_evidence".to_owned()),
-        Err(reason) => Err(reason.to_ascii_lowercase()),
-    })
+    Ok(score_context::prepare(&data, limit)?.map_err(str::to_ascii_lowercase))
 }
 
 fn settle(task: &Task, index: usize, operations: usize, outcome: ProviderOutcome) -> Result<()> {

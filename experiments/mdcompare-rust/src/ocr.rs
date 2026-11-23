@@ -111,9 +111,9 @@ fn v2_record(
         .ok_or(invalid)?;
     if &header[1] != mode.as_bytes()
         || &header[2] != digest.as_bytes()
-        || body
-            .iter()
-            .all(|ch| ch.is_ascii_whitespace() || *ch == 0x0b)
+        || std::str::from_utf8(body)
+            .ok()
+            .is_none_or(|text| text.trim().is_empty())
         || NESTED.is_match(body)
     {
         return Err(invalid);

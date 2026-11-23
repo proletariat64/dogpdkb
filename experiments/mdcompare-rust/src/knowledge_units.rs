@@ -13,6 +13,7 @@ macro_rules! rx {
 
 mod body_view;
 mod formatting;
+pub(crate) use body_view::declared_marker_positions;
 pub use formatting::{prose_key, table_key};
 
 #[derive(Clone, Debug, Serialize)]
@@ -84,7 +85,7 @@ fn blank(line: &str) -> bool {
     line.trim().is_empty()
 }
 
-fn is_source_line_end(ch: char) -> bool {
+pub(crate) fn is_source_line_end(ch: char) -> bool {
     matches!(
         ch,
         '\r' | '\n'
@@ -135,31 +136,49 @@ struct Extractor {
     bullet_parents: Vec<(usize, String)>,
     leadin: String,
     list_scope: String,
+    remaining_context_bytes: usize,
 }
 
 impl Extractor {
-    fn append(&mut self, kind: &'static str, start: usize, end: usize, text: String) {
+    fn append(
+        &mut self,
+        kind: &'static str,
+        start: usize,
+        end: usize,
+        text: String,
+    ) -> Result<(), &'static str> {
         let key = match kind {
             "code" => text.trim_end_matches('\n').to_owned(),
             "table" => table_key(&text),
             _ => prose_key(&text),
         };
         if key.is_empty() {
-            return;
+            return Ok(());
         }
-        let mut context: Vec<_> = self.headings.iter().map(|(_, key)| key.clone()).collect();
-        if !self.leadin.is_empty() {
-            context.push(self.leadin.clone());
-        }
-        if !self.list_scope.is_empty()
+        let include_list_scope = !self.list_scope.is_empty()
             && self.list_scope != self.leadin
-            && matches!(kind, "bullet" | "ordered" | "table" | "code")
-        {
-            context.push(self.list_scope.clone());
-        }
-        if kind == "bullet" {
-            context.extend(self.bullet_parents.iter().map(|(_, key)| key.clone()));
-        }
+            && matches!(kind, "bullet" | "ordered" | "table" | "code");
+        let parents = if kind == "bullet" {
+            self.bullet_parents.as_slice()
+        } else {
+            &[]
+        };
+        let context_parts = self
+            .headings
+            .iter()
+            .map(|(_, key)| key)
+            .chain((!self.leadin.is_empty()).then_some(&self.leadin))
+            .chain(include_list_scope.then_some(&self.list_scope))
+            .chain(parents.iter().map(|(_, key)| key));
+        // Context is repeated in the semantic evidence. Bound that expansion
+        // before allocating, including when the original text is small.
+        self.remaining_context_bytes = context_parts
+            .clone()
+            .try_fold(self.remaining_context_bytes, |remaining, key| {
+                remaining.checked_sub(key.len() + size_of::<String>())
+            })
+            .ok_or("BODY_CONTEXT_BUDGET_EXCEEDED")?;
+        let context = context_parts.cloned().collect();
         self.units.push(Unit {
             kind,
             key,
@@ -169,26 +188,40 @@ impl Extractor {
             end_line: end,
             exporter_title: false,
         });
+        Ok(())
     }
 
-    fn block(&mut self, kind: &'static str, start: usize, end: usize, lines: &[&str]) {
-        self.append(kind, start, end, lines[start..end].join("\n"));
+    fn block(
+        &mut self,
+        kind: &'static str,
+        start: usize,
+        end: usize,
+        lines: &[&str],
+    ) -> Result<(), &'static str> {
+        self.append(kind, start, end, lines[start..end].join("\n"))?;
         self.list_scope = self
             .units
             .last()
             .map_or_else(String::new, |unit| unit.key.clone());
+        Ok(())
     }
 }
 
-pub fn extract_units(text: &str, body_scope: &Value) -> Result<Vec<Unit>, &'static str> {
-    let (body, ignored) = body_view::body_view(text, body_scope)?;
+pub fn extract_units(
+    text: &str,
+    body_scope: &Value,
+    explicit_legacy_repair: bool,
+) -> Result<Vec<Unit>, &'static str> {
+    let (body, ignored) = body_view::body_view(text, body_scope, explicit_legacy_repair)?;
     let lines: Vec<_> = source_lines(&body, false).collect();
+    let original: Vec<_> = source_lines(text, false).collect();
     let mut output = Extractor {
         units: Vec::new(),
         headings: Vec::new(),
         bullet_parents: Vec::new(),
         leadin: String::new(),
         list_scope: String::new(),
+        remaining_context_bytes: crate::input::MANIFEST_LIMIT as usize,
     };
     let mut index = 0;
     while let Some(&line) = lines.get(index) {
@@ -204,7 +237,7 @@ pub fn extract_units(text: &str, body_scope: &Value) -> Result<Vec<Unit>, &'stat
             }
             output.leadin.clear();
             output.list_scope.clear();
-            output.append("heading", start, index, m[2].to_owned());
+            output.append("heading", start, index, m[2].to_owned())?;
             output.headings.push((level, prose_key(&m[2])));
             output.bullet_parents.clear();
             continue;
@@ -216,7 +249,7 @@ pub fn extract_units(text: &str, body_scope: &Value) -> Result<Vec<Unit>, &'stat
                     break;
                 }
             }
-            output.block("code", start, index, &lines);
+            output.block("code", start, index, &lines)?;
             continue;
         }
         if table_start(&lines, start) {
@@ -227,31 +260,30 @@ pub fn extract_units(text: &str, body_scope: &Value) -> Result<Vec<Unit>, &'stat
             {
                 index += 1;
             }
-            output.block("table", start, index, &lines);
+            output.block("table", start, index, &lines)?;
             continue;
         }
         if is_html_table(line) {
             while index < lines.len() && !rx!(r"(?i)</table\s*>").is_match(lines[index - 1]) {
                 index += 1;
             }
-            output.block("table", start, index, &lines);
+            output.block("table", start, index, &lines)?;
             continue;
         }
         if ordered().is_match(line) {
             index = list_end(&lines, index, ordered());
-            output.block("ordered", start, index, &lines);
+            output.block("ordered", start, index, &lines)?;
             continue;
         }
         if let Some(m) = bullet().captures(line) {
-            let heading_scope = output
+            if output
                 .headings
                 .iter()
-                .map(|(_, key)| key.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            if workflow().is_match(&format!("{} {}", heading_scope, output.list_scope)) {
+                .any(|(_, key)| workflow().is_match(key))
+                || workflow().is_match(&output.list_scope)
+            {
                 index = list_end(&lines, index, bullet());
-                output.block("ordered", start, index, &lines);
+                output.block("ordered", start, index, &lines)?;
                 continue;
             }
             let indent = tab_indent(&m[1]);
@@ -275,20 +307,22 @@ pub fn extract_units(text: &str, body_scope: &Value) -> Result<Vec<Unit>, &'stat
                 value.push_str(next.trim());
             }
             let key = prose_key(&value);
-            output.append("bullet", start, index, value);
+            output.append("bullet", start, index, value)?;
             output.bullet_parents.push((indent, key));
             continue;
         }
-        if is_indented(line) {
-            while lines.get(index).is_some_and(|next| is_indented(next)) {
+        if is_indented(original[start]) {
+            while original.get(index).is_some_and(|next| is_indented(next)) {
                 index += 1;
             }
-            output.block("code", start, index, &lines);
+            output.block("code", start, index, &lines)?;
             continue;
         }
         while let Some(&next) = lines.get(index) {
             let excluded = ignored.contains(&index);
-            if (!excluded && (blank(next) || block_start(next))) || table_start(&lines, index) {
+            if (!excluded && (blank(next) || block_start(next, original[index])))
+                || table_start(&lines, index)
+            {
                 break;
             }
             index += 1;
@@ -302,7 +336,7 @@ pub fn extract_units(text: &str, body_scope: &Value) -> Result<Vec<Unit>, &'stat
         } else {
             String::new()
         };
-        output.append("paragraph", start, index, value);
+        output.append("paragraph", start, index, value)?;
         output.list_scope = scope;
         if is_scope {
             output.leadin.clone_from(&output.list_scope);
@@ -319,12 +353,12 @@ fn table_start(lines: &[&str], index: usize) -> bool {
             .is_some_and(|next| table_separator().is_match(next))
 }
 
-fn block_start(line: &str) -> bool {
+fn block_start(line: &str, original: &str) -> bool {
     heading().is_match(line)
         || fence().is_match(line)
         || bullet().is_match(line)
         || ordered().is_match(line)
-        || is_indented(line)
+        || is_indented(original)
         || is_html_table(line)
 }
 
@@ -368,12 +402,15 @@ pub fn align_units(old: &[&Unit], new: &[&Unit], max_work: usize) -> Alignment {
         exact.entry(unit.exact_key()).or_default().push(index);
     }
     let mut used = HashSet::new();
+    let mut covered = HashSet::new();
     let mut items: Vec<_> = new
         .iter()
         .enumerate()
         .map(|(index, unit)| {
             exact.get(&unit.exact_key()).map(|matches| {
-                used.extend(matches.iter().copied());
+                if covered.insert(matches[0]) {
+                    used.extend(matches.iter().copied());
+                }
                 Match {
                     kind: "reuse",
                     old: Some(matches[0]),
@@ -481,7 +518,8 @@ mod tests {
 
     #[test]
     fn unicode_source_separators_preserve_headings_and_unit_locations() {
-        let units = extract_units("# Scope\u{2028}- limit\u{85}- refund", &Value::Null).unwrap();
+        let units =
+            extract_units("# Scope\u{2028}- limit\u{85}- refund", &Value::Null, false).unwrap();
         let actual: Vec<_> = units
             .iter()
             .map(|unit| (unit.kind, unit.key.as_str(), unit.start_line, unit.end_line))
@@ -493,6 +531,32 @@ mod tests {
                 ("bullet", "limit", 2, 2),
                 ("bullet", "refund", 3, 3)
             ]
+        );
+    }
+
+    #[test]
+    fn image_mask_padding_does_not_make_authored_prose_code() {
+        for text in [
+            "![diagram](old.png) Keep this policy.",
+            "![diagram](longer.png) Keep this policy.",
+        ] {
+            let units = extract_units(text, &Value::Null, false).unwrap();
+            assert_eq!(units.len(), 1);
+            assert_eq!(units[0].kind, "paragraph");
+            assert_eq!(units[0].key, "Keep this policy.");
+        }
+    }
+
+    #[test]
+    fn repeated_scope_is_bounded_before_evidence_expansion() {
+        let text = format!(
+            "{}:\n\n{}",
+            "scope ".repeat(170_000),
+            "- limit\n".repeat(24)
+        );
+        assert_eq!(
+            extract_units(&text, &Value::Null, false).unwrap_err(),
+            "BODY_CONTEXT_BUDGET_EXCEEDED"
         );
     }
 }

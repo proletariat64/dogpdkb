@@ -96,7 +96,7 @@ fn optional_joined_text(unit: &Unit) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-pub fn prepare(bytes: &[u8]) -> Result<Result<Packet, &'static str>> {
+pub fn prepare(bytes: &[u8], limit: u64) -> Result<Result<Packet, &'static str>> {
     let evidence: Evidence = serde_json::from_slice(bytes)?;
     let (Some(old), Some(new)) = (
         &evidence.source_inputs.baseline,
@@ -158,16 +158,12 @@ pub fn prepare(bytes: &[u8]) -> Result<Result<Packet, &'static str>> {
     let mut by_old = pairs.clone();
     by_old.sort_by_key(|pair| pair[0]);
     let anchors_by_ref = [&by_old, &pairs];
-    let incoming: Vec<_> = units[1]
-        .iter()
-        .enumerate()
-        .filter_map(|(index, unit)| Some((index, optional_joined_text(unit)?)))
-        .collect();
     let mut operations = Vec::new();
     let mut excluded = 0usize;
     let mut anchors = Vec::new();
     let mut wanted = [BTreeSet::new(), BTreeSet::new()];
     let mut targets = [HashSet::new(), HashSet::new()];
+    let mut unanchored = [false; 2];
     for change in &evidence.changes {
         if change.operation == "equal" {
             continue;
@@ -183,26 +179,12 @@ pub fn prepare(bytes: &[u8]) -> Result<Result<Packet, &'static str>> {
             }
         }
         let op_index = operations.len();
-        let mut operation = json!({
+        let operation = json!({
             "operation": change.operation,
             "operation_id": op_index,
             "old_ref": change.old_ref,
             "new_ref": change.new_ref,
         });
-        if change.operation == "delete"
-            && let Some(index) = change.old_ref
-            && let Some(text) = optional_joined_text(&units[0][index])
-        {
-            let mut candidates = incoming
-                .iter()
-                .filter(|(_, larger)| text.len() < larger.len() && larger.contains(&text));
-            if let Some((index, _)) = candidates.next()
-                && candidates.next().is_none()
-            {
-                operation["retained_text_candidate_new_ref"] = json!(index);
-                wanted[1].insert(*index);
-            }
-        }
         for side in 0..2 {
             if let Some(index) = refs[side] {
                 include(&mut wanted[side], units[side], index);
@@ -219,8 +201,12 @@ pub fn prepare(bytes: &[u8]) -> Result<Result<Packet, &'static str>> {
                     .into_iter()
                     .chain(pairs.get(after));
                 if before == 0 && after == pairs.len() {
-                    wanted[side]
-                        .extend((0..units[side].len()).filter(|&i| !units[side][i].exporter_title));
+                    if !unanchored[side] {
+                        wanted[side].extend(
+                            (0..units[side].len()).filter(|&i| !units[side][i].exporter_title),
+                        );
+                        unanchored[side] = true;
+                    }
                 } else {
                     for pair in neighbors {
                         include(&mut wanted[side], units[side], pair[side]);
@@ -249,7 +235,82 @@ pub fn prepare(bytes: &[u8]) -> Result<Result<Packet, &'static str>> {
         "opposite_context_anchors": anchors,
         "source_body": {},
     });
+    if let Err(reason) = project(&mut result, units, &wanted, &targets, limit) {
+        return Ok(Err(reason));
+    }
+    let mut evidence = serde_json::to_string(&result)?;
+    if evidence.len() as u64 > limit {
+        return Ok(Err("OVERSIZED_EVIDENCE"));
+    }
+    // Only search for supplemental retained text once the mandatory
+    // operation targets and their context fit the provider byte budget.
+    if add_retained_candidates(&mut result, units, &mut wanted[1]) {
+        if let Err(reason) = project(&mut result, units, &wanted, &targets, limit) {
+            return Ok(Err(reason));
+        }
+        evidence = serde_json::to_string(&result)?;
+        if evidence.len() as u64 > limit {
+            return Ok(Err("OVERSIZED_EVIDENCE"));
+        }
+    }
+    Ok(Ok(Packet {
+        evidence,
+        operations: count,
+    }))
+}
+
+fn add_retained_candidates(
+    result: &mut Value,
+    units: [&[Unit]; 2],
+    wanted: &mut BTreeSet<usize>,
+) -> bool {
+    let operations = result["operations"]
+        .as_array_mut()
+        .expect("assembled operations");
+    let mut deletions = operations
+        .iter_mut()
+        .filter_map(|op| {
+            if op["operation"] != "delete" {
+                return None;
+            }
+            let index = op["old_ref"].as_u64().expect("validated delete reference") as usize;
+            let text = optional_joined_text(&units[0][index])?;
+            Some((op, text))
+        })
+        .peekable();
+    if deletions.peek().is_none() {
+        return false;
+    }
+    let incoming: Vec<_> = units[1]
+        .iter()
+        .enumerate()
+        .filter_map(|(index, unit)| Some((index, optional_joined_text(unit)?)))
+        .collect();
+    let mut added = false;
+    for (operation, text) in deletions {
+        let mut matches = incoming
+            .iter()
+            .filter(|(_, larger)| text.len() < larger.len() && larger.contains(&text));
+        if let Some((index, _)) = matches.next()
+            && matches.next().is_none()
+        {
+            operation["retained_text_candidate_new_ref"] = json!(index);
+            wanted.insert(*index);
+            added = true;
+        }
+    }
+    added
+}
+
+fn project(
+    result: &mut Value,
+    units: [&[Unit]; 2],
+    wanted: &[BTreeSet<usize>; 2],
+    targets: &[HashSet<usize>; 2],
+    limit: u64,
+) -> std::result::Result<(), &'static str> {
     let mut partial = false;
+    let mut text_bytes = 0u64;
     for side in 0..2 {
         let available = units[side]
             .iter()
@@ -265,8 +326,12 @@ pub fn prepare(bytes: &[u8]) -> Result<Result<Packet, &'static str>> {
         let mut projected = Vec::new();
         for &index in &wanted[side] {
             let unit = &units[side][index];
+            text_bytes = text_bytes.saturating_add(unit.text.len() as u64);
+            if text_bytes > limit {
+                return Err("OVERSIZED_EVIDENCE");
+            }
             if has_residue(&unit.text) {
-                return Ok(Err("UNSAFE_OR_INCOMPLETE_EVIDENCE"));
+                return Err("UNSAFE_OR_INCOMPLETE_EVIDENCE");
             }
             projected.push(json!({
                 "ref": index,
@@ -279,10 +344,7 @@ pub fn prepare(bytes: &[u8]) -> Result<Result<Packet, &'static str>> {
         result[SIDES[side]] = json!(projected);
     }
     result["context_is_partial"] = json!(partial);
-    Ok(Ok(Packet {
-        evidence: serde_json::to_string(&result)?,
-        operations: count,
-    }))
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -397,6 +459,108 @@ pub fn validate_reply(raw: &str, count: usize) -> Result<(u8, bool), ReplyValida
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unit(text: &str) -> Value {
+        json!({"kind": "paragraph", "context": [], "key": text, "text": text})
+    }
+
+    fn diff(old: Vec<Value>, new: Vec<Value>, changes: Vec<Value>) -> Vec<u8> {
+        let source = json!({"content_kind": "raw", "metadata": {"name": "Limits"}});
+        serde_json::to_vec(&json!({
+            "source_inputs": {"baseline": source, "incoming": source},
+            "old_units": old,
+            "new_units": new,
+            "changes": changes,
+        }))
+        .unwrap()
+    }
+
+    fn deleted_with_retained_candidate(deleted: &str, candidate: &str) -> Vec<u8> {
+        let new = vec![
+            unit("anchor"),
+            unit("first"),
+            unit("second"),
+            unit(candidate),
+        ];
+        let old = [unit(deleted)]
+            .into_iter()
+            .chain(new.iter().cloned())
+            .collect();
+        let changes =
+            [json!({"operation": "delete", "old_ref": 0, "new_ref": null})]
+                .into_iter()
+                .chain((0..new.len()).map(
+                    |index| json!({"operation": "equal", "old_ref": index + 1, "new_ref": index}),
+                ))
+                .collect();
+        diff(old, new, changes)
+    }
+
+    #[test]
+    fn oversized_required_context_is_held_before_searching_for_retained_text() {
+        let deleted = "transfer limit ".repeat(130);
+        let sidecar = deleted_with_retained_candidate(
+            &deleted,
+            &format!("This paragraph retained {deleted} and ![image](diagram.svg)."),
+        );
+
+        assert_eq!(
+            prepare(&sidecar, 1024).unwrap().err(),
+            Some("OVERSIZED_EVIDENCE")
+        );
+        // With a larger budget the optional candidate is examined, and its
+        // embedded image marker keeps that packet from being sent.
+        assert_eq!(
+            prepare(&sidecar, 65536).unwrap().err(),
+            Some("UNSAFE_OR_INCOMPLETE_EVIDENCE")
+        );
+    }
+
+    #[test]
+    fn fitting_packets_still_include_unique_retained_text() {
+        let sidecar = deleted_with_retained_candidate(
+            "transfer limit",
+            "The existing transfer limit remains in effect.",
+        );
+        let packet = prepare(&sidecar, 65536).unwrap().unwrap();
+        let contents: Value = serde_json::from_str(&packet.evidence).unwrap();
+        assert_eq!(packet.operations, 1);
+        assert_eq!(
+            contents["operations"][0]["retained_text_candidate_new_ref"],
+            3
+        );
+        assert_eq!(contents["new_units"][3]["role"], "context_only");
+    }
+
+    #[test]
+    fn multiple_unanchored_changes_still_project_each_authored_unit_once() {
+        let sidecar = diff(
+            vec![unit("old first"), unit("old second")],
+            vec![unit("new first"), unit("new second")],
+            (0..2)
+                .flat_map(|index| {
+                    [
+                        json!({"operation": "delete", "old_ref": index, "new_ref": null}),
+                        json!({"operation": "add", "old_ref": null, "new_ref": index}),
+                    ]
+                })
+                .collect(),
+        );
+        let packet = prepare(&sidecar, 65536).unwrap().unwrap();
+        let contents: Value = serde_json::from_str(&packet.evidence).unwrap();
+        assert_eq!(packet.operations, 4);
+        assert_eq!(contents["opposite_context_anchors"], json!([]));
+        assert_eq!(contents["context_is_partial"], false);
+        for side in SIDES {
+            let refs: Vec<_> = contents[side]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|unit| unit["ref"].as_u64().unwrap())
+                .collect();
+            assert_eq!(refs, [0, 1]);
+        }
+    }
 
     #[test]
     fn validation_distinguishes_duplicate_claims_from_missing_operation_coverage() {

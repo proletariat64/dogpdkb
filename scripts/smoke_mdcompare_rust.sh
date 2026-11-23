@@ -9,6 +9,7 @@ if [[ $headers == *" INTERP "* || $headers == *"(NEEDED)"* ]]; then
 fi
 
 workspace=$(mktemp -d)
+workspace=$(cd -- "$workspace" && pwd -P)
 trap 'rm -rf -- "$workspace"' EXIT
 cp -- "$binary" "$workspace/mdcomparer"
 cd -- "$workspace"
@@ -25,10 +26,12 @@ expect() {
     fi
 }
 
-expect "$(mdcomparer --version)" 'mdcomparer '
-printf '%s\n' '# Report' '' 'The original body.' > before.md
-printf '%s\n' '# Report' '' 'The updated body.' > after.md
-draft=$(mdcomparer draft before.md after.md --plan work.json)
+version=$(mdcomparer --version)
+expect "$version" 'mdcomparer '
+mkdir before after
+printf '%s\n' '# Report' '' 'The original body.' > before/report.md
+printf '%s\n' '# Report' '' 'The updated body.' > after/report.md
+draft=$(mdcomparer draft before/report.md after/report.md --plan work.json)
 expect "$draft" '"command":"draft","state":"complete"'
 result=$(mdcomparer run --plan work.json)
 expect "$result" '"command":"run","state":"complete"'

@@ -14,6 +14,15 @@ const STATUSES: [&str; 5] = ["REUSE", "DELTA", "REVIEW", "NO_BODY", "UNKNOWN"];
 const GRAPHIFY_ACTIONS: [&str; 3] = ["KEEP_EXISTING", "HOLD_EXISTING", "BODY_DELTA_CANDIDATE"];
 
 pub fn extract_document_units(document: &Document, text: &str) -> Result<Vec<Unit>, &'static str> {
+    extract_document_body(document, text, &document.raw["body_scope"], false)
+}
+
+pub(crate) fn extract_document_body(
+    document: &Document,
+    text: &str,
+    body_scope: &Value,
+    explicit_legacy_repair: bool,
+) -> Result<Vec<Unit>, &'static str> {
     let name = document.metadata["name"].as_str().unwrap_or_default();
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines = source_lines(&normalized, true);
@@ -38,7 +47,7 @@ pub fn extract_document_units(document: &Document, text: &str) -> Result<Vec<Uni
     if let Some((start, end)) = header {
         normalized.replace_range(start..end, "");
     }
-    let mut units = extract_units(&normalized, &document.raw["body_scope"])?;
+    let mut units = extract_units(&normalized, body_scope, explicit_legacy_repair)?;
     if let Some((title, rest)) = units
         .split_first_mut()
         .filter(|(title, _)| title.kind == "heading" && title.start_line == 1 && title.text == name)

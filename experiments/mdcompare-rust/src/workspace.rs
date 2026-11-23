@@ -95,6 +95,8 @@ impl InputWitness {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenPlan {
+    #[serde(skip)]
+    plan_sha256: String,
     schema_version: String,
     source: PathBuf,
     source_sha256: String,
@@ -104,10 +106,14 @@ pub struct FrozenPlan {
     pub presence: BTreeMap<PathBuf, bool>,
     // A work plan and body-recovery declaration share the work-plan limit.
     manifest_inputs: BTreeSet<PathBuf>,
-    path_targets: BTreeMap<PathBuf, PathBuf>,
+    pub(crate) path_targets: BTreeMap<PathBuf, PathBuf>,
 }
 
 impl FrozenPlan {
+    pub fn digest(&self) -> &str {
+        &self.plan_sha256
+    }
+
     pub fn documents(&self) -> Vec<(Option<Document>, Option<Document>)> {
         let directory = self.source.parent().expect("absolute plan path");
         self.work
@@ -141,7 +147,7 @@ impl FrozenPlan {
 
     pub fn verify_inputs(&self) -> Result<()> {
         for (path, target) in &self.path_targets {
-            ensure!(input::resolved(path)? == *target, "input_drift");
+            ensure!(input::resolved_input(path)? == *target, "input_drift");
         }
         for (path, expected) in &self.inputs {
             ensure!(
@@ -164,8 +170,16 @@ impl FrozenPlan {
     }
 
     fn bind_path(&mut self, path: &Path) -> Result<PathBuf> {
-        let target = input::resolved(path)?;
-        self.path_targets.insert(path.to_owned(), target.clone());
+        let path = std::path::absolute(path)?;
+        let original = fs::metadata(&path);
+        let target = input::resolved_input(&path)?;
+        if path != target {
+            ensure!(
+                original.is_ok() == fs::metadata(&target).is_ok(),
+                "invalid_input"
+            );
+        }
+        self.path_targets.insert(path, target.clone());
         Ok(target)
     }
 
@@ -557,21 +571,28 @@ fn add_recovery(frozen: &mut FrozenPlan, path: &Path) -> Result<()> {
         recovery.schema_version == "mdcompare-body-recovery-1",
         "invalid_input"
     );
+    let valid: BTreeSet<_> = frozen
+        .work
+        .documents
+        .iter()
+        .flat_map(|row| {
+            [("baseline", &row.baseline), ("incoming", &row.incoming)]
+                .into_iter()
+                .filter(|(_, snapshot)| snapshot.is_some())
+                .map(|(side, _)| (row.knowledge_base.as_str(), row.document_id.as_str(), side))
+        })
+        .collect();
     let mut identities = BTreeSet::new();
+    let mut copies = Vec::new();
     let parent = path.parent().context("invalid_input")?;
     for item in recovery.documents {
         ensure!(
             !item.source_copy.as_os_str().is_empty()
-                && matches!(item.side.as_str(), "baseline" | "incoming")
-                && frozen.work.documents.iter().any(|row| {
-                    row.knowledge_base == item.knowledge_base
-                        && row.document_id == item.document_id
-                        && if item.side == "baseline" {
-                            row.baseline.is_some()
-                        } else {
-                            row.incoming.is_some()
-                        }
-                })
+                && valid.contains(&(
+                    item.knowledge_base.as_str(),
+                    item.document_id.as_str(),
+                    item.side.as_str()
+                ))
                 && identities.insert((item.knowledge_base, item.document_id, item.side)),
             "invalid_input"
         );
@@ -583,16 +604,24 @@ fn add_recovery(frozen: &mut FrozenPlan, path: &Path) -> Result<()> {
                     .all(|pair| pair[0].byte_offset <= pair[1].byte_offset),
             "invalid_input"
         );
-        let witness = frozen.bind_path(&parent.join(item.source_copy))?;
+        copies.push(parent.join(item.source_copy));
+    }
+    for copy in copies {
+        let witness = frozen.bind_path(&copy)?;
         frozen.observe(&witness)?;
     }
-    frozen.manifest_inputs.insert(path.to_owned());
-    frozen.inputs.insert(
-        path.to_owned(),
-        InputWitness::Bytes {
-            sha256: checksum(&bytes),
-        },
+    let witness = InputWitness::Bytes {
+        sha256: checksum(&bytes),
+    };
+    ensure!(
+        frozen
+            .inputs
+            .get(path)
+            .is_none_or(|previous| previous == &witness),
+        "invalid_input"
     );
+    frozen.manifest_inputs.insert(path.to_owned());
+    frozen.inputs.insert(path.to_owned(), witness);
     Ok(())
 }
 
@@ -609,8 +638,9 @@ fn create_plan(workspace: &Workspace, explicit: Option<&Path>) -> Result<FrozenP
     };
     let config = Config::load(Some(&workspace.source), explicit, Scope::Comparison)?;
     let config_source = config.source.clone();
-    let settings = config.comparison(work.operation == Operation::Strict);
+    let settings = config.comparison(work.operation);
     let mut frozen = FrozenPlan {
+        plan_sha256: String::new(),
         schema_version: "mdcompare-frozen-work-1".into(),
         source: workspace.source.clone(),
         source_sha256: workspace.source_sha256.clone(),
@@ -622,46 +652,58 @@ fn create_plan(workspace: &Workspace, explicit: Option<&Path>) -> Result<FrozenP
         path_targets: BTreeMap::new(),
     };
     let mut protected = Vec::new();
-    for document in frozen
-        .documents()
-        .into_iter()
-        .flat_map(|(a, b)| [a, b])
-        .flatten()
-    {
-        let path = frozen.bind_path(&document.path)?;
-        let declared = input::referenced_paths(&document);
-        protected.extend(declared.iter().cloned());
-        if frozen.work.operation == Operation::Catalog {
-            match input::read(&path, frozen.settings.compare.max_file_bytes) {
-                Ok((bytes, _)) => {
-                    frozen.inputs.insert(
-                        path.clone(),
-                        InputWitness::Bytes {
-                            sha256: checksum(&bytes),
-                        },
-                    );
-                    for candidate in crate::catalog::local_candidates(&document, &bytes)? {
-                        let candidate = frozen.bind_path(&candidate)?;
-                        let exists = candidate.is_file();
-                        frozen.presence.entry(candidate).or_insert(exists);
+    for (baseline, incoming) in frozen.documents() {
+        let consume_baseline = frozen.work.operation == Operation::Knowledge
+            || incoming.is_some() && frozen.work.operation != Operation::Catalog;
+        if let Some(advisory) = baseline.as_ref().filter(|_| !consume_baseline) {
+            protected.push(advisory.path.clone());
+            protected.extend(input::referenced_paths(advisory));
+        }
+        for document in [baseline.filter(|_| consume_baseline), incoming]
+            .into_iter()
+            .flatten()
+        {
+            let path = frozen.bind_path(&document.path)?;
+            let declared = input::referenced_paths(&document);
+            protected.push(document.path.clone());
+            protected.extend(declared.iter().cloned());
+            if frozen.work.operation == Operation::Catalog {
+                match input::read(&path, frozen.settings.compare.max_file_bytes) {
+                    Ok((bytes, _)) => {
+                        frozen.inputs.insert(
+                            path.clone(),
+                            InputWitness::Bytes {
+                                sha256: checksum(&bytes),
+                            },
+                        );
+                        for candidate in crate::catalog::local_candidates(&document, &bytes)? {
+                            let candidate = frozen.bind_path(&candidate)?;
+                            let exists = candidate.is_file();
+                            frozen.presence.entry(candidate).or_insert(exists);
+                        }
+                        for reference in declared {
+                            let reference = frozen.bind_path(&reference)?;
+                            let exists = reference.is_file();
+                            frozen.presence.entry(reference).or_insert(exists);
+                        }
+                    }
+                    Err("INPUT_CHANGED") => bail!("input_drift"),
+                    Err(reason) => {
+                        frozen.inputs.insert(
+                            path,
+                            InputWitness::Unavailable {
+                                reason: reason.into(),
+                            },
+                        );
                     }
                 }
-                Err("INPUT_CHANGED") => bail!("input_drift"),
-                Err(reason) => {
-                    frozen.inputs.insert(
-                        path,
-                        InputWitness::Unavailable {
-                            reason: reason.into(),
-                        },
-                    );
-                }
-            }
-        } else {
-            frozen.observe(&path)?;
-            if frozen.work.operation == Operation::Strict {
-                for dependency in &declared {
-                    let dependency = frozen.bind_path(dependency)?;
-                    frozen.observe(&dependency)?;
+            } else {
+                frozen.observe(&path)?;
+                if frozen.work.operation == Operation::Strict {
+                    for dependency in &declared {
+                        let dependency = frozen.bind_path(dependency)?;
+                        frozen.observe(&dependency)?;
+                    }
                 }
             }
         }
@@ -694,7 +736,7 @@ pub fn accept(plan: &Path, explicit: Option<&Path>) -> Result<(Workspace, Frozen
         check_explicit_config(&workspace, &frozen, explicit)?;
         return Ok((workspace, frozen));
     }
-    let prepared = create_plan(&workspace, explicit)?;
+    let mut prepared = create_plan(&workspace, explicit)?;
     let _lock = workspace.creation_lock()?;
     let frozen = if workspace.root.is_dir() {
         let frozen = load_frozen(&workspace)?;
@@ -707,10 +749,9 @@ pub fn accept(plan: &Path, explicit: Option<&Path>) -> Result<(Workspace, Frozen
             "input_drift"
         );
         prepared.verify_inputs()?;
-        workspace.initialize(&[(
-            "plan.json",
-            input::json_bytes(&serde_json::to_value(&prepared)?)?,
-        )])?;
+        let bytes = input::json_bytes(&serde_json::to_value(&prepared)?)?;
+        prepared.plan_sha256 = checksum(&bytes);
+        workspace.initialize(&[("plan.json", bytes)])?;
         prepared
     };
     Ok((workspace, frozen))
@@ -723,8 +764,9 @@ fn check_explicit_config(
 ) -> Result<()> {
     if let Some(explicit) = explicit {
         let config = Config::load(Some(&workspace.source), Some(explicit), Scope::Comparison)?;
+        let operation = frozen.work.operation;
         ensure!(
-            config.comparison(frozen.work.operation == Operation::Strict) == frozen.settings,
+            config.comparison(operation) == frozen.settings.clone().for_operation(operation),
             "invalid_config"
         );
     }
@@ -737,27 +779,30 @@ pub fn load_frozen(workspace: &Workspace) -> Result<FrozenPlan> {
 }
 
 fn decode_frozen(workspace: &Workspace, bytes: &[u8]) -> Result<FrozenPlan> {
-    let frozen: FrozenPlan = serde_json::from_value(parse_json(bytes).context("binding_invalid")?)
-        .context("binding_invalid")?;
+    let mut frozen: FrozenPlan =
+        serde_json::from_value(parse_json(bytes).context("binding_invalid")?)
+            .context("binding_invalid")?;
     ensure!(
         frozen.schema_version == "mdcompare-frozen-work-1"
             && frozen.source == workspace.source
             && frozen.source_sha256 == workspace.source_sha256,
         "binding_invalid"
     );
+    frozen.plan_sha256 = checksum(bytes);
     Ok(frozen)
 }
 
 pub fn draft(old: &Path, new: &Path, plan: &Path) -> Result<PathBuf> {
     let path = std::path::absolute(plan).context("invalid_input")?;
     ensure!(
-        path.extension().is_some_and(|ext| ext == "json"),
+        path.to_str().is_some() && path.extension().is_some_and(|ext| ext == "json"),
         "invalid_input"
     );
     input::check_output(&path, [old, new]).context("binding_invalid")?;
     let identity = checksum(input::resolved(&path)?.as_os_str().as_encoded_bytes());
     let snapshot = |source: &Path| -> Result<Value> {
         let source = input::resolved(source)?;
+        ensure!(source.to_str().is_some(), "invalid_input");
         let name = source
             .file_stem()
             .and_then(|v| v.to_str())
@@ -893,18 +938,30 @@ pub fn verify_commit(workspace: &Workspace) -> Result<Option<Commit>> {
         "binding_invalid"
     );
     verify_artifacts(workspace, &record, false)?;
+    // Resume the durability barrier if a previous writer installed the marker
+    // but stopped before syncing the directory.
+    File::open(&workspace.root)?
+        .sync_all()
+        .context("binding_invalid")?;
+    File::open(workspace.root.parent().context("binding_invalid")?)?
+        .sync_all()
+        .context("binding_invalid")?;
     Ok(Some(Commit {
         comparison_sha256: checksum(&bytes),
         artifacts: record.artifacts,
     }))
 }
 
-pub fn publish_commit(workspace: &Workspace, artifacts: &[&str]) -> Result<Commit> {
+pub fn publish_commit(
+    workspace: &Workspace,
+    plan_sha256: &str,
+    artifacts: &[&str],
+) -> Result<Commit> {
     let path = artifact_path(&workspace.root, "commit.json")?;
     ensure!(!path.exists(), "binding_invalid");
     let mut record = CommitRecord {
         schema_version: "mdcompare-commit-1".into(),
-        plan_sha256: checksum(&read_artifact(&workspace.root, "plan.json")?),
+        plan_sha256: plan_sha256.to_owned(),
         artifacts: BTreeMap::new(),
     };
     for &name in artifacts {
@@ -914,6 +971,11 @@ pub fn publish_commit(workspace: &Workspace, artifacts: &[&str]) -> Result<Commi
         );
     }
     verify_artifacts(workspace, &record, true)?;
+    let submitted = Workspace::locate(&workspace.source).context("input_drift")?;
+    ensure!(
+        submitted.source == workspace.source && submitted.source_sha256 == workspace.source_sha256,
+        "input_drift"
+    );
     let bytes = input::json_bytes(&serde_json::to_value(&record)?)?;
     atomic_new(&path, &bytes)?;
     Ok(Commit {
@@ -983,7 +1045,7 @@ mod tests {
         let incoming = directory.path().join("incoming.md");
         let plan = directory.path().join("work.json");
         draft(&base, &incoming, &plan)?;
-        let (workspace, _) = accept(&plan, None)?;
+        let (workspace, frozen) = accept(&plan, None)?;
         let report = b"{}";
         let sidecar = b"{\"test\":true}";
         fs::create_dir(workspace.root.join("evidence"))?;
@@ -997,7 +1059,25 @@ mod tests {
             }))?,
         )?;
         assert!(verify_commit(&workspace)?.is_none());
-        let published = publish_commit(&workspace, &["result.json", "diff-index.json"])?;
+        let frozen_bytes = fs::read(workspace.root.join("plan.json"))?;
+        let mut changed = frozen_bytes.clone();
+        changed.push(b' ');
+        fs::write(workspace.root.join("plan.json"), changed)?;
+        assert!(
+            publish_commit(
+                &workspace,
+                frozen.digest(),
+                &["result.json", "diff-index.json"]
+            )
+            .is_err()
+        );
+        assert!(!workspace.root.join("commit.json").exists());
+        fs::write(workspace.root.join("plan.json"), frozen_bytes)?;
+        let published = publish_commit(
+            &workspace,
+            frozen.digest(),
+            &["result.json", "diff-index.json"],
+        )?;
         assert_eq!(
             verify_commit(&workspace)?.unwrap().comparison_sha256,
             published.comparison_sha256

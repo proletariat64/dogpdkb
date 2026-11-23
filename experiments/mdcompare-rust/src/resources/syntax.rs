@@ -81,15 +81,87 @@ fn mask_spans(line: &str, output: &mut String) {
     output.push_str(&line[previous..]);
 }
 
+enum HtmlBlock {
+    BlankLine,
+    LiteralEnd(&'static str),
+    RawEnd(&'static Regex),
+}
+
+impl HtmlBlock {
+    fn start(line: &str) -> Option<Self> {
+        static RAW_TAGS: [LazyLock<(Regex, Regex)>; 4] = [
+            LazyLock::new(|| raw_html_boundary("script")),
+            LazyLock::new(|| raw_html_boundary("pre")),
+            LazyLock::new(|| raw_html_boundary("style")),
+            LazyLock::new(|| raw_html_boundary("textarea")),
+        ];
+        static BLOCK_TAG: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(concat!(
+                r"(?i)^</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|",
+                r"dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|",
+                r"h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|",
+                r"ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|",
+                r"title|tr|track|ul)(?:[\t />]|$)",
+            ))
+            .unwrap()
+        });
+        static STANDALONE_TAG: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"^</?[A-Za-z][A-Za-z0-9-]*(?:[\t />])(?:[^<>"']|"[^"]*"|'[^']*')*>\s*$|^</?[A-Za-z][A-Za-z0-9-]*>\s*$"#)
+                .unwrap()
+        });
+        let stripped = line.trim_start_matches(' ');
+        if line.len() - stripped.len() > 3 || !stripped.starts_with('<') {
+            return None;
+        }
+        for (prefix, end) in [("<!--", "-->"), ("<?", "?>"), ("<![CDATA[", "]]>")] {
+            if stripped.starts_with(prefix) {
+                return Some(Self::LiteralEnd(end));
+            }
+        }
+        if stripped
+            .strip_prefix("<!")
+            .is_some_and(|decl| decl.as_bytes().first().is_some_and(u8::is_ascii_uppercase))
+        {
+            return Some(Self::LiteralEnd(">"));
+        }
+        for (open, close) in RAW_TAGS.iter().map(|pattern| &**pattern) {
+            if open.is_match(stripped) {
+                return Some(Self::RawEnd(close));
+            }
+        }
+        // Standalone tag lines are kept visible even when the preceding
+        // paragraph makes their status as an HTML block ambiguous.
+        (BLOCK_TAG.is_match(stripped) || STANDALONE_TAG.is_match(stripped))
+            .then_some(Self::BlankLine)
+    }
+
+    fn ends(&self, line: &str) -> bool {
+        match self {
+            Self::BlankLine => line.trim_matches([' ', '\t']).is_empty(),
+            Self::LiteralEnd(marker) => line.contains(marker),
+            Self::RawEnd(marker) => marker.is_match(line),
+        }
+    }
+}
+
+fn raw_html_boundary(tag: &str) -> (Regex, Regex) {
+    (
+        Regex::new(&format!(r"(?i)^<{tag}(?:[\t />]|$)")).unwrap(),
+        Regex::new(&format!(r"(?i)</{tag}>")).unwrap(),
+    )
+}
+
 fn mask_code(text: &str) -> String {
     static FENCE_OPEN: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"^(\x60{3,}|~{3,})([^\r\n]*)$").unwrap());
+        LazyLock::new(|| Regex::new(r"^( {0,3})(\x60{3,}|~{3,})([^\r\n]*)$").unwrap());
     static FENCE_CLOSE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"^ {0,3}(\x60+|~+)[ \t]*$").unwrap());
-    static HTML_START: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^ {0,3}<").unwrap());
+    static LIST_START: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^ {0,3}(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]+|$)").unwrap());
     let mut output = String::with_capacity(text.len());
     let mut fence: Option<&str> = None;
-    let mut prior_html = false;
+    let mut html: Option<HtmlBlock> = None;
+    let mut list = false;
     for (index, line) in text.split('\n').enumerate() {
         if index != 0 {
             output.push('\n');
@@ -102,19 +174,25 @@ fn mask_code(text: &str) -> String {
                 fence = None;
             }
             output.extend(std::iter::repeat_n(' ', line.chars().count()));
+        } else if let Some(block) = html.take().or_else(|| HtmlBlock::start(line)) {
+            if !block.ends(line) {
+                html = Some(block);
+            }
+            output.push_str(line);
         } else if let Some(cap) = FENCE_OPEN.captures(line)
-            && !prior_html
-            && (cap[1].starts_with('~') || !cap[2].contains('\x60'))
+            && (!list || cap[1].is_empty())
+            && (cap[2].starts_with('~') || !cap[3].contains('\x60'))
         {
-            fence = cap.get(1).map(|marker| marker.as_str());
+            fence = cap.get(2).map(|marker| marker.as_str());
+            list = false;
             output.extend(std::iter::repeat_n(' ', line.chars().count()));
         } else {
-            if !prior_html && !HTML_START.is_match(line) {
-                mask_spans(line, &mut output);
-            } else {
-                output.push_str(line);
+            if LIST_START.is_match(line) {
+                list = true;
+            } else if !line.is_empty() && !line.starts_with([' ', '\t']) {
+                list = false;
             }
-            prior_html |= line.contains('<');
+            mask_spans(line, &mut output);
         }
     }
     output
@@ -195,9 +273,17 @@ fn html_unescape(value: &str) -> Cow<'_, str> {
         for end in ends.take_while(|end| *end >= 2) {
             let (prefix, suffix) = reference.split_at(end);
             if LEGACY.contains(prefix)
-                && let Some(value) = named_entity(prefix)
+                && let Some(entity) = named_entity(prefix)
             {
-                return format!("{value}{suffix}");
+                let next = cap.get(1).unwrap().start() + end;
+                if value
+                    .as_bytes()
+                    .get(next)
+                    .is_some_and(|ch| *ch == b'=' || ch.is_ascii_alphanumeric())
+                {
+                    return cap[0].to_owned();
+                }
+                return format!("{entity}{suffix}");
             }
         }
         cap[0].to_owned()
@@ -208,6 +294,7 @@ fn capture_attrs(
     start: usize,
     tag: &str,
     attrs: &str,
+    declared: &BTreeSet<&str>,
     uses: &mut Vec<Use>,
     reasons: &mut Vec<&'static str>,
 ) {
@@ -282,7 +369,11 @@ fn capture_attrs(
             push("image", target);
         }
     } else if let Some(target) = nonempty("href")
-        && (tag == "link" || tag == "a" && (pairs.contains_key("download") || download(target)))
+        && (tag == "link"
+            || tag == "a"
+                && (pairs.contains_key("download")
+                    || download(target)
+                    || declared.contains(target)))
     {
         push("attachment", target);
     }
@@ -291,7 +382,12 @@ fn capture_attrs(
     }
 }
 
-fn html_uses(text: &str, uses: &mut Vec<Use>, reasons: &mut Vec<&'static str>) -> Option<usize> {
+fn html_uses(
+    text: &str,
+    declared: &BTreeSet<&str>,
+    uses: &mut Vec<Use>,
+    reasons: &mut Vec<&'static str>,
+) -> Option<usize> {
     static TAG: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?s)^<([A-Za-z][^\s/<>]*)([^<>"']*(?:"[^"]*"[^<>"']*|'[^']*'[^<>"']*)*)>"#)
             .unwrap()
@@ -337,7 +433,7 @@ fn html_uses(text: &str, uses: &mut Vec<Use>, reasons: &mut Vec<&'static str>) -
         if RESOURCE_TAGS.contains(&tag.as_str()) {
             tags += 1;
         }
-        capture_attrs(start, &tag, &cap[2], uses, reasons);
+        capture_attrs(start, &tag, &cap[2], declared, uses, reasons);
         let end = match tag.as_str() {
             "script" => Some(&*SCRIPT_END),
             "style" => Some(&*STYLE_END),
@@ -360,12 +456,12 @@ pub(crate) fn uses(data: &[u8], declared: &BTreeSet<&str>) -> (Vec<Use>, Vec<&'s
     });
     static INLINE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r#"(!?)\[([^\]\r\n]*)\]\((?:<([^>\r\n]+)>|([^\s)]+))(?:\s+(?:"(.*?)"|'(.*?)'))?\)"#,
+            r#"(!?)\[([^\]\r\n]*)\]\([ \t]*(?:<([^>\r\n]+)>|([^\s)]+))(?:\s+(?:"(.*?)"|'(.*?)'|\(((?:\\[^\r\n]|[^()\\\r\n])*)\)))?[ \t]*\)"#,
         )
         .unwrap()
     });
     static DEFINITION: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?m)^ {0,3}\[([^\]\r\n]+)\]:[ \t]*(?:<([^>\r\n]+)>|(\S+))(?:[ \t]+(?:"(.*?)"|'(.*?)'))?[ \t]*$"#).unwrap()
+        Regex::new(r#"(?m)^ {0,3}\[([^\]\r\n]+)\]:[ \t]*(?:<([^>\r\n]+)>|(\S+))(?:[ \t]+(?:"(.*?)"|'(.*?)'|\(((?:\\[^\r\n]|[^()\\\r\n])*)\)))?[ \t]*$"#).unwrap()
     });
     static REFERENCE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(!?)\[([^\]\r\n]*)\](?:\[([^\]\r\n]*)\])?").unwrap());
@@ -399,7 +495,11 @@ pub(crate) fn uses(data: &[u8], declared: &BTreeSet<&str>) -> (Vec<Use>, Vec<&'s
     let mut unclaimed = text.as_bytes().to_owned();
     for cap in DEFINITION.captures_iter(&text) {
         let target = cap.get(2).or_else(|| cap.get(3)).unwrap().as_str();
-        let title = cap.get(4).or_else(|| cap.get(5)).map(|m| m.as_str());
+        let title = cap
+            .get(4)
+            .or_else(|| cap.get(5))
+            .or_else(|| cap.get(6))
+            .map(|m| m.as_str());
         if definitions
             .insert(label(&cap[1]), (target, title))
             .is_some()
@@ -430,6 +530,7 @@ pub(crate) fn uses(data: &[u8], declared: &BTreeSet<&str>) -> (Vec<Use>, Vec<&'s
             let title = cap
                 .get(5)
                 .or_else(|| cap.get(6))
+                .or_else(|| cap.get(7))
                 .map(|value| value.as_str());
             usages.push(Use::new(tag.start(), kind, target, &cap[2], title));
             if usages.len() > MAX_REFERENCES {
@@ -485,7 +586,9 @@ pub(crate) fn uses(data: &[u8], declared: &BTreeSet<&str>) -> (Vec<Use>, Vec<&'s
         reasons.push(SYNTAX);
     }
     let mut html_reasons = Vec::new();
-    if html_uses(&text, &mut usages, &mut html_reasons).is_some_and(|matched| matched != tags) {
+    if html_uses(&text, declared, &mut usages, &mut html_reasons)
+        .is_some_and(|matched| matched != tags)
+    {
         reasons.push(SYNTAX);
     }
     if CSS.is_match(&text) {
@@ -504,4 +607,71 @@ pub(crate) fn uses(data: &[u8], declared: &BTreeSet<&str>) -> (Vec<Use>, Vec<&'s
         usage.offset = char_offset;
     }
     (usages, reasons)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachments_support_parenthesized_inline_and_reference_titles() {
+        let (references, reasons) = uses(
+            b"[report]( report.pdf (Quarterly report) )\n[summary][stats]\n\n[stats]: stats.csv (Summary)\n",
+            &BTreeSet::new(),
+        );
+        assert!(reasons.is_empty());
+        assert_eq!(
+            references
+                .iter()
+                .map(|usage| (usage.kind, usage.url.as_str(), usage.title.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("attachment", "report.pdf", Some("Quarterly report")),
+                ("attachment", "stats.csv", Some("Summary")),
+            ]
+        );
+    }
+
+    #[test]
+    fn html_anchor_uses_declared_and_literal_attribute_targets() {
+        let (references, reasons) = uses(
+            b"<a href=\"opaque-reference\">Read</a>\n<a download href=\"report&amp=1.pdf\">Download</a>\n<a download href=\"file&ampx.pdf\">Download</a>\n<a download href=\"notes&amp;.pdf\">Download</a>",
+            &BTreeSet::from(["opaque-reference"]),
+        );
+        assert!(reasons.is_empty());
+        assert_eq!(
+            references
+                .iter()
+                .map(|usage| (usage.kind, usage.url.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("attachment", "opaque-reference"),
+                ("attachment", "report&amp=1.pdf"),
+                ("attachment", "file&ampx.pdf"),
+                ("attachment", "notes&.pdf"),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_proven_top_level_fences_exclude_image_examples() {
+        for input in [
+            "Limit < 10\n\n~~~~\n![example](example.png)\n~~~~\n",
+            "<div>HTML content</div>\n\n~~~~\n![example](example.png)\n~~~~\n",
+            "<!-- comment -->\n~~~~\n![example](example.png)\n~~~~\n",
+            "  ~~~~\n![example](example.png)\n  ~~~~\n",
+        ] {
+            let (references, reasons) = uses(input.as_bytes(), &BTreeSet::new());
+            assert!(references.is_empty() && reasons.is_empty(), "{input}");
+        }
+
+        for input in [
+            "- Sample\n  ~~~~\n  ![example](example.png)\n  ~~~~\n",
+            "<div>\n~~~~\n![example](example.png)\n~~~~\n</div>\n",
+            "<pre>\n\n~~~~\n![example](example.png)\n~~~~\n</pre>\n",
+        ] {
+            let (references, _) = uses(input.as_bytes(), &BTreeSet::new());
+            assert_eq!(references.len(), 1, "{input}");
+        }
+    }
 }

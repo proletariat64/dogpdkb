@@ -244,6 +244,7 @@ struct HtmlTable {
     links: Vec<String>,
     depth: i64,
     tables: usize,
+    literal_code: bool,
 }
 
 fn layout(name: &str) -> bool {
@@ -309,7 +310,10 @@ impl HtmlTable {
                     "br" | "p" | "div" if cosmetic_attrs(&attrs) => cell.push(' '),
                     "b" | "strong" => cell.push_str("**"),
                     "em" | "i" => cell.push('*'),
-                    "code" => cell.push('`'),
+                    "code" if !self.literal_code => {
+                        self.literal_code = true;
+                        cell.push('`');
+                    }
                     "a" => {
                         let href = attrs.iter().rev().find(|(name, _)| name == "href")?.1?;
                         self.links
@@ -326,6 +330,9 @@ impl HtmlTable {
     fn end(&mut self, tag: &str) -> Option<()> {
         match tag {
             "td" | "th" => {
+                if self.literal_code {
+                    return None;
+                }
                 let value = self.cell.take()?;
                 self.row.as_mut()?.push(prose_key(&value));
             }
@@ -344,7 +351,10 @@ impl HtmlTable {
                     "p" | "div" => cell.push(' '),
                     "b" | "strong" => cell.push_str("**"),
                     "em" | "i" => cell.push('*'),
-                    "code" => cell.push('`'),
+                    "code" if self.literal_code => {
+                        self.literal_code = false;
+                        cell.push('`');
+                    }
                     "a" => {
                         cell.push_str("](");
                         cell.push_str(&self.links.pop()?);
@@ -359,7 +369,17 @@ impl HtmlTable {
 
     fn data(&mut self, text: &str) -> Option<()> {
         if let Some(cell) = self.cell.as_mut() {
-            cell.push_str(&html_escape::decode_html_entities(text));
+            if self.literal_code {
+                let decoded = html_escape::decode_html_entities(text);
+                if decoded.contains('`') {
+                    return None;
+                }
+                cell.push_str(&decoded);
+            } else {
+                // Normalize entities after markup recognition so visible tags
+                // encoded as cell text cannot be stripped as presentation.
+                cell.push_str(text);
+            }
         } else if !text.trim().is_empty() {
             return None;
         }
@@ -414,7 +434,13 @@ impl HtmlTable {
 }
 
 fn markdown_cells(line: &str) -> Vec<String> {
-    let line = line.trim().trim_matches('|');
+    let line = line.trim();
+    let line = line.strip_prefix('|').unwrap_or(line);
+    let line = if line.ends_with("\\|") {
+        line
+    } else {
+        line.strip_suffix('|').unwrap_or(line)
+    };
     let mut cells = Vec::new();
     let mut start = 0;
     for (pos, _) in line.match_indices('|') {
@@ -449,4 +475,31 @@ pub fn table_key(text: &str) -> String {
         "table:{}",
         serde_json::to_string(&rows).expect("JSON strings")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::table_key;
+
+    #[test]
+    fn markdown_table_empty_edge_cells_keep_column_bindings() {
+        let header = "|A|B|C|\n|---|---|---|\n";
+        assert_eq!(
+            table_key(&format!("{header}||USD|100|")),
+            r#"table:[["A","B","C"],["","USD","100"]]"#
+        );
+        assert_eq!(
+            table_key(&format!("{header}|USD|100||")),
+            r#"table:[["A","B","C"],["USD","100",""]]"#
+        );
+    }
+
+    #[test]
+    fn escaped_html_cell_text_is_not_cosmetic_markup() {
+        let escaped = "<table><tr><td>&lt;span&gt;Limit&lt;/span&gt;</td></tr></table>";
+        let markup = "<table><tr><td><span>Limit</span></td></tr></table>";
+        let plain = "<table><tr><td>Limit</td></tr></table>";
+        assert_ne!(table_key(escaped), table_key(plain));
+        assert_eq!(table_key(markup), table_key(plain));
+    }
 }

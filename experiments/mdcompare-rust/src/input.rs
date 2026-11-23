@@ -93,10 +93,12 @@ pub fn read(path: &Path, limit: u64) -> Result<(Vec<u8>, Stamp), &'static str> {
 pub struct Reader {
     frozen: Option<BTreeMap<PathBuf, crate::workspace::InputWitness>>,
     presence: BTreeMap<PathBuf, bool>,
+    targets: BTreeMap<PathBuf, PathBuf>,
     drifted: bool,
     limit: u64,
     stamps: HashMap<PathBuf, Stamp>,
     cache: HashMap<PathBuf, Vec<u8>>,
+    cache_bytes: usize,
     document_started: bool,
 }
 
@@ -105,10 +107,12 @@ impl Reader {
         Self {
             frozen: None,
             presence: BTreeMap::new(),
+            targets: BTreeMap::new(),
             drifted: false,
             limit,
             stamps: HashMap::new(),
             cache: HashMap::new(),
+            cache_bytes: 0,
             document_started: false,
         }
     }
@@ -117,10 +121,12 @@ impl Reader {
         limit: u64,
         inputs: &BTreeMap<PathBuf, crate::workspace::InputWitness>,
         presence: &BTreeMap<PathBuf, bool>,
+        targets: &BTreeMap<PathBuf, PathBuf>,
     ) -> Self {
         Self {
             frozen: Some(inputs.clone()),
             presence: presence.clone(),
+            targets: targets.clone(),
             ..Self::new(limit)
         }
     }
@@ -129,9 +135,18 @@ impl Reader {
         self.drifted
     }
 
+    pub(crate) fn bound_target(&self, path: &Path) -> Result<PathBuf> {
+        let target = resolved_input(path).context("input_drift")?;
+        if self.frozen.is_some() {
+            let original = std::path::absolute(path).context("input_drift")?;
+            ensure!(self.targets.get(&original) == Some(&target), "input_drift");
+        }
+        Ok(target)
+    }
+
     pub fn local_file(&self, path: &Path) -> Result<(PathBuf, bool)> {
-        let target = resolved(path).context("input_drift")?;
-        let exists = target.is_file();
+        let target = self.bound_target(path)?;
+        let exists = path.is_file();
         if self.frozen.is_some() {
             ensure!(self.presence.get(&target) == Some(&exists), "input_drift");
         }
@@ -141,6 +156,7 @@ impl Reader {
     pub fn begin_document(&mut self) {
         self.document_started = true;
         self.cache.clear();
+        self.cache_bytes = 0;
     }
 
     pub fn changed_paths(&self) -> HashSet<PathBuf> {
@@ -157,6 +173,17 @@ impl Reader {
 
     pub fn read_with_limit(&mut self, path: &Path, limit: u64) -> Result<Vec<u8>, &'static str> {
         let path = std::path::absolute(path).map_err(|_| "INPUT_READ_FAILED")?;
+        let target = if self.frozen.is_some() {
+            match self.bound_target(&path) {
+                Ok(target) => Some(target),
+                Err(_) => {
+                    self.drifted = true;
+                    return Err("INPUT_CHANGED");
+                }
+            }
+        } else {
+            None
+        };
         if self
             .stamps
             .get(&path)
@@ -172,17 +199,16 @@ impl Reader {
             };
         }
         let observed = read(&path, limit);
-        if let Some(inputs) = &self.frozen {
+        if let (Some(inputs), Some(target)) = (&self.frozen, target) {
             use crate::workspace::{InputWitness, checksum};
-            let key = resolved(&path).map_err(|_| "INPUT_PATH_INVALID")?;
-            let matches = match (&observed, inputs.get(&key)) {
-                (Ok((bytes, _)), Some(InputWitness::Bytes { sha256 })) => {
-                    checksum(bytes) == *sha256
+            let matches = match (&observed, inputs.get(&target)) {
+                (Ok((bytes, stamp)), Some(InputWitness::Bytes { sha256 })) => {
+                    stamp.current(&target) && checksum(bytes) == *sha256
                 }
                 (Err(code), Some(InputWitness::Unavailable { reason })) => *code == reason,
                 _ => false,
             };
-            if !matches {
+            if !matches || self.bound_target(&path).is_err() {
                 self.drifted = true;
                 return Err("INPUT_CHANGED");
             }
@@ -196,7 +222,8 @@ impl Reader {
             return Err("INPUT_CHANGED");
         }
         self.stamps.insert(path.clone(), stamp);
-        if self.document_started {
+        if self.document_started && bytes.len() <= MANIFEST_LIMIT as usize - self.cache_bytes {
+            self.cache_bytes += bytes.len();
             self.cache.insert(path, bytes.clone());
         }
         Ok(bytes)
@@ -251,39 +278,22 @@ impl<'de> Deserialize<'de> for Unique {
     }
 }
 
-pub fn evidence_paths(v: &Value, root: &Path, paths: &mut Vec<PathBuf>) {
-    match v {
-        Value::Array(values) => {
-            for v in values {
-                evidence_paths(v, root, paths);
-            }
-        }
-        Value::Object(map) => {
-            for (key, v) in map {
-                if let Some(v) = v.as_str() {
-                    if matches!(
-                        key.as_str(),
-                        "path" | "file" | "artifact" | "prepared_image"
-                    ) || key.ends_with("_path")
-                        || key.ends_with("_file")
-                    {
-                        paths.push(root.join(v));
-                    }
-                } else {
-                    evidence_paths(v, root, paths);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
 pub fn referenced_paths(document: &Document) -> Vec<PathBuf> {
-    let mut paths = vec![document.path.clone()];
-    for key in ["resources", "ocr", "provenance"] {
-        evidence_paths(&document.raw[key], &document.base_dir, &mut paths);
-    }
-    paths
+    document.raw["resources"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|resource| &resource["path"])
+        .chain(
+            document.raw["ocr"]["images"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|image| [&image["source_path"], &image["artifact"]]),
+        )
+        .filter_map(|path| path.as_str().filter(|path| !path.is_empty()))
+        .map(|path| document.resolve(path))
+        .collect()
 }
 
 pub fn parse_utf8_json(bytes: &[u8]) -> Result<Value> {
@@ -301,10 +311,14 @@ pub fn parse_utf8_json(bytes: &[u8]) -> Result<Value> {
 }
 
 pub fn resolved(path: &Path) -> Result<PathBuf> {
-    resolve_path(path, &mut 40)
+    resolve_path(path, &mut 40, false)
 }
 
-fn resolve_path(path: &Path, links: &mut usize) -> Result<PathBuf> {
+pub fn resolved_input(path: &Path) -> Result<PathBuf> {
+    resolve_path(path, &mut 40, true)
+}
+
+fn resolve_path(path: &Path, links: &mut usize, allow_unreadable: bool) -> Result<PathBuf> {
     let path = std::path::absolute(path)?;
     let mut output = PathBuf::new();
     for part in path.components() {
@@ -326,8 +340,15 @@ fn resolve_path(path: &Path, links: &mut usize) -> Result<PathBuf> {
                         if let Ok(target) = fs::read_link(&output) {
                             *links = links.checked_sub(1).context("INPUT_PATH_INVALID")?;
                             output.pop();
-                            output = resolve_path(&output.join(target), links)?;
+                            output = resolve_path(&output.join(target), links, allow_unreadable)?;
                         }
+                    }
+                    Err(e)
+                        if allow_unreadable && e.kind() == std::io::ErrorKind::PermissionDenied =>
+                    {
+                        // There is no observable target. Bind the original
+                        // spelling and let its read witness record the failure.
+                        return Ok(path);
                     }
                     Err(_) => bail!("INPUT_PATH_INVALID"),
                 }
@@ -348,7 +369,7 @@ pub fn check_output<'a>(output: &Path, inputs: impl IntoIterator<Item = &'a Path
     let inode = |path: &Path| fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
     let output_inode = inode(output);
     for path in inputs {
-        let path_resolved = resolved(path)?;
+        let path_resolved = resolved_input(path)?;
         ensure!(
             !destination.starts_with(&path_resolved)
                 && !path_resolved.starts_with(&destination)

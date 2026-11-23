@@ -1,5 +1,7 @@
 use serde_json::{Value, json};
 
+use crate::knowledge_units::source_lines;
+
 pub struct Options {
     pub file_bytes: u64,
     pub normalize: bool,
@@ -78,36 +80,11 @@ fn myers<T: PartialEq>(old: &[T], new: &[T], work: &mut usize) -> Option<Vec<Edi
     unreachable!("Myers path must reach target")
 }
 
-fn lines(s: &str) -> Vec<&str> {
-    let mut result = Vec::new();
-    let mut start = 0;
-    let mut chars = s.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        if matches!(
-            c,
-            '\n' | '\r'
-                | '\x0b'
-                | '\x0c'
-                | '\x1c'
-                | '\x1d'
-                | '\x1e'
-                | '\u{85}'
-                | '\u{2028}'
-                | '\u{2029}'
-        ) {
-            let mut end = i + c.len_utf8();
-            if c == '\r' && chars.peek().is_some_and(|(_, ch)| *ch == '\n') {
-                chars.next();
-                end += 1;
-            }
-            result.push(&s[start..end]);
-            start = end;
-        }
-    }
-    if start < s.len() {
-        result.push(&s[start..]);
-    }
-    result
+fn excerpt(lines: &[&str], remaining: &mut usize) -> (Vec<char>, bool) {
+    let mut chars = lines.iter().flat_map(|line| line.chars());
+    let prefix: Vec<_> = chars.by_ref().take(*remaining).collect();
+    *remaining -= prefix.len();
+    (prefix, chars.next().is_some())
 }
 
 fn evidence(
@@ -137,15 +114,11 @@ fn evidence(
             truncated = true;
             break;
         }
-        let removed: Vec<char> = old[x..end_x].iter().flat_map(|l| l.chars()).collect();
-        let added: Vec<char> = new[y..end_y].iter().flat_map(|l| l.chars()).collect();
-        let nr = remaining.min(removed.len());
-        remaining -= nr;
-        let na = remaining.min(added.len());
-        remaining -= na;
-        let clipped = nr + na < removed.len() + added.len();
+        let (removed, clipped_removed) = excerpt(&old[x..end_x], &mut remaining);
+        let (added, clipped_added) = excerpt(&new[y..end_y], &mut remaining);
+        let clipped = clipped_removed || clipped_added;
         truncated |= clipped;
-        let mut omitted = clipped || nr + na > options.char_region;
+        let mut omitted = clipped || removed.len() + added.len() > options.char_region;
         let mut characters = Vec::new();
         if !omitted {
             for (op, i, j) in myers(&removed, &added, work)? {
@@ -165,7 +138,7 @@ fn evidence(
         }
         differences.push(json!({
             "old_start_line":x+1, "new_start_line":y+1,
-            "removed":removed[..nr].iter().collect::<String>(), "added":added[..na].iter().collect::<String>(),
+            "removed":removed.iter().collect::<String>(), "added":added.iter().collect::<String>(),
             "characters":characters, "characters_omitted":omitted
         }));
     }
@@ -216,10 +189,16 @@ pub fn compare(old: Option<&[u8]>, new: &[u8], options: &Options) -> Value {
     };
     let mut changed = result("CHANGED", &[diff], Some(false));
     if options.evidence {
-        let (old, new) = (lines(old), lines(new));
         let mut budget = options.work;
-        let explanation = myers(&old, &new, &mut budget)
-            .and_then(|edits| evidence(&old, &new, &edits, options, &mut budget));
+        let explanation = (|| {
+            let old: Vec<_> = source_lines(old, true).take(budget).collect();
+            let new: Vec<_> = source_lines(new, true).take(budget).collect();
+            if old.len().max(new.len()) == budget {
+                return None;
+            }
+            let edits = myers(&old, &new, &mut budget)?;
+            evidence(&old, &new, &edits, options, &mut budget)
+        })();
         match explanation {
             Some((diffs, truncated)) => {
                 changed["differences"] = json!(diffs);

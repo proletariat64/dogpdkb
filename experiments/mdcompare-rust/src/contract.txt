@@ -204,6 +204,8 @@ evidence path, and the sidecar sha256. The sidecar holds source_inputs,
 old_units, new_units, changes, recovery and reason_codes. The zero-based
 old_ref and new_ref in each change address the corresponding unit array and
 are null on the absent side. Human excerpt settings never clip these sidecars.
+Semantic and knowledge extraction stop with BODY_CONTEXT_BUDGET_EXCEEDED if
+expanding inherited context across body units exceeds 16 MiB per snapshot.
 
 Knowledge rows report status (REUSE, DELTA, REVIEW, NO_BODY or UNKNOWN),
 comparison_complete, reason_codes, counts, units and graphify_plan.

@@ -71,6 +71,35 @@ fn invoke(plan: &std::path::Path, command: &str, extra: &[&str]) -> std::process
         .unwrap()
 }
 
+#[test]
+fn shared_config_can_change_unused_semantic_report_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("report.md"), "# Report\n\nThe body.\n").unwrap();
+    let plan = root.join("work.json");
+    fs::write(
+        &plan,
+        json!({"schema_version":"mdcompare-work-1","operation":"semantic","documents":[{
+            "knowledge_base":"book","document_id":"report","baseline":null,
+            "incoming":{"path":"report.md","content_kind":"raw",
+                "metadata":{"name":"Report","logical_path":"Report","source_ref":"report"}}
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    let config = root.join("default.toml");
+    let args = ["--config", config.to_str().unwrap()];
+    fs::write(&config, "[report]\nmarkdown = false\n").unwrap();
+    stdout(&invoke(&plan, "accept", &args), 0);
+    fs::write(&config, "[report]\nmarkdown = true\n").unwrap();
+    stdout(&invoke(&plan, "run", &args), 0);
+    fs::write(&config, "[compare]\nmax_diff_work = 100\n").unwrap();
+    assert_eq!(
+        stdout(&invoke(&plan, "run", &args), 1)["reason_code"],
+        "invalid_config"
+    );
+}
+
 fn stdout(output: &std::process::Output, code: i32) -> Value {
     assert_eq!(
         output.status.code(),
