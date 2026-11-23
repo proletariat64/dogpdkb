@@ -12,6 +12,7 @@ import tempfile
 from contextlib import closing
 from pathlib import Path
 
+from dogpdkb import rust_mdcompare
 from dogpdkb.directory_snapshot import catalog_paths, copy_snapshot
 from dogpdkb.help import HelpParser
 from dogpdkb.ocr_batch import (
@@ -76,7 +77,10 @@ def call_tool(settings, run, name, arguments, *, timeout=None, command=None):
 def failure(run, row, step, reason, *, persist=True, **details):
     tool = run.data.get("tool", {})
     expected = {"export": "skylark", "ocr": "mdocr", "compare": "mdcompare"}
-    if "exit_code" in details and tool.get("name") == expected.get(step):
+    name = tool.get("name")
+    if "exit_code" in details and (
+        name == expected.get(step) or (step == "compare" and name == "mdcompare_rust")
+    ):
         details.setdefault("argv", tool.get("argv"))
     details.setdefault("source_key", row.get("source_key"))
     details.setdefault("input_sha256", row.get("raw_sha256"))
@@ -641,28 +645,38 @@ def catalog_failed_exports(settings, book, run, rows):
     source = run.directory / "failed-export-descriptors.json"
     report = run.directory / "failed-export-resources.json"
     try:
-        atomic_json(
-            source,
-            {
-                "schema_version": "1.0",
-                "documents": [
-                    descriptor(book, rows[item["document_id"]], item["input"])
-                    for item in failures
-                ],
-            },
-        )
-        code = call_tool(
-            settings,
-            run,
-            "mdcompare",
-            ["catalog", "--input", source, "--output", report],
-        )
-        if code:
-            raise ValueError("failed export resource catalog unavailable")
-        payload = read_json(report)
-        if not isinstance(payload, dict) or payload.get("schema_version") != "1.0":
-            raise ValueError("invalid failed export resource catalog")
-        documents = {item["document_id"]: item for item in payload["documents"]}
+        snapshots = [
+            descriptor(book, rows[item["document_id"]], item["input"])
+            for item in failures
+        ]
+        if rust_mdcompare.selected(settings):
+            catalog = rust_mdcompare.compare(
+                settings, run, source, "catalog", [], snapshots
+            )
+            report = catalog.result
+            documents = {
+                item["document_id"]: item for item in catalog.payload["results"]
+            }
+        else:
+            atomic_json(
+                source,
+                {
+                    "schema_version": "1.0",
+                    "documents": snapshots,
+                },
+            )
+            code = call_tool(
+                settings,
+                run,
+                "mdcompare",
+                ["catalog", "--input", source, "--output", report],
+            )
+            if code:
+                raise ValueError("failed export resource catalog unavailable")
+            payload = read_json(report)
+            if not isinstance(payload, dict) or payload.get("schema_version") != "1.0":
+                raise ValueError("invalid failed export resource catalog")
+            documents = {item["document_id"]: item for item in payload["documents"]}
         for item in failures:
             document = documents[item["document_id"]]
             if document.get("resource_warnings"):
@@ -742,15 +756,6 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
                 evidence={"resources": row["resources"] or []},
             )
         )
-    manifests, sources = [], []
-    for name, documents in (("baseline", baseline), ("incoming", incoming)):
-        source, target = (
-            workspace / f"{name}-descriptors.json",
-            workspace / f"{name}.json",
-        )
-        atomic_json(source, {"schema_version": "1.0", "documents": documents})
-        sources.append(source)
-        manifests.append(target)
     store.complete_batch(
         {
             "doc_id": row["document_id"],
@@ -763,6 +768,96 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
         for row in active
     )
     run.stage("compare", total=len(active), phase="tools")
+    if rust_mdcompare.selected(settings):
+        reports, semantic, code, inputs = _rust_compare_tools(
+            settings, book, store, run, active, baseline, incoming, workspace, replan
+        )
+    else:
+        reports, semantic, code, inputs = _legacy_compare_tools(
+            settings, book, store, run, active, baseline, incoming, workspace, replan
+        )
+    semantic_report_path = run.data["artifacts"]["semantic"]
+    semantic_diff_path = run.data["artifacts"]["semantic_diff"]
+    run.stage("compare", total=len(active), phase="record-results")
+    outcomes = []
+    semantic_by_id = {item["document_id"]: item for item in semantic["results"]}
+    for row in active:
+        identifier = row["document_id"]
+        semantic_item = semantic_by_id.get(identifier)
+        status = "completed" if semantic_item is not None else "failed"
+        if (
+            semantic_item is not None
+            and semantic_item["semantic_status"] == "UNAVAILABLE"
+        ):
+            status = "unknown"
+        if status == "failed":
+            failure(
+                run,
+                row,
+                "compare",
+                "COMPARISON_REPORT_UNAVAILABLE",
+                persist=False,
+                exit_code=code,
+                argv=run.data.get("tool", {}).get("argv"),
+                reports=[
+                    run.data["artifacts"][name] for name in ("knowledge", "compare")
+                ],
+                inputs=[str(path) for path in inputs],
+            )
+        outcomes.append(
+            {
+                "doc_id": row["document_id"],
+                "name": "compare",
+                "version": row["version"],
+                "status": status,
+                "run_id": run.id,
+                "knowledge": run.data["artifacts"]["knowledge"],
+                "comparison": run.data["artifacts"]["compare"],
+                "semantic": str(semantic_report_path),
+                "semantic_diff": str(semantic_diff_path),
+            }
+        )
+    store.complete_batch(outcomes)
+    run.save()
+    return (*reports, semantic)
+
+
+def _record_comparison_resources(store, run, active, cataloged_documents, replan):
+    resources = {
+        str(r["document_id"]): r.get("resources", []) for r in cataloged_documents
+    }
+    for row in active:
+        row["resources"] = resources.get(row["document_id"], [])
+    if not replan and run.data.get("artifacts", {}).get("admitted_run"):
+        # Comparison-derived resources must not rewrite an admitted raw
+        # fact; the admission record stays byte-exact for revalidation.
+        # Persist them on the prepared rows so a later resume keeps
+        # the catalog instead of re-deriving it.
+        prepared = Path(run.data["artifacts"]["prepared_inputs"])
+        cataloged = read_json(prepared)
+        for prepared_row in active:
+            cataloged[prepared_row["document_id"]]["resources"] = prepared_row[
+                "resources"
+            ]
+        atomic_json(prepared, cataloged)
+    elif not replan:
+        for row in active:
+            store.document(row["document_id"])["raw"]["resources"] = row["resources"]
+    store.save()
+
+
+def _legacy_compare_tools(
+    settings, book, store, run, active, baseline, incoming, workspace, replan
+):
+    manifests, sources = [], []
+    for name, documents in (("baseline", baseline), ("incoming", incoming)):
+        source, target = (
+            workspace / f"{name}-descriptors.json",
+            workspace / f"{name}.json",
+        )
+        atomic_json(source, {"schema_version": "1.0", "documents": documents})
+        sources.append(source)
+        manifests.append(target)
     valid = True
     for source, target in zip(sources, manifests):
         code = call_tool(
@@ -775,30 +870,9 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
     if valid:
         try:
             catalog = read_json(manifests[1])
-            resources = {
-                str(r["document_id"]): r.get("resources", [])
-                for r in catalog["documents"]
-            }
-            for row in active:
-                row["resources"] = resources.get(row["document_id"], [])
-            if not replan and run.data.get("artifacts", {}).get("admitted_run"):
-                # Comparison-derived resources must not rewrite an admitted raw
-                # fact; the admission record stays byte-exact for revalidation.
-                # Persist them on the prepared rows so a later resume keeps
-                # the catalog instead of re-deriving it.
-                prepared = Path(run.data["artifacts"]["prepared_inputs"])
-                cataloged = read_json(prepared)
-                for prepared_row in active:
-                    cataloged[prepared_row["document_id"]]["resources"] = prepared_row[
-                        "resources"
-                    ]
-                atomic_json(prepared, cataloged)
-            elif not replan:
-                for row in active:
-                    store.document(row["document_id"])["raw"]["resources"] = row[
-                        "resources"
-                    ]
-            store.save()
+            _record_comparison_resources(
+                store, run, active, catalog["documents"], replan
+            )
         except (ValueError, KeyError, TypeError):
             valid = False
     semantic_root = store.path.parent / "semantic" / run.id
@@ -877,56 +951,128 @@ def _compare_inputs(settings, book, store, run, rows, *, workspace=None, replan=
             report = {}
         reports.append(report)
         run.data["artifacts"][mode] = str(output)
-    run.stage("compare", total=len(active), phase="record-results")
-    outcomes = []
-    semantic_by_id = {item["document_id"]: item for item in semantic["results"]}
-    for row in active:
-        identifier = row["document_id"]
-        semantic_item = semantic_by_id.get(identifier)
-        status = "completed" if semantic_item is not None else "failed"
-        if (
-            semantic_item is not None
-            and semantic_item["semantic_status"] == "UNAVAILABLE"
-        ):
-            status = "unknown"
-        if status == "failed":
-            failure(
+    return reports, semantic, code, manifests
+
+
+def _rust_compare_tools(
+    settings, book, store, run, active, baseline, incoming, workspace, replan
+):
+    reports = []
+    inputs = []
+    workspace = Path(tempfile.mkdtemp(prefix="mdcompare-", dir=workspace))
+    catalog_ok = True
+    try:
+        # Body routing has its own snapshot set and does not consume image bytes.
+        # Catalog separate plans enrich the strict and later OCR inputs.
+        for side, snapshots in (("baseline", baseline), ("incoming", incoming)):
+            catalog = rust_mdcompare.compare(
+                settings,
                 run,
-                row,
-                "compare",
-                "COMPARISON_REPORT_UNAVAILABLE",
-                persist=False,
-                exit_code=code,
-                argv=run.data.get("tool", {}).get("argv"),
-                reports=[
-                    str(workspace / f"{name}-report.json")
-                    for name in ("knowledge", "compare")
-                ],
-                inputs=[str(path) for path in manifests],
+                workspace / f"{side}-catalog-work.json",
+                "catalog",
+                [],
+                snapshots,
             )
-        outcomes.append(
-            {
-                "doc_id": row["document_id"],
-                "name": "compare",
-                "version": row["version"],
-                "status": status,
-                "run_id": run.id,
-                "knowledge": run.data["artifacts"]["knowledge"],
-                "comparison": run.data["artifacts"]["compare"],
-                "semantic": str(semantic_report_path),
-                "semantic_diff": str(semantic_diff_path),
-            }
+            inputs.append(catalog.plan)
+            for descriptor, resource_row in zip(snapshots, catalog.payload["results"]):
+                descriptor["resources"] = resource_row["resources"]
+            if side == "incoming":
+                _record_comparison_resources(
+                    store, run, active, catalog.payload["results"], replan
+                )
+    except InterruptedError:
+        raise
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        run.failure(
+            step="compare", reason="RESOURCE_CATALOG_UNAVAILABLE", message=str(error)
         )
-    store.complete_batch(outcomes)
-    run.save()
-    return (*reports, semantic)
+        catalog_ok = False
+
+    semantic_root = store.path.parent / "semantic" / run.id
+    semantic_root.mkdir(parents=True, exist_ok=True)
+    recovery = freeze_recovery(settings.body_recovery, semantic_root / "recovery")
+    semantic_dir = Path(tempfile.mkdtemp(prefix="comparison-", dir=semantic_root))
+    comparison = rust_mdcompare.compare(
+        settings,
+        run,
+        semantic_dir / "work.json",
+        "semantic",
+        baseline,
+        incoming,
+        recovery=recovery,
+    )
+    inputs.append(comparison.plan)
+    semantic = read_semantic_artifacts(
+        comparison.code,
+        comparison.result,
+        comparison.index,
+        active,
+        book.key,
+        native_artifacts=comparison.artifacts,
+    )
+    run.data["artifacts"]["semantic"] = str(comparison.result)
+    run.data["artifacts"]["semantic_diff"] = str(comparison.index)
+    run.data["artifacts"]["semantic_commit"] = str(comparison.commit)
+    run.data["artifacts"]["semantic_generation"] = {
+        "path": str(comparison.commit),
+        "sha256": comparison.sha256,
+    }
+    run.data["artifacts"].pop("semantic_scoring", None)
+    if recovery is not None:
+        run.data["artifacts"]["body_recovery"] = str(recovery)
+    if (
+        not replan
+        and not run.data.get("semantic_score_started")
+        and rust_mdcompare.score_enabled(settings)
+    ):
+        semantic = _score_inputs(
+            settings,
+            book,
+            store,
+            run,
+            active,
+            semantic,
+            comparison.result,
+            comparison.index,
+            native=comparison,
+        )
+    for name, operation in (("knowledge", "knowledge"), ("compare", "strict")):
+        plan = workspace / f"{operation}-work.json"
+        report = {}
+        path = plan.with_suffix(".mdcompare") / "result.json"
+        if operation != "strict" or catalog_ok:
+            try:
+                outcome = rust_mdcompare.compare(
+                    settings, run, plan, operation, baseline, incoming
+                )
+                report, path = outcome.payload, outcome.result
+                inputs.append(outcome.plan)
+            except InterruptedError:
+                raise
+            except (OSError, ValueError) as error:
+                run.failure(
+                    step="compare",
+                    reason="COMPARISON_REPORT_UNAVAILABLE",
+                    message=str(error),
+                    operation=operation,
+                )
+        reports.append(report)
+        run.data["artifacts"][name] = str(path)
+    return reports, semantic, comparison.code, inputs
 
 
-def _score_inputs(settings, book, store, run, rows, semantic, report, diff_index):
+def _score_inputs(
+    settings, book, store, run, rows, semantic, report, diff_index, *, native=None
+):
     eligible = {
         row["document_id"] for row in semantic["results"] if score_eligible(row)
     }
-    score_path = report.with_name("scores.json")
+    score_work = report.parent.parent / "score.json" if native is not None else None
+    score_path = (
+        score_work.with_suffix(".mdcompare") / "result.json"
+        if score_work is not None
+        else report.with_name("scores.json")
+    )
     route_path = report.with_name("score-route.json")
     records = {}
     for row in rows:
@@ -952,7 +1098,10 @@ def _score_inputs(settings, book, store, run, rows, semantic, report, diff_index
         }
     if not records:
         return semantic
-    run.data["semantic_score_started"] = str(score_path)
+    if native is not None:
+        rust_mdcompare.score_plan(score_work, native, book.key, records)
+        run.data["artifacts"]["semantic_score_plan"] = str(score_work)
+    run.data["semantic_score_started"] = str(score_work or score_path)
     run.save(durable=True)
     store.complete_batch(
         (
@@ -961,27 +1110,35 @@ def _score_inputs(settings, book, store, run, rows, semantic, report, diff_index
         ),
         durable=True,
     )
-    common = ["--report", report, "--diff-index", diff_index]
-    request_budget = settings.semantic_score_request_budget
-    score_args = [
-        "semantic-score",
-        *common,
-        "--output",
-        score_path,
-        "--request-budget",
-        str(len(records) if request_budget is None else request_budget),
-    ]
-    for identifier in records:
-        score_args += ["--document-id", identifier]
-    if settings.semantic_score_model:
-        score_args += ["--model", settings.semantic_score_model]
-    code = call_tool(settings, run, "mdcompare", score_args)
+    code = None
     try:
-        if code not in {0, 2} or not score_path.is_file():
-            raise ValueError("semantic score execution did not publish its result")
-        outcomes = read_score_outcomes(
-            score_path, report, diff_index, {(book.key, key) for key in records}
-        )
+        if native is not None:
+            score_path, outcomes, native_scores = rust_mdcompare.score(
+                settings, run, score_work, native, book.key, records
+            )
+        else:
+            common = ["--report", report, "--diff-index", diff_index]
+            request_budget = settings.semantic_score_request_budget
+            score_args = [
+                "semantic-score",
+                *common,
+                "--output",
+                score_path,
+                "--request-budget",
+                str(len(records) if request_budget is None else request_budget),
+            ]
+            for identifier in records:
+                score_args += ["--document-id", identifier]
+            if settings.semantic_score_model:
+                score_args += ["--model", settings.semantic_score_model]
+            code = call_tool(settings, run, "mdcompare", score_args)
+            if code not in {0, 2} or not score_path.is_file():
+                raise ValueError("semantic score execution did not publish its result")
+            outcomes = read_score_outcomes(
+                score_path, report, diff_index, {(book.key, key) for key in records}
+            )
+    except InterruptedError:
+        raise
     except (OSError, ValueError) as error:
         run.failure(
             step="compare",
@@ -1010,14 +1167,29 @@ def _score_inputs(settings, book, store, run, rows, semantic, report, diff_index
     )
     if not verified:
         return semantic
-    route_code = call_tool(
-        settings,
-        run,
-        "mdcompare",
-        ["semantic-route", *common, "--scores", score_path, "--output", route_path],
-    )
+    route_code = None
     try:
-        routed = read_score_route(route_code, route_path, semantic)
+        if native is not None:
+            route_path, routed = rust_mdcompare.route(
+                settings, run, native, score_path, native_scores
+            )
+        else:
+            route_code = call_tool(
+                settings,
+                run,
+                "mdcompare",
+                [
+                    "semantic-route",
+                    *common,
+                    "--scores",
+                    score_path,
+                    "--output",
+                    route_path,
+                ],
+            )
+            routed = read_score_route(route_code, route_path, semantic)
+    except InterruptedError:
+        raise
     except (OSError, ValueError) as error:
         run.failure(
             step="compare",
@@ -1033,6 +1205,16 @@ def _score_inputs(settings, book, store, run, rows, semantic, report, diff_index
             "semantic_diff": diff_index,
             "scores": score_path,
             "route": route_path,
+            **(
+                {
+                    "comparison_commit": native.commit,
+                    "score_work": score_work,
+                    "score_plan": score_path.parent / "plan.json",
+                    "journal": score_path.parent / "journal.json",
+                }
+                if native is not None
+                else {}
+            ),
         }
     )
     return routed

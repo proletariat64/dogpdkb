@@ -179,6 +179,8 @@ def make_plan(book, run, documents, knowledge, comparison, semantic, *, workspac
         "body_recovery": run.data["artifacts"].get("body_recovery"),
         "semantic_scoring": run.data["artifacts"].get("semantic_scoring"),
     }
+    if generation := run.data["artifacts"].get("semantic_generation"):
+        plan["semantic_generation"] = generation
     path = (workspace or run.directory) / "plan.json"
     atomic_json(path, plan)
     run.data["artifacts"]["plan"] = str(path)
@@ -193,6 +195,10 @@ def validate_plan(plan, book, store, *, check_baseline=False):
         from dogpdkb.semantic import validate_recovery
 
         validate_recovery(plan["body_recovery"])
+    if generation := plan.get("semantic_generation"):
+        from dogpdkb.rust_mdcompare import verify_semantic_commit
+
+        verify_semantic_commit(generation)
     if plan.get("semantic_scoring"):
         from dogpdkb.semantic import verify_score_artifacts
 

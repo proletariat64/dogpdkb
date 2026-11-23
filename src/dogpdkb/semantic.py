@@ -220,20 +220,32 @@ def _validate_evidence(payload, item, result, row):
                 raise SemanticArtifactError("incomplete semantic occurrence ownership")
 
 
-def read_semantic_artifacts(code, report_path, diff_path, rows, knowledge_base):
+def read_semantic_artifacts(
+    code, report_path, diff_path, rows, knowledge_base, *, native_artifacts=None
+):
     if code not in {0, 2} or not report_path.is_file() or not diff_path.is_file():
         raise SemanticArtifactError("authoritative semantic comparison unavailable")
     report_bytes = report_path.read_bytes()
-    report, diff = json.loads(report_bytes), read_json(diff_path)
+    diff_bytes = diff_path.read_bytes()
+    native = native_artifacts is not None
+    if native and any(
+        native_artifacts.get(name) != hashlib.sha256(data).hexdigest()
+        for name, data in (
+            ("result.json", report_bytes),
+            ("diff-index.json", diff_bytes),
+        )
+    ):
+        raise SemanticArtifactError("semantic commit witness changed")
+    report, diff = json.loads(report_bytes), json.loads(diff_bytes)
     if (
         not isinstance(report, dict)
-        or report.get("schema_version") != "semantic-1.0"
+        or report.get("schema_version")
+        != ("mdcompare-semantic-result-1" if native else "semantic-1.0")
         or report.get("scope") != "authored_body"
     ):
         raise SemanticArtifactError("invalid semantic report schema or scope")
-    if (
-        not isinstance(diff, dict)
-        or diff.get("schema_version") != "mdcompare-semantic-diff-1"
+    if not isinstance(diff, dict) or diff.get("schema_version") != (
+        "mdcompare-diff-index-1" if native else "mdcompare-semantic-diff-1"
     ):
         raise SemanticArtifactError("invalid semantic diff schema")
     if diff.get("report_sha256") != hashlib.sha256(report_bytes).hexdigest():
@@ -273,9 +285,13 @@ def read_semantic_artifacts(code, report_path, diff_path, rows, knowledge_base):
         if item.get("sha256") != hashlib.sha256(data).hexdigest():
             raise SemanticArtifactError("semantic evidence digest mismatch")
         identifier = item["document_id"]
-        _validate_evidence(
-            json.loads(data), item, by_result[identifier], by_id[identifier]
-        )
+        sidecar = json.loads(data)
+        if native and (
+            not isinstance(sidecar, dict)
+            or sidecar.get("schema_version") != "mdcompare-diff-evidence-1"
+        ):
+            raise SemanticArtifactError("invalid semantic evidence schema")
+        _validate_evidence(sidecar, item, by_result[identifier], by_id[identifier])
     return report
 
 

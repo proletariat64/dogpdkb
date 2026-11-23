@@ -74,7 +74,8 @@ def diagnose(
             )
     if any(row["status"] == "fail" for row in report):
         return report
-    tools = ["graphify", "mdcompare", "mdocr"]
+    compare = "mdcompare_rust" if "mdcompare_rust" in settings.tools else "mdcompare"
+    tools = ["graphify", compare, "mdocr"]
     if any(isinstance(source, YuqueSource) for source in sources):
         tools.append("skylark")
     for name in tools:

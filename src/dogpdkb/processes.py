@@ -45,14 +45,18 @@ def run_command(
     cwd: Path | None = None,
     timeout: float | None = None,
     env: dict[str, str] | None = None,
+    stdout: Path | None = None,
 ) -> int:
-    """Stream both child streams to stderr; return 124 timeout, 130/143 signals."""
+    """Stream child diagnostics, optionally capturing stdout separately."""
     if not argv or any(not isinstance(arg, str) for arg in argv):
         raise ValueError("command must be a nonempty argv list")
     if log is not None:
         log = Path(log)
         log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("a", encoding="utf-8") if log else nullcontext(None) as stream:
+    with (
+        log.open("a", encoding="utf-8") if log else nullcontext(None) as stream,
+        stdout.open("wb") if stdout is not None else nullcontext(None) as output,
+    ):
         if stream:
             stream.write(f"command: {shlex.join(diagnostic_argv(argv))}\n")
             stream.flush()
@@ -60,8 +64,8 @@ def run_command(
             child = subprocess.Popen(
                 argv,
                 cwd=cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stdout=output if output is not None else subprocess.PIPE,
+                stderr=subprocess.PIPE if output is not None else subprocess.STDOUT,
                 start_new_session=True,
                 pass_fds=lock_fds() + runtime_lock_fds(),
                 env={**os.environ, **(env or {})},
@@ -72,6 +76,7 @@ def run_command(
             if stream:
                 stream.write(message)
             return 127
+        pipe = child.stderr if output is not None else child.stdout
         received = 0
         terminating = None
         previous = {}
@@ -91,7 +96,7 @@ def run_command(
             started, expired = time.monotonic(), False
             decoder = codecs.getincrementaldecoder("utf-8")("replace")
             with selectors.DefaultSelector() as selector:
-                selector.register(child.stdout, selectors.EVENT_READ)
+                selector.register(pipe, selectors.EVENT_READ)
                 while selector.get_map() or child.poll() is None:
                     elapsed = time.monotonic() - started
                     if (
@@ -129,7 +134,7 @@ def run_command(
         finally:
             for signum, handler in previous.items():
                 signal.signal(signum, handler)
-            child.stdout.close()
+            pipe.close()
             if child.poll() is None:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
