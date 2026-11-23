@@ -1,47 +1,55 @@
-# Rust mdocr experiment
+# mdocr
 
-Build with Rust 1.95 or later. For a static x86-64 Linux executable, run this
-from the repository root on x86-64 Linux:
+mdocr extracts OCR from images referenced by Markdown. A caller supplies a JSON
+work plan and optionally a TOML configuration. A batch owns its saved plan,
+request journal, and results. Single-file and batch jobs use the same workflow.
+
+## Build
+
+Build on x86-64 Linux with Rust 1.95 or later. The release command produces one
+statically linked executable with its Markdown parser, image processing,
+embedded fonts, TLS roots, Mermaid checker, and help.
 
 ```sh
 RUSTFLAGS="-C target-feature=+crt-static" cargo build --locked --release \
   --target x86_64-unknown-linux-gnu --manifest-path experiments/mdocr-rust/Cargo.toml
 ```
 
-The output is `experiments/mdocr-rust/target/x86_64-unknown-linux-gnu/release/mdocr`.
-The binary embeds its image codecs, SVG renderer, fonts, TLS roots, and Mermaid
-parser. Use `mdocr licenses` for the embedded font notices.
+The executable is at
+`experiments/mdocr-rust/target/x86_64-unknown-linux-gnu/release/mdocr`.
+
+## Run one document
 
 ```sh
-mdocr plan --mode paddle --input source.md --output enriched.md --plan plan.json
-mdocr run --plan plan.json --result result.json
+mdocr draft --input-single source.md --output-single enriched.md --plan work.json
+mdocr doctor --config provider.toml
+mdocr run --plan work.json --config provider.toml > summary.json 2>> mdocr.log
 ```
 
-- **Plan** accepts a Markdown file, a JSON path list, or a directory. Use
-  `--download` to stage selected HTTP(S) image bytes and `--download-list` to
-  restrict staging to named documents. The plan freezes Markdown and image
-  hashes before any OCR calls.
-- **Run** prepares images, calls the selected OCR provider, and writes the
-  `mdocr-result-2` report and plan-bound Markdown evidence. Resume using the
-  same plan and result. A request with an unknown outcome stays in the
-  journal. Automatic replay is limited to the documented, explicitly configured
-  batch fix exception for typed connection interruptions.
-- **Assemble** reads a running journal and recovers already accepted patches
-  offline. Pass the producing runtime's version and a fresh output directory.
-- **Check Mermaid** validates fenced diagrams in a file or stdin.
+Run `tail -F mdocr.log` in a second terminal for live progress. Read
+`work.mdocr/result.json` for document and image outcomes. For directory batches,
+use `draft --input-dir DIR --output-dir DIR` or write an exact work plan.
 
-Paddle uses `PADDLEOCR_TOKEN` and the configured PaddleOCR job endpoint.
-LLM uses the saved Pi OAuth entries for `openai/…` or `openai-codex/…`.
-It reads and refreshes credentials natively. Use `PI_CODING_AGENT_DIR` to
-locate the OAuth store when it lives outside `~/.pi/agent`.
-Both provider modes need network access for OCR.
+At first acceptance mdocr uses the explicit TOML, the `default.toml` next to the
+work plan, or compiled defaults, in that order. Provider credentials are files
+named by the TOML. Provider calls and authorized remote image downloads require
+network access.
 
-The Rust renderer supports SVG shapes and text with embedded Latin and CJK
-fonts. SVGs with HTML `foreignObject` labels, missing glyphs, or unsupported
-embedded resources are held before sending. Raster support covers PNG, JPEG,
-WebP, GIF, BMP, ICO, and TIFF.
+## Inspect, resume, and recover
 
-The experiment is opt-in. Use Rust with a fresh plan or one with no previous
-admissions. Continue an in-flight execution with its original runtime. An
-explicit offline assembly can validate historical request keys with the
-original runtime version.
+```sh
+mdocr accept --plan work.json --config provider.toml
+mdocr run --plan work.json
+mdocr cancel --plan work.json
+mdocr run --plan work.json --resume
+mdocr assemble --plan work.json --output-dir recovered
+mdocr purge --plan work.json
+```
+
+Run again with the same work plan after an interruption. After explicit
+cancellation, resume with `--resume`. Use `assemble` to recover already accepted
+results locally. Purge is explicit and preserves published Markdown.
+
+Use `mdocr --help` to browse commands and `mdocr help all` for the full embedded
+contract. The [product specification](../../.scratch/mdocr-rust-cli/spec.md)
+covers image syntax, provider support, and batch artifacts.

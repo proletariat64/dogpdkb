@@ -367,6 +367,14 @@ fn cancellation_settles_in_flight_work_and_requires_explicit_resume() {
         .unwrap();
     serve_success(&listener, &base, || {
         assert_admission(root, &plan_hash, 1, &first.join("image.png"));
+        let purge = cli(root, &["purge", "--plan", "work.json", "-Y"])
+            .output()
+            .unwrap();
+        assert_exit(&purge, 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&purge.stdout).unwrap()["reason_code"],
+            "WORKSPACE_ACTIVE"
+        );
         let cancel = cli(root, &["cancel", "--plan", "work.json"])
             .output()
             .unwrap();

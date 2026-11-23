@@ -95,7 +95,3 @@ pub(crate) fn client_for(settings: &Value) -> Result<Client> {
         .build()
         .context("cannot build HTTP client")
 }
-
-pub(crate) fn client() -> reqwest::Result<Client> {
-    base_builder().build()
-}

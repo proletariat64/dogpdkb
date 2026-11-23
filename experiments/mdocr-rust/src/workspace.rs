@@ -84,16 +84,15 @@ impl Workspace {
     pub(crate) fn create_and_lock(&self) -> Result<File> {
         self.ensure_live()?;
         fs::create_dir_all(&self.root).context("cannot create the batch workspace")?;
+        let owner = self.owner();
+        owned_path(&owner)?;
+        if !owner.try_exists()? {
+            self.check_unclaimed()?;
+        }
         let lock = try_lock(&self.lock)?;
         self.ensure_live()?;
-        let owner = self.owner();
         if !owner.try_exists()? {
-            for entry in fs::read_dir(&self.root)? {
-                ensure!(
-                    entry?.path() == self.lock,
-                    "workspace directory is occupied and has no mdocr ownership record"
-                );
-            }
+            self.check_unclaimed()?;
             atomic(
                 &owner,
                 &json_bytes(&json!({"schema_version":"mdocr-workspace-1", "work_path":self.work}))?,
@@ -102,6 +101,16 @@ impl Workspace {
         }
         self.ensure_owner()?;
         Ok(lock)
+    }
+
+    fn check_unclaimed(&self) -> Result<()> {
+        for entry in fs::read_dir(&self.root)? {
+            ensure!(
+                entry?.path() == self.lock,
+                "workspace directory is occupied and has no mdocr ownership record"
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn lock_existing(&self) -> Result<File> {
