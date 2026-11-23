@@ -101,35 +101,38 @@ def _active_ignore_rules(path):
 def _git_info_exclude(root):
     if (root / ".git").is_dir():
         return root / ".git/info/exclude"
-    result = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(root),
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-path",
-            "info/exclude",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "info/exclude",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValueError("cannot resolve the Git worktree exclude file") from error
     if result.returncode:
         raise ValueError("cannot resolve the Git worktree exclude file")
     return Path(result.stdout.strip())
 
 
 def _missing_whitelist(path, rules):
-    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    existing = path.read_bytes() if path.exists() else b""
 
     def key(line):
         line = line.strip()
-        return "!/" + line[1:].lstrip("/") if line.startswith("!") else line
+        return b"!/" + line[1:].lstrip(b"/") if line.startswith(b"!") else line
 
     present = {key(line) for line in existing.splitlines()}
-    return [rule for rule in rules if key(rule) not in present]
+    return [rule for rule in rules if key(rule.encode()) not in present]
 
 
 def _ensure_corpus_whitelist(corpus):
@@ -185,14 +188,14 @@ def _ensure_corpus_whitelist(corpus):
         missing = _missing_whitelist(path, rules)
         if not missing:
             return
-        existing = path.read_text(encoding="utf-8") if path.exists() else ""
-        # Existing Graphify rules come later and retain their last-match priority.
-        content = "\n".join(missing) + "\n" + existing
+        existing = path.read_bytes() if path.exists() else b""
+        # Existing Graphify rules come later and retain their bytes and priority.
+        content = "\n".join(missing).encode() + b"\n" + existing
         mode = path.stat().st_mode if path.exists() else None
         fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         temporary = Path(temporary_name)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            with os.fdopen(fd, "wb") as stream:
                 stream.write(content)
                 stream.flush()
                 os.fsync(stream.fileno())

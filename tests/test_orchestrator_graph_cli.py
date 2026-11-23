@@ -380,6 +380,34 @@ def test_corpus_whitelist_rejects_symlink_update(tmp_path):
     assert not (tmp_path / ".graphifyignore.lock").exists()
 
 
+def test_git_exclude_timeout_is_contextual(tmp_path, monkeypatch):
+    (tmp_path / ".git").write_text("gitdir: /invalid\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(["git"], 10)
+
+    monkeypatch.setattr("dogpdkb.graph.subprocess.run", timeout)
+    with pytest.raises(ValueError, match="Git worktree exclude") as error:
+        _ensure_corpus_whitelist(corpus)
+    assert isinstance(error.value.__cause__, subprocess.TimeoutExpired)
+
+
+def test_corpus_whitelist_preserves_crlf_and_existing_bytes(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Existing rules\r\nignored.md\r\n"
+    ignore_file.write_bytes(original)
+
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == b"!/corpus/\n!/corpus/**\n" + original
+
+
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):
     config, manifest, source = fixture(tmp_path, title="Cafe\u0301")
     result = cli(config, manifest)
