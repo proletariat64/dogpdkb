@@ -770,6 +770,7 @@ def ocr_inputs(settings, book, store, run, rows, *, stale=()):
         return {}
     run.stage("ocr", total=len(candidates))
     results, pending, observed = {}, [], {}
+    batch_reason = None
     existing = read_json(request_path) if request_path.exists() else None
     enrolled = _index(existing["documents"]) if existing else {}
     rejected = existing["rejected"] if existing else {}

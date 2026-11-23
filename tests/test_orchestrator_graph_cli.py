@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from dogpdkb.graph import _ensure_corpus_whitelist, _git_info_exclude
 from scripts.smoke_install import GRAPHIFY_PREFLIGHT, GRAPHIFY_PROOF
 from tests.source_fixture import graphify_offline_env, graphify_sse, yuque_binding
 
@@ -27,9 +29,9 @@ def write(path, value):
     path.write_text(json.dumps(value))
 
 
-def fixture(tmp_path, *, title="Title"):
-    corpus = tmp_path / "corpus"
-    corpus.mkdir()
+def fixture(tmp_path, *, title="Title", corpus_path="corpus"):
+    corpus = tmp_path / corpus_path
+    corpus.mkdir(parents=True)
     run = tmp_path / "runs/funds/run-graph"
     run.mkdir(parents=True)
     source = corpus / f"{title}-2026-11-12-[42].md"
@@ -120,7 +122,7 @@ def fixture(tmp_path, *, title="Title"):
                         "url": "https://example.invalid/book",
                     }
                 ],
-                "corpus": "corpus",
+                "corpus": corpus_path,
             }
         ],
     )
@@ -134,6 +136,7 @@ def value(flag): return args[args.index(flag)+1]
 with (root/'calls.jsonl').open('a') as log: log.write(json.dumps(sys.argv[2:])+'\\n')
 assert command=='extract', command
 assert '--no-cluster' in args
+assert '--no-gitignore' in args
 assert value('--backend')=='openai-oauth'
 assert value('--max-concurrency')=='3'
 assert os.environ['GRAPHIFY_OPENAI_OAUTH_PARALLEL']=='1'
@@ -192,6 +195,581 @@ def cli(config, manifest, environment=None, *, retry_graph=False):
     )
 
 
+def test_corpus_whitelist_uses_configured_nested_path(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "published/custom-book"
+    corpus.mkdir(parents=True)
+    ignore_file = tmp_path / ".graphifyignore"
+
+    _ensure_corpus_whitelist(corpus)
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == (
+        b"!/published/\n!/published/custom-book/\n!/published/custom-book/**\n"
+    )
+
+
+def test_corpus_whitelist_uses_existing_corpus_ignore_file(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "published/custom-book"
+    corpus.mkdir(parents=True)
+    ignore_file = corpus / ".graphifyignore"
+    original = b"!/**\n# Corpus-local rules\nignored.md\n"
+    ignore_file.write_bytes(original)
+
+    _ensure_corpus_whitelist(corpus)
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == original
+    assert not (tmp_path / ".graphifyignore").exists()
+
+
+def test_corpus_whitelist_skips_writes_without_git_rules(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+
+    _ensure_corpus_whitelist(corpus)
+
+    assert not (tmp_path / ".graphifyignore").exists()
+    assert not (tmp_path / ".graphifyignore.lock").exists()
+
+
+def test_corpus_whitelist_rejects_pattern_syntax_before_writing(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "published/bad*book"
+    corpus.mkdir(parents=True)
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Existing rules\nignored.md\n"
+    ignore_file.write_bytes(original)
+
+    with pytest.raises(ValueError, match="cannot be represented"):
+        _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == original
+    assert not (tmp_path / ".graphifyignore.lock").exists()
+
+
+def test_corpus_whitelist_serializes_concurrent_books(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpora = []
+    for index in range(8):
+        corpus = tmp_path / f"corpus/book-{index}"
+        corpus.mkdir(parents=True)
+        corpora.append(corpus)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(_ensure_corpus_whitelist, corpora))
+
+    rules = (tmp_path / ".graphifyignore").read_text().splitlines()
+    winners = [index for index in range(8) if f"!/corpus/book-{index}/" in rules]
+    assert len(winners) == 1
+    for index in range(8):
+        assert rules.count(f"!/corpus/book-{index}/") <= 1
+        assert rules.count(f"!/corpus/book-{index}/**") <= 1
+
+
+def test_corpus_whitelist_supports_linked_worktree_exclude_file(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+    (root / ".git/info/exclude").write_text("*\n")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    linked = tmp_path / "linked"
+    subprocess.run(
+        ["git", "-C", str(root), "worktree", "add", "--detach", str(linked)],
+        check=True,
+        capture_output=True,
+    )
+    corpus = linked / "corpus"
+    corpus.mkdir()
+    other = tmp_path / "other"
+    subprocess.run(["git", "init", "--quiet", str(other)], check=True)
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_COMMON_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+
+    _ensure_corpus_whitelist(corpus)
+
+    assert (linked / ".graphifyignore").read_bytes() == b"!/corpus/\n!/corpus/**\n"
+
+
+def test_corpus_whitelist_ignores_non_utf8_git_comment(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_bytes(b"# legacy \xff comment\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+
+    _ensure_corpus_whitelist(corpus)
+
+    assert not (tmp_path / ".graphifyignore").exists()
+    assert not (tmp_path / ".graphifyignore.lock").exists()
+
+
+def test_complete_corpus_whitelist_needs_no_lock_or_write(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"!/corpus/\n!/corpus/**\n# Existing rules\nignored.md\n"
+    ignore_file.write_bytes(original)
+
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == original
+    assert not (tmp_path / ".graphifyignore.lock").exists()
+
+
+def test_corpus_whitelist_preserves_symlink_for_operator(tmp_path, capsys):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    target = tmp_path / "shared-ignore"
+    original = b"# Shared user rules\nignored.md\n"
+    target.write_bytes(original)
+    (tmp_path / ".graphifyignore").symlink_to(target)
+
+    _ensure_corpus_whitelist(corpus)
+
+    assert target.read_bytes() == original
+    assert "operator provisioning" in capsys.readouterr().err
+    assert not (tmp_path / ".graphifyignore.lock").exists()
+
+
+def test_git_exclude_timeout_preserves_extraction(tmp_path, monkeypatch, capsys):
+    (tmp_path / ".git").write_text("gitdir: /invalid\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(["git"], 10)
+
+    monkeypatch.setattr("dogpdkb.graph.subprocess.run", timeout)
+    _ensure_corpus_whitelist(corpus)
+
+    assert not (tmp_path / ".graphifyignore").exists()
+    assert "continuing with --no-gitignore" in capsys.readouterr().err
+
+
+def test_corpus_whitelist_preserves_crlf_and_existing_bytes(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Existing rules\r\nignored.md\r\n"
+    ignore_file.write_bytes(original)
+
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == original
+
+
+def test_git_ignore_probe_handles_bom_and_first_column_comments(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".gitignore"
+    ignore_file.write_bytes(b"\xef\xbb\xbf# comment only\n")
+
+    _ensure_corpus_whitelist(corpus)
+    assert not (tmp_path / ".graphifyignore").exists()
+
+    ignore_file.write_bytes(b" #published/\n")
+    _ensure_corpus_whitelist(corpus)
+    assert (tmp_path / ".graphifyignore").is_file()
+
+
+def test_git_ignore_probe_skips_non_regular_and_symlinked_paths(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".gitignore"
+    ignore_file.mkdir()
+
+    _ensure_corpus_whitelist(corpus)
+    assert not (tmp_path / ".graphifyignore").exists()
+
+    ignore_file.rmdir()
+    target = tmp_path / "rules"
+    target.write_text("*\n")
+    ignore_file.symlink_to(target)
+    _ensure_corpus_whitelist(corpus)
+    assert not (tmp_path / ".graphifyignore").exists()
+
+    ignore_file.unlink()
+    os.mkfifo(ignore_file)
+    _ensure_corpus_whitelist(corpus)
+    assert not (tmp_path / ".graphifyignore").exists()
+
+
+def test_git_exclude_path_uses_filesystem_decoding(tmp_path, monkeypatch):
+    (tmp_path / ".git").write_text("gitdir: /unused\n")
+    raw = os.fsencode(str(tmp_path)) + b"/repo-\xff/info/exclude"
+
+    def resolved(*args, **kwargs):
+        return subprocess.CompletedProcess(["git"], 0, stdout=raw + b"\n")
+
+    monkeypatch.setattr("dogpdkb.graph.subprocess.run", resolved)
+    result = _git_info_exclude(tmp_path)
+    assert os.fsencode(result) == raw
+
+
+def test_non_regular_graphifyignore_is_rejected_before_read(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    os.mkfifo(tmp_path / ".graphifyignore")
+
+    with pytest.raises(ValueError, match="regular file"):
+        _ensure_corpus_whitelist(corpus)
+
+    assert not (tmp_path / ".graphifyignore.lock").exists()
+
+
+def test_invalid_corpus_local_ignore_never_falls_back_to_root(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    root_rules = tmp_path / ".graphifyignore"
+    original = b"# Root rules\nignored.md\n"
+    root_rules.write_bytes(original)
+    for kind in ("fifo", "dangling"):
+        corpus = tmp_path / f"corpus-{kind}"
+        corpus.mkdir()
+        candidate = corpus / ".graphifyignore"
+        if kind == "fifo":
+            os.mkfifo(candidate)
+        else:
+            candidate.symlink_to(corpus / "missing")
+        with pytest.raises(ValueError, match="regular file"):
+            _ensure_corpus_whitelist(corpus)
+        assert root_rules.read_bytes() == original
+
+
+def test_local_git_rules_do_not_require_git_executable(tmp_path, monkeypatch):
+    (tmp_path / ".git").write_text("gitdir: /unused\n")
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+
+    def unexpected(root):
+        raise AssertionError("info/exclude lookup is unnecessary")
+
+    monkeypatch.setattr("dogpdkb.graph._git_info_exclude", unexpected)
+    _ensure_corpus_whitelist(corpus)
+    assert (tmp_path / ".graphifyignore").is_file()
+
+
+def test_git_ignore_probe_uses_lf_and_significant_whitespace(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".gitignore"
+    ignore_file.write_bytes(b"# note\r*\n")
+
+    _ensure_corpus_whitelist(corpus)
+    assert not (tmp_path / ".graphifyignore").exists()
+
+    ignore_file.write_bytes(b"\t\n")
+    _ensure_corpus_whitelist(corpus)
+    assert (tmp_path / ".graphifyignore").is_file()
+
+
+def test_git_exclude_relative_output_uses_worktree_root(tmp_path, monkeypatch):
+    (tmp_path / ".git").write_text("gitdir: /unused\n")
+    calls = []
+
+    def resolved(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            command, 0, stdout=b"../shared/info/exclude\n"
+        )
+
+    monkeypatch.setattr("dogpdkb.graph.subprocess.run", resolved)
+    result = _git_info_exclude(tmp_path)
+    assert result == tmp_path / "../shared/info/exclude"
+    assert "--path-format=absolute" not in calls[0]
+
+
+def test_corpus_whitelist_lock_denied_preserves_original(tmp_path, monkeypatch, capsys):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Original\nignored.md\n"
+    ignore_file.write_bytes(original)
+
+    def denied(*args, **kwargs):
+        raise PermissionError("EPERM")
+
+    monkeypatch.setattr("dogpdkb.graph.os.open", denied)
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == original
+    assert "continuing with --no-gitignore" in capsys.readouterr().err
+
+
+def test_unreadable_git_ignore_warns_and_skips_maintenance(
+    tmp_path, monkeypatch, capsys
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".gitignore"
+    ignore_file.write_text("*\n")
+    (tmp_path / ".git/info/exclude").write_text("*\n")
+    real_read = Path.read_bytes
+
+    def denied(path):
+        if path == ignore_file:
+            raise PermissionError("EPERM")
+        return real_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", denied)
+    _ensure_corpus_whitelist(corpus)
+
+    assert not (tmp_path / ".graphifyignore").exists()
+    assert "cannot read Git ignore source" in capsys.readouterr().err
+
+
+def test_corpus_whitelist_update_permission_failure_preserves_original(
+    tmp_path, monkeypatch, capsys
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Original\nignored.md\n"
+    ignore_file.write_bytes(original)
+
+    def denied(*args, **kwargs):
+        raise PermissionError("EPERM")
+
+    monkeypatch.setattr("dogpdkb.graph.tempfile.mkstemp", denied)
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == original
+    assert "continuing with --no-gitignore" in capsys.readouterr().err
+
+
+def test_unavailable_git_exclude_lookup_preserves_extraction(
+    tmp_path, monkeypatch, capsys
+):
+    (tmp_path / ".git").write_text("gitdir: /unused\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+
+    def unavailable(root):
+        raise ValueError("Git unavailable")
+
+    monkeypatch.setattr("dogpdkb.graph._git_info_exclude", unavailable)
+    _ensure_corpus_whitelist(corpus)
+
+    assert not (tmp_path / ".graphifyignore").exists()
+    assert "cannot resolve the Git exclude source" in capsys.readouterr().err
+
+
+def test_initial_whitelist_permission_failure_preserves_original(
+    tmp_path, monkeypatch, capsys
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Original\nignored.md\n"
+    ignore_file.write_bytes(original)
+    real_read = Path.read_bytes
+
+    def denied(path):
+        if path == ignore_file:
+            raise PermissionError("EPERM")
+        return real_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", denied)
+    _ensure_corpus_whitelist(corpus)
+    monkeypatch.undo()
+
+    assert ignore_file.read_bytes() == original
+    assert "cannot read the current Corpus whitelist" in capsys.readouterr().err
+
+
+def test_git_ignore_predicate_permission_warns_and_continues(
+    tmp_path, monkeypatch, capsys
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    target = tmp_path / ".git/info/exclude"
+    real_is_file = Path.is_file
+
+    def denied(path):
+        if path == target:
+            raise PermissionError("EPERM")
+        return real_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", denied)
+    _ensure_corpus_whitelist(corpus)
+
+    assert not (tmp_path / ".graphifyignore").exists()
+    assert "cannot read Git ignore source" in capsys.readouterr().err
+
+
+def test_hardlinked_graphifyignore_is_preserved(tmp_path, capsys):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Shared rules\nignored.md\n"
+    ignore_file.write_bytes(original)
+    linked = tmp_path / "linked-rules"
+    os.link(ignore_file, linked)
+
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == original
+    assert linked.read_bytes() == original
+    assert ignore_file.stat().st_nlink == 2
+    assert "operator provisioning" in capsys.readouterr().err
+
+
+def test_corpus_symlink_is_selected_before_exists(tmp_path, monkeypatch):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    target = tmp_path / "shared-rules"
+    target.write_bytes(b"!/**\n")
+    candidate = corpus / ".graphifyignore"
+    candidate.symlink_to(target)
+    real_exists = Path.exists
+
+    def guarded(path):
+        if path == candidate:
+            raise PermissionError("target is not traversable")
+        return real_exists(path)
+
+    monkeypatch.setattr(Path, "exists", guarded)
+    _ensure_corpus_whitelist(corpus)
+
+    assert candidate.is_symlink()
+    assert target.read_bytes() == b"!/**\n"
+
+
+def test_new_graphifyignore_publish_never_overwrites_concurrent_file(
+    tmp_path, monkeypatch, capsys
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    user_content = b"# Concurrent user rules\nignored.md\n"
+
+    def concurrent_create(source, destination):
+        Path(destination).write_bytes(user_content)
+        raise FileExistsError("exists")
+
+    monkeypatch.setattr("dogpdkb.graph.os.link", concurrent_create)
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == user_content
+    assert "created concurrently" in capsys.readouterr().err
+
+
+def test_disappearing_graphifyignore_warns_and_continues(tmp_path, monkeypatch, capsys):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    ignore_file.write_text("# Existing\n")
+    real_read = Path.read_bytes
+
+    def disappear(path):
+        if path == ignore_file:
+            raise FileNotFoundError("removed")
+        return real_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", disappear)
+    _ensure_corpus_whitelist(corpus)
+    monkeypatch.undo()
+
+    assert ignore_file.read_bytes() == b"# Existing\n"
+    assert "disappeared during inspection" in capsys.readouterr().err
+
+
+def test_graphifyignore_full_disk_preserves_extraction(tmp_path, monkeypatch, capsys):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+
+    def full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "full")
+
+    monkeypatch.setattr("dogpdkb.graph.tempfile.mkstemp", full)
+    _ensure_corpus_whitelist(corpus)
+
+    assert not (tmp_path / ".graphifyignore").exists()
+    assert "insufficient resources" in capsys.readouterr().err
+
+
+def test_existing_graphifyignore_disappearance_never_recreates_it(
+    tmp_path, monkeypatch, capsys
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Existing rules\nignored.md\n"
+    ignore_file.write_bytes(original)
+    real_exists = Path.exists
+    checks = 0
+
+    def disappear_after_selection(path):
+        nonlocal checks
+        if path != ignore_file:
+            return real_exists(path)
+        checks += 1
+        return checks == 1
+
+    monkeypatch.setattr(Path, "exists", disappear_after_selection)
+    _ensure_corpus_whitelist(corpus)
+    monkeypatch.undo()
+
+    assert ignore_file.read_bytes() == original
+    assert "disappeared before update" in capsys.readouterr().err
+
+
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):
     config, manifest, source = fixture(tmp_path, title="Cafe\u0301")
     result = cli(config, manifest)
@@ -224,6 +802,7 @@ def test_complete_source_calls_only_public_graphify_and_records_success(
     assert "candidate" not in report
     assert (Path(calls[0][1]) / source.name).read_bytes() == source.read_bytes()
     assert "--no-cluster" in calls[0]
+    assert "--no-gitignore" in calls[0]
     if budget is None:
         assert "--token-budget" not in calls[0]
     else:
@@ -819,6 +1398,118 @@ def test_original_graphify_incremental_directory_preserves_other_sources(tmp_pat
         server.server_close()
 
 
+@pytest.mark.parametrize(
+    ("git_exclude", "git_pattern", "corpus_path"),
+    [
+        (
+            ".gitignore",
+            "*",
+            "corpus",
+        ),
+        (
+            ".git/info/exclude",
+            "*",
+            "corpus",
+        ),
+        (
+            ".gitignore",
+            "published/custom-book/",
+            "published/custom-book",
+        ),
+        (
+            ".git/info/exclude",
+            "published/",
+            "published/custom-book",
+        ),
+        (
+            ".git/info/exclude",
+            "published/custom-*/",
+            "published/custom-book",
+        ),
+        (
+            ".gitignore",
+            "published/custom-book/Title*",
+            "published/custom-book",
+        ),
+    ],
+)
+def test_installed_graphify_bypasses_git_exclusions_and_preserves_ignore_rules(
+    tmp_path, git_exclude, git_pattern, corpus_path
+):
+    import shutil
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    executable = shutil.which("graphify")
+    if not executable:
+        pytest.skip("patched Graphify CLI is not installed")
+    config, manifest, source = fixture(tmp_path, corpus_path=corpus_path)
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / git_exclude).write_text(git_pattern + "\n")
+    ignored = source.with_name("ignored.md")
+    ignored.write_text("# Explicitly excluded by Graphify rules\n")
+    ignore_file = tmp_path / ".graphifyignore"
+    ignore_file.write_text("# Retain user rules\nignored.md\n")
+    config.write_text(
+        config.read_text().split("[tools]")[0]
+        + "[tools]\ngraphify="
+        + json.dumps(executable)
+        + "\n"
+    )
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            body = request["input"][0]["content"][0]["text"]
+            calls.append(body)
+            assert source.name in body
+            assert ignored.name not in body
+            result = graphify_sse(
+                [
+                    {
+                        "id": "current",
+                        "label": "current",
+                        "source_file": source.name,
+                        "file_type": "concept",
+                    }
+                ]
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(result)))
+            self.end_headers()
+            self.wfile.write(result)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    environment = graphify_offline_env(tmp_path, server.server_port)
+    try:
+        result = cli(config, manifest, environment)
+        assert result.returncode == 0, result.stdout + result.stderr
+        report = json.loads(Path(json.loads(result.stdout)["report"]).read_text())
+        assert "--no-gitignore" in report["argv"]
+        graph = json.loads((source.parent / "graphify-out/graph.json").read_text())
+        assert source.name in {n.get("source_file") for n in graph["nodes"]}
+        assert ignored.name not in {n.get("source_file") for n in graph["nodes"]}
+        expected = b"# Retain user rules\nignored.md\n"
+        assert ignore_file.read_bytes() == expected
+
+        # A real second dispatch preserves existing rules and adds no duplicate.
+        source.write_text("# Changed source\n\nCurrent full Markdown.\n")
+        data = json.loads(manifest.read_text())
+        Path(data["documents"][0]["input_copy"]).write_bytes(source.read_bytes())
+        assert cli(config, manifest, environment).returncode == 0
+        assert ignore_file.read_bytes() == expected
+        assert len(calls) == 2
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_installed_graphify_budget_recovers_omissions_with_three_inflight(tmp_path):
     import shutil
     import threading
@@ -914,7 +1605,9 @@ def test_installed_graphify_budget_recovers_omissions_with_three_inflight(tmp_pa
         assert result.returncode == 2, result.stdout + result.stderr
         assert dispatched == [names]
         failed = json.loads(
-            next(manifest.parent.glob("graphify-*/result.json")).read_text()
+            next(
+                (tmp_path / "state/funds/graph-evidence").glob("graphify-*/result.json")
+            ).read_text()
         )
         assert failed["exit_code"] == 0
         assert "GRAPHIFY_INCOMPLETE_EXTRACTION" in failed["reason"]
@@ -925,7 +1618,8 @@ def test_installed_graphify_budget_recovers_omissions_with_three_inflight(tmp_pa
             in log
         )
         public_graph = corpus / "graphify-out/graph.json"
-        assert not public_graph.exists()
+        # Native extraction writes in place; dogpdkb withholds acknowledgement.
+        assert public_graph.is_file()
         assert all(
             not row.get("graph")
             for row in json.loads(state_path.read_text())["documents"].values()
@@ -940,10 +1634,11 @@ def test_installed_graphify_budget_recovers_omissions_with_three_inflight(tmp_pa
         peak = 0
         result = cli(config, manifest, environment, retry_graph=True)
         assert result.returncode == 0, result.stdout + result.stderr
-        assert len(dispatched) == len(names)
-        assert set.union(*dispatched) == names
+        omitted = names - {source.name}
+        assert len(dispatched) == len(omitted)
+        assert set.union(*dispatched) == omitted
         assert peak == 3
-        assert models == ["gpt-6.1-terra"] * len(names)
+        assert models == ["gpt-6.1-terra"] * len(omitted)
         assert {
             n["source_file"] for n in json.loads(public_graph.read_text())["nodes"]
         } == names
@@ -954,7 +1649,7 @@ def test_installed_graphify_budget_recovers_omissions_with_three_inflight(tmp_pa
         report = json.loads(Path(documents["42"]["graph"]["report"]).read_text())
         assert report["graphify_model"] == "gpt-6.1-terra"
         assert report["graphify_token_budget"] == 512
-        assert "chunk 5/5 done" in Path(report["native_log"]).read_text()
+        assert "chunk 4/4 done" in Path(report["native_log"]).read_text()
     finally:
         server.shutdown()
         server.server_close()

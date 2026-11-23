@@ -275,7 +275,14 @@ def test_cleanup_failure_proves_unsent_only_without_an_earlier_send(
                 raise runner.LlmError('bad response', reason='response_json_invalid')
             raise runner.LlmError('local cleanup error', reason='svg_profile_cleanup_failed')
 """
-    driver.write_text(old.replace(marker, marker + new))
+    driver.write_text(
+        old.replace(
+            marker,
+            "        (root / 'runtime-version').write_text(runner.__version__)\n"
+            + marker
+            + new,
+        )
+    )
     outcome = cli("apply", "--config", config, "--input", differences)
     assert outcome.returncode == 2, outcome.stderr
     (root,) = (tmp_path / "state/funds/ocr").glob("run-*")
@@ -291,6 +298,7 @@ def test_cleanup_failure_proves_unsent_only_without_an_earlier_send(
     )
     expected = ("failed", "settled") if earlier_send else ("skipped", "not_sent")
     history = _request_history(report)
+    assert history is not None
     execution = Execution(
         plan,
         report["plan_sha256"],
@@ -298,19 +306,23 @@ def test_cleanup_failure_proves_unsent_only_without_an_earlier_send(
         root / "result.json",
         root / "plan.json.evidence",
         False,
+        version=(tmp_path / "runtime-version").read_text(),
     )
     peer = next(
         attempt
         for attempt in execution.state["requests"]
         if attempt["status"] == "success"
     )
+    assert peer is not None
     peer_sha = peer.pop(
         "source_sha256"
     )  # Simulate a same-version historical admission.
     execution.plan_jobs()
     assert "source_sha256" not in peer
     assert execution.state["legacy_request_sources"] == {peer["key"]: peer_sha}
-    assert _request_history(execution.state)[peer_sha] == [peer]
+    legacy_history = _request_history(execution.state)
+    assert legacy_history is not None
+    assert legacy_history[peer_sha] == [peer]
     doc = docs[entry["path"]]
     assert (
         _verified_result(root, plan, doc, entry, row, lambda: history)[1:3] == expected
@@ -322,6 +334,7 @@ def test_cleanup_failure_proves_unsent_only_without_an_earlier_send(
     else:
         other = next(d for d in docs.values() if d is not doc)
         (reused,) = other["images"]
+        assert reused is not None
         doc["images"].append({**reused, "id": "cached-peer"})
         original = next(e for e in request["documents"] if e is not entry)
         entry["assets"].update(original["assets"])

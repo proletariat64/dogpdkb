@@ -16,6 +16,32 @@ exchange graph output, provide per-run scan modes, or require an operator scope
 file, checksum, or other wrapper-generated proof. Existing corpus files and
 native Graphify output are used in place.
 
+Every extract passes `--no-gitignore`, so `.gitignore`, `.git/info/exclude` and
+Git's user-wide excludes cannot remove published Corpus sources from the scan.
+Graphify's own `.graphifyignore` rules remain active. Before dispatch inside a
+Git worktree with active local Git ignore rules, dogpdkb selects the nearest
+existing `.graphifyignore` in the worktree-to-Corpus directory chain, defaulting
+to the worktree root. Existing complete whitelists require no write. An existing
+incomplete whitelist remains byte-identical and produces an operator-provisioning
+warning; dogpdkb never replaces an existing policy file. This preserves concurrent
+operator edits, ownership, ACLs, symlinks, and hard links.
+
+A previously absent destination is written to a same-directory temporary file,
+fsynced, and published with atomic no-overwrite link creation. Concurrent creators
+preserve the winning destination and warn. Disappearing files, permission
+failures, unavailable Git exclude lookup, resource exhaustion, and unsupported or
+read-only locations preserve the original and emit a warning while
+`--no-gitignore` keeps extraction usable.
+
+Linked worktrees resolve `info/exclude` through `git rev-parse --git-path`, with
+relative filesystem-decoded output resolved against the selected worktree. Git
+probes handle BOMs and first-column comments, skip non-regular or symlinked
+sources, preserve non-UTF-8 bytes, and clear repository-selection environment
+overrides. Non-regular destinations and Corpus paths containing pattern syntax or
+line breaks are rejected before modification. This small scope guard is
+orchestrator-owned input selection; Graphify still owns pattern evaluation and
+scanning.
+
 Graphify's manifest and cache decide which sources need work. The orchestrator
 uses its workflow state to suppress a new directory dispatch when it would
 silently resend a known failed or unknown input at the same version. This does

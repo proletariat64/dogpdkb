@@ -233,7 +233,8 @@ class Execution:
         self.published_images = set()
         self.fix_limit = self.settings.get("fix", 0)
         self.fixes = {}
-        self.result, self.ledger, self.artifacts = result, ledger, artifacts
+        self.result, self.artifacts = result, artifacts
+        self.ledger: Path | None = ledger
         self.retry = retry
         self.deadline = time.monotonic() + self.settings["max_seconds"]
         self.limit = self.settings["concurrency"]

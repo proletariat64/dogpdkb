@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -85,6 +87,180 @@ _NATIVE_ENV = {
 }
 
 
+def _active_ignore_rules(path):
+    try:
+        if path.is_symlink() or not path.is_file():
+            return False
+        content = path.read_bytes()
+    except FileNotFoundError:
+        return False
+    except PermissionError:
+        _warn_ignore_preserved(f"cannot read Git ignore source {path}")
+        return None
+    content = content.removeprefix(b"\xef\xbb\xbf")
+    return any(
+        line.removesuffix(b"\r").strip(b" ") and not line.startswith(b"#")
+        for line in content.split(b"\n")
+    )
+
+
+def _git_info_exclude(root):
+    if (root / ".git").is_dir():
+        return root / ".git/info/exclude"
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "rev-parse",
+                "--git-path",
+                "info/exclude",
+            ],
+            capture_output=True,
+            timeout=10,
+            check=False,
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if key not in {"GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"}
+            },
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValueError("cannot resolve the Git worktree exclude file") from error
+    if result.returncode:
+        raise ValueError("cannot resolve the Git worktree exclude file")
+    output = result.stdout.removesuffix(b"\n").removesuffix(b"\r")
+    path = Path(os.fsdecode(output))
+    return path if path.is_absolute() else root / path
+
+
+def _missing_whitelist(path, rules):
+    if path.is_symlink():
+        if not path.is_file():
+            raise ValueError(".graphifyignore symlink must resolve to a regular file")
+    elif path.exists() and not path.is_file():
+        raise ValueError(".graphifyignore must be a regular file")
+    try:
+        existing = path.read_bytes() if path.exists() else b""
+    except FileNotFoundError:
+        _warn_ignore_preserved("the ignore file disappeared during inspection")
+        return []
+
+    def key(line):
+        line = line.strip()
+        return b"!/" + line[1:].lstrip(b"/") if line.startswith(b"!") else line
+
+    present = {key(line) for line in existing.splitlines()}
+    return [rule for rule in rules if key(rule.encode()) not in present]
+
+
+def _warn_ignore_preserved(reason):
+    print(
+        f"dogpdkb: {reason}; keeping .graphifyignore unchanged and "
+        "continuing with --no-gitignore",
+        file=sys.stderr,
+    )
+
+
+def _ensure_corpus_whitelist(corpus):
+    """Provision a new Corpus whitelist without replacing operator files."""
+    corpus = corpus.resolve()
+    root = None
+    home = Path.home()
+    for directory in (corpus, *corpus.parents):
+        if (directory / ".git").exists():
+            root = directory
+            break
+        if directory == home:
+            break
+    if root is None:
+        return
+
+    relative = corpus.relative_to(root)
+    current_path = root
+    chain = [root]
+    for part in relative.parts:
+        current_path /= part
+        chain.append(current_path)
+    local_statuses = [
+        _active_ignore_rules(directory / ".gitignore") for directory in chain
+    ]
+    if any(status is None for status in local_statuses):
+        return
+    local_rules = any(local_statuses)
+    if not local_rules:
+        try:
+            info_exclude = _git_info_exclude(root)
+        except ValueError:
+            _warn_ignore_preserved("cannot resolve the Git exclude source")
+            return
+        info_status = _active_ignore_rules(info_exclude)
+        if info_status is None or not info_status:
+            return
+
+    anchor = root
+    observed_existing = False
+    for directory in reversed(chain):
+        candidate = directory / ".graphifyignore"
+        if candidate.is_symlink() or candidate.exists():
+            anchor = directory
+            observed_existing = True
+            break
+
+    relative = corpus.relative_to(anchor)
+    rules = []
+    current = ""
+    for part in relative.parts:
+        if any(character in part for character in "\0\r\n*?[]\\"):
+            raise ValueError("Corpus path cannot be represented in .graphifyignore")
+        current += f"/{part}"
+        rules.append(f"!{current}/")
+    rules.append(f"!{current}/**" if current else "!/**")
+
+    path = anchor / ".graphifyignore"
+    try:
+        missing = _missing_whitelist(path, rules)
+    except PermissionError:
+        _warn_ignore_preserved("cannot read the current Corpus whitelist")
+        return
+    if not missing:
+        return
+    if path.is_symlink() or path.exists():
+        _warn_ignore_preserved("the existing whitelist needs operator provisioning")
+        return
+    if observed_existing:
+        _warn_ignore_preserved("the existing whitelist disappeared before update")
+        return
+
+    temporary = None
+    try:
+        fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        temporary = Path(temporary_name)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write("\n".join(missing).encode() + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            _warn_ignore_preserved("the whitelist was created concurrently")
+    except PermissionError:
+        _warn_ignore_preserved("cannot create the Corpus whitelist")
+    except OSError as error:
+        if error.errno not in {
+            errno.EROFS,
+            errno.ENOTSUP,
+            errno.ENOSPC,
+            errno.EDQUOT,
+        }:
+            raise
+        _warn_ignore_preserved("the whitelist location has insufficient resources")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def _native_extract(command, corpus, token_budget, model, concurrency):
     argv = [
         *command,
@@ -93,6 +269,7 @@ def _native_extract(command, corpus, token_budget, model, concurrency):
         "--out",
         str(corpus),
         "--no-cluster",
+        "--no-gitignore",
         "--backend",
         "openai-oauth",
         "--max-concurrency",
@@ -313,6 +490,7 @@ def run_graph(
     graph_dir = settings.graph_for(book)
     graph_path = graph_dir / "graph.json"
     native_manifest = graph_dir / "manifest.json"
+    _ensure_corpus_whitelist(corpus)
     run.stage("graphify", total=len(pending), completed=0, failed=0, phase="prepare")
     evidence_root = store.path.parent / "graph-evidence"
     evidence_root.mkdir(parents=True, exist_ok=True)
