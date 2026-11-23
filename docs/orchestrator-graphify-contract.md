@@ -27,8 +27,9 @@ rules. Existing lines remain unchanged and retain their last-match priority, and
 a complete existing whitelist is not duplicated. No Git rules means no write or
 new permission requirement. A per-file lock serializes concurrent books, and
 updates use a same-directory temporary file plus atomic replacement after a
-last-moment type, identity, and byte comparison, including a second identity
-check after the final byte read. Hard-linked ignore files remain unchanged with a
+last-moment type, identity, and byte comparison. A previously absent destination
+is published with atomic no-overwrite link creation. Identity is checked again
+after the final byte read. Hard-linked ignore files remain unchanged with a
 warning rather than splitting shared configuration. Existing ownership and
 extended attributes, including POSIX ACLs, are copied while the replacement
 remains writable, before final mode restoration; inherited ACLs are cleared when

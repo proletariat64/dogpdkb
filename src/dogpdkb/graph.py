@@ -215,7 +215,7 @@ def _ensure_corpus_whitelist(corpus):
     anchor = root
     for directory in reversed(chain):
         candidate = directory / ".graphifyignore"
-        if candidate.exists() or candidate.is_symlink():
+        if candidate.is_symlink() or candidate.exists():
             anchor = directory
             break
 
@@ -300,7 +300,14 @@ def _ensure_corpus_whitelist(corpus):
                 raise ValueError(".graphifyignore changed during Corpus update")
             if _regular_identity(path) != identity:
                 raise ValueError(".graphifyignore changed during Corpus update")
-            os.replace(temporary, path)
+            if identity is None:
+                try:
+                    os.link(temporary, path)
+                except FileExistsError:
+                    _warn_ignore_preserved("the whitelist was created concurrently")
+                    return
+            else:
+                os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
     except PermissionError:

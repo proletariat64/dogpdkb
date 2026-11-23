@@ -922,6 +922,50 @@ def test_hardlinked_graphifyignore_is_preserved(tmp_path, capsys):
     assert "hard-linked" in capsys.readouterr().err
 
 
+def test_corpus_symlink_is_selected_before_exists(tmp_path, monkeypatch):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    target = tmp_path / "shared-rules"
+    target.write_bytes(b"!/**\n")
+    candidate = corpus / ".graphifyignore"
+    candidate.symlink_to(target)
+    real_exists = Path.exists
+
+    def guarded(path):
+        if path == candidate:
+            raise PermissionError("target is not traversable")
+        return real_exists(path)
+
+    monkeypatch.setattr(Path, "exists", guarded)
+    _ensure_corpus_whitelist(corpus)
+
+    assert candidate.is_symlink()
+    assert target.read_bytes() == b"!/**\n"
+
+
+def test_new_graphifyignore_publish_never_overwrites_concurrent_file(
+    tmp_path, monkeypatch, capsys
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    user_content = b"# Concurrent user rules\nignored.md\n"
+
+    def concurrent_create(source, destination):
+        Path(destination).write_bytes(user_content)
+        raise FileExistsError("exists")
+
+    monkeypatch.setattr("dogpdkb.graph.os.link", concurrent_create)
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == user_content
+    assert "created concurrently" in capsys.readouterr().err
+
+
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):
     config, manifest, source = fixture(tmp_path, title="Cafe\u0301")
     result = cli(config, manifest)
