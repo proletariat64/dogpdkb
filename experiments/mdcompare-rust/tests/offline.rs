@@ -207,3 +207,42 @@ fn strict_explanation_work_is_independent_of_the_machine_verdict() {
     assert_eq!(machine_report(&output), machine_report(&with_report));
     assert!(std::path::Path::new(with_report["artifacts"]["review"].as_str().unwrap()).is_file());
 }
+
+#[test]
+fn catalog_accepts_shared_snapshot_paths_and_rejects_candidate_alias_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("first.md"), "![Captured](alias.md)\n").unwrap();
+    fs::write(root.join("second.md"), "# Captured\n").unwrap();
+    std::os::unix::fs::symlink("second.md", root.join("alias.md")).unwrap();
+    let descriptor = |id, file| {
+        json!({
+            "knowledge_base":"book","document_id":id,"baseline":null,
+            "incoming":{"path":file,"content_kind":"raw",
+                "metadata":{"name":"Captured","logical_path":"Example","source_ref":"book"}}
+        })
+    };
+    let work = json!({"schema_version":"mdcompare-work-1","operation":"catalog",
+        "documents":[descriptor("first","first.md"),descriptor("second","second.md")]});
+    let plan = root.join("catalog.json");
+    fs::write(&plan, work.to_string()).unwrap();
+    let completed = stdout(&invoke(&plan, "run", &[]), 0);
+    let report: Value = serde_json::from_slice(
+        &fs::read(completed["artifacts"]["result"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        report["results"][0]["resources"][0]["path"],
+        json!(root.join("second.md"))
+    );
+
+    let frozen = root.join("frozen.json");
+    fs::write(&frozen, work.to_string()).unwrap();
+    stdout(&invoke(&frozen, "accept", &[]), 0);
+    fs::remove_file(root.join("alias.md")).unwrap();
+    std::os::unix::fs::symlink("first.md", root.join("alias.md")).unwrap();
+    assert_eq!(
+        stdout(&invoke(&frozen, "run", &[]), 1)["reason_code"],
+        "input_drift"
+    );
+}

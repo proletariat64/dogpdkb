@@ -8,6 +8,12 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+pub(crate) struct Snapshots {
+    pub baseline: BTreeMap<Identity, Document>,
+    pub incoming: BTreeMap<Identity, Document>,
+    pub order: Vec<Identity>,
+}
+
 pub(crate) fn run(plan: &Path, config: Option<&Path>, progress: &Progress) -> Result<Outcome> {
     let (workspace, frozen) = workspace::accept(plan, config)?;
     if let Some(commit) = workspace::verify_commit(&workspace)? {
@@ -39,6 +45,12 @@ pub(crate) fn run(plan: &Path, config: Option<&Path>, progress: &Progress) -> Re
         }
     }
 
+    let snapshots = Snapshots {
+        baseline: old,
+        incoming: new,
+        order,
+    };
+    let total = snapshots.incoming.len();
     let compare = &frozen.settings.compare;
     let report = &frozen.settings.report;
     let options = Options {
@@ -49,42 +61,39 @@ pub(crate) fn run(plan: &Path, config: Option<&Path>, progress: &Progress) -> Re
         chars: report.max_excerpt_chars.unwrap_or(8000),
         char_region: 4096,
     };
-    let mut reader = Reader::new_frozen(options.file_bytes, &frozen.inputs);
-    progress.update("compare", 0, new.len(), 0, 0);
+    let mut reader = Reader::new_frozen(options.file_bytes, &frozen.inputs, &frozen.presence);
+    progress.update("compare", 0, total, 0, 0);
     let mut artifacts = vec!["result.json"];
     let operation = frozen.work.operation;
     let result = match operation {
         Operation::Semantic => {
             crate::semantic::compare_documents(
-                &old,
-                &new,
-                &order,
+                &snapshots,
                 stage.path(),
                 frozen.work.body_recovery.as_deref(),
                 &options,
                 &mut reader,
+                progress,
             )?;
             artifacts.push("diff-index.json");
             None
         }
         Operation::Knowledge => Some(crate::knowledge::compare_documents(
-            &old,
-            &new,
-            &order,
+            &snapshots,
             &options,
             &mut reader,
+            progress,
         )),
         Operation::Strict => Some(crate::compare::compare_documents(
-            &old,
-            &new,
-            &order,
+            &snapshots,
             &options,
             &mut reader,
+            progress,
         )?),
         Operation::Catalog => Some(crate::catalog::catalog_documents(
-            &new,
-            &order,
+            &snapshots,
             &mut reader,
+            progress,
         )?),
     };
 
@@ -133,7 +142,7 @@ pub(crate) fn run(plan: &Path, config: Option<&Path>, progress: &Progress) -> Re
         }
         workspace::atomic_write(&stage.path().join("result.json"), &json_bytes(&result)?)?;
     }
-    progress.update("publish", new.len(), new.len(), 0, 0);
+    progress.update("publish", total, total, 0, 0);
     for name in artifacts
         .iter()
         .copied()

@@ -1,3 +1,4 @@
+use crate::{offline::Snapshots, summary::Progress};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -437,14 +438,18 @@ fn emit(directory: &Path, diff_root: &Path, count: usize, evidence: &Value) -> R
 }
 
 pub(crate) fn compare_documents(
-    old: &BTreeMap<Identity, Document>,
-    new: &BTreeMap<Identity, Document>,
-    order: &[Identity],
+    snapshots: &Snapshots,
     staging: &Path,
     recovery_path: Option<&Path>,
     options: &Options,
     reader: &mut Reader,
+    progress: &Progress,
 ) -> Result<()> {
+    let Snapshots {
+        baseline: old,
+        incoming: new,
+        order,
+    } = snapshots;
     let recovery = load_recovery(recovery_path, reader)?;
     let directory = staging.join("evidence");
     fs::DirBuilder::new().mode(0o700).create(&directory)?;
@@ -479,6 +484,7 @@ pub(crate) fn compare_documents(
             .or_default() += 1;
         results.push(outcome);
         documents.push(emit(&directory, staging, documents.len(), &evidence)?);
+        progress.update("compare", results.len(), new.len(), 0, 0);
     }
     ensure!(reader.changed_paths().is_empty(), "input_drift");
     let baseline_only: Vec<_> = order
