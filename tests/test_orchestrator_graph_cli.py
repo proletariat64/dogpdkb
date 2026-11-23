@@ -540,6 +540,70 @@ def test_git_exclude_relative_output_uses_worktree_root(tmp_path, monkeypatch):
     assert "--path-format=absolute" not in calls[0]
 
 
+def test_corpus_whitelist_aborts_replace_after_external_edit(tmp_path, monkeypatch):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    ignore_file.write_bytes(b"# Original\nignored.md\n")
+    external = b"# Operator edit\nnew-exclusion.md\n"
+    real_fsync = os.fsync
+
+    def edit_before_replace(fd):
+        ignore_file.write_bytes(external)
+        real_fsync(fd)
+
+    monkeypatch.setattr("dogpdkb.graph.os.fsync", edit_before_replace)
+    with pytest.raises(ValueError, match="changed during"):
+        _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == external
+
+
+def test_corpus_whitelist_preserves_ownership_and_xattrs(tmp_path, monkeypatch):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    ignore_file.write_bytes(b"# Original\nignored.md\n")
+    copied = []
+    real_chown = os.chown
+
+    def attributes(path, *, follow_symlinks):
+        return ["user.fixture"] if Path(path) == ignore_file else []
+
+    def read_attribute(path, name, *, follow_symlinks):
+        assert (Path(path), name) == (ignore_file, "user.fixture")
+        return b"attribute-value"
+
+    def write_attribute(path, name, value, *, follow_symlinks):
+        copied.append((Path(path).name, name, value))
+
+    def change_owner(path, uid, gid):
+        copied.append((Path(path).name, uid, gid))
+        real_chown(path, uid, gid)
+
+    monkeypatch.setattr("dogpdkb.graph.os.listxattr", attributes)
+    monkeypatch.setattr("dogpdkb.graph.os.getxattr", read_attribute)
+    monkeypatch.setattr("dogpdkb.graph.os.setxattr", write_attribute)
+    monkeypatch.setattr("dogpdkb.graph.os.chown", change_owner)
+    _ensure_corpus_whitelist(corpus)
+
+    stat = ignore_file.stat()
+    assert any(
+        entry[1:] == (stat.st_uid, stat.st_gid)
+        for entry in copied
+        if entry[0] != "user.fixture"
+    )
+    assert any(
+        name == "user.fixture" and value == b"attribute-value"
+        for _, name, value in copied
+        if name == "user.fixture"
+    )
+
+
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):
     config, manifest, source = fixture(tmp_path, title="Cafe\u0301")
     result = cli(config, manifest)

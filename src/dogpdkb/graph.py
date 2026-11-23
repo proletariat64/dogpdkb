@@ -206,7 +206,7 @@ def _ensure_corpus_whitelist(corpus):
         existing = path.read_bytes() if path.exists() else b""
         # Existing Graphify rules come later and retain their bytes and priority.
         content = "\n".join(missing).encode() + b"\n" + existing
-        mode = path.stat().st_mode if path.exists() else None
+        stat = path.stat() if path.exists() else None
         fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         temporary = Path(temporary_name)
         try:
@@ -214,8 +214,15 @@ def _ensure_corpus_whitelist(corpus):
                 stream.write(content)
                 stream.flush()
                 os.fsync(stream.fileno())
-            if mode is not None:
-                os.chmod(temporary, mode)
+            if stat is not None:
+                os.chmod(temporary, stat.st_mode)
+                os.chown(temporary, stat.st_uid, stat.st_gid)
+                for attribute in os.listxattr(path, follow_symlinks=False):
+                    value = os.getxattr(path, attribute, follow_symlinks=False)
+                    os.setxattr(temporary, attribute, value, follow_symlinks=False)
+            current = path.read_bytes() if path.exists() else b""
+            if current != existing:
+                raise ValueError(".graphifyignore changed during Corpus update")
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
