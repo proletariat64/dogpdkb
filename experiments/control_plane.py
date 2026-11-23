@@ -73,7 +73,7 @@ def graph(db):
         for doc, version in rows:
             db.execute("UPDATE docs SET status='compiled' WHERE doc=? AND version=? AND stage=3",
                        (doc, version))
-    return {"batch": batch_id, "compiled": rows}
+    return {"batch": batch_id, "compiled": [list(row) for row in rows]}
 
 def main():
     parser = argparse.ArgumentParser()
