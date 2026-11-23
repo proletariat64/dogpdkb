@@ -11,6 +11,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
+from dogpdkb import rust_mdcompare
 from dogpdkb.directory_snapshot import (
     copy_snapshot,
     observe_resources,
@@ -260,39 +261,59 @@ def _directory_listing(settings, book, run, source):
 def _catalog_directory(settings, book, run, source, documents):
     request = run.directory / f"directory-{source.key}-descriptors.json"
     report = run.directory / f"directory-{source.key}-catalog.json"
-    atomic_json(
-        request,
-        {
-            "schema_version": "1.0",
-            "documents": [
-                descriptor(book, row, source.path / row["source_document_id"])
-                for row in documents.values()
-            ],
-        },
-    )
-    argv = [
-        *settings.command("mdcompare"),
-        "catalog",
-        "--input",
-        str(request),
-        "--output",
-        str(report),
+    snapshots = [
+        descriptor(book, row, source.path / row["source_document_id"])
+        for row in documents.values()
     ]
-    code = run_command(argv, log=report.with_suffix(".log"))
-    if code:
-        raise DiscoverError(
-            f"directory resource catalog failed with exit {code}",
-            code if code in {130, 143} else 1,
+    if rust_mdcompare.selected(settings):
+        try:
+            catalog = rust_mdcompare.compare(
+                settings,
+                run,
+                request,
+                "catalog",
+                [],
+                snapshots,
+            )
+        except InterruptedError as error:
+            raise DiscoverError(
+                "directory resource catalog interrupted", error.args[0]
+            ) from error
+        except (OSError, ValueError) as error:
+            raise DiscoverError("directory resource catalog unavailable") from error
+        catalog_rows = catalog.payload["results"]
+    else:
+        atomic_json(
+            request,
+            {
+                "schema_version": "1.0",
+                "documents": snapshots,
+            },
         )
-    result = read_json(report)
-    if (
-        not isinstance(result, dict)
-        or result.get("schema_version") != "1.0"
-        or not isinstance(result.get("documents"), list)
-    ):
-        raise DiscoverError("invalid directory resource catalog")
+        argv = [
+            *settings.command("mdcompare"),
+            "catalog",
+            "--input",
+            str(request),
+            "--output",
+            str(report),
+        ]
+        code = run_command(argv, log=report.with_suffix(".log"))
+        if code:
+            raise DiscoverError(
+                f"directory resource catalog failed with exit {code}",
+                code if code in {130, 143} else 1,
+            )
+        result = read_json(report)
+        if (
+            not isinstance(result, dict)
+            or result.get("schema_version") != "1.0"
+            or not isinstance(result.get("documents"), list)
+        ):
+            raise DiscoverError("invalid directory resource catalog")
+        catalog_rows = result["documents"]
     seen = set()
-    for item in result["documents"]:
+    for item in catalog_rows:
         identity = item.get("document_id") if isinstance(item, dict) else None
         row = documents.get(identity)
         if row is None or identity in seen or item.get("knowledge_base") != book.key:

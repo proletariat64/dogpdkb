@@ -56,8 +56,13 @@ def freeze_policy(settings, store, run):
                 for name in ("mdcompare", "mdocr", "graphify", "skylark")
             },
             "ocr_cache": str(settings.ocr_cache),
+            "mdcompare_config": str(settings.mdcompare_config)
+            if settings.mdcompare_config
+            else None,
             "body_recovery": str(source) if source else None,
         }
+        if "mdcompare_rust" in settings.tools:
+            policy["tools"]["mdcompare_rust"] = settings.command("mdcompare_rust")
         policy["graphify_model"] = settings.graphify_model
         policy["graphify_token_budget"] = settings.graphify_token_budget
         policy["graphify_concurrency"] = settings.graphify_concurrency
@@ -72,6 +77,9 @@ def freeze_policy(settings, store, run):
         # Legacy policies lacked concurrency; preserve historical CLI default.
         graphify_concurrency=policy.get("graphify_concurrency", 3),
         tools=policy["tools"],
+        mdcompare_config=Path(policy["mdcompare_config"])
+        if policy.get("mdcompare_config")
+        else None,
         ocr_cache=Path(policy["ocr_cache"]),
         body_recovery=Path(policy["body_recovery"])
         if policy["body_recovery"]
