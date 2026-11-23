@@ -66,8 +66,8 @@ mdcompare run --plan work.json >summary.json 2>>mdcompare.log
 
 - `operation` 明确取 `semantic`、`knowledge`、`strict`、`catalog` 之一，每张工作单执行一种比较或盘点。如需多种诊断，由调用方创建各自工作单。
 - `documents` 按提交顺序输出，空批次合法。每个条目至少一侧非空，缺侧用 `null`。baseline-only 只进入提示，不由工具解释为删除。catalog 只接受 incoming。
-- 文档身份在条目层提供一次。每侧描述捕获的快照，可包含 `content_kind`、`metadata`、`provenance`、`body_scope`、`resources`、`ocr`。strict 要求明确资源声明，空数组仍按正文实际引用核验。catalog 可以从缺省资源声明开始盘点。
-- 仅 `semantic` 工作单可带 `body_recovery`，引用 `mdcompare-body-recovery-1`。每项指定作用域身份、baseline/incoming、与原文逐字节相同的本地见证，以及按原始 UTF-8 字节偏移排序的插入。只接受生成区域边界标记或换行。修复清单与 witness 均参与接受时绑定。只在内存投影正文，证据保存原始坐标。
+- 文档身份在条目层提供一次。`content_kind` 取 `raw` 或 `enriched`。每侧描述捕获的快照，可包含 `content_kind`、`metadata`、`provenance`、`body_scope`、`resources`、`ocr`。strict 要求明确资源声明，空数组仍按正文实际引用核验。catalog 可以从缺省资源声明开始盘点。
+- 仅 `semantic` 工作单可带 `body_recovery`，引用 `mdcompare-body-recovery-1`。每项指定作用域身份、baseline/incoming、与原文逐字节相同的本地见证，以及按原始 UTF-8 字节偏移排序的插入。只接受生成区域边界标记或换行。修复清单与 witness 均参与接受时绑定。只在内存投影正文，证据保存原始坐标。正文投影只识别明确配对的生成区域边界及已声明的范围。
 - `draft` 只创建工作单文件。新文件使用独立本地身份和可编辑的快照元数据。批量输入仍由有身份和快照知识的上游生成。
 
 ## 操作、配置和输出
