@@ -40,7 +40,7 @@ fn read_json(dir: &Path, path: &str) -> Value {
     serde_json::from_slice(&fs::read(dir.join(path)).unwrap()).unwrap()
 }
 
-fn fixtures() -> TempDir {
+fn fixtures(baseline_kind: &str) -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join("prior.md"),
@@ -53,18 +53,18 @@ fn fixtures() -> TempDir {
     )
     .unwrap();
     let doc = |knowledge_base: &str| {
-        let snapshot = |path| {
+        let snapshot = |path, content_kind| {
             json!({
                 "path": path,
-                "content_kind": "raw",
+                "content_kind": content_kind,
                 "metadata": {"name": "Transfer limits", "logical_path": "Limits", "source_ref": "42"}
             })
         };
         json!({
             "knowledge_base": knowledge_base,
             "document_id": "42",
-            "baseline": snapshot("prior.md"),
-            "incoming": snapshot("current.md"),
+            "baseline": snapshot("prior.md", baseline_kind),
+            "incoming": snapshot("current.md", "raw"),
         })
     };
     write_json(
@@ -203,7 +203,7 @@ fn start(dir: &Path, resume: bool) -> Child {
 
 #[test]
 fn admitted_request_is_not_replayed_after_interruption() {
-    let dir = fixtures();
+    let dir = fixtures("raw");
     let listener = listener(dir.path(), 1);
     let mut child = start(dir.path(), false);
     let (_socket, _) = request(&listener, &mut child, dir.path());
@@ -235,7 +235,7 @@ fn admitted_request_is_not_replayed_after_interruption() {
 
 #[test]
 fn cancellation_waits_for_in_flight_work_and_explicit_resume_only_sends_pending() {
-    let dir = fixtures();
+    let dir = fixtures("raw");
     let listener = listener(dir.path(), 2);
     let mut child = start(dir.path(), false);
     let (mut socket, body) = request(&listener, &mut child, dir.path());
@@ -282,7 +282,7 @@ fn cancellation_waits_for_in_flight_work_and_explicit_resume_only_sends_pending(
 
 #[test]
 fn zero_budget_publishes_proven_unsent_rows_without_credentials() {
-    let dir = fixtures();
+    let dir = fixtures("raw");
     fs::write(
         dir.path().join("default.toml"),
         "[score]\nrequest_budget = 0\n",
@@ -303,7 +303,7 @@ fn zero_budget_publishes_proven_unsent_rows_without_credentials() {
 
 #[test]
 fn rate_limit_at_minimum_concurrency_leaves_pending_documents_unsent() {
-    let dir = fixtures();
+    let dir = fixtures("enriched");
     let listener = listener(dir.path(), 2);
     let mut child = start(dir.path(), false);
     let (mut socket, _) = request(&listener, &mut child, dir.path());
@@ -327,7 +327,7 @@ fn rate_limit_at_minimum_concurrency_leaves_pending_documents_unsent() {
 
 #[test]
 fn interruption_after_admission_before_connection_does_not_replay() {
-    let dir = fixtures();
+    let dir = fixtures("raw");
     let listener = listener(dir.path(), 1);
     // Linux retains one pending connection for backlog zero. Fill that slot
     // before launching the scorer, so no scoring HTTP bytes can be sent yet.
@@ -368,7 +368,7 @@ fn interruption_after_admission_before_connection_does_not_replay() {
 
 #[test]
 fn removing_the_score_workspace_cannot_reset_an_initialized_request_budget() {
-    let dir = fixtures();
+    let dir = fixtures("raw");
     let listener = listener(dir.path(), 1);
     let mut child = start(dir.path(), false);
     let (_socket, _) = request(&listener, &mut child, dir.path());

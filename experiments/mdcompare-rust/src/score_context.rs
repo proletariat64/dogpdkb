@@ -104,7 +104,7 @@ pub fn prepare(bytes: &[u8]) -> Result<Result<Packet, &'static str>> {
     ) else {
         return Ok(Err("SOURCE_NOT_SCOREABLE"));
     };
-    if !matches!(old.content_kind.as_str(), "raw" | "historical_enriched")
+    if !matches!(old.content_kind.as_str(), "raw" | "enriched")
         || new.content_kind != "raw"
         || ["name", "logical_path"]
             .iter()
