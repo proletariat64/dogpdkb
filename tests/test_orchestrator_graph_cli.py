@@ -604,6 +604,76 @@ def test_corpus_whitelist_preserves_ownership_and_xattrs(tmp_path, monkeypatch):
     )
 
 
+def test_corpus_whitelist_clears_inherited_acl(tmp_path, monkeypatch):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    ignore_file.write_bytes(b"# Original\nignored.md\n")
+    removed = []
+
+    def attributes(path, *, follow_symlinks):
+        return [] if Path(path) == ignore_file else ["system.posix_acl_access"]
+
+    def remove_attribute(path, name, *, follow_symlinks):
+        removed.append((Path(path).name, name))
+
+    monkeypatch.setattr("dogpdkb.graph.os.listxattr", attributes)
+    monkeypatch.setattr("dogpdkb.graph.os.removexattr", remove_attribute)
+    _ensure_corpus_whitelist(corpus)
+
+    assert removed and all(name == "system.posix_acl_access" for _, name in removed)
+
+
+def test_corpus_whitelist_chown_denied_preserves_original(
+    tmp_path, monkeypatch, capsys
+):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"# Original\nignored.md\n"
+    ignore_file.write_bytes(original)
+
+    def denied(path, uid, gid):
+        raise PermissionError("EPERM")
+
+    monkeypatch.setattr("dogpdkb.graph.os.chown", denied)
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == original
+    assert "continuing with --no-gitignore" in capsys.readouterr().err
+
+
+def test_corpus_whitelist_rejects_symlink_added_at_lock(tmp_path, monkeypatch):
+    import fcntl
+
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    ignore_file.write_bytes(b"# Original\nignored.md\n")
+    target = tmp_path / "shared-rules"
+    original_target = b"# Shared\nother.md\n"
+    target.write_bytes(original_target)
+    real_flock = fcntl.flock
+
+    def replace_with_symlink(fd, operation):
+        real_flock(fd, operation)
+        ignore_file.unlink()
+        ignore_file.symlink_to(target)
+
+    monkeypatch.setattr("dogpdkb.graph.fcntl.flock", replace_with_symlink)
+    with pytest.raises(ValueError, match="regular file"):
+        _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.is_symlink()
+    assert target.read_bytes() == original_target
+
+
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):
     config, manifest, source = fixture(tmp_path, title="Cafe\u0301")
     result = cli(config, manifest)
