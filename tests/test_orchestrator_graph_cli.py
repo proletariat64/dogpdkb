@@ -301,6 +301,85 @@ def test_corpus_whitelist_serializes_concurrent_books(tmp_path):
         assert rules.count(f"!/corpus/book-{index}/**") == 1
 
 
+def test_corpus_whitelist_supports_linked_worktree_exclude_file(tmp_path):
+    root = tmp_path / "root"
+    subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+    (root / ".git/info/exclude").write_text("*\n")
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    linked = tmp_path / "linked"
+    subprocess.run(
+        ["git", "-C", str(root), "worktree", "add", "--detach", str(linked)],
+        check=True,
+        capture_output=True,
+    )
+    corpus = linked / "corpus"
+    corpus.mkdir()
+
+    _ensure_corpus_whitelist(corpus)
+
+    assert (linked / ".graphifyignore").read_bytes() == b"!/corpus/\n!/corpus/**\n"
+
+
+def test_corpus_whitelist_ignores_non_utf8_git_comment(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_bytes(b"# legacy \xff comment\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+
+    _ensure_corpus_whitelist(corpus)
+
+    assert not (tmp_path / ".graphifyignore").exists()
+    assert not (tmp_path / ".graphifyignore.lock").exists()
+
+
+def test_complete_corpus_whitelist_needs_no_lock_or_write(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    ignore_file = tmp_path / ".graphifyignore"
+    original = b"!/corpus/\n!/corpus/**\n# Existing rules\nignored.md\n"
+    ignore_file.write_bytes(original)
+
+    _ensure_corpus_whitelist(corpus)
+
+    assert ignore_file.read_bytes() == original
+    assert not (tmp_path / ".graphifyignore.lock").exists()
+
+
+def test_corpus_whitelist_rejects_symlink_update(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("*\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    target = tmp_path / "shared-ignore"
+    original = b"# Shared user rules\nignored.md\n"
+    target.write_bytes(original)
+    (tmp_path / ".graphifyignore").symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlinked"):
+        _ensure_corpus_whitelist(corpus)
+
+    assert target.read_bytes() == original
+    assert not (tmp_path / ".graphifyignore.lock").exists()
+
+
 def test_graph_input_digest_uses_native_normalized_source_identity(tmp_path):
     config, manifest, source = fixture(tmp_path, title="Cafe\u0301")
     result = cli(config, manifest)

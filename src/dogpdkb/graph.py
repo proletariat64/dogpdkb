@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -88,12 +89,47 @@ _NATIVE_ENV = {
 
 def _active_ignore_rules(path):
     try:
-        text = path.read_text(encoding="utf-8")
+        content = path.read_bytes()
     except FileNotFoundError:
         return False
     return any(
-        line.strip() and not line.lstrip().startswith("#") for line in text.splitlines()
+        line.strip() and not line.lstrip().startswith(b"#")
+        for line in content.splitlines()
     )
+
+
+def _git_info_exclude(root):
+    if (root / ".git").is_dir():
+        return root / ".git/info/exclude"
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/exclude",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode:
+        raise ValueError("cannot resolve the Git worktree exclude file")
+    return Path(result.stdout.strip())
+
+
+def _missing_whitelist(path, rules):
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def key(line):
+        line = line.strip()
+        return "!/" + line[1:].lstrip("/") if line.startswith("!") else line
+
+    present = {key(line) for line in existing.splitlines()}
+    return [rule for rule in rules if key(rule) not in present]
 
 
 def _ensure_corpus_whitelist(corpus):
@@ -116,7 +152,7 @@ def _ensure_corpus_whitelist(corpus):
     for part in relative.parts:
         current_path /= part
         chain.append(current_path)
-    if not _active_ignore_rules(root / ".git/info/exclude") and not any(
+    if not _active_ignore_rules(_git_info_exclude(root)) and not any(
         _active_ignore_rules(directory / ".gitignore") for directory in chain
     ):
         return
@@ -137,21 +173,19 @@ def _ensure_corpus_whitelist(corpus):
         rules.append(f"!{current}/")
     rules.append(f"!{current}/**" if current else "!/**")
 
-    path = (anchor / ".graphifyignore").resolve()
+    path = anchor / ".graphifyignore"
+    if not _missing_whitelist(path, rules):
+        return
+    if path.is_symlink():
+        raise ValueError("provision Corpus whitelist in the symlinked .graphifyignore")
     lock_path = path.with_name(path.name + ".lock")
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
-        existing = path.read_text(encoding="utf-8") if path.exists() else ""
-
-        def key(line):
-            line = line.strip()
-            return "!/" + line[1:].lstrip("/") if line.startswith("!") else line
-
-        present = {key(line) for line in existing.splitlines()}
-        missing = [rule for rule in rules if key(rule) not in present]
+        missing = _missing_whitelist(path, rules)
         if not missing:
             return
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
         # Existing Graphify rules come later and retain their last-match priority.
         content = "\n".join(missing) + "\n" + existing
         mode = path.stat().st_mode if path.exists() else None

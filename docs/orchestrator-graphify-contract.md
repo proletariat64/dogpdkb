@@ -26,8 +26,11 @@ configured Corpus path and its parent directories before that file's existing
 rules. Existing lines remain unchanged and retain their last-match priority, and
 a complete existing whitelist is not duplicated. No Git rules means no write or
 new permission requirement. A per-file lock serializes concurrent books, and
-updates use a same-directory temporary file plus atomic replacement. Corpus
-paths containing pattern syntax or line breaks are rejected before modification. This
+updates use a same-directory temporary file plus atomic replacement. Complete
+whitelists require no lock or write. Linked worktrees resolve `info/exclude`
+through Git, and Git ignore probes tolerate non-UTF-8 bytes. Corpus paths
+containing pattern syntax or line breaks are rejected before modification, as
+are symlinked ignore files that require an update. This
 small scope guard is orchestrator-owned input selection; Graphify still owns
 pattern evaluation and scanning.
 
