@@ -51,5 +51,5 @@ cancellation, resume with `--resume`. Use `assemble` to recover already accepted
 results locally. Purge is explicit and preserves published Markdown.
 
 Use `mdocr --help` to browse commands and `mdocr help all` for the full embedded
-contract. The [product specification](../../.scratch/mdocr-rust-cli/spec.md)
+contract. The [product specification](../.scratch/mdocr-rust-cli/spec.md)
 covers image syntax, provider support, and batch artifacts.
