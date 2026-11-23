@@ -171,6 +171,10 @@ fn doctor_rejects_invalid_provider_policy_and_reports_a_bad_ca_file() {
             "proxy_url = \"http://user:private-value@127.0.0.1:1\"",
             "without credentials",
         ),
+        (
+            "effort = \"https://private-value.invalid/model\"",
+            "unsupported value at line 1",
+        ),
     ] {
         fs::write(&config, contents).unwrap();
         let invalid = doctor(root.path(), Some(&config));
@@ -178,6 +182,7 @@ fn doctor_rejects_invalid_provider_policy_and_reports_a_bad_ca_file() {
         let stderr = String::from_utf8(invalid.stderr).unwrap();
         assert!(stderr.contains(diagnostic), "{stderr}");
         assert!(!stderr.contains("private-value"));
+        assert!(!String::from_utf8_lossy(&invalid.stdout).contains("private-value"));
     }
 
     fs::write(root.path().join("invalid.pem"), "no certificate\n").unwrap();

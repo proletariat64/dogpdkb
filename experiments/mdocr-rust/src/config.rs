@@ -90,14 +90,19 @@ pub(crate) fn source(work: Option<&Path>, explicit: Option<&Path>) -> Result<Opt
 }
 
 pub(crate) fn load(work: Option<&Path>, explicit: Option<&Path>) -> Result<Value> {
-    load_from(source(work, explicit)?.as_deref())
+    load_from(source(work, explicit)?.as_deref(), false)
 }
 
-fn load_from(source: Option<&Path>) -> Result<Value> {
+fn load_from(source: Option<&Path>, redact_toml_values: bool) -> Result<Value> {
     let (options, directory) = if let Some(path) = source {
         let text = read_text_file(path, "configuration")?;
         let options: Options = toml::from_str(&text).map_err(|error| {
-            anyhow::anyhow!("invalid TOML in {}: {}", path.display(), error.message())
+            let diagnostic = if redact_toml_values {
+                redacted_toml_error(&text, &error)
+            } else {
+                error.message().to_owned()
+            };
+            anyhow::anyhow!("invalid TOML in {}: {diagnostic}", path.display())
         })?;
         let directory = path
             .parent()
@@ -107,6 +112,33 @@ fn load_from(source: Option<&Path>) -> Result<Value> {
         (Options::default(), None)
     };
     options.effective(directory)
+}
+
+fn redacted_toml_error(text: &str, error: &toml::de::Error) -> String {
+    let message = error.message();
+    let kind = if message.starts_with("unknown field") {
+        "unknown field"
+    } else if message.starts_with("unknown variant") {
+        "unsupported value"
+    } else if message.starts_with("invalid type") {
+        "invalid type"
+    } else if message.starts_with("duplicate") {
+        "duplicate field"
+    } else {
+        "invalid syntax or value"
+    };
+    let Some(prefix) = error.span().and_then(|span| text.get(..span.start)) else {
+        return kind.to_owned();
+    };
+    let line = prefix.bytes().filter(|&byte| byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit('\n')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .count()
+        + 1;
+    format!("{kind} at line {line}, column {column}")
 }
 
 fn read_text_file(path: &Path, label: &str) -> Result<String> {
@@ -334,7 +366,7 @@ fn embedded_image_check() -> bool {
 
 pub(crate) fn doctor(explicit: Option<&Path>) -> Result<(u8, Value)> {
     let source = source(None, explicit)?;
-    let settings = load_from(source.as_deref())?;
+    let settings = load_from(source.as_deref(), true)?;
     let mode = settings["mode"]
         .as_str()
         .context("configuration missing provider mode")?;
