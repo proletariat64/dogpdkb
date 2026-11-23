@@ -1,12 +1,9 @@
-use crate::input::{
-    Document, Reader, check_output, json_bytes, load, publish as publish_outputs, referenced_paths,
-    resolved,
-};
+use crate::input::{Document, Identity, Reader, resolved};
 use crate::resources::{decoded, entries, split_url, uses};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn absolute(doc: &Document, entry: &mut Value, key: &str) -> Result<()> {
     if let Some(path) = entry[key].as_str() {
@@ -15,30 +12,55 @@ fn absolute(doc: &Document, entry: &mut Value, key: &str) -> Result<()> {
     Ok(())
 }
 
-// Duplicate declared IDs keep their final declared value and first position,
-// matching manifest-catalog behavior. The comparison independently validates
-// uniqueness when reading its evidence manifest.
-fn declarations(doc: &Document) -> (Vec<Value>, BTreeMap<&str, usize>) {
+fn declarations(doc: &Document) -> Result<(Vec<Value>, BTreeMap<&str, usize>)> {
     let mut declared = Vec::new();
     let mut by_id = BTreeMap::new();
     for value in entries(doc) {
-        if let Some(id) = value["resource_id"].as_str() {
-            if let Some(&index) = by_id.get(id) {
-                declared[index] = value.clone();
-            } else {
-                by_id.insert(id, declared.len());
-                declared.push(value.clone());
-            }
-        }
+        let id = value["resource_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .context("RESOURCE_SCHEMA_INVALID")?;
+        ensure!(
+            by_id.insert(id, declared.len()).is_none(),
+            "RESOURCE_ID_COLLISION"
+        );
+        declared.push(value.clone());
     }
-    (declared, by_id)
+    Ok((declared, by_id))
 }
 
-fn catalog_document(
-    doc: &Document,
-    reader: &mut Reader,
-    protected: &mut Vec<PathBuf>,
-) -> Result<Value> {
+fn candidate(doc: &Document, url: &str) -> Result<Option<PathBuf>> {
+    let cleaned = url.replace(['\r', '\n', '\t'], "");
+    let target = split_url(&cleaned).context("RESOURCE_SYNTAX_UNVERIFIED")?;
+    if !target.scheme.is_empty() || !target.host.is_empty() {
+        return Ok(None);
+    }
+    let parent = doc.path.parent().context("INPUT_PATH_INVALID")?;
+    Ok(Some(resolved(&parent.join(decoded(target.path)))?))
+}
+
+pub(crate) fn local_candidates(doc: &Document, bytes: &[u8]) -> Result<Vec<PathBuf>> {
+    let (declared, _) = declarations(doc)?;
+    let by_url: BTreeMap<_, _> = declared
+        .iter()
+        .filter_map(|entry| Some((entry["url"].as_str()?, entry)))
+        .collect();
+    let (references, _) = uses(bytes, &by_url.keys().copied().collect());
+    let mut paths = Vec::new();
+    for usage in references {
+        let path = match by_url
+            .get(usage.url.as_str())
+            .and_then(|entry| entry["path"].as_str())
+        {
+            Some(path) => Some(resolved(&doc.resolve(path))?),
+            None => candidate(doc, &usage.url)?,
+        };
+        paths.extend(path);
+    }
+    Ok(paths)
+}
+
+fn catalog_document(doc: &Document, data: &[u8], reader: &mut Reader) -> Result<Value> {
     let mut row = doc.raw.clone();
     ensure!(
         row.get("resources").is_none_or(Value::is_array),
@@ -61,17 +83,16 @@ fn catalog_document(
         }
     }
 
-    let (declared, by_id) = declarations(doc);
+    let (declared, by_id) = declarations(doc)?;
     let mut by_url = BTreeMap::new();
     for entry in &declared {
         if let Some(url) = entry["url"].as_str() {
             by_url.entry(url).or_insert(entry);
         }
     }
-    let data = reader.read(&doc.path).map_err(anyhow::Error::msg)?;
     let declared_urls = by_url.keys().copied().collect();
-    let (used, warnings) = uses(&data, &declared_urls);
-    let historical = doc.content_kind() == "historical_enriched";
+    let (used, warnings) = uses(data, &declared_urls);
+    let historical = doc.content_kind() == "enriched";
     let mut resources = Vec::new();
     let mut retained = BTreeSet::new();
     if historical {
@@ -101,51 +122,58 @@ fn catalog_document(
         entry["kind"] = json!(usage.kind);
         if entry["path"].is_string() {
             absolute(doc, &mut entry, "path")?;
-        } else {
-            let cleaned = usage.url.replace(['\r', '\n', '\t'], "");
-            let target = split_url(&cleaned).context("RESOURCE_SYNTAX_UNVERIFIED")?;
-            if target.scheme.is_empty() && target.host.is_empty() {
-                let parent = doc.path.parent().context("INPUT_PATH_INVALID")?;
-                let candidate = resolved(&parent.join(decoded(target.path)))?;
-                if candidate.is_file() {
-                    entry["path"] = json!(candidate);
-                }
+        } else if let Some(candidate) = candidate(doc, &usage.url)? {
+            if reader.local_file_exists(&candidate)? {
+                entry["path"] = json!(candidate);
             }
         }
         if retained.insert(id) {
             resources.push(entry);
         }
     }
-    protected.extend(referenced_paths(doc));
-    protected.extend(
-        resources
-            .iter()
-            .filter_map(|entry| entry["path"].as_str())
-            .map(PathBuf::from),
-    );
     row["path"] = json!(resolved(&doc.path)?);
     row["resources"] = json!(resources);
     row["resource_warnings"] = json!(warnings);
+    row["status"] = json!(if warnings.is_empty() {
+        "COMPLETE"
+    } else {
+        "UNKNOWN"
+    });
     Ok(row)
 }
 
-pub(crate) fn publish(input: &Path, output: &Path) -> Result<()> {
-    let mut reader = Reader::new(16 * 1024 * 1024);
-    let documents = load(input, &mut reader, true)?;
-    let mut protected = vec![input.to_path_buf()];
+pub(crate) fn catalog_documents(
+    documents: &BTreeMap<Identity, Document>,
+    order: &[Identity],
+    reader: &mut Reader,
+) -> Result<Value> {
     let mut rows = Vec::new();
-    for document in documents.values() {
-        rows.push(catalog_document(document, &mut reader, &mut protected)?);
+    let mut unresolved = 0;
+    for identity in order {
+        let document = &documents[identity];
+        reader.begin_document();
+        let mut row = match reader.read(&document.path) {
+            Ok(bytes) => catalog_document(document, &bytes, reader)?,
+            Err(reason) => json!({
+                "path": document.path,
+                "resources": [],
+                "resource_warnings": [reason],
+                "status": "UNKNOWN",
+            }),
+        };
+        row["knowledge_base"] = json!(identity.knowledge_base);
+        row["document_id"] = json!(identity.document_id);
+        unresolved += usize::from(
+            row["resource_warnings"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty()),
+        );
+        rows.push(row);
     }
-    check_output(
-        output,
-        protected.iter().chain(reader.paths()).map(PathBuf::as_path),
-    )?;
-    let parent = output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let report = json!({"schema_version":"1.0","documents":rows});
-    publish_outputs(&[(output.into(), json_bytes(&report)?)])
+    Ok(json!({
+        "schema_version":"mdcompare-catalog-result-1",
+        "state":if unresolved == 0 {"complete"} else {"partial"},
+        "results":rows,"baseline_only":[],
+        "counts":{"total":rows.len(),"unresolved":unresolved},
+    }))
 }

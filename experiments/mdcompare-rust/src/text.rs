@@ -214,18 +214,19 @@ pub fn compare(old: Option<&[u8]>, new: &[u8], options: &Options) -> Value {
     let (Ok(old), Ok(new)) = (std::str::from_utf8(old), std::str::from_utf8(new)) else {
         return result("UNKNOWN", &[diff, "TEXT_ENCODING_UNSUPPORTED"], Some(false));
     };
-    let (old, new) = (lines(old), lines(new));
-    let mut budget = options.work;
-    let Some(edits) = myers(&old, &new, &mut budget) else {
-        return result("UNKNOWN", &[diff, "DIFF_BUDGET_EXCEEDED"], Some(false));
-    };
     let mut changed = result("CHANGED", &[diff], Some(false));
     if options.evidence {
-        let Some((diffs, truncated)) = evidence(&old, &new, &edits, options, &mut budget) else {
-            return result("UNKNOWN", &[diff, "DIFF_BUDGET_EXCEEDED"], Some(false));
-        };
-        changed["differences"] = json!(diffs);
-        changed["evidence_truncated"] = json!(truncated);
+        let (old, new) = (lines(old), lines(new));
+        let mut budget = options.work;
+        let explanation = myers(&old, &new, &mut budget)
+            .and_then(|edits| evidence(&old, &new, &edits, options, &mut budget));
+        match explanation {
+            Some((diffs, truncated)) => {
+                changed["differences"] = json!(diffs);
+                changed["evidence_truncated"] = json!(truncated);
+            }
+            None => changed["evidence_truncated"] = json!(true),
+        }
     }
     changed
 }

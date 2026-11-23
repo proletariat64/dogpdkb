@@ -1,10 +1,9 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::de::{Deserialize, Deserializer, Error, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value, json};
-use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, Metadata, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
@@ -92,34 +91,55 @@ pub fn read(path: &Path, limit: u64) -> Result<(Vec<u8>, Stamp), &'static str> {
 }
 
 pub struct Reader {
+    frozen: Option<BTreeMap<PathBuf, crate::workspace::InputWitness>>,
+    drifted: bool,
     limit: u64,
-    paths: HashSet<PathBuf>,
     stamps: HashMap<PathBuf, Stamp>,
     cache: HashMap<PathBuf, Vec<u8>>,
-    current: Option<Identity>,
-    dependencies: BTreeMap<Identity, HashSet<PathBuf>>,
+    document_started: bool,
 }
 
 impl Reader {
     pub fn new(limit: u64) -> Self {
         Self {
+            frozen: None,
+            drifted: false,
             limit,
-            paths: HashSet::new(),
             stamps: HashMap::new(),
             cache: HashMap::new(),
-            current: None,
-            dependencies: BTreeMap::new(),
+            document_started: false,
         }
     }
 
-    pub fn begin_document(&mut self, identity: &Identity) {
-        self.current = Some(identity.clone());
-        self.cache.clear();
-        self.dependencies.entry(identity.clone()).or_default();
+    pub fn new_frozen(
+        limit: u64,
+        inputs: &BTreeMap<PathBuf, crate::workspace::InputWitness>,
+    ) -> Self {
+        Self {
+            frozen: Some(inputs.clone()),
+            ..Self::new(limit)
+        }
     }
 
-    pub fn paths(&self) -> &HashSet<PathBuf> {
-        &self.paths
+    pub fn drifted(&self) -> bool {
+        self.drifted
+    }
+
+    pub fn local_file_exists(&mut self, path: &Path) -> Result<bool> {
+        let exists = path.is_file();
+        if let Some(inputs) = &self.frozen {
+            let key = resolved(path)?;
+            ensure!(
+                matches!(inputs.get(&key), Some(crate::workspace::InputWitness::Presence { exists: expected }) if *expected == exists),
+                "input_drift"
+            );
+        }
+        Ok(exists)
+    }
+
+    pub fn begin_document(&mut self) {
+        self.document_started = true;
+        self.cache.clear();
     }
 
     pub fn changed_paths(&self) -> HashSet<PathBuf> {
@@ -130,27 +150,12 @@ impl Reader {
             .collect()
     }
 
-    pub fn affected_documents(&self, changed: &HashSet<PathBuf>) -> BTreeSet<Identity> {
-        self.dependencies
-            .iter()
-            .filter(|(_, paths)| !paths.is_disjoint(changed))
-            .map(|(identity, _)| identity.clone())
-            .collect()
-    }
-
     pub fn read(&mut self, path: &Path) -> Result<Vec<u8>, &'static str> {
         self.read_with_limit(path, self.limit)
     }
 
     pub fn read_with_limit(&mut self, path: &Path, limit: u64) -> Result<Vec<u8>, &'static str> {
         let path = std::path::absolute(path).map_err(|_| "INPUT_READ_FAILED")?;
-        self.paths.insert(path.clone());
-        if let Some(identity) = &self.current {
-            self.dependencies
-                .entry(identity.clone())
-                .or_default()
-                .insert(path.clone());
-        }
         if self
             .stamps
             .get(&path)
@@ -165,7 +170,23 @@ impl Reader {
                 Ok(bytes.clone())
             };
         }
-        let (bytes, stamp) = read(&path, limit)?;
+        let observed = read(&path, limit);
+        if let Some(inputs) = &self.frozen {
+            use crate::workspace::{InputWitness, checksum};
+            let key = resolved(&path).map_err(|_| "INPUT_PATH_INVALID")?;
+            let matches = match (&observed, inputs.get(&key)) {
+                (Ok((bytes, _)), Some(InputWitness::Bytes { sha256 })) => {
+                    checksum(bytes) == *sha256
+                }
+                (Err(code), Some(InputWitness::Unavailable { reason })) => *code == reason,
+                _ => false,
+            };
+            if !matches {
+                self.drifted = true;
+                return Err("INPUT_CHANGED");
+            }
+        }
+        let (bytes, stamp) = observed?;
         if self
             .stamps
             .get(&path)
@@ -174,7 +195,7 @@ impl Reader {
             return Err("INPUT_CHANGED");
         }
         self.stamps.insert(path.clone(), stamp);
-        if self.current.is_some() {
+        if self.document_started {
             self.cache.insert(path, bytes.clone());
         }
         Ok(bytes)
@@ -264,139 +285,18 @@ pub fn referenced_paths(document: &Document) -> Vec<PathBuf> {
     paths
 }
 
-fn json_utf8(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
-    const INVALID: &str = "MANIFEST_UNREADABLE_OR_INVALID";
-    if let Some(bytes) = bytes.strip_prefix(b"\xef\xbb\xbf") {
-        return Ok(Cow::Borrowed(bytes));
-    }
-    let (size, little_endian, data) = match bytes {
-        [0, 0, 0xfe, 0xff, rest @ ..] => (4, false, rest),
-        [0xff, 0xfe, 0, 0, rest @ ..] => (4, true, rest),
-        [0xfe, 0xff, rest @ ..] => (2, false, rest),
-        [0xff, 0xfe, rest @ ..] => (2, true, rest),
-        [0, 0, 0, _, ..] => (4, false, bytes),
-        [_, 0, 0, 0, ..] => (4, true, bytes),
-        [0, _, ..] => (2, false, bytes),
-        [_, 0, ..] => (2, true, bytes),
-        _ => return Ok(Cow::Borrowed(bytes)),
-    };
-    ensure!(data.len().is_multiple_of(size), INVALID);
-    let text = if size == 2 {
-        let units = data.as_chunks::<2>().0.iter().map(|&chunk| {
-            if little_endian {
-                u16::from_le_bytes(chunk)
-            } else {
-                u16::from_be_bytes(chunk)
-            }
-        });
-        char::decode_utf16(units)
-            .collect::<Result<String, _>>()
-            .context(INVALID)?
-    } else {
-        data.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&chunk| {
-                let codepoint = if little_endian {
-                    u32::from_le_bytes(chunk)
-                } else {
-                    u32::from_be_bytes(chunk)
-                };
-                char::from_u32(codepoint).context(INVALID)
-            })
-            .collect::<Result<String>>()?
-    };
-    Ok(Cow::Owned(text.into_bytes()))
-}
-
-pub fn parse_json(bytes: &[u8]) -> Result<Value> {
-    let Unique(value) = serde_json::from_slice(&json_utf8(bytes)?).map_err(|err| {
+pub fn parse_utf8_json(bytes: &[u8]) -> Result<Value> {
+    let Unique(value) = serde_json::from_slice(bytes).map_err(|err| {
         anyhow::anyhow!(
             "{}",
             if err.to_string().starts_with("DUPLICATE_JSON_FIELD") {
                 "DUPLICATE_JSON_FIELD"
             } else {
-                "MANIFEST_UNREADABLE_OR_INVALID"
+                "WORK_PLAN_UNREADABLE_OR_INVALID"
             }
         )
     })?;
     Ok(value)
-}
-
-pub fn load(
-    path: &Path,
-    reader: &mut Reader,
-    body_only: bool,
-) -> Result<BTreeMap<Identity, Document>> {
-    let bytes = reader
-        .read_with_limit(path, MANIFEST_LIMIT)
-        .map_err(anyhow::Error::msg)?;
-    decode_manifest(
-        &parse_json(&bytes)?,
-        path.parent().context("MANIFEST_SCHEMA_INVALID")?,
-        body_only,
-    )
-}
-
-pub fn decode_manifest(
-    value: &Value,
-    root: &Path,
-    body_only: bool,
-) -> Result<BTreeMap<Identity, Document>> {
-    ensure!(value["schema_version"] == "1.0", "MANIFEST_SCHEMA_INVALID");
-    let mut documents = BTreeMap::new();
-    for row in value["documents"]
-        .as_array()
-        .context("MANIFEST_SCHEMA_INVALID")?
-    {
-        let field = |k| {
-            row[k]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .context("DOCUMENT_SCHEMA_INVALID")
-        };
-        let id = Identity {
-            knowledge_base: field("knowledge_base")?.to_owned(),
-            document_id: field("document_id")?.to_owned(),
-        };
-        let path = root.join(field("path")?);
-        ensure!(
-            matches!(
-                row["content_kind"].as_str(),
-                Some("raw" | "historical_enriched")
-            ),
-            "CONTENT_KIND_INVALID"
-        );
-        let metadata = &row["metadata"];
-        ensure!(
-            METADATA_KEYS.iter().all(|&k| metadata[k].is_string())
-                && metadata.get("sync_timestamp").is_none_or(Value::is_string),
-            "METADATA_SCHEMA_INVALID"
-        );
-        if !body_only {
-            ensure!(
-                row["resources"]
-                    .as_array()
-                    .is_some_and(|items| items.iter().all(Value::is_object)),
-                "RESOURCE_SCHEMA_INVALID"
-            );
-            let ocr = &row["ocr"];
-            ensure!(
-                (ocr.is_null() || ocr.is_object())
-                    && row.get("provenance").is_none_or(Value::is_object),
-                "PROVENANCE_SCHEMA_INVALID"
-            );
-        }
-        let doc = Document {
-            identity: id.clone(),
-            raw: row.clone(),
-            path,
-            metadata: metadata.clone(),
-            base_dir: root.to_owned(),
-        };
-        ensure!(documents.insert(id, doc).is_none(), "DUPLICATE_DOCUMENT_ID");
-    }
-    Ok(documents)
 }
 
 pub fn resolved(path: &Path) -> Result<PathBuf> {
@@ -442,62 +342,6 @@ pub fn json_bytes(value: &Value) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-fn parent(path: &Path) -> &Path {
-    path.parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
-}
-
-pub fn publish(outputs: &[(PathBuf, Vec<u8>)]) -> Result<()> {
-    let mut staged = Vec::with_capacity(outputs.len());
-    let mut backups = Vec::with_capacity(outputs.len());
-    for (index, (path, data)) in outputs.iter().enumerate() {
-        check_output(
-            path,
-            outputs[..index]
-                .iter()
-                .map(|(previous, _)| previous.as_path()),
-        )?;
-        let mut temp =
-            tempfile::NamedTempFile::new_in(parent(path)).context("REPORT_WRITE_FAILED")?;
-        temp.write_all(data).context("REPORT_WRITE_FAILED")?;
-        temp.as_file().sync_all().context("REPORT_WRITE_FAILED")?;
-        staged.push(temp);
-    }
-    for (path, _) in outputs {
-        let backup = match fs::symlink_metadata(path) {
-            Ok(_) => {
-                let directory =
-                    tempfile::tempdir_in(parent(path)).context("REPORT_WRITE_FAILED")?;
-                fs::hard_link(path, directory.path().join("backup"))
-                    .context("REPORT_WRITE_FAILED")?;
-                Some(directory)
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => return Err(err).context("REPORT_WRITE_FAILED"),
-        };
-        backups.push(backup);
-    }
-    for (index, (temp, (path, _))) in staged.into_iter().zip(outputs).enumerate() {
-        if let Err(err) = temp.persist(path) {
-            let mut failed = false;
-            for ((previous, _), backup) in outputs[..index].iter().zip(&mut backups).rev() {
-                if let Some(backup) = backup.take() {
-                    if fs::rename(backup.path().join("backup"), previous).is_err() {
-                        let _ = backup.keep();
-                        failed = true;
-                    }
-                } else {
-                    failed |= fs::remove_file(previous).is_err();
-                }
-            }
-            ensure!(!failed, "REPORT_ROLLBACK_FAILED");
-            return Err(err).context("REPORT_WRITE_FAILED");
-        }
-    }
-    Ok(())
-}
-
 pub fn check_output<'a>(output: &Path, inputs: impl IntoIterator<Item = &'a Path>) -> Result<()> {
     let destination = resolved(output)?;
     let inode = |path: &Path| fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
@@ -519,28 +363,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn late_drift_invalidates_only_documents_that_read_the_path() -> Result<()> {
+    fn late_drift_invalidates_a_consumed_snapshot() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let first_path = directory.path().join("first.md");
         let second_path = directory.path().join("second.md");
         fs::write(&first_path, "first")?;
         fs::write(&second_path, "second")?;
-        let identity = |id: &str| Identity {
-            knowledge_base: "book".into(),
-            document_id: id.into(),
-        };
-        let first = identity("first");
-        let second = identity("second");
         let mut reader = Reader::new(100);
-        reader.begin_document(&first);
+        reader.begin_document();
         assert_eq!(reader.read(&first_path), Ok(b"first".to_vec()));
-        reader.begin_document(&second);
+        reader.begin_document();
         assert_eq!(reader.read(&second_path), Ok(b"second".to_vec()));
         fs::write(&first_path, "changed first")?;
-        assert_eq!(
-            reader.affected_documents(&reader.changed_paths()),
-            BTreeSet::from([first])
-        );
+        assert_eq!(reader.changed_paths(), HashSet::from([first_path.clone()]));
         assert_eq!(reader.read(&first_path), Err("INPUT_CHANGED"));
         Ok(())
     }
