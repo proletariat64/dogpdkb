@@ -243,7 +243,10 @@ null together with its status and reason.
 
 A network request requires durable admission first. An interrupted admission
 without a durable settlement becomes unknown and is never repeated. Missing or
-corrupt journal state fails closed. A 429 drains in-flight work and lowers the
+corrupt journal state fails closed. The score.mdcompare.score-seal sibling binds
+the initialized frozen plan before scoring and prevents recreating a missing
+score workspace as an empty ledger. Keep the seal with the workspace.
+A 429 drains in-flight work and lowers the
 persisted concurrency by one. A 429 at concurrency one stops new admissions.
 Authentication failure and observed unknown network outcomes stop admissions.
 Cancel persists an intent before it succeeds. In-flight requests can settle.
