@@ -1,5 +1,5 @@
 use std::{
-    env, fs,
+    fs,
     io::{BufRead, BufReader, Cursor, ErrorKind, Write},
     path::{Path, PathBuf},
     sync::{
@@ -136,16 +136,18 @@ fn field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key)?.as_str().filter(|s| !s.trim().is_empty())
 }
 
-fn auth_path() -> Result<PathBuf, Failure> {
-    let root = env::var_os("PI_CODING_AGENT_DIR")
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::home_dir().map(|home| home.join(".pi").join("agent")))
+fn auth_path(settings: &Value) -> Result<PathBuf, Failure> {
+    let path = field(settings, "oauth_file")
+        .map(Path::new)
+        .filter(|path| path.is_absolute())
         .ok_or_else(oauth_failure)?;
-    fs::canonicalize(root.join("auth.json")).map_err(|_| oauth_failure())
+    fs::canonicalize(path).map_err(|_| oauth_failure())
 }
 
 fn read_credentials(path: &Path) -> Result<Value, Failure> {
+    if !fs::metadata(path).map_err(|_| oauth_failure())?.is_file() {
+        return Err(oauth_failure());
+    }
     let data = fs::read_to_string(path).map_err(|_| oauth_failure())?;
     let auth: Value =
         serde_json::from_str(data.trim_start_matches('\u{feff}')).map_err(|_| oauth_failure())?;
@@ -295,27 +297,45 @@ fn access_token(client: &Client, route: Route, path: &Path) -> Result<Bearer, Fa
     Bearer::from_credential(route, &auth[route.key()])
 }
 
-pub(crate) fn preflight(client: &Client, settings: &Value) -> Result<Auth, Failure> {
-    let unsupported = || Failure::known("unsupported_model");
-    let (provider, model) = field(settings, "model")
-        .and_then(|route| route.split_once('/'))
-        .ok_or_else(unsupported)?;
+fn model_route(configured_model: &str) -> Option<(Route, &str)> {
+    let (provider, model) = configured_model.split_once('/')?;
     let route = match provider {
         "openai" => Route::OpenAi,
         "openai-codex" => Route::Codex,
-        _ => return Err(unsupported()),
+        _ => return None,
     };
     if model.is_empty()
         || !model
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
     {
-        return Err(unsupported());
+        return None;
     }
+    Some((route, model))
+}
+
+pub(crate) fn model_supported(configured_model: &str) -> bool {
+    model_route(configured_model).is_some()
+}
+
+pub(crate) fn oauth_expired(settings: &Value) -> Result<bool, Failure> {
+    let (route, _) = field(settings, "model")
+        .and_then(model_route)
+        .ok_or_else(|| Failure::known("unsupported_model"))?;
+    let path = auth_path(settings)?;
+    let auth = read_credentials(&path)?;
+    let bearer = Bearer::from_credential(route, credential(&auth, route)?)?;
+    Ok(bearer.expires <= now_millis()?)
+}
+
+pub(crate) fn preflight(client: &Client, settings: &Value) -> Result<Auth, Failure> {
+    let (route, model) = field(settings, "model")
+        .and_then(model_route)
+        .ok_or_else(|| Failure::known("unsupported_model"))?;
     let effort = field(settings, "effort")
         .filter(|s| ["low", "medium", "high", "xhigh"].contains(s))
         .ok_or_else(|| Failure::known("unsupported_effort"))?;
-    let path = auth_path()?;
+    let path = auth_path(settings)?;
     let bearer = access_token(client, route, &path)?;
     Ok(Auth {
         route,

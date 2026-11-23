@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::provider::Failure;
 
-const JOB_URL: &str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs";
+pub(crate) const JOB_URL: &str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs";
 pub(crate) const MODEL: &str = "PaddleOCR-VL-1.6";
 pub(crate) const JPEG_QUALITY: u8 = 90;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
