@@ -1,4 +1,6 @@
-use crate::artifacts::{atomic, json_bytes, owned_path, read_bound, sha};
+use crate::artifacts::{
+    atomic, json_bytes, load_plan_for_staged_repair, owned_path, read_bound, sha,
+};
 use crate::plan::{self, Work};
 use crate::runner::{PublicationReceipt, publication_state};
 use anyhow::{Context, Result, ensure};
@@ -313,7 +315,11 @@ fn saved_work_digest(workspace: &Workspace) -> Result<String> {
             return Ok(digest.to_owned());
         }
     }
-    plan::normalize(&workspace.work)?.digest()
+    // An owned workspace with no accepted plan, checkpoint or reset intent
+    // can be purged, but supplies no prior work binding for reset.
+    Ok(workspace
+        .read_reset()?
+        .map_or_else(String::new, |intent| intent.cleanup.work_sha256))
 }
 
 fn cleanup_state(workspace: &Workspace) -> Result<(String, Cleanup)> {
@@ -366,6 +372,10 @@ impl Cleanup {
     }
 
     fn verify_digest(&self, digest: &str) -> Result<()> {
+        ensure!(
+            !self.work_sha256.is_empty(),
+            "workspace cleanup has no verified work binding"
+        );
         ensure!(
             self.work_sha256 == digest,
             "WORK_PLAN_CHANGED: cleanup is bound to a different work plan"
@@ -463,6 +473,7 @@ fn sync_parent(path: &Path) -> Result<()> {
 
 const REPEATED_REQUEST_WARNING: &str =
     "Unresolved provider requests may already have been accepted.";
+const RESET_REQUEST_COST_WARNING: &str = "Reset can repeat those requests and their cost.";
 
 fn reset_summary(workspace: &Workspace, status: &str, intent: &ResetIntent) -> Value {
     let outputs = intent
@@ -471,10 +482,19 @@ fn reset_summary(workspace: &Workspace, status: &str, intent: &ResetIntent) -> V
         .iter()
         .map(|receipt| &receipt.path)
         .collect::<Vec<_>>();
+    let warnings = if intent.cleanup.unresolved_requests {
+        json!([{
+            "reason_code": "REPEATED_PROVIDER_REQUEST_COST",
+            "message": format!("{REPEATED_REQUEST_WARNING} {RESET_REQUEST_COST_WARNING}"),
+        }])
+    } else {
+        json!([])
+    };
     json!({
         "status": status,
         "workspace_path": workspace.root,
         "unresolved_requests": intent.cleanup.unresolved_requests,
+        "warnings": warnings,
         "cleanup": {
             "outputs": outputs,
             "ocr_state": ["journal.json", "result.json", ".cancel.json", "evidence/"],
@@ -521,6 +541,14 @@ pub(crate) fn reset(workspace: &Workspace) -> Result<(u8, Value)> {
         };
         cleanup.verify_digest(&digest)?;
         cleanup.verify_outputs(&work, workspace)?;
+        if !after_purge && workspace.plan.try_exists()? {
+            load_plan_for_staged_repair(
+                &workspace.plan,
+                &workspace.result,
+                &workspace.journal,
+                &workspace.evidence,
+            )?;
+        }
         let intent = ResetIntent {
             status: ResetPhase::Resetting,
             after_purge,
@@ -537,7 +565,8 @@ pub(crate) fn reset(workspace: &Workspace) -> Result<(u8, Value)> {
         if intent.cleanup.unresolved_requests {
             message.push('\n');
             message.push_str(REPEATED_REQUEST_WARNING);
-            message.push_str(" Reset can repeat those requests and their cost.");
+            message.push(' ');
+            message.push_str(RESET_REQUEST_COST_WARNING);
         }
         if !confirm(&message)? {
             return Ok((2, reset_summary(workspace, "declined", &intent)));

@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
@@ -159,12 +159,22 @@ fn resume_before_freeze_reuses_only_committed_downloads_and_saved_policy() {
 
     // The saved zero budget still applies after the default file becomes unusable.
     fs::write(root.join("default.toml"), "not valid TOML").unwrap();
+    let sentinel = UNIX_EPOCH + Duration::from_secs(1);
+    fs::File::open(&checkpoint_path)
+        .unwrap()
+        .set_modified(sentinel)
+        .unwrap();
     let resumed = start_command(root, &resume);
     let (stream, request) = await_get(&listener);
     assert!(request.starts_with("GET /second.png "), "{request}");
+    let checkpoint_mtime = fs::metadata(&checkpoint_path).unwrap().modified().unwrap();
     respond_png(stream, &png);
     let resumed = resumed.wait_with_output().unwrap();
     assert_eq!(resumed.status.code(), Some(2), "{resumed:?}");
+    assert_eq!(
+        checkpoint_mtime, sentinel,
+        "rewrote the durable first image"
+    );
     let plan = json_file(&workspace.join("plan.json"));
     assert_eq!(plan["settings"]["request_budget"], 0);
     assert!(
@@ -177,6 +187,87 @@ fn resume_before_freeze_reuses_only_committed_downloads_and_saved_policy() {
     assert_eq!(
         json_file(&workspace.join("result.json"))["budget"]["requests"],
         0
+    );
+}
+
+#[test]
+fn resume_before_freeze_refetches_only_unusable_or_unrecorded_images() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let (listener, intact) = remote_batch(
+        root,
+        &[
+            "intact.png",
+            "missing.png",
+            "damaged.png",
+            "failed.png",
+            "pending.png",
+        ],
+    );
+    let mut variants = Vec::new();
+    for color in [[10, 30, 90], [20, 40, 100]] {
+        let fixture = root.join("variant.png");
+        image::RgbImage::from_pixel(2, 2, image::Rgb(color))
+            .save(&fixture)
+            .unwrap();
+        variants.push(fs::read(&fixture).unwrap());
+    }
+    let mut interrupted = start_command(root, &["run", "--plan", "work.json"]);
+    for (name, bytes) in [
+        ("intact.png", &intact),
+        ("missing.png", &variants[0]),
+        ("damaged.png", &variants[1]),
+    ] {
+        let (stream, request) = await_get(&listener);
+        assert!(request.starts_with(&format!("GET /{name} ")), "{request}");
+        respond_png(stream, bytes);
+    }
+    let (mut stream, request) = await_get(&listener);
+    assert!(request.starts_with("GET /failed.png "), "{request}");
+    stream
+        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    drop(stream);
+    let (stream, request) = await_get(&listener);
+    assert!(request.starts_with("GET /pending.png "), "{request}");
+    interrupted.kill().unwrap();
+    interrupted.wait().unwrap();
+    drop(stream);
+
+    let checkpoint = json_file(&root.join("work.mdocr/download.json"));
+    let images = &checkpoint["documents"][0]["images"];
+    fs::remove_file(images[1]["outcome"]["source_path"].as_str().unwrap()).unwrap();
+    fs::write(
+        images[2]["outcome"]["source_path"].as_str().unwrap(),
+        b"corrupt",
+    )
+    .unwrap();
+    assert_eq!(images[3]["outcome"]["status"], "failure");
+
+    let resumed = start_command(root, &["run", "--plan", "work.json", "--resume"]);
+    for (name, bytes) in [
+        ("missing.png", &variants[0]),
+        ("damaged.png", &variants[1]),
+        ("failed.png", &intact),
+        ("pending.png", &intact),
+    ] {
+        let (stream, request) = await_get(&listener);
+        assert!(request.starts_with(&format!("GET /{name} ")), "{request}");
+        respond_png(stream, bytes);
+    }
+    let resumed = resumed.wait_with_output().unwrap();
+    assert_eq!(resumed.status.code(), Some(2), "{resumed:?}");
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let frozen = json_file(&root.join("work.mdocr/plan.json"));
+    assert!(
+        frozen["documents"][0]["images"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|image| image["error"].is_null())
     );
 }
 

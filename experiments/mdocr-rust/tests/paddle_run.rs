@@ -514,6 +514,16 @@ fn paddle_run_assembles_accepted_work_without_replaying_a_crash_admission() {
     assert_exit(&declined, 2);
     let summary: Value = serde_json::from_slice(&declined.stdout).unwrap();
     assert_eq!(summary["unresolved_requests"], true);
+    assert_eq!(
+        summary["warnings"][0]["reason_code"],
+        "REPEATED_PROVIDER_REQUEST_COST"
+    );
+    assert!(
+        summary["warnings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("can repeat those requests and their cost")
+    );
     assert!(
         String::from_utf8_lossy(&declined.stderr).contains("repeat those requests and their cost")
     );

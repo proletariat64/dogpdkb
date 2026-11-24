@@ -804,11 +804,13 @@ fn planned_json(
         });
         if image.selected {
             let record = &mut checkpoint.documents[position].images[selected_index];
-            let outcome = match staging.saved_binding(&image, record.outcome.as_ref())? {
+            let saved = staging.saved_binding(&image, record.outcome.as_ref())?;
+            let reused = saved.is_some();
+            let outcome = match saved {
                 Some(binding) => Ok(binding),
                 None => staging.bind(&image)?,
             };
-            record.outcome = Some(match outcome {
+            let outcome = match outcome {
                 Ok(binding) => {
                     value["source_path"] = json!(&binding.source);
                     value["original_link"] = json!(binding.link);
@@ -824,9 +826,12 @@ fn planned_json(
                         reason_code: reason.into(),
                     }
                 }
-            });
+            };
             selected_index += 1;
-            atomic(download_path, &json_bytes(checkpoint)?, false)?;
+            if !reused {
+                record.outcome = Some(outcome);
+                atomic(download_path, &json_bytes(checkpoint)?, false)?;
+            }
             progress::emit(
                 "image_checkpoint",
                 format_args!(
