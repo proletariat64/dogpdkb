@@ -1,4 +1,5 @@
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -73,6 +74,100 @@ fn publishes_english_help_and_rejects_undocumented_command_forms() {
         Some(64)
     );
     assert_eq!(fs::read_dir(root).unwrap().count(), 0);
+}
+
+#[test]
+fn publication_receipt_recovers_both_sides_of_output_creation() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let root = root.as_path();
+    draft(root);
+    let run_args = ["run", "--plan", "work.json"];
+    let first = run(root, &run_args);
+    assert!(first.status.success(), "{first:?}");
+
+    let journal_path = root.join("work.mdocr/journal.json");
+    let result_path = root.join("work.mdocr/result.json");
+    let output_path = root.join("output.md");
+    let expected_output = b"Body without images.\n";
+    let mut journal: Value = serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    let receipt = &journal["publication_receipts"][root
+        .join("input.md")
+        .canonicalize()
+        .unwrap()
+        .to_str()
+        .unwrap()];
+    assert_eq!(
+        receipt,
+        &serde_json::json!({
+            "path": output_path,
+            "sha256": format!("{:x}", Sha256::digest(expected_output)),
+        })
+    );
+
+    journal["status"] = "running".into();
+    journal["documents"] = serde_json::json!([]);
+    let interrupted_journal = serde_json::to_vec(&journal).unwrap();
+    for output_already_written in [false, true] {
+        fs::remove_file(&result_path).unwrap();
+        fs::write(&journal_path, &interrupted_journal).unwrap();
+        if !output_already_written {
+            fs::remove_file(&output_path).unwrap();
+        }
+        let recovered = run(root, &run_args);
+        assert!(recovered.status.success(), "{recovered:?}");
+        assert_eq!(result(&recovered)["status"], "completed");
+        assert_eq!(result(&recovered)["counts"]["requests"], 0);
+        assert_eq!(fs::read(&output_path).unwrap(), expected_output);
+        assert!(result_path.exists());
+    }
+}
+
+#[test]
+fn publication_refuses_changed_or_unowned_outputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    draft(root);
+    let run_args = ["run", "--plan", "work.json"];
+    let first = run(root, &run_args);
+    assert!(first.status.success(), "{first:?}");
+    let output = root.join("output.md");
+    let original = fs::read(&output).unwrap();
+    let journal_path = root.join("work.mdocr/journal.json");
+    let saved = fs::read(&journal_path).unwrap();
+
+    fs::write(&output, b"Operator change.\n").unwrap();
+    let drift = run(root, &run_args);
+    assert_eq!(drift.status.code(), Some(1), "{drift:?}");
+    assert!(String::from_utf8_lossy(&drift.stderr).contains("OCR artifact has drifted"));
+    assert_eq!(fs::read(&output).unwrap(), b"Operator change.\n");
+    assert_eq!(fs::read(&journal_path).unwrap(), saved);
+
+    fs::write(&output, &original).unwrap();
+    let mut journal: Value = serde_json::from_slice(&saved).unwrap();
+    let document_id = root.join("input.md").canonicalize().unwrap();
+    journal["publication_receipts"][document_id.to_str().unwrap()]["path"] =
+        serde_json::json!(document_id);
+    fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    let wrong_path = run(root, &run_args);
+    assert_eq!(wrong_path.status.code(), Some(1), "{wrong_path:?}");
+    assert!(
+        String::from_utf8_lossy(&wrong_path.stderr)
+            .contains("publication receipt does not match its frozen document")
+    );
+    assert_eq!(fs::read(&output).unwrap(), original);
+    assert_eq!(fs::read(document_id).unwrap(), original);
+
+    journal["publication_receipts"] = serde_json::json!({});
+    let without_receipt = serde_json::to_vec(&journal).unwrap();
+    fs::write(&journal_path, &without_receipt).unwrap();
+    let unowned = run(root, &run_args);
+    assert_eq!(unowned.status.code(), Some(1), "{unowned:?}");
+    assert!(
+        String::from_utf8_lossy(&unowned.stderr).contains("preexisting unowned document output")
+    );
+    assert_eq!(fs::read(output).unwrap(), original);
+    assert_eq!(fs::read(journal_path).unwrap(), without_receipt);
 }
 
 #[test]

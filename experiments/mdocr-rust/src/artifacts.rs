@@ -519,13 +519,39 @@ fn quote(value: &str) -> String {
     quoted
 }
 
-pub(crate) fn publish_document(
+pub(crate) struct RenderedDocument {
+    row: Value,
+    evidence: Vec<(PathBuf, String)>,
+    output: Option<String>,
+}
+
+impl RenderedDocument {
+    pub(crate) fn output_sha256(&self) -> Option<&str> {
+        self.row["output_sha256"].as_str()
+    }
+
+    pub(crate) fn publish(self, output: &Path, first_write: bool) -> Result<Value> {
+        for (path, block) in &self.evidence {
+            verify_immutable(path, block.as_bytes())?;
+        }
+        if let Some(content) = &self.output {
+            if first_write {
+                atomic(output, content.as_bytes(), true)?;
+            } else {
+                verify_immutable(output, content.as_bytes())?;
+            }
+        }
+        Ok(self.row)
+    }
+}
+
+pub(crate) fn render_document(
     document: &Document,
     evidence_dir: &Path,
     config: &Value,
     records: Vec<Value>,
     patches: &[Option<&Value>],
-) -> Result<Value> {
+) -> Result<RenderedDocument> {
     ensure!(
         document.images.len() == patches.len() && patches.len() == records.len(),
         "incorrect number of OCR occurrences at publication"
@@ -535,6 +561,7 @@ pub(crate) fn publish_document(
         .context("missing OCR configuration mode")?;
     let mut replacements = Vec::new();
     let mut evidence = Vec::new();
+    let mut evidence_files = Vec::new();
     let mut resources = HashSet::new();
     for ((image, patch), record) in document.images.iter().zip(patches).zip(&records) {
         let successful =
@@ -547,7 +574,6 @@ pub(crate) fn publish_document(
         let block = block(image, mode, patch)?;
         if resources.insert(&image.resource_id) {
             let artifact = evidence_dir.join(format!("{}.md", image.id));
-            verify_immutable(&artifact, block.as_bytes())?;
             evidence.push(json!({
                 "resource_id": image.resource_id,
                 "status": "success",
@@ -556,6 +582,7 @@ pub(crate) fn publish_document(
                 "artifact": artifact,
                 "artifact_sha256": sha(block.as_bytes()),
             }));
+            evidence_files.push((artifact, block.clone()));
         }
         replacements.push((image.edit.clone(), block));
     }
@@ -566,7 +593,7 @@ pub(crate) fn publish_document(
         "output": null,
         "resources": records,
     });
-    if records.iter().all(|record| {
+    let output = if records.iter().all(|record| {
         matches!(
             record["status"].as_str(),
             Some("success" | "reused" | "unselected")
@@ -577,7 +604,6 @@ pub(crate) fn publish_document(
         for (span, block) in replacements.into_iter().rev() {
             content.replace_range(span, &format!("\n\n{block}\n\n"));
         }
-        verify_immutable(&document.output, content.as_bytes())?;
         let mut ocr = json!({
             "contract": "mdocr-ocr-2",
             "configuration": config,
@@ -596,8 +622,15 @@ pub(crate) fn publish_document(
         row["output"] = json!(document.output);
         row["output_sha256"] = json!(sha(content.as_bytes()));
         row["ocr"] = ocr;
-    }
-    Ok(row)
+        Some(content)
+    } else {
+        None
+    };
+    Ok(RenderedDocument {
+        row,
+        evidence: evidence_files,
+        output,
+    })
 }
 
 #[cfg(test)]
@@ -652,13 +685,14 @@ mod tests {
         let document = &frozen.documents[0];
         let patch = json!({"markdown": "可见文字", "uncertainty": "字迹较淡\r\n复核第二行"});
         let records = vec![json!({"status": "success"}), json!({"status": "reused"})];
-        let row = publish_document(
+        let row = render_document(
             document,
             &evidence.join("0"),
             &json!({"mode": "llm"}),
             records,
             &[Some(&patch), Some(&patch)],
-        )?;
+        )?
+        .publish(&document.output, true)?;
         let actual = fs::read_to_string(&output)?;
         assert_eq!(row["output_sha256"], sha(actual.as_bytes()));
         assert!(actual.starts_with(text));
@@ -728,13 +762,14 @@ mod tests {
         let patch = json!({"markdown":"readable text","uncertainty":""});
         let patches = vec![Some(&patch); 3];
         let records = vec![json!({"status":"success"}); 3];
-        publish_document(
+        render_document(
             document,
             &evidence.join("0"),
             &json!({"mode":"paddle"}),
             records,
             &patches,
-        )?;
+        )?
+        .publish(&document.output, true)?;
         let output = fs::read_to_string(root.join("out/in.md"))?;
         assert!(output.contains(original_link));
         assert!(output.contains(original_html));

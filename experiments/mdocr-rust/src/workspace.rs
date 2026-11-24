@@ -161,29 +161,25 @@ fn read_object(path: &Path) -> Result<Value> {
 
 fn state_before_purge(workspace: &Workspace) -> Result<(String, bool)> {
     // The journal is authoritative when a process was interrupted before mirroring.
-    for path in [&workspace.journal, &workspace.result] {
-        owned_path(path)?;
-        if path.try_exists()? {
-            let record = read_object(path)?;
-            let plan = fs::read(&workspace.plan).context("workspace plan is missing")?;
-            ensure!(
-                record["plan_sha256"] == sha(&plan),
-                "workspace state does not match its plan"
-            );
-            let state = record["status"]
-                .as_str()
-                .context("workspace state has no status")?;
-            ensure!(
-                matches!(state, "running" | "completed" | "partial" | "canceled"),
-                "unknown workspace state"
-            );
-            let unresolved = record["requests"].as_array().is_some_and(|requests| {
-                requests.iter().any(|attempt| {
-                    matches!(attempt["status"].as_str(), Some("admitted" | "unknown"))
-                })
-            });
-            return Ok((state.to_owned(), unresolved));
-        }
+    if let Some(publication) = crate::runner::publication_state(workspace)? {
+        return Ok((publication.status, publication.unresolved));
+    }
+    owned_path(&workspace.result)?;
+    if workspace.result.try_exists()? {
+        let record = read_object(&workspace.result)?;
+        let plan = fs::read(&workspace.plan).context("workspace plan is missing")?;
+        ensure!(
+            record["plan_sha256"] == sha(&plan),
+            "workspace state does not match its plan"
+        );
+        let state = record["status"]
+            .as_str()
+            .context("workspace state has no status")?;
+        ensure!(
+            matches!(state, "running" | "completed" | "partial" | "canceled"),
+            "unknown workspace state"
+        );
+        return Ok((state.to_owned(), false));
     }
     Ok(("accepted".to_owned(), false))
 }

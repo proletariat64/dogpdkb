@@ -85,6 +85,18 @@ struct Concurrency {
     transitions: Vec<Value>,
 }
 
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct PublicationReceipt {
+    pub(crate) path: PathBuf,
+    pub(crate) sha256: String,
+}
+
+pub(crate) struct PublicationState {
+    pub(crate) status: String,
+    pub(crate) receipts: Vec<PublicationReceipt>,
+    pub(crate) unresolved: bool,
+}
+
 #[derive(Deserialize, Serialize)]
 struct Journal {
     schema_version: String,
@@ -98,6 +110,8 @@ struct Journal {
     #[serde(default)]
     reused: BTreeMap<String, Attempt>,
     documents: Vec<Value>,
+    #[serde(default)]
+    publication_receipts: BTreeMap<String, PublicationReceipt>,
 }
 
 struct Layout<'a> {
@@ -276,10 +290,122 @@ fn read_journal(path: &Path) -> Result<Journal> {
         .with_context(|| format!("invalid journal {}", path.display()))
 }
 
+fn validate_receipts(journal: &Journal, outputs: &HashMap<&str, &Path>) -> Result<()> {
+    for (id, receipt) in &journal.publication_receipts {
+        ensure!(
+            outputs.get(id.as_str()).copied() == Some(receipt.path.as_path())
+                && receipt.path.is_absolute()
+                && receipt.sha256.len() == 64
+                && receipt
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "publication receipt does not match its frozen document"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn publication_state(workspace: &Workspace) -> Result<Option<PublicationState>> {
+    artifacts::owned_path(&workspace.journal)?;
+    if !workspace.journal.try_exists()? {
+        return Ok(None);
+    }
+    artifacts::owned_path(&workspace.plan)?;
+    ensure!(
+        workspace.journal.is_file() && workspace.plan.is_file(),
+        "publication state requires a journal and frozen plan file"
+    );
+    let bytes = fs::read(&workspace.plan).context("workspace plan is missing")?;
+    let frozen: Value =
+        serde_json::from_slice(&bytes).context("invalid frozen publication plan")?;
+    let journal = read_journal(&workspace.journal)?;
+    ensure!(
+        frozen["schema_version"] == crate::plan::FROZEN_SCHEMA
+            && frozen["work_path"].as_str().map(Path::new) == Some(workspace.work.as_path())
+            && journal.schema_version == JOURNAL_SCHEMA
+            && journal.plan_sha256 == sha(&bytes)
+            && matches!(
+                journal.status.as_str(),
+                "running" | "completed" | "partial" | "canceled"
+            ),
+        "workspace publication state does not match its plan"
+    );
+    let mut outputs = HashMap::new();
+    for document in frozen["documents"]
+        .as_array()
+        .context("invalid frozen documents")?
+    {
+        let id = document["document_id"]
+            .as_str()
+            .context("invalid frozen document identity")?;
+        let output = document["output"]
+            .as_str()
+            .map(Path::new)
+            .context("invalid frozen output path")?;
+        ensure!(
+            outputs.insert(id, output).is_none(),
+            "duplicate frozen document identity"
+        );
+    }
+    validate_receipts(&journal, &outputs)?;
+    let publication = PublicationState {
+        status: journal.status,
+        receipts: journal.publication_receipts.into_values().collect(),
+        unresolved: journal
+            .requests
+            .iter()
+            .any(|attempt| matches!(attempt.status, Status::Admitted | Status::Unknown)),
+    };
+    ensure!(
+        publication
+            .receipts
+            .iter()
+            .all(|receipt| !receipt.path.starts_with(&workspace.root)
+                && !workspace.root.starts_with(&receipt.path)
+                && receipt.path != workspace.work),
+        "publication receipt overlaps the work plan or workspace"
+    );
+    Ok(Some(publication))
+}
+
+fn validate_plan_receipts(plan: &Plan, journal: &Journal) -> Result<()> {
+    ensure!(
+        journal.schema_version == JOURNAL_SCHEMA && journal.plan_sha256 == plan.digest,
+        "execution journal schema or plan binding is invalid"
+    );
+    let outputs = plan
+        .documents
+        .iter()
+        .map(|document| (document.document_id.as_str(), document.output.as_path()))
+        .collect();
+    validate_receipts(journal, &outputs)
+}
+
 fn journal_for(plan: &Plan, result: &Path, ledger: &Path) -> Result<Journal> {
     validate_mirror(plan, result)?;
     if ledger.try_exists()? {
-        return read_journal(ledger);
+        let journal = read_journal(ledger)?;
+        validate_plan_receipts(plan, &journal)?;
+        for document in &plan.documents {
+            if document.output.try_exists()? {
+                let receipt = journal
+                    .publication_receipts
+                    .get(&document.document_id)
+                    .with_context(|| {
+                        format!(
+                            "preexisting unowned document output: {}",
+                            document.output.display()
+                        )
+                    })?;
+                read_bound(
+                    &document.output,
+                    &receipt.sha256,
+                    "OCR artifact has drifted",
+                )?;
+            }
+        }
+        return Ok(journal);
     }
     ensure!(
         !result.try_exists()?,
@@ -312,6 +438,7 @@ fn journal_for(plan: &Plan, result: &Path, ledger: &Path) -> Result<Journal> {
         requests: Vec::new(),
         reused: BTreeMap::new(),
         documents: Vec::new(),
+        publication_receipts: BTreeMap::new(),
     })
 }
 
@@ -806,7 +933,7 @@ impl<'a> Execution<'a> {
                 pending.insert(key.clone(), None);
             }
         }
-        self.state.documents = self.document_rows(None)?;
+        self.state.documents = self.document_rows();
         self.save_journal()?;
         self.save_result()?;
         self.progress_snapshot("started", 0);
@@ -984,59 +1111,61 @@ impl<'a> Execution<'a> {
         })
     }
 
-    fn document_rows(&self, evidence: Option<&Path>) -> Result<Vec<Value>> {
-        let mut rows = Vec::with_capacity(self.plan.documents.len());
-        for (index, document) in self.plan.documents.iter().enumerate() {
-            let bindings = &self.layout.bindings[index];
-            let mut records = Vec::with_capacity(document.images.len());
-            let mut patches = Vec::with_capacity(document.images.len());
-            for (image, key) in document.images.iter().zip(bindings) {
-                let mut record = json!({"id": image.id, "resource_id": image.resource_id, "status":"unselected"});
-                let mut patch = None;
-                if image.selected {
-                    if let Some(error) = &image.error {
-                        record["status"] = json!("failed");
-                        record["reason_code"] = json!(error);
-                    } else if let Some(attempt) = key.as_deref().and_then(|key| self.last(key)) {
-                        record["status"] = json!(attempt.status);
-                        if let Some(value) = attempt.patch() {
-                            if value["kind"] == "hold" {
-                                record["status"] = json!("held");
-                                record["reason_code"] = json!("IMAGE_CONVERSION_HELD");
-                                record["uncertainty"] = value["uncertainty"].clone();
-                            } else if let Some(warnings) = value.get("warnings") {
-                                record["status"] = json!("failed");
-                                record["reason_code"] = json!("response_mermaid_syntax_invalid");
-                                record["warnings"] = warnings.clone();
-                            } else {
-                                patch = Some(value);
-                            }
-                        } else if let Some(reason) = &attempt.reason {
-                            record["reason_code"] = json!(reason);
+    fn document_records(&self, index: usize) -> (Vec<Value>, Vec<Option<&Value>>) {
+        let document = &self.plan.documents[index];
+        let bindings = &self.layout.bindings[index];
+        let mut records = Vec::with_capacity(document.images.len());
+        let mut patches = Vec::with_capacity(document.images.len());
+        for (image, key) in document.images.iter().zip(bindings) {
+            let mut record =
+                json!({"id": image.id, "resource_id": image.resource_id, "status":"unselected"});
+            let mut patch = None;
+            if image.selected {
+                if let Some(error) = &image.error {
+                    record["status"] = json!("failed");
+                    record["reason_code"] = json!(error);
+                } else if let Some(attempt) = key.as_deref().and_then(|key| self.last(key)) {
+                    record["status"] = json!(attempt.status);
+                    if let Some(value) = attempt.patch() {
+                        if value["kind"] == "hold" {
+                            record["status"] = json!("held");
+                            record["reason_code"] = json!("IMAGE_CONVERSION_HELD");
+                            record["uncertainty"] = value["uncertainty"].clone();
+                        } else if let Some(warnings) = value.get("warnings") {
+                            record["status"] = json!("failed");
+                            record["reason_code"] = json!("response_mermaid_syntax_invalid");
+                            record["warnings"] = warnings.clone();
+                        } else {
+                            patch = Some(value);
                         }
-                    } else {
-                        record["status"] = json!("unattempted");
-                        if let Some(reason) = self.stop {
-                            record["reason_code"] = json!(reason);
-                        }
+                    } else if let Some(reason) = &attempt.reason {
+                        record["reason_code"] = json!(reason);
+                    }
+                } else {
+                    record["status"] = json!("unattempted");
+                    if let Some(reason) = self.stop {
+                        record["reason_code"] = json!(reason);
                     }
                 }
-                patches.push(patch);
-                records.push(record);
             }
-            let row = if let Some(dir) = evidence {
-                artifacts::publish_document(
-                    document,
-                    &dir.join(index.to_string()),
-                    &self.config,
-                    records,
-                    &patches,
-                )?
-            } else if let Some(row) = self.state.documents.get(index).filter(|row| {
-                row["status"] == "completed" && row["document_id"] == document.document_id
-            }) {
-                row.clone()
-            } else {
+            patches.push(patch);
+            records.push(record);
+        }
+        (records, patches)
+    }
+
+    fn document_rows(&self) -> Vec<Value> {
+        self.plan
+            .documents
+            .iter()
+            .enumerate()
+            .map(|(index, document)| {
+                if let Some(row) = self.state.documents.get(index).filter(|row| {
+                    row["status"] == "completed" && row["document_id"] == document.document_id
+                }) {
+                    return row.clone();
+                }
+                let (records, _) = self.document_records(index);
                 json!({
                     "document_id": document.document_id,
                     "path": document.path,
@@ -1044,15 +1173,71 @@ impl<'a> Execution<'a> {
                     "output": null,
                     "resources": records,
                 })
+            })
+            .collect()
+    }
+
+    fn render_document(
+        &self,
+        index: usize,
+        evidence: &Path,
+    ) -> Result<artifacts::RenderedDocument> {
+        let (records, patches) = self.document_records(index);
+        artifacts::render_document(
+            &self.plan.documents[index],
+            &evidence.join(index.to_string()),
+            &self.config,
+            records,
+            &patches,
+        )
+    }
+
+    fn bind_publication(&mut self, index: usize, digest: &str) -> Result<bool> {
+        let document = &self.plan.documents[index];
+        let receipt = PublicationReceipt {
+            path: document.output.clone(),
+            sha256: digest.into(),
+        };
+        if let Some(saved) = self.state.publication_receipts.get(&document.document_id) {
+            ensure!(
+                saved == &receipt,
+                "publication receipt differs from the rendered document"
+            );
+            return Ok(false);
+        }
+        artifacts::owned_path(&document.output)?;
+        ensure!(
+            !document.output.try_exists()?,
+            "preexisting unowned document output: {}",
+            document.output.display()
+        );
+        self.state
+            .publication_receipts
+            .insert(document.document_id.clone(), receipt);
+        self.save_journal()?;
+        Ok(true)
+    }
+
+    fn publish_documents(&mut self) -> Result<Vec<Value>> {
+        let mut rows = Vec::with_capacity(self.plan.documents.len());
+        for index in 0..self.plan.documents.len() {
+            let rendered = self.render_document(index, &self.workspace.evidence)?;
+            let first_write = if let Some(digest) = rendered.output_sha256() {
+                self.bind_publication(index, digest)?
+            } else {
+                false
             };
-            rows.push(row);
+            rows.push(rendered.publish(&self.plan.documents[index].output, first_write)?);
         }
         Ok(rows)
     }
 
     fn finish(&mut self, publish: bool) -> Result<(u8, Value)> {
-        self.state.documents =
-            self.document_rows(publish.then_some(self.workspace.evidence.as_path()))?;
+        self.state.documents = if publish {
+            self.publish_documents()?
+        } else {
+            self.document_rows()
+        };
         let (code, status) = if self.stop == Some(CANCELED) {
             (3, "canceled")
         } else if self
@@ -1240,6 +1425,7 @@ pub(crate) fn assemble(workspace: &Workspace, output_dir: PathBuf) -> Result<(u8
     let raw = fs::read(&workspace.journal)?;
     let digest = sha(&raw);
     let state: Journal = serde_json::from_slice(&raw)?;
+    validate_plan_receipts(&plan, &state)?;
     let output = artifacts::resolve(&output_dir)?;
     ensure!(!output.try_exists()?, "assembly directory must be new");
     let cache = plan.settings["cache_dir"].as_str().map(PathBuf::from);
@@ -1262,7 +1448,17 @@ pub(crate) fn assemble(workspace: &Workspace, output_dir: PathBuf) -> Result<(u8
     read_bound(&workspace.plan, &plan.digest, "PLAN_DRIFT")?;
     read_bound(&workspace.journal, &digest, "JOURNAL_DRIFT")?;
     fs::create_dir(&output)?;
-    let rows = execution.document_rows(Some(&output.join("evidence")))?;
+    let evidence = output.join("evidence");
+    let rows = plan
+        .documents
+        .iter()
+        .enumerate()
+        .map(|(index, document)| {
+            execution
+                .render_document(index, &evidence)?
+                .publish(&document.output, true)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let (code, status) = if rows.iter().all(|row| row["status"] == "completed") {
         (0, "completed")
     } else {
@@ -1339,7 +1535,7 @@ mod tests {
         )?;
         assert_eq!(execution.pending_repairs()?.len(), 1);
 
-        let rows = execution.document_rows(Some(&workspace.evidence))?;
+        let rows = execution.publish_documents()?;
         assert_eq!(rows[0]["status"], "partial");
         let resource = &rows[0]["resources"][0];
         assert_eq!(resource["status"], "failed");
