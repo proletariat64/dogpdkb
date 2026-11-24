@@ -1,4 +1,4 @@
-use super::{Disposition, PlannedDocument, read_image};
+use super::{DOWNLOAD_SCHEMA, Disposition, PlannedDocument, read_image};
 use crate::artifacts::{atomic, json_bytes, owned_path, read_bound, sha, validate_settings};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -6,8 +6,6 @@ use serde_json::Value;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-
-const SCHEMA: &str = "mdocr-download-1";
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -80,7 +78,7 @@ impl DownloadCheckpoint {
             Err(error) => return Err(error).context("read download checkpoint"),
         };
         ensure!(
-            checkpoint.schema_version == SCHEMA,
+            checkpoint.schema_version == DOWNLOAD_SCHEMA,
             "invalid download checkpoint schema"
         );
         ensure!(
@@ -120,7 +118,7 @@ impl DownloadCheckpoint {
         documents: Vec<DownloadDocument>,
     ) -> Result<Self> {
         let initial = Self {
-            schema_version: SCHEMA.into(),
+            schema_version: DOWNLOAD_SCHEMA.into(),
             work_path,
             work_sha256,
             settings,

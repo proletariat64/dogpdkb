@@ -56,12 +56,33 @@ mdocrr run --plan work.json
 mdocrr cancel --plan work.json
 mdocrr run --plan work.json --resume
 mdocrr assemble --plan work.json --output-dir recovered
-mdocrr purge --plan work.json
 ```
 
-Run again with the same work plan after an interruption. After explicit
-cancellation, resume with `--resume`. Use `assemble` to recover already accepted
-results locally. Purge is explicit and preserves published Markdown.
+Run again with the same work plan after interrupted OCR. Use `--resume` for an
+interrupted download or an explicit cancellation. Use `assemble` to recover
+already accepted results locally.
+
+To perform OCR again with the retained downloads, confirm a reset and run.
+
+```sh
+mdocrr reset --plan work.json
+mdocrr run --plan work.json
+```
+
+Reset clears the batch's OCR state and removes published Markdown whose paths
+and digests match its publication receipts. The next execution starts with zero
+used OCR budget and bypasses persistent OCR cache reads until it completes.
+Repeat an interrupted reset to finish cleanup before running again.
+
+To discard staged images as well, purge before resetting. Purge preserves
+published Markdown until the operator confirms reset. Finish an interrupted
+purge by repeating it before requesting reset.
+
+```sh
+mdocrr purge --plan work.json
+mdocrr reset --plan work.json
+mdocrr run --plan work.json
+```
 
 Use `mdocrr --help` to browse commands and `mdocrr help all` for the full embedded
 contract. The [product specification](../.scratch/mdocr-rust-cli/spec.md)

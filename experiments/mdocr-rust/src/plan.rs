@@ -20,6 +20,7 @@ use std::time::Duration;
 use walkdir::WalkDir;
 
 pub(crate) const FROZEN_SCHEMA: &str = "mdocr-frozen-plan-1";
+pub(crate) const DOWNLOAD_SCHEMA: &str = "mdocr-download-1";
 const WORK_SCHEMA: &str = "mdocr-work-1";
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -54,6 +55,12 @@ pub(crate) struct Work {
 impl Work {
     pub(crate) fn digest(&self) -> Result<String> {
         Ok(sha(&json_bytes(self)?))
+    }
+
+    pub(crate) fn outputs(&self) -> impl Iterator<Item = &Path> {
+        self.documents
+            .iter()
+            .map(|doc| doc.output.as_deref().expect("normalized output"))
     }
 }
 
@@ -886,6 +893,7 @@ pub(crate) fn accept(
     }
     let request = normalize(work)?;
     let work_digest = request.digest()?;
+    workspace.verify_reset_binding(&work_digest)?;
     match fs::read(frozen) {
         Ok(bytes) => {
             let previous: Value = serde_json::from_slice(&bytes).context("invalid frozen plan")?;

@@ -916,6 +916,7 @@ impl<'a> Execution<'a> {
     }
 
     fn dispatch(&mut self, engine: &Engine<'_>) -> Result<()> {
+        let reset = self.workspace.reset_active()?;
         self.state.status = "running".into();
         let mut pending = HashMap::new();
         for key in self.layout.jobs.keys() {
@@ -925,7 +926,7 @@ impl<'a> Execution<'a> {
             {
                 continue;
             }
-            if let Some(patches) = self.read_cache(key)? {
+            if !reset && let Some(patches) = self.read_cache(key)? {
                 let mut attempt = Attempt::new(key.clone(), Status::Reused);
                 attempt.patches = Some(patches);
                 self.state.reused.insert(key.clone(), attempt);
@@ -1253,6 +1254,9 @@ impl<'a> Execution<'a> {
         self.state.status = status.into();
         self.save_journal()?;
         self.save_result()?;
+        if status == "completed" {
+            self.workspace.complete_reset()?;
+        }
         self.progress_snapshot(
             if status == "canceled" {
                 "canceled"

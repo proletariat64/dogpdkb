@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use workspace::{Purged, Workspace};
+use workspace::{CleanupPending, Purged, Workspace};
 
 const FULL_HELP: &str = include_str!("../../../.scratch/mdocr-rust-cli/spec.md");
 
@@ -103,6 +103,12 @@ enum Command {
         output_dir: PathBuf,
     },
 
+    /// Clear owned OCR state and published outputs so the next run performs OCR again.
+    #[command(
+        after_help = "Example: mdocrr reset --plan work.json\nVerified downloads are kept when available. The next execution starts a new OCR budget and skips cache reads."
+    )]
+    Reset(BatchArgs),
+
     /// Delete the named batch's workspace with explicit consent.
     #[command(
         after_help = "Example: mdocrr purge --plan work.json\nIncomplete batches require a second confirmation. Published Markdown and source files survive cleanup."
@@ -152,6 +158,7 @@ impl Command {
             Self::Run { .. } => "run",
             Self::Cancel(_) => "cancel",
             Self::Assemble { .. } => "assemble",
+            Self::Reset(_) => "reset",
             Self::Purge { .. } => "purge",
             Self::Doctor { .. } => "doctor",
             Self::CheckMermaid { .. } => "check-mermaid",
@@ -220,6 +227,7 @@ fn execute(command: Command) -> Outcome {
             let _lock = ws.lock_existing()?;
             runner::assemble(&ws, output_dir)
         }
+        Command::Reset(batch) => workspace::reset(&Workspace::new(&batch.plan)?),
         Command::Purge { batch, yes } => workspace::purge(&Workspace::new(&batch.plan)?, yes),
         Command::Doctor { config, .. } => config::doctor(config.as_deref()),
         Command::CheckMermaid { input } => check_mermaid(input),
@@ -340,6 +348,8 @@ fn main() -> ExitCode {
         Err(error) => {
             let (status, reason) = if error.is::<Purged>() {
                 ("purged", "WORKSPACE_PURGED")
+            } else if let Some(pending) = error.downcast_ref::<CleanupPending>() {
+                ("error", pending.reason())
             } else if error.chain().any(|cause| {
                 cause
                     .downcast_ref::<std::fs::TryLockError>()

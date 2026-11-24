@@ -171,6 +171,174 @@ fn publication_refuses_changed_or_unowned_outputs() {
 }
 
 #[test]
+fn reset_requires_consent_and_allows_the_same_owned_outputs_to_be_published_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    draft(root);
+    assert!(run(root, &["run", "--plan", "work.json"]).status.success());
+    let workspace = root.join("work.mdocr");
+    let output = root.join("output.md");
+    let frozen = fs::read(workspace.join("plan.json")).unwrap();
+    let download = fs::read(workspace.join("download.json")).unwrap();
+    let journal = fs::read(workspace.join("journal.json")).unwrap();
+
+    let declined = with_confirmation(root, &["reset", "--plan", "work.json"], b"n\n");
+    assert_eq!(declined.status.code(), Some(2));
+    assert_eq!(result(&declined)["status"], "declined");
+    assert_eq!(fs::read(workspace.join("journal.json")).unwrap(), journal);
+    assert!(output.exists());
+    assert!(!workspace.join("reset.json").exists());
+
+    let reset = with_confirmation(root, &["reset", "--plan", "work.json"], b"y\n");
+    assert!(reset.status.success(), "{reset:?}");
+    assert_eq!(result(&reset)["status"], "reset");
+    assert_eq!(result(&reset)["unresolved_requests"], false);
+    assert!(
+        String::from_utf8_lossy(&reset.stderr).contains(output.to_str().unwrap()),
+        "{reset:?}"
+    );
+    assert!(!output.exists());
+    assert!(!workspace.join("journal.json").exists());
+    assert!(!workspace.join("result.json").exists());
+    assert!(workspace.join("reset.json").is_file());
+    assert_eq!(fs::read(workspace.join("plan.json")).unwrap(), frozen);
+    assert_eq!(fs::read(workspace.join("download.json")).unwrap(), download);
+
+    assert!(run(root, &["run", "--plan", "work.json"]).status.success());
+    assert_eq!(fs::read(output).unwrap(), b"Body without images.\n");
+    assert!(!workspace.join("reset.json").exists());
+    assert_eq!(
+        fs::read(root.join("input.md")).unwrap(),
+        b"Body without images.\n"
+    );
+}
+
+#[test]
+fn interrupted_reset_blocks_execution_and_finishes_from_saved_cleanup_targets() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    draft(root);
+    assert!(run(root, &["run", "--plan", "work.json"]).status.success());
+    let workspace = root.join("work.mdocr");
+    let evidence = workspace.join("evidence");
+    if evidence.exists() {
+        fs::remove_dir_all(&evidence).unwrap();
+    }
+    fs::write(&evidence, b"cleanup obstruction").unwrap();
+    let stopped = with_confirmation(root, &["reset", "--plan", "work.json"], b"y\n");
+    assert_eq!(stopped.status.code(), Some(1));
+    assert!(workspace.join("reset.json").is_file());
+    assert!(!root.join("output.md").exists());
+
+    let blocked = run(root, &["run", "--plan", "work.json"]);
+    assert_eq!(blocked.status.code(), Some(1));
+    assert_eq!(result(&blocked)["reason_code"], "WORKSPACE_RESET_PENDING");
+    let blocked_purge = run(root, &["purge", "--plan", "work.json", "-Y"]);
+    assert_eq!(
+        result(&blocked_purge)["reason_code"],
+        "WORKSPACE_RESET_PENDING"
+    );
+
+    fs::remove_file(evidence).unwrap();
+    let resumed = run(root, &["reset", "--plan", "work.json"]);
+    assert!(resumed.status.success(), "{resumed:?}");
+    assert_eq!(result(&resumed)["status"], "reset");
+    assert!(run(root, &["run", "--plan", "work.json"]).status.success());
+    assert!(root.join("output.md").is_file());
+}
+
+#[test]
+fn interrupted_purge_keeps_its_receipts_and_requires_finishing_before_reset() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    draft(root);
+    assert!(run(root, &["run", "--plan", "work.json"]).status.success());
+    let workspace = root.join("work.mdocr");
+    let images = workspace.join("images");
+    if images.exists() {
+        fs::remove_dir_all(&images).unwrap();
+    }
+    fs::write(&images, b"cleanup obstruction").unwrap();
+    let stopped = run(root, &["purge", "--plan", "work.json", "-Y"]);
+    assert_eq!(stopped.status.code(), Some(1));
+    assert!(!workspace.join("journal.json").exists());
+    assert!(root.join("output.md").is_file());
+    let blocked = run(root, &["reset", "--plan", "work.json"]);
+    assert_eq!(blocked.status.code(), Some(1));
+    assert_eq!(result(&blocked)["reason_code"], "WORKSPACE_PURGE_PENDING");
+
+    fs::remove_file(images).unwrap();
+    let purge = run(root, &["purge", "--plan", "work.json", "-Y"]);
+    assert!(purge.status.success(), "{purge:?}");
+    let seal = workspace.join(".purged.json");
+    let saved = fs::read(&seal).unwrap();
+    assert!(
+        run(root, &["purge", "--plan", "work.json", "-Y"])
+            .status
+            .success()
+    );
+    assert_eq!(fs::read(&seal).unwrap(), saved);
+    assert!(root.join("output.md").is_file());
+    let reset = with_confirmation(root, &["reset", "--plan", "work.json"], b"y\n");
+    assert!(reset.status.success(), "{reset:?}");
+    assert!(!root.join("output.md").exists());
+
+    // Re-create the durable state immediately before a successful reset unseals.
+    fs::write(&seal, saved).unwrap();
+    assert_eq!(
+        result(&run(root, &["run", "--plan", "work.json"]))["reason_code"],
+        "WORKSPACE_PURGED"
+    );
+    assert!(
+        run(root, &["reset", "--plan", "work.json"])
+            .status
+            .success()
+    );
+    assert!(!seal.exists());
+    assert!(run(root, &["run", "--plan", "work.json"]).status.success());
+}
+
+#[test]
+fn reset_refuses_modified_and_unowned_outputs_before_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    draft(root);
+    assert!(run(root, &["run", "--plan", "work.json"]).status.success());
+    let output = root.join("output.md");
+    let workspace = root.join("work.mdocr");
+    let journal = fs::read(workspace.join("journal.json")).unwrap();
+    fs::write(&output, "replacement").unwrap();
+    let reset = with_confirmation(root, &["reset", "--plan", "work.json"], b"y\n");
+    assert_eq!(reset.status.code(), Some(1));
+    assert_eq!(fs::read(workspace.join("journal.json")).unwrap(), journal);
+    assert!(!workspace.join("reset.json").exists());
+
+    assert!(
+        run(root, &["purge", "--plan", "work.json", "-Y"])
+            .status
+            .success()
+    );
+    let reset = with_confirmation(root, &["reset", "--plan", "work.json"], b"y\n");
+    assert_eq!(reset.status.code(), Some(1));
+    assert_eq!(fs::read(&output).unwrap(), b"replacement");
+    assert!(workspace.join(".purged.json").exists());
+
+    let unowned = tempfile::tempdir().unwrap();
+    let root = unowned.path();
+    draft(root);
+    assert!(
+        run(root, &["accept", "--plan", "work.json"])
+            .status
+            .success()
+    );
+    fs::write(root.join("output.md"), "Body without images.\n").unwrap();
+    let reset = with_confirmation(root, &["reset", "--plan", "work.json"], b"y\n");
+    assert_eq!(reset.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&reset.stderr).contains("unowned output"));
+    assert!(root.join("output.md").is_file());
+}
+
+#[test]
 fn explicit_completed_purge_prompts_once_and_keeps_the_published_output() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

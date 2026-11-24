@@ -45,6 +45,15 @@ fn source(root: &Path, color: [u8; 3]) {
 }
 
 fn plan(root: &Path, endpoint: &str, output_dir: &str, documents: Value) -> String {
+    write_plan(root, endpoint, output_dir, documents);
+    let output = cli(root, &["accept", "--plan", "work.json"])
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    sha(&fs::read(root.join("work.mdocr/plan.json")).unwrap())
+}
+
+fn write_plan(root: &Path, endpoint: &str, output_dir: &str, documents: Value) {
     fs::write(
         root.join("work.json"),
         serde_json::to_vec_pretty(&json!({
@@ -62,11 +71,6 @@ fn plan(root: &Path, endpoint: &str, output_dir: &str, documents: Value) -> Stri
             "mode = \"paddle\"\nendpoint = \"{endpoint}\"\nrequest_budget = 4\nconcurrency = 1\ntoken_file = \"token\"\n"
         ),
     ).unwrap();
-    let output = cli(root, &["accept", "--plan", "work.json"])
-        .output()
-        .unwrap();
-    assert_exit(&output, 0);
-    sha(&fs::read(root.join("work.mdocr/plan.json")).unwrap())
 }
 
 fn accept(listener: &TcpListener) -> TcpStream {
@@ -131,6 +135,29 @@ fn respond(mut stream: TcpStream, body: &Value) {
     stream.write_all(&body).unwrap();
 }
 
+fn confirm_reset(root: &Path, answer: &[u8]) -> Output {
+    let mut child = cli(root, &["reset", "--plan", "work.json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(answer).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn serve_png(listener: &TcpListener, bytes: &[u8]) {
+    let mut stream = accept(listener);
+    assert_eq!(read_request(&mut stream).0, "GET /image.png HTTP/1.1");
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: image/png\r\ncontent-length: {}\r\n\r\n",
+        bytes.len()
+    )
+    .unwrap();
+    stream.write_all(bytes).unwrap();
+}
+
 fn assert_admission(root: &Path, plan_hash: &str, count: usize, image: &Path) -> Value {
     let journal = read_json(&root.join("work.mdocr/journal.json"));
     assert_eq!(journal["plan_sha256"], plan_hash);
@@ -180,6 +207,139 @@ fn serve_success(listener: &TcpListener, base: &str, on_post: impl FnOnce()) {
         stream,
         &json!({"result":{"layoutParsingResults":[{"markdown":{"text":"Recognized. ![chart](provider.png)"}}]}}),
     );
+}
+
+#[test]
+fn reset_reruns_warm_ocr_and_only_purge_discards_the_downloads() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    source(root, [12, 34, 56]);
+    source(&root.join("second"), [12, 34, 57]);
+    let bytes = fs::read(root.join("image.png")).unwrap();
+    let (listener, base) = listener();
+    fs::write(root.join("in.md"), format!("![seed]({base}/image.png)\n")).unwrap();
+    write_plan(
+        root,
+        &format!("{base}/jobs"),
+        ".",
+        json!([
+            {"path": "in.md", "output": "out.md", "download_remote": true},
+            {"path": "second/in.md", "output": "second.md"},
+        ]),
+    );
+    let config = root.join("default.toml");
+    let toml = fs::read_to_string(&config).unwrap();
+    fs::write(config, format!("{toml}cache_dir = \"cache\"\n")).unwrap();
+    let start = || {
+        cli(root, RUN_ARGS)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let initial = start();
+    serve_png(&listener, &bytes);
+    serve_success(&listener, &base, || {});
+    serve_success(&listener, &base, || {});
+    assert_exit(&initial.wait_with_output().unwrap(), 0);
+    let workspace = root.join("work.mdocr");
+    let checkpoint = fs::read(workspace.join("download.json")).unwrap();
+    let cached = || fs::read_dir(root.join("cache")).unwrap().count();
+    assert!(cached() > 0);
+    let count = || read_json(&workspace.join("result.json"))["budget"]["requests"].clone();
+    assert_eq!(count(), 2);
+
+    assert_exit(&confirm_reset(root, b"y\n"), 0);
+    assert_eq!(
+        fs::read(workspace.join("download.json")).unwrap(),
+        checkpoint
+    );
+    assert!(cached() > 0);
+    assert!(!workspace.join("evidence").exists());
+    assert!(!root.join("out.md").exists());
+    fs::remove_file(root.join("token")).unwrap();
+    let first_attempt = cli(root, RUN_ARGS).output().unwrap();
+    assert_exit(&first_attempt, 2);
+    assert_eq!(count(), 0);
+    assert!(workspace.join("reset.json").exists());
+    let cancel = cli(root, &["cancel", "--plan", "work.json"])
+        .output()
+        .unwrap();
+    assert_exit(&cancel, 0);
+    assert_exit(&cli(root, RUN_ARGS).output().unwrap(), 3);
+    fs::write(root.join("token"), TOKEN).unwrap();
+    let redo = cli(root, RUN_ARGS)
+        .arg("--resume")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serve_success(&listener, &base, || {
+        let active = cli(root, &["reset", "--plan", "work.json"])
+            .output()
+            .unwrap();
+        assert_exit(&active, 1);
+        let summary: Value = serde_json::from_slice(&active.stdout).unwrap();
+        assert_eq!(summary["reason_code"], "WORKSPACE_ACTIVE");
+    });
+    serve_success(&listener, &base, || {});
+    assert_exit(&redo.wait_with_output().unwrap(), 0);
+    assert_eq!(count(), 2);
+    assert!(!workspace.join("reset.json").exists());
+    assert!(root.join("out.md").is_file());
+
+    assert_exit(&confirm_reset(root, b"y\n"), 0);
+    let mut killed = start();
+    let mut in_flight = accept(&listener);
+    assert_eq!(read_request(&mut in_flight).0, "POST /jobs HTTP/1.1");
+    killed.kill().unwrap();
+    assert!(!killed.wait().unwrap().success());
+    drop(in_flight);
+    let restarted = start();
+    serve_success(&listener, &base, || {});
+    assert_exit(&restarted.wait_with_output().unwrap(), 2);
+    assert_eq!(count(), 2);
+    assert!(workspace.join("reset.json").exists());
+    assert!(!root.join("out.md").exists());
+    assert!(root.join("second.md").is_file());
+
+    assert_exit(
+        &cli(root, &["purge", "--plan", "work.json", "-Y"])
+            .output()
+            .unwrap(),
+        0,
+    );
+    assert!(!workspace.join("download.json").exists());
+    assert!(!workspace.join("images").exists());
+    assert!(root.join("second.md").is_file());
+    assert_exit(&confirm_reset(root, b"y\n"), 0);
+    assert!(!root.join("out.md").exists());
+    assert!(!root.join("second.md").exists());
+    let redownload = start();
+    serve_png(&listener, &bytes);
+    serve_success(&listener, &base, || {});
+    serve_success(&listener, &base, || {});
+    assert_exit(&redownload.wait_with_output().unwrap(), 0);
+    assert_eq!(count(), 2);
+
+    let mut other_work = read_json(&root.join("work.json"));
+    other_work["documents"][0]["output"] = json!("cache-copy.md");
+    other_work["documents"][1]["output"] = json!("cache-copy-second.md");
+    fs::write(
+        root.join("cache-copy.json"),
+        serde_json::to_vec(&other_work).unwrap(),
+    )
+    .unwrap();
+    let reused = cli(root, &["run", "--plan", "cache-copy.json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serve_png(&listener, &bytes);
+    assert_exit(&reused.wait_with_output().unwrap(), 0);
+    let reused = read_json(&root.join("cache-copy.mdocr/result.json"));
+    assert_eq!(reused["budget"]["requests"], 0);
+    assert_eq!(reused["documents"][0]["resources"][0]["status"], "reused");
 }
 
 #[test]
@@ -343,6 +503,27 @@ fn paddle_run_assembles_accepted_work_without_replaying_a_crash_admission() {
     assert!(report["documents"][1]["output"].is_null());
     assert_eq!(fs::read(root.join("out/first/in.md")).unwrap(), recovered);
     assert!(!root.join("out/second/in.md").exists());
+
+    assert_exit(
+        &cli(root, &["purge", "--plan", "work.json", "-Y"])
+            .output()
+            .unwrap(),
+        0,
+    );
+    let declined = confirm_reset(root, b"n\n");
+    assert_exit(&declined, 2);
+    let summary: Value = serde_json::from_slice(&declined.stdout).unwrap();
+    assert_eq!(summary["unresolved_requests"], true);
+    assert!(
+        String::from_utf8_lossy(&declined.stderr).contains("repeat those requests and their cost")
+    );
+    assert_eq!(fs::read(root.join("out/first/in.md")).unwrap(), recovered);
+    assert_exit(&confirm_reset(root, b"y\n"), 0);
+    assert!(!root.join("out/first/in.md").exists());
+    assert_eq!(
+        fs::read(root.join("assembly/documents/0.md")).unwrap(),
+        recovered
+    );
 }
 
 #[test]
