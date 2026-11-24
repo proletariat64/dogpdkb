@@ -2,6 +2,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -54,6 +55,19 @@ fn draft(root: &Path) {
     assert!(output.status.success(), "{:?}", output);
 }
 
+fn stamp_stage(path: &Path, receipt_id: &str, bytes: &[u8]) {
+    let mut file = fs::File::create(path).unwrap();
+    let stamp = format!("{receipt_id}:{}", file.metadata().unwrap().ino());
+    rustix::fs::fsetxattr(
+        &file,
+        "user.mdocrr.publication",
+        stamp.as_bytes(),
+        rustix::fs::XattrFlags::CREATE,
+    )
+    .unwrap();
+    file.write_all(bytes).unwrap();
+}
+
 #[test]
 fn publishes_english_help_and_rejects_undocumented_command_forms() {
     let temp = tempfile::tempdir().unwrap();
@@ -91,28 +105,32 @@ fn publication_receipt_recovers_both_sides_of_output_creation() {
     let output_path = root.join("output.md");
     let expected_output = b"Body without images.\n";
     let mut journal: Value = serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
-    let receipt = &journal["publication_receipts"][root
-        .join("input.md")
-        .canonicalize()
-        .unwrap()
-        .to_str()
-        .unwrap()];
+    let id = root.join("input.md");
+    let receipt = &journal["publication_receipts"][id.to_str().unwrap()];
+    assert_eq!(receipt["path"], serde_json::json!(output_path));
     assert_eq!(
-        receipt,
-        &serde_json::json!({
-            "path": output_path,
-            "sha256": format!("{:x}", Sha256::digest(expected_output)),
-        })
+        receipt["sha256"],
+        format!("{:x}", Sha256::digest(expected_output))
     );
-
+    let receipt_id = receipt["id"].as_str().unwrap().to_owned();
+    let stage = root.join(format!(".mdocrr-stage-{receipt_id}"));
+    assert!(!stage.exists());
     journal["status"] = "running".into();
     journal["documents"] = serde_json::json!([]);
     let interrupted_journal = serde_json::to_vec(&journal).unwrap();
-    for output_already_written in [false, true] {
+    for interruption in ["receipt", "empty_stage", "partial_stage", "renamed"] {
         fs::remove_file(&result_path).unwrap();
         fs::write(&journal_path, &interrupted_journal).unwrap();
-        if !output_already_written {
-            fs::remove_file(&output_path).unwrap();
+        fs::remove_file(&output_path).unwrap();
+        match interruption {
+            "receipt" => {}
+            "empty_stage" => fs::write(&stage, b"").unwrap(),
+            "partial_stage" => stamp_stage(&stage, &receipt_id, b"partial bytes"),
+            "renamed" => {
+                stamp_stage(&stage, &receipt_id, expected_output);
+                fs::rename(&stage, &output_path).unwrap();
+            }
+            _ => unreachable!(),
         }
         let recovered = run(root, &run_args);
         assert!(recovered.status.success(), "{recovered:?}");
@@ -120,7 +138,90 @@ fn publication_receipt_recovers_both_sides_of_output_creation() {
         assert_eq!(result(&recovered)["counts"]["requests"], 0);
         assert_eq!(fs::read(&output_path).unwrap(), expected_output);
         assert!(result_path.exists());
+        assert!(!stage.exists());
     }
+
+    fs::write(&journal_path, &interrupted_journal).unwrap();
+    stamp_stage(&stage, &receipt_id, b"partial bytes");
+    fs::remove_file(&output_path).unwrap();
+    fs::write(&output_path, expected_output).unwrap();
+    // The bytes match, but this output was created independently of this stage.
+    for command in ["run", "reset"] {
+        let rejected = with_confirmation(root, &[command, "--plan", "work.json"], b"y\n");
+        assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("unowned document output"));
+        assert_eq!(fs::read(&output_path).unwrap(), expected_output);
+    }
+    let purge = run(root, &["purge", "--plan", "work.json", "-Y"]);
+    assert!(purge.status.success(), "{purge:?}");
+    assert!(!stage.exists());
+    let reset = with_confirmation(root, &["reset", "--plan", "work.json"], b"y\n");
+    assert_eq!(reset.status.code(), Some(1), "{reset:?}");
+    assert_eq!(fs::read(output_path).unwrap(), expected_output);
+}
+
+#[test]
+fn old_receipt_cannot_claim_a_later_batches_identical_output() {
+    for purge in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        draft(root);
+        let args = ["run", "--plan", "work.json"];
+        assert!(run(root, &args).status.success());
+        if purge {
+            assert!(
+                run(root, &["purge", "--plan", "work.json", "-Y"])
+                    .status
+                    .success()
+            );
+        }
+        fs::rename(root.join("output.md"), root.join("archived.md")).unwrap();
+        fs::copy(root.join("work.json"), root.join("other.json")).unwrap();
+        assert!(run(root, &["run", "--plan", "other.json"]).status.success());
+        let rejected = with_confirmation(root, &["reset", "--plan", "work.json"], b"y\n");
+        assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("unowned document output"));
+        assert_eq!(
+            fs::read(root.join("output.md")).unwrap(),
+            fs::read(root.join("archived.md")).unwrap()
+        );
+        assert!(run(root, &["run", "--plan", "other.json"]).status.success());
+    }
+}
+
+#[test]
+fn reset_rechecks_a_missing_output_under_the_publication_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    draft(root);
+    assert!(run(root, &["run", "--plan", "work.json"]).status.success());
+    let output = root.join("output.md");
+    fs::rename(&output, root.join("archived.md")).unwrap();
+    let lock = fs::File::open(root).unwrap();
+    lock.lock().unwrap();
+    let mut reset = command(root)
+        .args(["reset", "--plan", "work.json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    reset.stdin.take().unwrap().write_all(b"y\n").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !root.join("work.mdocr/reset.json").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "reset never recorded its intent"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // A cooperating publisher now owns this directory lock and writes first.
+    fs::write(&output, b"Body without images.\n").unwrap();
+    drop(lock);
+    let rejected = reset.wait_with_output().unwrap();
+    assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("unowned document output"));
+    assert_eq!(fs::read(output).unwrap(), b"Body without images.\n");
 }
 
 #[test]
@@ -286,6 +387,17 @@ fn interrupted_purge_keeps_its_receipts_and_requires_finishing_before_reset() {
     draft(root);
     assert!(run(root, &["run", "--plan", "work.json"]).status.success());
     let workspace = root.join("work.mdocr");
+    let journal_path = workspace.join("journal.json");
+    let mut journal: Value = serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    let input = root.join("input.md").canonicalize().unwrap();
+    let receipt_id = journal["publication_receipts"][input.to_str().unwrap()]["id"]
+        .as_str()
+        .unwrap();
+    let stage = root.join(format!(".mdocrr-stage-{receipt_id}"));
+    stamp_stage(&stage, receipt_id, b"partial bytes");
+    journal["status"] = "running".into();
+    fs::write(journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
     let images = workspace.join("images");
     if images.exists() {
         fs::remove_dir_all(&images).unwrap();
@@ -294,6 +406,7 @@ fn interrupted_purge_keeps_its_receipts_and_requires_finishing_before_reset() {
     let stopped = run(root, &["purge", "--plan", "work.json", "-Y"]);
     assert_eq!(stopped.status.code(), Some(1));
     assert!(!workspace.join("journal.json").exists());
+    assert!(!stage.exists());
     assert!(root.join("output.md").is_file());
     let blocked = run(root, &["reset", "--plan", "work.json"]);
     assert_eq!(blocked.status.code(), Some(1));
@@ -467,7 +580,7 @@ fn purge_keeps_the_saved_binding_if_inputs_disappear_after_reset() {
 }
 
 #[test]
-fn purge_cleans_an_owned_unaccepted_batch_without_authorizing_reset() {
+fn purge_of_unaccepted_batch_allows_reset_without_claiming_existing_outputs() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     draft(root);
@@ -492,6 +605,40 @@ fn purge_cleans_an_owned_unaccepted_batch_without_authorizing_reset() {
         result(&run(root, &["run", "--plan", "work.json"]))["status"],
         "purged"
     );
+    fs::remove_file(root.join("output.md")).unwrap();
+    assert!(
+        with_confirmation(root, &["reset", "--plan", "work.json"], b"y\n")
+            .status
+            .success()
+    );
+    assert!(run(root, &["run", "--plan", "work.json"]).status.success());
+}
+
+#[test]
+fn invalid_toml_values_are_redacted_for_every_config_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    draft(root);
+    fs::write(
+        root.join("bad.toml"),
+        "concurrency = \"http://test:dummy-secret@localhost\"\n",
+    )
+    .unwrap();
+    for args in [
+        &["doctor", "--config", "bad.toml"][..],
+        &["accept", "--plan", "work.json", "--config", "bad.toml"],
+        &["run", "--plan", "work.json", "--config", "bad.toml"],
+    ] {
+        let rejected = run(root, args);
+        assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            stderr.contains("invalid type") && stderr.contains("line 1"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("dummy-secret"), "{stderr}");
+        assert!(!String::from_utf8_lossy(&rejected.stdout).contains("dummy-secret"));
+    }
 }
 
 #[test]

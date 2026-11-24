@@ -745,6 +745,22 @@ fn image_extension(
 }
 
 fn download(client: &Client, url: &Url) -> std::result::Result<Vec<u8>, &'static str> {
+    std::thread::scope(|scope| {
+        let (finished, waiting) = std::sync::mpsc::channel::<()>();
+        scope.spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                waiting.recv_timeout(Duration::from_secs(5))
+            {
+                progress::emit("download_waiting", format_args!("phase=accept in_flight=1"));
+            }
+        });
+        let result = fetch_image(client, url);
+        drop(finished);
+        result
+    })
+}
+
+fn fetch_image(client: &Client, url: &Url) -> std::result::Result<Vec<u8>, &'static str> {
     let mut current = url.clone();
     let failed = "REMOTE_IMAGE_DOWNLOAD_FAILED";
     for _ in 0..=8 {

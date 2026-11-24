@@ -6,6 +6,7 @@ mod paddle;
 mod plan;
 mod progress;
 mod provider;
+mod publication;
 mod runner;
 mod workspace;
 

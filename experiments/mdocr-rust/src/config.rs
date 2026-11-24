@@ -90,18 +90,14 @@ pub(crate) fn source(work: Option<&Path>, explicit: Option<&Path>) -> Result<Opt
 }
 
 pub(crate) fn load(work: Option<&Path>, explicit: Option<&Path>) -> Result<Value> {
-    load_from(source(work, explicit)?.as_deref(), false)
+    load_from(source(work, explicit)?.as_deref())
 }
 
-fn load_from(source: Option<&Path>, redact_toml_values: bool) -> Result<Value> {
+fn load_from(source: Option<&Path>) -> Result<Value> {
     let (options, directory) = if let Some(path) = source {
         let text = read_text_file(path, "configuration")?;
         let options: Options = toml::from_str(&text).map_err(|error| {
-            let diagnostic = if redact_toml_values {
-                redacted_toml_error(&text, &error)
-            } else {
-                error.message().to_owned()
-            };
+            let diagnostic = redacted_toml_error(&text, &error);
             anyhow::anyhow!("invalid TOML in {}: {diagnostic}", path.display())
         })?;
         let directory = path
@@ -366,7 +362,7 @@ fn embedded_image_check() -> bool {
 
 pub(crate) fn doctor(explicit: Option<&Path>) -> Result<(u8, Value)> {
     let source = source(None, explicit)?;
-    let settings = load_from(source.as_deref(), true)?;
+    let settings = load_from(source.as_deref())?;
     let mode = settings["mode"]
         .as_str()
         .context("configuration missing provider mode")?;

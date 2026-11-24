@@ -99,6 +99,32 @@ fn remote_batch(root: &Path, destinations: &[&str]) -> (TcpListener, Vec<u8>) {
 }
 
 #[test]
+fn slow_download_emits_progress_before_response() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let (listener, png) = remote_batch(root, &["slow.png"]);
+    let mut child = start_command(root, &["accept", "--plan", "work.json"]);
+    let stderr = child.stderr.take().unwrap();
+    let (log, lines) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            log.send(line.unwrap()).unwrap();
+        }
+    });
+    let (stream, _) = await_get(&listener);
+    let heartbeat = lines.recv_timeout(Duration::from_secs(10));
+    respond_png(stream, &png);
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        heartbeat
+            .unwrap()
+            .contains("event=download_waiting phase=accept in_flight=1")
+    );
+}
+
+#[test]
 fn resume_before_freeze_reuses_only_committed_downloads_and_saved_policy() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

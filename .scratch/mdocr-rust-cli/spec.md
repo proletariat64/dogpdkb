@@ -371,11 +371,18 @@ without provider traffic. Use a digest-based `resource_id` for inline Base64
 in public reports and use the staged original as the source witness.
 
 Before publishing each output, persist its resolved destination and expected
-SHA-256 as a journal publication receipt bound to the frozen plan. Publish
-output files and evidence atomically. On resume, verify existing
-immutable output and evidence before accepting them. Refuse drift and preexisting
-unowned destinations. The receipt lets cleanup recognize an output even if the
-process stopped after writing it and before updating the result.
+SHA-256 and a unique publication identity in the journal, bound to the frozen
+plan. Derive the staging path from that receipt before creating it. Store the
+identity as a user extended attribute on the staged file and atomically rename
+it into place without replacing any destination. The stored attribute and file
+identity continue to prove ownership after publication and purge. Matching
+content alone cannot authorize a receipt. Before admitting OCR, verify the
+destination filesystem can lock directories, preserve the attribute and rename
+without replacing files. Serialize publication and reset across mdocrr batches
+using the same output directory. Publish output files and evidence atomically.
+On resume, verify existing immutable output and evidence before accepting them.
+Refuse drift and preexisting unowned destinations. The receipt lets cleanup
+recognize an output even if the process stopped before updating the result.
 
 ### Assemble
 
@@ -425,6 +432,8 @@ marker, and old OCR evidence. Remove prior published Markdown only when its
 resolved path and current SHA-256 match an owned publication receipt. For a
 purged workspace, take the receipts from its purge seal and verify the seal's
 work path and digest. A caller-declared output path alone provides no ownership.
+If the workspace never accepted work and holds no receipts, a verified empty
+purge seal permits reset against the currently valid work plan.
 Validate all destinations before cleanup and refuse a changed or unowned file.
 Missing outputs are already clear. Never delete source Markdown, caller-owned
 images, recovery directories, or whole output directories.
@@ -511,7 +520,8 @@ Include the phase and relevant counts for document progress, in-flight
 requests, and cumulative requests and budget. Emit events for acceptance,
 admission, settlement, retries, throttling, budget or deadline stops,
 cancellation, and publication. During long waits emit periodic status even when
-no provider event arrives. Use English messages and stable reason codes.
+no provider event arrives. Include a heartbeat during remote image downloads.
+Use English messages and stable reason codes.
 Avoid credentials, data URLs, image bytes, raw provider responses, terminal
 control sequences, and progress that rewrites prior lines.
 

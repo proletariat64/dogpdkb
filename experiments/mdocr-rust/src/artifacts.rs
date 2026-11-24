@@ -549,20 +549,28 @@ pub(crate) struct RenderedDocument {
 }
 
 impl RenderedDocument {
-    pub(crate) fn output_sha256(&self) -> Option<&str> {
-        self.row["output_sha256"].as_str()
+    pub(crate) fn publish(self, output: &Path, first_write: bool) -> Result<Value> {
+        self.publish_with(|content, _| {
+            if first_write {
+                atomic(output, content, true)
+            } else {
+                verify_immutable(output, content)
+            }
+        })
     }
 
-    pub(crate) fn publish(self, output: &Path, first_write: bool) -> Result<Value> {
+    pub(crate) fn publish_with(
+        self,
+        publish: impl FnOnce(&[u8], &str) -> Result<()>,
+    ) -> Result<Value> {
         for (path, block) in &self.evidence {
             verify_immutable(path, block.as_bytes())?;
         }
         if let Some(content) = &self.output {
-            if first_write {
-                atomic(output, content.as_bytes(), true)?;
-            } else {
-                verify_immutable(output, content.as_bytes())?;
-            }
+            let digest = self.row["output_sha256"]
+                .as_str()
+                .context("missing rendered output digest")?;
+            publish(content.as_bytes(), digest)?;
         }
         Ok(self.row)
     }

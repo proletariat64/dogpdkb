@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -340,6 +341,36 @@ fn reset_reruns_warm_ocr_and_only_purge_discards_the_downloads() {
     let reused = read_json(&root.join("cache-copy.mdocr/result.json"));
     assert_eq!(reused["budget"]["requests"], 0);
     assert_eq!(reused["documents"][0]["resources"][0]["status"], "reused");
+}
+
+#[test]
+fn output_preflight_failure_blocks_provider_admission() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path();
+    source(root, [12, 34, 56]);
+    let (listener, base) = listener();
+    let output = root.join("out");
+    fs::create_dir(&output).unwrap();
+    let config = fs::Permissions::from_mode(0o500);
+    fs::set_permissions(&output, config).unwrap();
+    if tempfile::tempdir_in(&output).is_ok() {
+        // A privileged test runner can bypass directory permissions.
+        return;
+    }
+    plan(
+        root,
+        &format!("{base}/jobs"),
+        "out",
+        json!([{"path": "in.md"}]),
+    );
+    let failed = cli(root, RUN_ARGS).output().unwrap();
+    assert_exit(&failed, 1);
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("output filesystem"));
+    assert!(!root.join("work.mdocr/journal.json").exists());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
 
 #[test]

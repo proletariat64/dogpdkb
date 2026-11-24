@@ -1,8 +1,7 @@
-use crate::artifacts::{
-    atomic, json_bytes, load_plan_for_staged_repair, owned_path, read_bound, sha,
-};
+use crate::artifacts::{atomic, json_bytes, load_plan_for_staged_repair, owned_path, sha};
 use crate::plan::{self, Work};
-use crate::runner::{PublicationReceipt, publication_state};
+use crate::publication::PublicationReceipt;
+use crate::runner::publication_state;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -65,11 +64,8 @@ impl std::error::Error for CleanupPending {}
 #[derive(Clone, Deserialize, Serialize, Eq, PartialEq)]
 struct Cleanup {
     work_path: PathBuf,
-    #[serde(default)]
     work_sha256: String,
-    #[serde(default)]
     unresolved_requests: bool,
-    #[serde(default)]
     outputs: Vec<PublicationReceipt>,
 }
 
@@ -189,6 +185,13 @@ impl Workspace {
         let seal: Option<PurgeSeal> = read_state(&self.purge_marker())?;
         if let Some(seal) = &seal {
             seal.cleanup.verify_path(self)?;
+            ensure!(
+                valid_digest(&seal.cleanup.work_sha256)
+                    || (seal.cleanup.work_sha256.is_empty()
+                        && seal.cleanup.outputs.is_empty()
+                        && !seal.cleanup.unresolved_requests),
+                "invalid purge work binding"
+            );
         }
         Ok(seal)
     }
@@ -315,8 +318,7 @@ fn saved_work_digest(workspace: &Workspace) -> Result<String> {
             return Ok(digest.to_owned());
         }
     }
-    // An owned workspace with no accepted plan, checkpoint or reset intent
-    // can be purged, but supplies no prior work binding for reset.
+    // A workspace that never accepted work has no prior digest or receipts.
     Ok(workspace
         .read_reset()?
         .map_or_else(String::new, |intent| intent.cleanup.work_sha256))
@@ -407,7 +409,7 @@ impl Cleanup {
                     valid_digest(&receipt.sha256),
                     "invalid cleanup receipt digest"
                 );
-                verify_output_if_present(receipt)?;
+                receipt.verify_output_if_present()?;
                 matched += 1;
             } else {
                 ensure!(
@@ -423,18 +425,6 @@ impl Cleanup {
         );
         Ok(())
     }
-}
-
-fn verify_output_if_present(receipt: &PublicationReceipt) -> Result<()> {
-    owned_path(&receipt.path)?;
-    if receipt.path.try_exists()? {
-        read_bound(
-            &receipt.path,
-            &receipt.sha256,
-            "published OCR output has drifted",
-        )?;
-    }
-    Ok(())
 }
 
 fn remove_file(path: &Path) -> Result<()> {
@@ -518,14 +508,21 @@ pub(crate) fn reset(workspace: &Workspace) -> Result<(u8, Value)> {
     }
     let work = plan::normalize(&workspace.work)?;
     let digest = work.digest()?;
+    let sealed_cleanup = seal.as_ref().map(|seal| {
+        let mut cleanup = seal.cleanup.clone();
+        if cleanup.work_sha256.is_empty() {
+            cleanup.work_sha256.clone_from(&digest);
+        }
+        cleanup
+    });
     let marker = workspace.reset_marker();
     let pending = workspace.read_reset()?.filter(|intent| {
         intent.status == ResetPhase::Resetting || seal.is_some() && intent.after_purge
     });
     let mut intent = if let Some(intent) = pending {
         ensure!(
-            match &seal {
-                Some(seal) => intent.after_purge && intent.cleanup == seal.cleanup,
+            match &sealed_cleanup {
+                Some(cleanup) => intent.after_purge && &intent.cleanup == cleanup,
                 None => !intent.after_purge,
             },
             "reset intent and purge seal disagree"
@@ -535,8 +532,8 @@ pub(crate) fn reset(workspace: &Workspace) -> Result<(u8, Value)> {
         intent
     } else {
         let after_purge = seal.is_some();
-        let cleanup = match seal {
-            Some(ref seal) => seal.cleanup.clone(),
+        let cleanup = match sealed_cleanup {
+            Some(cleanup) => cleanup,
             None => cleanup_state(workspace)?.1,
         };
         cleanup.verify_digest(&digest)?;
@@ -577,9 +574,7 @@ pub(crate) fn reset(workspace: &Workspace) -> Result<(u8, Value)> {
 
     if intent.status == ResetPhase::Resetting {
         for receipt in &intent.cleanup.outputs {
-            verify_output_if_present(receipt)?;
-            remove_file(&receipt.path)?;
-            sync_parent(&receipt.path)?;
+            receipt.remove_output()?;
         }
         for path in [&workspace.journal, &workspace.result, &workspace.cancel] {
             remove_file(path)?;
@@ -654,9 +649,10 @@ pub(crate) fn purge(workspace: &Workspace, force: bool) -> Result<(u8, Value)> {
         atomic(&marker, &json_bytes(&seal)?, true)?;
         seal
     };
-    // An older seal has no digest or phase evidence for reset. Preserve its
-    // run barrier, and let a repeated purge finish its workspace-only cleanup.
-    if seal.status == PurgePhase::Purging || seal.cleanup.work_sha256.is_empty() {
+    if seal.status == PurgePhase::Purging {
+        for receipt in &seal.cleanup.outputs {
+            receipt.remove_stage()?;
+        }
         for path in [
             &workspace.download,
             &workspace.plan,

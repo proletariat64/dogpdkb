@@ -1,6 +1,7 @@
 use crate::artifacts::{self, Image, Plan, atomic, json_bytes, read_bound, sha, validate_patch};
 use crate::progress;
 use crate::provider::{self, Failure};
+use crate::publication::{self, PublicationReceipt};
 use crate::workspace::{Workspace, lock_control, try_lock};
 use anyhow::{Context, Result, ensure};
 use reqwest::blocking::Client;
@@ -83,12 +84,6 @@ struct Concurrency {
     #[serde(rename = "final")]
     current: usize,
     transitions: Vec<Value>,
-}
-
-#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct PublicationReceipt {
-    pub(crate) path: PathBuf,
-    pub(crate) sha256: String,
 }
 
 pub(crate) struct PublicationState {
@@ -302,6 +297,7 @@ fn validate_receipts(journal: &Journal, outputs: &HashMap<&str, &Path>) -> Resul
                     .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
             "publication receipt does not match its frozen document"
         );
+        receipt.validate()?;
     }
     Ok(())
 }
@@ -398,11 +394,7 @@ fn journal_for(plan: &Plan, result: &Path, ledger: &Path) -> Result<Journal> {
                             document.output.display()
                         )
                     })?;
-                read_bound(
-                    &document.output,
-                    &receipt.sha256,
-                    "OCR artifact has drifted",
-                )?;
+                receipt.verify_output_if_present()?;
             }
         }
         return Ok(journal);
@@ -1193,42 +1185,40 @@ impl<'a> Execution<'a> {
         )
     }
 
-    fn bind_publication(&mut self, index: usize, digest: &str) -> Result<bool> {
+    fn publish_output(&mut self, index: usize, bytes: &[u8], digest: &str) -> Result<()> {
         let document = &self.plan.documents[index];
-        let receipt = PublicationReceipt {
-            path: document.output.clone(),
-            sha256: digest.into(),
-        };
-        if let Some(saved) = self.state.publication_receipts.get(&document.document_id) {
+        let output = &document.output;
+        let id = &document.document_id;
+        let parent = publication::parent(output)?;
+        artifacts::owned_path(output)?;
+        fs::create_dir_all(parent)?;
+        let directory =
+            publication::lock_directory(parent)?.context("publication directory disappeared")?;
+        if let Some(receipt) = self.state.publication_receipts.get(id) {
             ensure!(
-                saved == &receipt,
+                &receipt.path == output && receipt.sha256 == digest,
                 "publication receipt differs from the rendered document"
             );
-            return Ok(false);
+        } else {
+            ensure!(
+                !output.try_exists()?,
+                "preexisting unowned document output: {}",
+                output.display()
+            );
+            let receipt = PublicationReceipt::new(output.clone(), digest.into())?;
+            self.state.publication_receipts.insert(id.clone(), receipt);
+            self.save_journal()?;
         }
-        artifacts::owned_path(&document.output)?;
-        ensure!(
-            !document.output.try_exists()?,
-            "preexisting unowned document output: {}",
-            document.output.display()
-        );
-        self.state
-            .publication_receipts
-            .insert(document.document_id.clone(), receipt);
-        self.save_journal()?;
-        Ok(true)
+        self.state.publication_receipts[id].write_output(bytes, &directory)
     }
 
     fn publish_documents(&mut self) -> Result<Vec<Value>> {
         let mut rows = Vec::with_capacity(self.plan.documents.len());
         for index in 0..self.plan.documents.len() {
             let rendered = self.render_document(index, &self.workspace.evidence)?;
-            let first_write = if let Some(digest) = rendered.output_sha256() {
-                self.bind_publication(index, digest)?
-            } else {
-                false
-            };
-            rows.push(rendered.publish(&self.plan.documents[index].output, first_write)?);
+            rows.push(
+                rendered.publish_with(|bytes, digest| self.publish_output(index, bytes, digest))?,
+            );
         }
         Ok(rows)
     }
@@ -1353,6 +1343,7 @@ pub(crate) fn run(workspace: &Workspace, resume: bool, retry_failed: bool) -> Re
     {
         let _control = lock_control(&workspace.control)?;
         if execution.state.status == "completed" {
+            publication::preflight(plan.documents.iter().map(|doc| doc.output.as_path()))?;
             return execution.finish(true);
         }
         let requested = cancel_requested(workspace, &plan.digest)?;
@@ -1366,6 +1357,7 @@ pub(crate) fn run(workspace: &Workspace, resume: bool, retry_failed: bool) -> Re
             execution.save_journal()?;
         }
     }
+    publication::preflight(plan.documents.iter().map(|doc| doc.output.as_path()))?;
     let engine = Engine {
         settings: &plan.settings,
         http: provider::client_for(&plan.settings)?,
