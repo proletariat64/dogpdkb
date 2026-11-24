@@ -769,17 +769,11 @@ mod tests {
                 "documents":[{"path":"in.md"}]
             }))?,
         )?;
-        crate::plan::accept(
-            &work,
-            &plan,
-            &workspace.join("images"),
-            Some(&json!({
-                "mode":"paddle", "request_budget":null, "concurrency": 3, "admission_seconds":900,
-                "retry_rounds":0, "cache_dir":null, "endpoint":null,
-            })),
-            None,
-            None,
-        )?;
+        let workspace = crate::workspace::Workspace::new(&work)?;
+        let _execution = workspace.create_and_lock()?;
+        let config = root.join("provider.toml");
+        fs::write(&config, "mode = \"paddle\"\n")?;
+        crate::plan::accept(&workspace, Some(&config), true)?;
         let loaded = load_plan(&plan, &result, &journal, &evidence, &[])?;
         let document = &loaded.documents[0];
         let patch = json!({"markdown":"readable text","uncertainty":""});

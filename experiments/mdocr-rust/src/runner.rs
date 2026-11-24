@@ -1512,15 +1512,8 @@ mod tests {
             }))?,
         )?;
         let workspace = Workspace::new(&work)?;
-        let settings = crate::config::load(None, None)?;
-        crate::plan::accept(
-            &workspace.work,
-            &workspace.plan,
-            &workspace.images,
-            Some(&settings),
-            None,
-            None,
-        )?;
+        let _execution = workspace.create_and_lock()?;
+        crate::plan::accept(&workspace, None, true)?;
         let plan = load_workspace(&workspace)?;
         let state = journal_for(&plan, &workspace.result, &workspace.journal)?;
         let mut execution = Execution::new(&plan, &workspace, state, false)?;
