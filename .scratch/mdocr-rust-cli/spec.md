@@ -32,6 +32,7 @@ workspaces and caches under the Rust contract.
 | `mdocrr run --plan FILE [--config FILE] [--resume] [--retry-failed]` | Accept and execute a new batch or continue an existing batch. |
 | `mdocrr cancel --plan FILE` | Record a cancellation and stop new request admission for that batch. |
 | `mdocrr assemble --plan FILE --output-dir DIR` | Recover publishable Markdown from accepted OCR patches offline into a new directory. |
+| `mdocrr reset --plan FILE` | Clear owned OCR state and outputs so the next run performs OCR again. |
 | `mdocrr purge --plan FILE [-Y]` | Explicitly remove the named batch's workspace artifacts. |
 | `mdocrr doctor [--config FILE] [--pretty]` | Diagnose local readiness and probe a configured LLM once. |
 | `mdocrr check-mermaid FILE` | Check Mermaid fences in a Markdown file. Use `-` for stdin. |
@@ -200,11 +201,14 @@ work plan path. The caller may inspect documented artifacts.
 
 | Artifact | Purpose |
 | --- | --- |
+| `download.json` | `mdocr-download-1`. Work and document bindings, effective acceptance policy, and image records committed one occurrence at a time. |
 | `plan.json` | `mdocr-frozen-plan-1`. Frozen request digest, effective configuration, canonical paths, planned document order, input hashes, selected image occurrences, and download results. |
-| `journal.json` | `mdocr-journal-1`. Runtime and execution schema versions, bound plan hash, durable request admissions and outcomes, budget use, retries, accepted patches, and cancellation state. |
+| `journal.json` | `mdocr-journal-1`. Runtime and execution schema versions, bound plan hash, durable request admissions and outcomes, budget use, retries, accepted patches, output publication receipts, and cancellation state. |
 | `result.json` | `mdocr-batch-result-1`. Batch status, ordered document outcomes, occurrence statuses, output hashes, and evidence references. |
 | `images/` | Original bytes staged from authorized downloads or inline data URLs, bound to the frozen plan. |
 | `evidence/` | Published per-image evidence and its source and output bindings. |
+| `reset.json` | Durable cleanup state and cache-read bypass for the execution started after reset. |
+| `.purged.json` | Purge seal with work identity and the path and SHA-256 of each owned published output. |
 
 `accept` validates the manifest and TOML, parses documents, resolves and selects
 images, stages permitted remote or inline image data, and commits the frozen
@@ -215,16 +219,40 @@ source document, or path collision is a batch-level error. Acceptance reports
 the document count and selected, unselected, staged, and failed image counts
 with the frozen plan path. An accepted plan may contain failed occurrences.
 
-Repeat `accept` with the same effective work plan to obtain the same frozen
-artifact. Omission of `--config` on an existing batch uses the frozen policy.
-If explicitly provided, validate the file and compare effective values, resolved
-paths, and prompt content against the frozen plan. Formatting differences are
-immaterial. Changed work-plan semantics, selected occurrence order, or explicit
-effective policy must fail with a diagnostic. Reject drift in the frozen source
-Markdown or bound image bytes before dispatch. Rewrite of a frozen plan and
-repeat download of an already frozen remote asset are outside this operation.
-Serialize initial acceptance and publish its frozen file atomically. A crash
-during staging must not expose a half-accepted plan.
+### Download checkpoints
+
+After validating the manifest, configuration, paths, and image selection, create
+one `download.json` before staging starts. Bind it to the resolved work path
+and normalized work digest, effective policy and config source, source Markdown
+paths and SHA-256 digests, and ordered selected occurrences. Each image record
+contains its occurrence identity, parsed source identity, and success or failure.
+A success records the verified file path and SHA-256. Use a digest identity for
+inline data and store no credential material.
+
+For each selected image, validate the bytes, atomically write staged bytes into
+`images/` when needed, then atomically replace `download.json` with the
+updated record before emitting progress. Local image records bind the original
+file. A retry of interrupted staging reuses a success only when the work,
+document version, occurrence and source match and the recorded path still
+holds a verified file with the recorded SHA-256. If a record is absent, failed,
+or its bytes are missing or invalid, process that occurrence again under the
+same authorization. An unrecorded file left by a crash never establishes a
+successful checkpoint. A malformed checkpoint fails with a diagnostic.
+
+Before freezing, verify the staged records and publish `plan.json` atomically.
+The checkpoint supplies the saved policy during staging recovery; the frozen
+plan is authoritative once present. Omission of `--config` uses that saved
+policy. An explicit configuration must match effective values, resolved paths
+and prompt content. Changes to the work, source Markdown, selected occurrence
+order, or effective policy fail with a diagnostic.
+
+After freezing, repeat `accept` to obtain the same plan. If a previously bound
+remote or inline staged file is missing or damaged, recover only that file at
+its recorded path and only if the validated replacement bytes match the frozen
+SHA-256. A changed remote response fails with a drift diagnostic and leaves the
+binding intact. A changed caller-owned local file also fails. Frozen failed
+occurrences stay frozen until the batch is purged and reset. Serialize staging,
+frozen-asset recovery, and publication under the workspace locks.
 
 ### Image syntax and loading
 
@@ -283,9 +311,11 @@ requirement applies when a document references an exported flowchart as an image
 ## Run, cancel, and resume
 
 `run` calls the same acceptance operation for a new batch and reuses an accepted
-workspace. It does not reread an implicit default TOML after acceptance. Acquire
-workspace ownership before dispatch. Verify plan binding and data witnesses.
-At most one live scheduler may dispatch a given batch.
+workspace. `run --resume` requires a frozen `plan.json` or an initialized
+`download.json`; the latter allows resuming interrupted downloads before
+acceptance finishes. Use the saved effective policy. Acquire workspace ownership
+before dispatch. Verify plan binding and data witnesses. At most one live
+scheduler may dispatch a given batch.
 
 Persist admission to the journal before sending each provider request, then
 persist its outcome and accepted patch before publishing Markdown. Track
@@ -319,7 +349,7 @@ already accepted by a provider. An unexpected interruption permits ordinary
 `run --resume` to continue. The same configuration and cumulative budget apply.
 Completed batches return their existing result without submitting work again.
 
-## Results, recovery, and purge
+## Results, recovery, reset, and purge
 
 ### Result and publication
 
@@ -340,9 +370,12 @@ publish independently. A document with zero selected images can complete
 without provider traffic. Use a digest-based `resource_id` for inline Base64
 in public reports and use the staged original as the source witness.
 
-Publish output files and evidence atomically. On resume, verify existing
+Before publishing each output, persist its resolved destination and expected
+SHA-256 as a journal publication receipt bound to the frozen plan. Publish
+output files and evidence atomically. On resume, verify existing
 immutable output and evidence before accepting them. Refuse drift and preexisting
-unowned destinations.
+unowned destinations. The receipt lets cleanup recognize an output even if the
+process stopped after writing it and before updating the result.
 
 ### Assemble
 
@@ -366,11 +399,54 @@ ordered document outcomes. Preserve original inputs, workspace, outputs, and
 budget. The command works offline with provider credentials unavailable.
 A crash-only admission remains unknown in the assembly report.
 
+### Reset
+
+```sh
+# Keep verified downloads and perform OCR again.
+mdocrr reset --plan work.json
+mdocrr run --plan work.json
+
+# Discard staged bytes and perform downloads and OCR again.
+mdocrr purge --plan work.json -Y
+mdocrr reset --plan work.json
+mdocrr run --plan work.json
+```
+
+Reset acts only on the named owned workspace. Acquire the execution and control
+locks and reject an active writer. Show the outputs and OCR state that will be
+removed and ask for confirmation before changing state. A decline leaves the
+workspace intact. Warn when the old journal or purge seal records unresolved
+provider requests, since a new OCR submission can repeat a request and its cost.
+Report the cleanup scope and unresolved-request warning in the reset summary.
+
+For an unpurged workspace, keep its saved policy, frozen plan if present,
+`download.json` and staged `images/`. Clear the OCR journal, result, cancel
+marker, and old OCR evidence. Remove prior published Markdown only when its
+resolved path and current SHA-256 match an owned publication receipt. For a
+purged workspace, take the receipts from its purge seal and verify the seal's
+work path and digest. A caller-declared output path alone provides no ownership.
+Validate all destinations before cleanup and refuse a changed or unowned file.
+Missing outputs are already clear. Never delete source Markdown, caller-owned
+images, recovery directories, or whole output directories.
+
+Persist reset intent and its cleanup targets before deleting anything. If
+cleanup is interrupted, `run` refuses the unfinished reset; repeating `reset`
+finishes cleanup from the saved intent. Clear the purge seal only after its
+outputs have been handled and durable reset state prevents old OCR replay.
+After reset of a purged workspace, the next run uses normal fresh acceptance
+and stages all selected images again under their download permissions.
+
+The next execution starts with a fresh journal and zero used OCR budget.
+It bypasses persistent OCR cache reads for all jobs, including on continuation
+after interruption, cancellation, or a partial result. Verified download
+checkpoints remain usable when retained. Clear the bypass only after successful
+batch completion. Keep shared cache contents and the regular cache-write
+policy. Ordinary runs outside a reset execution keep the existing cache rules.
+
 ### Purge
 
-`mdocrr purge --plan work.json` is the only CLI operation that removes batch
-workspaces. Normal completion, cancellation, and recovery perform no automatic
-purge. Direct filesystem removal remains possible for the operator.
+`mdocrr purge --plan work.json` explicitly discards both download state and OCR
+state. Normal completion, cancellation, and recovery perform no automatic purge.
 
 - A `completed` batch gets one `Y/n` confirmation.
 - Any other state gets the same first confirmation and a second `Y/n` after
@@ -380,15 +456,15 @@ purge. Direct filesystem removal remains possible for the operator.
   batch outcome. Use it for intentional noninteractive deletion. Without it,
   an unavailable interactive input must not imply consent.
 - Obtain exclusive workspace ownership before deleting. A live writer must not
-  race cleanup. Deletion covers only this workspace's owned plan, journal,
-  reports, staged images and evidence. The caller's work plan, source Markdown,
-  original local images, config, published Markdown outside the workspace, and
-  shared cache survive.
-- Leave a minimal purge marker containing the work-plan identity and cleanup
-  status. A subsequent `run` for that purged work plan reports `purged` and
-  does not submit work as a fresh batch. The caller retrieves or copies any
-  workspace-bound evidence it needs before purge. Manual removal of the marker
-  and workspace removes the basis for detecting earlier execution.
+  race cleanup. Deletion covers `download.json`, the frozen plan, journal,
+  result, cancel/reset state, staged images and evidence. Preserve the caller's
+  work plan, source Markdown, original local images, config, previously
+  published Markdown and shared cache.
+- Before removing the journal, durably save the work identity, unresolved-request
+  indicator and owned output receipts in the purge seal. Repeating purge
+  preserves those receipts. A subsequent `run` reports `purged` until the
+  caller explicitly resets the workspace. Without the seal or another owned
+  publication receipt, reset cannot remove existing destinations.
 
 ## Diagnostics and help
 
@@ -465,7 +541,7 @@ log file and retention. Resume can append to the same log. The workspace
 | --- | --- |
 | `0` | Requested action completed. For `run` or `assemble`, all planned documents completed. `accept` may report individual image failures in a successfully frozen plan. |
 | `1` | Configuration, input, workspace binding, I/O, or other fatal action error. |
-| `2` | Usable partial output or an actionable diagnostic outcome, such as a failed local readiness or Mermaid check or a declined purge. Use the structured status to discriminate. |
+| `2` | Usable partial output or an actionable diagnostic outcome, such as a failed local readiness or Mermaid check or a declined purge or reset. Use the structured status to discriminate. |
 | `3` | A batch is canceled and requires explicit resume. A successful `cancel` request itself exits zero. |
 | `64` | Invalid CLI usage. |
 
@@ -519,6 +595,22 @@ Keep installed-host and live-provider acceptance distinct from this suite.
     with no executable search path, a stripped environment and no source
     checkout. Run independent live provider smoke checks only as a separate
     acceptance step with authorized credentials and nonproduction images.
+11. Interrupt staging before `plan.json`, then `run --resume`. Verify zero
+    repeat GETs for valid recorded files, and fetches only for missing,
+    corrupt, failed or unrecorded occurrences. After freezing, recover a lost
+    staged file only if the replacement matches the frozen SHA-256.
+12. Reset and run against a warm OCR cache and old published outputs. Verify
+    zero image GETs for retained valid files, fresh OCR admissions, fresh
+    evidence and publication at the original destinations. Interrupt the
+    reset and the new execution separately, verify safe continuation and
+    persistent cache-read bypass. Reject active runs and changed or unowned
+    outputs, and report possible repeated provider charges from unknown
+    admissions.
+13. Purge, reset and run the same work plan. Verify the seal blocks run until
+    reset, purge retains marked published files, reset clears only recorded
+    outputs with matching hashes, and the new execution fetches authorized
+    remote images again. Reject a replacement caller file at an output path,
+    and preserve already published files when purge is run without reset.
 
 ## Deployment boundary
 
