@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 pub(crate) struct Workspace {
     pub work: PathBuf,
     pub root: PathBuf,
+    pub download: PathBuf,
     pub plan: PathBuf,
     pub journal: PathBuf,
     pub result: PathBuf,
@@ -40,6 +41,7 @@ impl Workspace {
         owned_path(&root)?;
         Ok(Self {
             work,
+            download: root.join("download.json"),
             plan: root.join("plan.json"),
             journal: root.join("journal.json"),
             result: root.join("result.json"),

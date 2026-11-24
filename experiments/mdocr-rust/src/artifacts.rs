@@ -168,7 +168,7 @@ fn integer(object: &Value, key: &str) -> Result<u64> {
         .with_context(|| format!("invalid plan {key}"))
 }
 
-fn validate_settings(settings: &Value) -> Result<Option<PathBuf>> {
+pub(crate) fn validate_settings(settings: &Value) -> Result<Option<PathBuf>> {
     let mode = string(settings, "mode")?;
     let llm = mode == "llm";
     ensure!(llm || mode == "paddle", "invalid plan mode");
@@ -222,6 +222,7 @@ fn image_value(
     index: usize,
     document: &Path,
     images_dir: &Path,
+    verify_staged: bool,
 ) -> Result<Image> {
     let id = format!("image-{}", index + 1);
     let resource_id = occurrence.resource_id();
@@ -265,7 +266,9 @@ fn image_value(
             Destination::Unsupported => false,
         };
         ensure!(bound, "image source no longer agrees with frozen plan");
-        read_bound(path, digest, "IMAGE_DRIFT")?;
+        if verify_staged || !staged {
+            read_bound(path, digest, "IMAGE_DRIFT")?;
+        }
     } else {
         ensure!(
             source_path.is_none()
@@ -311,6 +314,26 @@ pub(crate) fn load_plan(
     journal: &Path,
     evidence: &Path,
     locks: &[PathBuf],
+) -> Result<Plan> {
+    load_plan_inner(plan_path, result_path, journal, evidence, locks, true)
+}
+
+pub(crate) fn load_plan_for_staged_repair(
+    plan_path: &Path,
+    result_path: &Path,
+    journal: &Path,
+    evidence: &Path,
+) -> Result<Plan> {
+    load_plan_inner(plan_path, result_path, journal, evidence, &[], false)
+}
+
+fn load_plan_inner(
+    plan_path: &Path,
+    result_path: &Path,
+    journal: &Path,
+    evidence: &Path,
+    locks: &[PathBuf],
+    verify_staged: bool,
 ) -> Result<Plan> {
     let mut controls = HashSet::new();
     for path in [plan_path, result_path, journal]
@@ -385,7 +408,7 @@ pub(crate) fn load_plan(
         let item_dir = evidence.join(position.to_string());
         checked_path(&item_dir, true)?;
         for (index, (value, occurrence)) in frozen.iter().zip(&occurrences).enumerate() {
-            let image = image_value(value, occurrence, index, &path, &images_dir)?;
+            let image = image_value(value, occurrence, index, &path, &images_dir, verify_staged)?;
             if let Some(path) = &image.source_path {
                 protected.insert(path.clone());
             }

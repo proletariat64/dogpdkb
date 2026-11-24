@@ -1325,6 +1325,23 @@ fn write_cancel(workspace: &Workspace, digest: &str, requested: bool) -> Result<
     atomic(&workspace.cancel, &json_bytes(&marker)?, false)
 }
 
+pub(crate) fn frozen_batch_canceled(workspace: &Workspace, digest: &str) -> Result<bool> {
+    let _control = lock_control(&workspace.control)?;
+    if cancel_requested(workspace, digest)? {
+        return Ok(true);
+    }
+    artifacts::owned_path(&workspace.journal)?;
+    if !workspace.journal.try_exists()? {
+        return Ok(false);
+    }
+    let state = read_journal(&workspace.journal)?;
+    ensure!(
+        state.schema_version == JOURNAL_SCHEMA && state.plan_sha256 == digest,
+        "execution journal schema or plan binding is invalid"
+    );
+    Ok(state.status == "canceled")
+}
+
 pub(crate) fn run(workspace: &Workspace, resume: bool, retry_failed: bool) -> Result<(u8, Value)> {
     let plan = load_workspace(workspace)?;
     let state = journal_for(&plan, &workspace.result, &workspace.journal)?;

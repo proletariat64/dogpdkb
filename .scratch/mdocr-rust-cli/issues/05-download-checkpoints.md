@@ -1,6 +1,6 @@
 # Checkpoint image staging and resume before freeze
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: [02](02-accept-draft.md)
 
@@ -14,3 +14,12 @@ Keep cancellation scoped to accepted plans and keep `assemble` offline.
 Prove the public CLI can resume from a checkpoint after interrupted staging.
 Check provider settings and source binding, committed and unrecorded files,
 missing or damaged bytes, and changed content after freeze.
+
+## Acceptance
+
+CLI tests interrupt a loopback download after the first durable record, then
+check that resume skips the committed image, rejects invalid checkpoints and
+changed inputs or policy, and keeps the saved zero budget. A separate fixture
+checks that a canceled ordinary run and offline assembly make zero GETs, exact
+bytes can repair a damaged frozen image, and different bytes cannot alter the
+frozen binding or create a staged file.

@@ -1,6 +1,9 @@
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
@@ -26,6 +29,234 @@ fn json_file(path: &Path) -> Value {
 
 fn write_json(root: &Path, name: &str, value: &Value) {
     fs::write(root.join(name), serde_json::to_vec(value).unwrap()).unwrap();
+}
+
+fn await_get(listener: &TcpListener) -> (TcpStream, String) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                return (stream, request);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "image GET did not arrive");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("accept image GET: {error}"),
+        }
+    }
+}
+
+fn respond_png(mut stream: TcpStream, png: &[u8]) {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        png.len()
+    )
+    .unwrap();
+    stream.write_all(png).unwrap();
+}
+
+fn start_command(root: &Path, args: &[&str]) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_mdocrr"))
+        .current_dir(root)
+        .env_clear()
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn remote_batch(root: &Path, destinations: &[&str]) -> (TcpListener, Vec<u8>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let input = destinations
+        .iter()
+        .map(|name| {
+            format!(
+                "![photo](http://{}/{name})\n",
+                listener.local_addr().unwrap()
+            )
+        })
+        .collect::<String>();
+    fs::write(root.join("input.md"), input).unwrap();
+    write_json(
+        root,
+        "work.json",
+        &json!({"schema_version":"mdocr-work-1","output_dir":"out",
+                "documents":[{"path":"input.md","download_remote":true}]}),
+    );
+    fs::write(root.join("default.toml"), "request_budget = 0\n").unwrap();
+    write_png(&root.join("fixture.png"));
+    (listener, fs::read(root.join("fixture.png")).unwrap())
+}
+
+#[test]
+fn resume_before_freeze_reuses_only_committed_downloads_and_saved_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let (listener, png) = remote_batch(root, &["first.png", "second.png"]);
+    let mut interrupted = start_command(root, &["run", "--plan", "work.json"]);
+    let (stream, request) = await_get(&listener);
+    assert!(request.starts_with("GET /first.png "));
+    respond_png(stream, &png);
+    let (stream, request) = await_get(&listener);
+    assert!(request.starts_with("GET /second.png "));
+    interrupted.kill().unwrap();
+    interrupted.wait().unwrap();
+    drop(stream);
+    let workspace = root.join("work.mdocr");
+    assert!(!workspace.join("plan.json").exists());
+    assert!(!workspace.join("journal.json").exists());
+    let checkpoint_path = workspace.join("download.json");
+    assert_eq!(
+        json_file(&checkpoint_path)["schema_version"],
+        "mdocr-download-1"
+    );
+    let resume = ["run", "--plan", "work.json", "--resume"];
+    let checkpoint_bytes = fs::read(&checkpoint_path).unwrap();
+    fs::write(&checkpoint_path, b"{").unwrap();
+    let malformed = command(root, &resume);
+    assert!(!malformed.status.success());
+    assert!(String::from_utf8_lossy(&malformed.stderr).contains("invalid download checkpoint"));
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    fs::write(&checkpoint_path, checkpoint_bytes).unwrap();
+
+    let original = fs::read(root.join("input.md")).unwrap();
+    fs::write(root.join("input.md"), b"source changed").unwrap();
+    let rejected = command(root, &resume);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("SOURCE_DRIFT"));
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    fs::write(root.join("input.md"), original).unwrap();
+    fs::write(root.join("changed.toml"), "request_budget = 1\n").unwrap();
+    let mismatch = command(
+        root,
+        &[
+            "run",
+            "--plan",
+            "work.json",
+            "--resume",
+            "--config",
+            "changed.toml",
+        ],
+    );
+    assert!(!mismatch.status.success());
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("CONFIG_CHANGED"));
+
+    // The saved zero budget still applies after the default file becomes unusable.
+    fs::write(root.join("default.toml"), "not valid TOML").unwrap();
+    let resumed = start_command(root, &resume);
+    let (stream, request) = await_get(&listener);
+    assert!(request.starts_with("GET /second.png "), "{request}");
+    respond_png(stream, &png);
+    let resumed = resumed.wait_with_output().unwrap();
+    assert_eq!(resumed.status.code(), Some(2), "{resumed:?}");
+    let plan = json_file(&workspace.join("plan.json"));
+    assert_eq!(plan["settings"]["request_budget"], 0);
+    assert!(
+        plan["documents"][0]["images"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|image| image["error"].is_null())
+    );
+    assert_eq!(
+        json_file(&workspace.join("result.json"))["budget"]["requests"],
+        0
+    );
+}
+
+#[test]
+fn frozen_staged_image_repair_requires_identical_bytes_and_explicit_resume_after_cancel() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let (listener, png) = remote_batch(root, &["photo.png"]);
+    let accept = ["accept", "--plan", "work.json"];
+    let started = start_command(root, &accept);
+    let (stream, request) = await_get(&listener);
+    assert!(request.starts_with("GET /photo.png "));
+    respond_png(stream, &png);
+    assert!(started.wait_with_output().unwrap().status.success());
+    let workspace = root.join("work.mdocr");
+    let frozen = workspace.join("plan.json");
+    let frozen_bytes = fs::read(&frozen).unwrap();
+    let plan = json_file(&frozen);
+    let staged = PathBuf::from(
+        plan["documents"][0]["images"][0]["source_path"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(command(root, &accept).status.success());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(
+        command(root, &["cancel", "--plan", "work.json"])
+            .status
+            .success()
+    );
+
+    fs::write(&staged, b"corrupt staged bytes").unwrap();
+    let ordinary = command(root, &["run", "--plan", "work.json"]);
+    assert!(matches!(ordinary.status.code(), Some(1 | 3)));
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let assembly = command(
+        root,
+        &[
+            "assemble",
+            "--plan",
+            "work.json",
+            "--output-dir",
+            "recovered",
+        ],
+    );
+    assert!(!assembly.status.success());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    let resumed = start_command(root, &["run", "--plan", "work.json", "--resume"]);
+    let (stream, request) = await_get(&listener);
+    assert!(request.starts_with("GET /photo.png "));
+    respond_png(stream, &png);
+    let outcome = resumed.wait_with_output().unwrap();
+    assert_eq!(outcome.status.code(), Some(2), "{outcome:?}");
+    assert_eq!(fs::read(&staged).unwrap(), png);
+    assert_eq!(fs::read(&frozen).unwrap(), frozen_bytes);
+
+    fs::remove_file(&staged).unwrap();
+    image::RgbImage::from_pixel(2, 2, image::Rgb([210, 140, 70]))
+        .save(root.join("changed.png"))
+        .unwrap();
+    let changed = fs::read(root.join("changed.png")).unwrap();
+    let started = start_command(root, &accept);
+    let (stream, request) = await_get(&listener);
+    assert!(request.starts_with("GET /photo.png "));
+    respond_png(stream, &changed);
+    let outcome = started.wait_with_output().unwrap();
+    assert_eq!(outcome.status.code(), Some(1), "{outcome:?}");
+    assert!(String::from_utf8_lossy(&outcome.stderr).contains("IMAGE_DRIFT"));
+    assert_eq!(fs::read(&frozen).unwrap(), frozen_bytes);
+    assert_eq!(fs::read_dir(workspace.join("images")).unwrap().count(), 0);
 }
 
 #[test]

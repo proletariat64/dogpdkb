@@ -9,7 +9,7 @@ mod provider;
 mod runner;
 mod workspace;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pulldown_cmark::{CodeBlockKind, Event, Parser as Markdown, Tag, TagEnd};
 use serde_json::{Value, json};
@@ -77,7 +77,7 @@ enum Command {
     Run {
         #[command(flatten)]
         input: ConfiguredBatch,
-        /// Continue a batch that was canceled explicitly.
+        /// Resume interrupted downloads or continue a batch that was canceled explicitly.
         #[arg(long)]
         resume: bool,
         /// Retry eligible known failures from a previous run.
@@ -161,30 +161,10 @@ impl Command {
     }
 }
 
-fn accept(workspace: &Workspace, explicit: Option<&Path>) -> Result<Value> {
+fn accept(workspace: &Workspace, explicit: Option<&Path>, repair_canceled: bool) -> Result<Value> {
     artifacts::owned_path(&workspace.plan)?;
     let fresh = !workspace.plan.try_exists()?;
-    let (settings, config_source) = if fresh || explicit.is_some() {
-        let source = config::source(Some(&workspace.work), explicit)?;
-        (Some(config::load(None, source.as_deref())?), source)
-    } else {
-        (None, None)
-    };
-    let http = if fresh {
-        Some(provider::client_for(
-            settings.as_ref().context("missing batch settings")?,
-        )?)
-    } else {
-        None
-    };
-    let summary = plan::accept(
-        &workspace.work,
-        &workspace.plan,
-        &workspace.images,
-        settings.as_ref(),
-        http.as_ref(),
-        config_source.as_deref(),
-    )?;
+    let summary = plan::accept(workspace, explicit, repair_canceled)?;
     let counts = &summary["counts"];
     progress::emit(
         "accepted",
@@ -205,7 +185,7 @@ fn execute(command: Command) -> Outcome {
         Command::Accept(input) => {
             let ws = Workspace::new(&input.batch.plan)?;
             let _lock = ws.create_and_lock()?;
-            let mut output = accept(&ws, input.config.as_deref())?;
+            let mut output = accept(&ws, input.config.as_deref(), true)?;
             output["status"] = json!("accepted");
             Ok((0, output))
         }
@@ -216,13 +196,17 @@ fn execute(command: Command) -> Outcome {
         } => {
             let ws = Workspace::new(&input.batch.plan)?;
             let _lock = ws.create_and_lock()?;
-            if resume || retry_failed {
+            let frozen = ws.plan.try_exists()?;
+            if retry_failed {
+                ensure!(frozen, "no accepted batch exists to retry");
+            }
+            if resume {
                 ensure!(
-                    ws.plan.try_exists()?,
-                    "no accepted batch exists to resume or retry"
+                    frozen || ws.download.try_exists()?,
+                    "no accepted batch or download checkpoint exists to resume"
                 );
             }
-            accept(&ws, input.config.as_deref())?;
+            accept(&ws, input.config.as_deref(), resume)?;
             runner::run(&ws, resume, retry_failed)
         }
         Command::Cancel(batch) => {

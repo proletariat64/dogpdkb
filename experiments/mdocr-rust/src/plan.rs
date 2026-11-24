@@ -1,5 +1,9 @@
-use crate::artifacts::{self, atomic, json_bytes, resolve, sha, verify_immutable};
+mod checkpoint;
+
+use self::checkpoint::{DownloadCheckpoint, DownloadDocument, Outcome};
+use crate::artifacts::{self, atomic, json_bytes, resolve, sha};
 use crate::markdown::{self, Destination};
+use crate::{config, progress, provider, runner, workspace::Workspace};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose};
 use clap::Args as ClapArgs;
@@ -41,10 +45,16 @@ pub(crate) struct DraftArgs {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Work {
+pub(crate) struct Work {
     schema_version: String,
     output_dir: PathBuf,
     documents: Vec<WorkDocument>,
+}
+
+impl Work {
+    pub(crate) fn digest(&self) -> Result<String> {
+        Ok(sha(&json_bytes(self)?))
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -190,7 +200,7 @@ pub(crate) fn draft(args: DraftArgs) -> Result<PathBuf> {
     Ok(plan)
 }
 
-fn normalize(work: &Path) -> Result<Work> {
+pub(crate) fn normalize(work: &Path) -> Result<Work> {
     work_filename(work)?;
     ensure!(work.is_file(), "work plan is not a file");
     let mut value: Work =
@@ -418,21 +428,86 @@ type BindingResult = std::result::Result<Binding, &'static str>;
 
 struct Staging<'a> {
     images: &'a Path,
-    http: Option<&'a Client>,
-    llm: bool,
+    settings: &'a Value,
+    http: Option<Client>,
     remote: HashMap<Url, BindingResult>,
     local: HashMap<PathBuf, BindingResult>,
 }
 
-impl Staging<'_> {
+impl<'a> Staging<'a> {
+    fn new(images: &'a Path, settings: &'a Value) -> Self {
+        Self {
+            images,
+            settings,
+            http: None,
+            remote: HashMap::new(),
+            local: HashMap::new(),
+        }
+    }
+
+    fn http(&mut self) -> Result<&Client> {
+        if self.http.is_none() {
+            self.http = Some(provider::client_for(self.settings)?);
+        }
+        Ok(self.http.as_ref().expect("download client initialized"))
+    }
+
+    fn saved_binding(
+        &self,
+        image: &PendingImage,
+        outcome: Option<&Outcome>,
+    ) -> Result<Option<Binding>> {
+        let Some(Outcome::Success {
+            source_path,
+            sha256,
+        }) = outcome
+        else {
+            return Ok(None);
+        };
+        let bytes = match &image.disposition {
+            Disposition::Local(path) if path == source_path => read_image(path).ok(),
+            Disposition::Remote(_) | Disposition::Inline
+                if source_path.parent() == Some(self.images) =>
+            {
+                read_staged(source_path)?
+            }
+            _ => return Ok(None),
+        };
+        let Some(bytes) = bytes.filter(|data| sha(data) == *sha256) else {
+            return Ok(None);
+        };
+        let Ok((extension, _)) = image_extension(&bytes, self.settings["mode"] == "llm") else {
+            return Ok(None);
+        };
+        let staged = matches!(
+            image.disposition,
+            Disposition::Remote(_) | Disposition::Inline
+        );
+        if staged && *source_path != self.images.join(format!("{sha256}.{extension}")) {
+            return Ok(None);
+        }
+        let link = match &image.disposition {
+            Disposition::Remote(url) => url.as_str(),
+            _ => source_path
+                .to_str()
+                .context("invalid image path in download checkpoint")?,
+        };
+        Ok(Some(Binding {
+            source: source_path.clone(),
+            link: link.into(),
+            digest: sha256.clone(),
+        }))
+    }
+
     fn bind(&mut self, image: &PendingImage) -> Result<BindingResult> {
+        let llm = self.settings["mode"] == "llm";
         let value = match &image.disposition {
             Disposition::Local(path) => self
                 .local
                 .entry(path.clone())
                 .or_insert_with(|| {
                     let bytes = read_image(path)?;
-                    image_extension(&bytes, self.llm)?;
+                    image_extension(&bytes, llm)?;
                     Ok(Binding {
                         source: path.clone(),
                         link: path.to_str().ok_or("IMAGE_UNREADABLE")?.into(),
@@ -443,11 +518,8 @@ impl Staging<'_> {
             Disposition::Remote(url) => match self.remote.get(url) {
                 Some(binding) => binding.clone(),
                 None => {
-                    let client = self
-                        .http
-                        .context("remote download requires a configured HTTP client")?;
-                    let binding = match download(client, url) {
-                        Ok(bytes) => self.stage(&bytes, Some(url.as_str()), None)?,
+                    let binding = match download(self.http()?, url) {
+                        Ok(bytes) => self.stage(&bytes, Some(url.as_str()), None, None)?,
                         Err(reason) => Err(reason),
                     };
                     self.remote.insert(url.clone(), binding.clone());
@@ -455,7 +527,7 @@ impl Staging<'_> {
                 }
             },
             Disposition::Inline => match decode_data(&image.occurrence.target) {
-                Ok((mime, bytes)) => self.stage(&bytes, None, Some(mime))?,
+                Ok((mime, bytes)) => self.stage(&bytes, None, Some(mime), None)?,
                 Err(reason) => Err(reason),
             },
             Disposition::Failed(reason) => Err(*reason),
@@ -463,8 +535,15 @@ impl Staging<'_> {
         Ok(value)
     }
 
-    fn stage(&self, bytes: &[u8], link: Option<&str>, mime: Option<&str>) -> Result<BindingResult> {
-        let (extension, content_type) = match image_extension(bytes, self.llm) {
+    fn stage(
+        &self,
+        bytes: &[u8],
+        link: Option<&str>,
+        mime: Option<&str>,
+        frozen: Option<(&Path, &str)>,
+    ) -> Result<BindingResult> {
+        let (extension, content_type) = match image_extension(bytes, self.settings["mode"] == "llm")
+        {
             Ok(format) => format,
             Err(reason) => return Ok(Err(reason)),
         };
@@ -473,7 +552,16 @@ impl Staging<'_> {
         }
         let digest = sha(bytes);
         let source = self.images.join(format!("{digest}.{extension}"));
-        verify_immutable(&source, bytes)?;
+        if let Some((path, expected)) = frozen {
+            ensure!(
+                source == path && digest == expected,
+                "IMAGE_DRIFT: replacement does not match frozen image {}",
+                path.display()
+            );
+        }
+        if read_staged(&source)?.is_none_or(|previous| previous != bytes) {
+            atomic(&source, bytes, !source.try_exists()?)?;
+        }
         let link = link
             .unwrap_or(source.to_str().context("invalid staged image path")?)
             .into();
@@ -482,6 +570,71 @@ impl Staging<'_> {
             link,
             digest,
         }))
+    }
+}
+
+fn restore_staged(plan: &artifacts::Plan, request: &Work, images: &Path) -> Result<()> {
+    ensure!(
+        plan.documents.len() == request.documents.len(),
+        "WORK_PLAN_CHANGED: frozen document list does not match the work plan"
+    );
+    let mut repairs = Vec::new();
+    for (doc, work_doc) in plan.documents.iter().zip(&request.documents) {
+        ensure!(
+            doc.path == work_doc.path && Some(&doc.output) == work_doc.output.as_ref(),
+            "WORK_PLAN_CHANGED: frozen document paths do not match the work plan"
+        );
+        for (image, occurrence) in doc.images.iter().zip(markdown::occurrences(&doc.text)) {
+            let selected = work_doc
+                .select_images
+                .as_ref()
+                .is_none_or(|list| list.binary_search(&occurrence.target).is_ok());
+            ensure!(
+                selected == image.selected,
+                "WORK_PLAN_CHANGED: frozen image selection does not match the work plan"
+            );
+            let (Some(path), Some(digest)) = (&image.source_path, &image.sha256) else {
+                continue;
+            };
+            if path.parent() != Some(images) {
+                continue;
+            }
+            let destination = markdown::destination(&occurrence.target);
+            match destination {
+                Destination::Remote(_) if work_doc.download_remote => {}
+                Destination::Inline => {}
+                _ => bail!("frozen image does not have staging permission"),
+            }
+            if read_staged(path)?.is_none_or(|bytes| sha(&bytes) != *digest) {
+                repairs.push((path, digest, occurrence.target, destination));
+            }
+        }
+    }
+    let mut staging = Staging::new(images, &plan.settings);
+    for (path, digest, target, destination) in repairs {
+        // Different occurrences can share a content-addressed staged file.
+        if read_staged(path)?.is_some_and(|bytes| sha(&bytes) == *digest) {
+            continue;
+        }
+        let (mime, bytes) = match destination {
+            Destination::Remote(url) => download(staging.http()?, &url).map(|bytes| (None, bytes)),
+            Destination::Inline => decode_data(&target).map(|(mime, bytes)| (Some(mime), bytes)),
+            _ => unreachable!("repairs contain only staged images"),
+        }
+        .map_err(|reason| anyhow::anyhow!("IMAGE_DRIFT: {}: {reason}", path.display()))?;
+        staging
+            .stage(&bytes, None, mime, Some((path, digest)))?
+            .map_err(|reason| anyhow::anyhow!("IMAGE_DRIFT: {}: {reason}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn read_staged(path: &Path) -> Result<Option<Vec<u8>>> {
+    artifacts::owned_path(path)?;
+    match read_image(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err("IMAGE_NOT_FOUND" | "IMAGE_TOO_LARGE") => Ok(None),
+        Err(reason) => bail!("{reason}: {}", path.display()),
     }
 }
 
@@ -623,7 +776,14 @@ fn download(client: &Client, url: &Url) -> std::result::Result<Vec<u8>, &'static
     Err(failed)
 }
 
-fn planned_json(doc: PlannedDocument, staging: &mut Staging<'_>) -> Result<Value> {
+fn planned_json(
+    doc: PlannedDocument,
+    staging: &mut Staging<'_>,
+    checkpoint: &mut DownloadCheckpoint,
+    position: usize,
+    download_path: &Path,
+) -> Result<Value> {
+    let mut selected_index = 0;
     let mut images = Vec::with_capacity(doc.images.len());
     for (index, image) in doc.images.into_iter().enumerate() {
         let resource = image.occurrence.resource_id();
@@ -636,14 +796,39 @@ fn planned_json(doc: PlannedDocument, staging: &mut Staging<'_>) -> Result<Value
             "original_link": null, "sha256": null, "error": null,
         });
         if image.selected {
-            match staging.bind(&image)? {
+            let record = &mut checkpoint.documents[position].images[selected_index];
+            let outcome = match staging.saved_binding(&image, record.outcome.as_ref())? {
+                Some(binding) => Ok(binding),
+                None => staging.bind(&image)?,
+            };
+            record.outcome = Some(match outcome {
                 Ok(binding) => {
-                    value["source_path"] = json!(binding.source);
+                    value["source_path"] = json!(&binding.source);
                     value["original_link"] = json!(binding.link);
-                    value["sha256"] = json!(binding.digest);
+                    value["sha256"] = json!(&binding.digest);
+                    Outcome::Success {
+                        source_path: binding.source,
+                        sha256: binding.digest,
+                    }
                 }
-                Err(reason) => value["error"] = json!(reason),
-            }
+                Err(reason) => {
+                    value["error"] = json!(reason);
+                    Outcome::Failure {
+                        reason_code: reason.into(),
+                    }
+                }
+            });
+            selected_index += 1;
+            atomic(download_path, &json_bytes(checkpoint)?, false)?;
+            progress::emit(
+                "image_checkpoint",
+                format_args!(
+                    "phase=accept document={} image={} verified={}",
+                    position + 1,
+                    index + 1,
+                    value["error"].is_null()
+                ),
+            );
         }
         images.push(value);
     }
@@ -688,19 +873,19 @@ fn summary(plan: &Value, frozen: &Path, images: &Path) -> Result<Value> {
 }
 
 pub(crate) fn accept(
-    work: &Path,
-    frozen: &Path,
-    images: &Path,
-    settings: Option<&Value>,
-    http: Option<&Client>,
-    config_source: Option<&Path>,
+    workspace: &Workspace,
+    explicit: Option<&Path>,
+    repair_canceled: bool,
 ) -> Result<Value> {
-    artifacts::owned_path(work)?;
-    artifacts::owned_path(frozen)?;
-    artifacts::owned_path(images)?;
+    let work = &workspace.work;
+    let frozen = &workspace.plan;
+    let images = &workspace.images;
+    let download_path = &workspace.download;
+    for path in [work, frozen, images, download_path] {
+        artifacts::owned_path(path)?;
+    }
     let request = normalize(work)?;
-    let work_digest = sha(&json_bytes(&request)?);
-    let workspace = frozen.parent().context("frozen plan needs a workspace")?;
+    let work_digest = request.digest()?;
     match fs::read(frozen) {
         Ok(bytes) => {
             let previous: Value = serde_json::from_slice(&bytes).context("invalid frozen plan")?;
@@ -712,42 +897,97 @@ pub(crate) fn accept(
                 previous["work_path"] == json!(work) && previous["work_sha256"] == work_digest,
                 "WORK_PLAN_CHANGED: workspace is bound to a different work plan"
             );
-            if let Some(settings) = settings {
+            if let Some(explicit) = explicit {
                 ensure!(
-                    *settings == previous["settings"],
+                    config::load(None, Some(explicit))? == previous["settings"],
                     "CONFIG_CHANGED: workspace is bound to a different effective policy"
                 );
             }
-            artifacts::load_plan(
-                frozen,
-                &workspace.join("result.json"),
-                &workspace.join("journal.json"),
-                &workspace.join("evidence"),
-                &[],
-            )?;
+            let strict_load = || {
+                artifacts::load_plan(
+                    frozen,
+                    &workspace.result,
+                    &workspace.journal,
+                    &workspace.evidence,
+                    &[],
+                )
+            };
+            if let Err(error) = strict_load() {
+                let digest = sha(&bytes);
+                if !repair_canceled && runner::frozen_batch_canceled(workspace, &digest)? {
+                    return Err(error);
+                }
+                let plan = artifacts::load_plan_for_staged_repair(
+                    frozen,
+                    &workspace.result,
+                    &workspace.journal,
+                    &workspace.evidence,
+                )?;
+                ensure!(plan.digest == digest, "PLAN_DRIFT: frozen plan changed");
+                restore_staged(&plan, &request, images)?;
+                strict_load()?;
+            }
             return summary(&previous, frozen, images);
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("read frozen plan"),
     }
-    let settings = settings.context("new acceptance requires effective settings")?;
-    let mut protected = HashSet::from([work.to_path_buf()]);
-    if let Some(path) = config_source {
-        protected.insert(resolve(path)?);
-    }
-    let docs = inputs(request, workspace, &mut protected)?;
-    check_paths(workspace, &docs, &mut protected, settings)?;
-    let mut staging = Staging {
-        images,
-        http,
-        llm: settings["mode"] == "llm",
-        remote: HashMap::new(),
-        local: HashMap::new(),
+    let saved = DownloadCheckpoint::read(download_path, work, &work_digest)?;
+    let (settings, config_source) = if let Some(checkpoint) = &saved {
+        if let Some(explicit) = explicit {
+            ensure!(
+                config::load(None, Some(explicit))? == checkpoint.settings,
+                "CONFIG_CHANGED: download checkpoint is bound to a different effective policy"
+            );
+        }
+        (
+            checkpoint.settings.clone(),
+            checkpoint.config_source.clone(),
+        )
+    } else {
+        let source = config::source(Some(work), explicit)?;
+        let settings = config::load(None, source.as_deref())?;
+        provider::ca_certificates(&settings)?;
+        (settings, source)
     };
+    let mut protected = HashSet::from([work.to_path_buf()]);
+    if let Some(path) = &config_source {
+        ensure!(
+            path.is_absolute(),
+            "invalid config source in download checkpoint"
+        );
+        artifacts::owned_path(path)?;
+        protected.insert(path.clone());
+    }
+    let docs = inputs(request, &workspace.root, &mut protected)?;
+    check_paths(&workspace.root, &docs, &mut protected, &settings)?;
+    let bindings = docs
+        .iter()
+        .map(DownloadDocument::from_input)
+        .collect::<Vec<_>>();
+    let mut checkpoint = match saved {
+        Some(checkpoint) => {
+            checkpoint.verify_inputs(&bindings)?;
+            checkpoint
+        }
+        None => DownloadCheckpoint::create(
+            download_path,
+            work.clone(),
+            work_digest.clone(),
+            settings.clone(),
+            config_source,
+            bindings,
+        )?,
+    };
+    let mut staging = Staging::new(images, &settings);
     let documents = docs
         .into_iter()
-        .map(|doc| planned_json(doc, &mut staging))
+        .enumerate()
+        .map(|(position, doc)| {
+            planned_json(doc, &mut staging, &mut checkpoint, position, download_path)
+        })
         .collect::<Result<Vec<_>>>()?;
+    checkpoint.verify_files()?;
     let mut protected = protected.into_iter().collect::<Vec<_>>();
     protected.sort_unstable();
     let plan = json!({"schema_version":FROZEN_SCHEMA, "work_path": work, "work_sha256":work_digest,
