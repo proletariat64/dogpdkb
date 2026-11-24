@@ -40,6 +40,8 @@ pub(crate) const SCORE: &str = "Example
 A score plan selects scoped identities and binds one committed comparison.
 Configure an explicit request budget. Zero is a local run with no requests.
 Resume uses the frozen configuration and never repeats a recorded admission.
+Use --recover by itself to publish a settled journal offline. It fails if
+the journal is missing, invalid, cancelled, or still has work to do.
 
 Exit codes
   0 complete, 1 invocation or artifact failure, 2 partial, 3 cancelled,

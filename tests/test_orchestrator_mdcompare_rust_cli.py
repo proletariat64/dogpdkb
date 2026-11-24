@@ -47,7 +47,7 @@ def configure(tmp_path, binary, *, scoring=False, interrupt=False):
         wrapper.write_text(
             "import os, signal, subprocess, sys\n"
             "child = subprocess.run(sys.argv[1:], check=False)\n"
-            "if sys.argv[2] == 'score' and child.returncode in {0, 2}:\n"
+            "if sys.argv[2] == 'score' and '--recover' not in sys.argv and child.returncode in {0, 2}:\n"
             "    os.kill(os.getppid(), signal.SIGKILL)\n"
             "raise SystemExit(child.returncode)\n"
         )
@@ -170,7 +170,18 @@ def test_recovery_plan_uses_only_submitted_snapshot_sides(tmp_path, binary):
     assert (frozen["document_id"], frozen["side"]) == (identity, "incoming")
 
 
-@pytest.mark.parametrize("interruption", [None, "terminal", "missing_result"])
+@pytest.mark.parametrize(
+    "interruption",
+    [
+        None,
+        "terminal",
+        "missing_result",
+        "settled_unsealed",
+        "pending",
+        "corrupt",
+        "mismatched_pin",
+    ],
+)
 def test_score_and_route_bind_the_reserved_document_version(
     tmp_path, binary, interruption
 ):
@@ -252,16 +263,48 @@ def test_score_and_route_bind_the_reserved_document_version(
                     for path in (tmp_path / "runs").rglob("run.json")
                     if (data := json.loads(path.read_text())).get("native_score_job")
                 ]
-                if interruption == "missing_result":
-                    Path(job["score_work"]).with_suffix(".mdcompare").joinpath(
-                        "result.json"
-                    ).unlink()
+                score_root = Path(job["score_work"]).with_suffix(".mdcompare")
+                journal_file = score_root / "journal.json"
+                if interruption in {
+                    "missing_result",
+                    "settled_unsealed",
+                    "pending",
+                    "corrupt",
+                }:
+                    (score_root / "result.json").unlink()
+                if interruption in {"settled_unsealed", "pending"}:
+                    journal = json.loads(journal_file.read_text())
+                    journal["terminal"] = None
+                    if interruption == "pending":
+                        journal["attempts"][0].update(
+                            state="admitted",
+                            score=None,
+                            ambiguous=None,
+                            usage_tokens=None,
+                        )
+                    journal_file.write_text(json.dumps(journal))
+                if interruption == "corrupt":
+                    journal_file.write_text("{")
+                if interruption == "mismatched_pin":
+                    state_path = tmp_path / "state/funds/state.json"
+                    [reserved_document] = json.loads(state_path.read_text())[
+                        "documents"
+                    ].values()
+                    reservation = reserved_document["steps"]["semantic_score"]
+                    run = json.loads(previous_run.read_text())
+                    run["native_score_job"]["score_work"] += ".mismatch"
+                    previous_run.write_text(json.dumps(run))
+                journal_before = journal_file.read_bytes()
                 result = invoke_sync(config, "plan", "--resume", previous_run)
                 assert result.returncode == 0, result.stderr
                 run = json.loads(previous_run.read_text())
-                assert run["native_score_job"] == job
-                log = previous_run.with_name("mdcompare_rust.log").read_text()
-                assert "command=status" in log
+                if interruption != "mismatched_pin":
+                    assert run["native_score_job"] == job
+                if interruption in {"pending", "corrupt", "mismatched_pin"}:
+                    assert journal_file.read_bytes() == journal_before
+                    assert (score_root / "result.json").exists() == (
+                        interruption == "mismatched_pin"
+                    )
             else:
                 run = sync(config, "plan")
         finally:
@@ -271,16 +314,22 @@ def test_score_and_route_bind_the_reserved_document_version(
     [(authorization, packet)] = calls
     assert authorization is None
     assert packet["operations"]
-    if interruption == "missing_result":
+    if interruption in {"pending", "corrupt", "mismatched_pin"}:
         assert "semantic_scoring" not in run["artifacts"]
         persisted = json.loads((tmp_path / "state/funds/state.json").read_text())
         [document] = persisted["documents"].values()
-        assert document["steps"]["semantic_score"]["status"] == "unknown"
-        assert document["blocked_versions"]["semantic_score"]
-        assert any(
-            failure["reason"] == "SEMANTIC_SCORE_UNVERIFIABLE"
+        if interruption == "mismatched_pin":
+            assert document["steps"]["semantic_score"] == reservation
+        else:
+            assert document["steps"]["semantic_score"]["status"] == "unknown"
+            assert document["blocked_versions"]["semantic_score"]
+        [failure] = [
+            failure
             for failure in run["failures"]
-        )
+            if failure["reason"] == "SEMANTIC_SCORE_UNVERIFIABLE"
+        ]
+        if interruption == "mismatched_pin":
+            assert "Pinned mdcompare score reservations" in failure["message"]
         return
     artifacts = run["artifacts"]["semantic_scoring"]
     score = json.loads(Path(artifacts["scores"]["path"]).read_text())

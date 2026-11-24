@@ -77,6 +77,9 @@ pub(crate) enum Command {
         /// Clear an explicit cancellation and resume under the frozen budget.
         #[arg(long)]
         resume: bool,
+        /// Publish an already settled journal offline without admitting requests.
+        #[arg(long, conflicts_with_all = ["resume", "config"])]
+        recover: bool,
     },
     /// Apply routing policy to a comparison and its bound scores offline.
     #[command(after_help = help::ROUTE)]

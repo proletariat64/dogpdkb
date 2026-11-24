@@ -208,7 +208,10 @@ comparison generation. The caller releases a reservation only when the score
 result, frozen score plan and complete journal establish zero admissions for
 that document. The run durably records the comparison generation and score
 work plan. After an interruption, resume queries the same scoring workspace for
-its terminal result. An unverifiable or missing result keeps reserved outcomes
-unknown. The offline route must bind the same comparison and score bytes and preserve
-all unscored deterministic decisions. The caller records the resulting
-artifact hashes in its plan for resume validation.
+its terminal result. If publication was interrupted, `score --recover` can
+republish a fully settled journal without admitting provider requests.
+Unverifiable outcomes keep their reservations. The offline route must bind
+the same comparison and score bytes and preserve all unscored deterministic
+decisions. The caller validates the route's published policy and artifact
+fields and treats the route directory identifier as opaque. It records the
+resulting artifact hashes in its plan for resume validation.

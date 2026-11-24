@@ -69,11 +69,7 @@ def _invoke(settings, run, command, plan, *arguments, configured=True):
         not isinstance(summary, dict)
         or summary.get("schema_version") != "mdcompare-summary-1"
         or summary.get("command") != command
-        or (
-            summary.get("state") not in {"partial", "complete"}
-            if command == "status"
-            else summary.get("state") != ("partial" if code == 2 else "complete")
-        )
+        or summary.get("state") != ("partial" if code == 2 else "complete")
         or not isinstance(summary.get("artifacts"), dict)
     ):
         raise ValueError("invalid mdcompare final summary")
@@ -282,10 +278,9 @@ def score(settings, run, plan, comparison, book_key, identifiers, *, recover=Fal
     root = plan.with_suffix(".mdcompare")
     result = root / "result.json"
     if recover:
-        status_code, summary = _invoke(settings, run, "status", plan, configured=False)
-        if status_code != 0:
-            raise ValueError("invalid mdcompare status exit code")
-        code = 2 if summary["state"] == "partial" else 0
+        code, summary = _invoke(
+            settings, run, "score", plan, "--recover", configured=False
+        )
     else:
         code, summary = _invoke(settings, run, "score", plan)
     _artifact(summary, result, "result")
@@ -387,15 +382,6 @@ def score(settings, run, plan, comparison, book_key, identifiers, *, recover=Fal
 
 
 def route(settings, run, comparison, score_result, expected_scores):
-    config = settings.mdcompare_config
-    if config is None:
-        default = comparison.plan.parent / "default.toml"
-        if default.is_file():
-            config = default
-    policy = {}
-    if config is not None:
-        with config.open("rb") as stream:
-            policy = tomllib.load(stream).get("route", {})
     code, summary = _invoke(
         settings, run, "route", comparison.plan, "--scores", score_result
     )
@@ -422,17 +408,10 @@ def route(settings, run, comparison, score_result, expected_scores):
         or type(threshold) is not int
         or not 1 <= threshold <= 5
         or type(intercept) is not bool
-        or threshold != policy.get("compile_above", 3)
-        or intercept != policy.get("compile_ambiguous", False)
         or not isinstance(route.get("results"), list)
         or len(route["results"]) != len(comparison.payload["results"])
     ):
         raise ValueError("invalid mdcompare route result")
-    binding = json.dumps(
-        [comparison.sha256, score_sha256, threshold, intercept], separators=(",", ":")
-    ).encode()
-    if path.parent.name != _digest(binding):
-        raise ValueError("mdcompare route policy digest mismatch")
     for old, row in zip(comparison.payload["results"], route["results"]):
         new = _object(row)
         score, ambiguous = expected_scores.get(old["document_id"], (None, None))
@@ -441,14 +420,16 @@ def route(settings, run, comparison, score_result, expected_scores):
             scored and score <= threshold and not (ambiguous and intercept)
         )
         expected_action = "SKIP" if allowed_to_skip else old["action"]
+        reason = new.get("routing_reason")
         if (
             any(new.get(key) != value for key, value in old.items() if key != "action")
             or new.get("original_action") != old["action"]
             or new.get("score") != score
             or new.get("ambiguous") != ambiguous
             or new.get("action") != expected_action
-            or not isinstance(new.get("routing_reason"), str)
-            or not new["routing_reason"]
+            or not isinstance(reason, str)
+            or not reason
+            or (allowed_to_skip and reason != "SCORE_AT_OR_BELOW_THRESHOLD")
         ):
             raise ValueError("mdcompare route changed deterministic evidence")
     return path, {**comparison.payload, "results": route["results"]}

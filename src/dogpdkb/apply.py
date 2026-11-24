@@ -1163,6 +1163,11 @@ def _score_inputs(
                 for key, record in records.items()
             )
         ):
+            run.failure(
+                step="compare",
+                reason="SEMANTIC_SCORE_UNVERIFIABLE",
+                message="Pinned mdcompare score reservations do not match this run",
+            )
             return semantic
     else:
         records = {}

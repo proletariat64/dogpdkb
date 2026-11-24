@@ -20,8 +20,8 @@ const CODEX_CLIENT: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DIRECT_SCOPE: &str = "chatgpt.tokens.use.direct";
 const DIRECT_RESOURCE: &str = "https://api.openai.com/v1";
 const RESPONSE_LIMIT: u64 = 8 * 1024 * 1024;
-pub const FORMAT: &str = include_str!("../../../src/mdcompare/semantic_score_format.json");
-pub const PROMPT: &str = include_str!("../../../src/mdcompare/semantic_score_prompt.txt");
+pub const FORMAT: &str = include_str!("semantic_score_format.json");
+pub const PROMPT: &str = include_str!("semantic_score_prompt.txt");
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Backend {

@@ -207,8 +207,18 @@ fn admitted_request_is_not_replayed_after_interruption() {
     let listener = listener(dir.path(), 1);
     let mut child = start(dir.path(), false);
     let (_socket, _) = request(&listener, &mut child, dir.path());
+    let recover = ["score", "--plan", "score.json", "--recover"];
+    assert_eq!(
+        invoke(dir.path(), &recover, 1)["reason_code"],
+        "workspace_busy"
+    );
     child.kill().unwrap();
     child.wait().unwrap();
+    let journal = dir.path().join("score.mdcompare/journal.json");
+    let original = fs::read(&journal).unwrap();
+    invoke(dir.path(), &recover, 1);
+    assert_eq!(fs::read(&journal).unwrap(), original);
+    assert!(!dir.path().join("score.mdcompare/result.json").exists());
 
     let summary = invoke(dir.path(), &["score", "--plan", "score.json"], 2);
     assert_eq!(summary["counts"]["admitted"], 1);
@@ -247,6 +257,15 @@ fn cancellation_waits_for_in_flight_work_and_explicit_resume_only_sends_pending(
     assert_eq!(cancelled["rows"][0]["state"], "scored");
     assert_eq!(cancelled["rows"][1]["state"], "not_sent");
     invoke(dir.path(), &["score", "--plan", "score.json"], 3);
+    invoke(
+        dir.path(),
+        &["score", "--plan", "score.json", "--recover"],
+        1,
+    );
+    assert_eq!(
+        read_json(dir.path(), "score.mdcompare/result.json"),
+        cancelled
+    );
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
@@ -267,7 +286,7 @@ fn cancellation_waits_for_in_flight_work_and_explicit_resume_only_sends_pending(
     fs::remove_file(dir.path().join("score.mdcompare/result.json")).unwrap();
     invoke(
         dir.path(),
-        &["score", "--plan", "score.json", "--resume"],
+        &["score", "--plan", "score.json", "--recover"],
         0,
     );
     assert_eq!(
@@ -299,6 +318,16 @@ fn zero_budget_publishes_proven_unsent_rows_without_credentials() {
         assert_eq!(row["admission"], Value::Null);
         assert_eq!(row["reason_code"], "request_budget_exhausted");
     }
+    let published = dir.path().join("score.mdcompare/result.json");
+    let expected = fs::read(&published).unwrap();
+    fs::remove_file(&published).unwrap();
+    fs::write(dir.path().join("default.toml"), "invalid config").unwrap();
+    invoke(
+        dir.path(),
+        &["score", "--plan", "score.json", "--recover"],
+        2,
+    );
+    assert_eq!(fs::read(published).unwrap(), expected);
 }
 
 #[test]

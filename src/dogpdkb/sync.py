@@ -243,8 +243,6 @@ def _select_run(store, args, sources):
     if not args.retry_graph:
         if run.data.get("command") != "sync":
             raise ValueError("ordinary resume requires a sync run")
-        if run.data.get("cleanup"):
-            raise ValueError("run has been cleaned; start a new run")
     else:
         manifest = run.data["artifacts"].get("manifest")
         if not manifest:
@@ -254,6 +252,27 @@ def _select_run(store, args, sources):
 
 
 def _execute_sync(settings, book, store, run, args, sources):
+    if args.resume and not args.retry_graph and (cleanup := run.data.get("cleanup")):
+        if cleanup.get("status") not in {"started", "failed"} or run.data[
+            "status"
+        ] not in {"completed", "partial"}:
+            raise ValueError("run has been cleaned; start a new run")
+        if args.stop_after and args.stop_after != "graph":
+            raise ValueError("cannot stop before the last completed phase")
+        from dogpdkb.cleanup import clean_run
+
+        clean_run(store, run)
+        code = run.data["exit_code"]
+        result = {
+            "exit_code": code,
+            "paused": False,
+            "manifest": run.data["artifacts"]["manifest"],
+            "run": str(run.path),
+            "status": run.data["status"],
+        }
+        print(json.dumps(result, ensure_ascii=False))
+        return code
+
     run.data.update(
         status="running",
         pid=os.getpid(),

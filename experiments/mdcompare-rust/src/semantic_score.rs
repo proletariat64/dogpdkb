@@ -281,19 +281,31 @@ fn protect_score_destinations(
     crate::input::check_output(&seal_path(workspace), protected()).context("binding_invalid")
 }
 
-fn ensure_seal(task: &Task, path: &Path) -> Result<()> {
+fn seal_file(path: &Path) -> Result<PathBuf> {
     let parent = path.parent().context("binding_invalid")?;
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .context("binding_invalid")?;
-    let path = workspace::artifact_path(parent, name)?;
-    let seal = format!("{}\n", task.plan_sha256);
+    workspace::artifact_path(parent, name)
+}
+
+fn verify_seal(task: &Task, path: &Path) -> Result<()> {
+    let (existing, _) = crate::input::read(path, 65)
+        .map_err(anyhow::Error::msg)
+        .context("binding_invalid")?;
+    ensure!(
+        existing == format!("{}\n", task.plan_sha256).as_bytes(),
+        "binding_invalid"
+    );
+    Ok(())
+}
+
+fn ensure_seal(task: &Task, path: &Path) -> Result<()> {
+    let path = seal_file(path)?;
+    let parent = path.parent().context("binding_invalid")?;
     if exists(&path)? {
-        let (existing, _) = crate::input::read(&path, 65)
-            .map_err(anyhow::Error::msg)
-            .context("binding_invalid")?;
-        ensure!(existing == seal.as_bytes(), "binding_invalid");
+        verify_seal(task, &path)?;
     } else {
         // Adoption is only safe for an accepted workspace that never began
         // execution. A spent journal without its ownership seal is damaged.
@@ -303,7 +315,7 @@ fn ensure_seal(task: &Task, path: &Path) -> Result<()> {
             "binding_invalid"
         );
         let mut temp = tempfile::NamedTempFile::new_in(parent).context("publish_failed")?;
-        temp.write_all(seal.as_bytes()).context("publish_failed")?;
+        writeln!(temp, "{}", task.plan_sha256).context("publish_failed")?;
         temp.as_file().sync_all().context("publish_failed")?;
         temp.persist_noclobber(&path).context("publish_failed")?;
     }
@@ -971,6 +983,66 @@ fn run_pending(task: &Task, directory: &Path, progress: &Progress) -> Result<()>
     })
 }
 
+fn finish_settled(task: &Task, journal: &Journal, sha: String) -> Result<Outcome> {
+    let terminal = journal.terminal.context("binding_invalid")?;
+    let expected = task.result(journal, sha)?;
+    if load_result(&task.workspace.root, Some(expected.clone()))?.is_none() {
+        workspace::atomic_write(&task.workspace.root.join("result.json"), &bytes(&expected)?)?;
+    }
+    Ok(task
+        .summary("score", terminal.name(), journal, false, true)
+        .exit(terminal.exit()))
+}
+
+/// Reconstruct only an already settled receipt. This entry point cannot
+/// initialize a score plan, recover unknown admissions or dispatch requests.
+pub fn recover(plan: &Path) -> Result<Outcome> {
+    let task = Task::open(Workspace::locate(plan)?)?;
+    let _lock = journal_lock(&task.workspace.root)?;
+    let _execution =
+        open_lock(&task.workspace.root, EXECUTION_LOCK, false)?.context("workspace_busy")?;
+    verify_seal(&task, &seal_file(&seal_path(&task.workspace))?)?;
+    task.comparison()?;
+    let (mut journal, mut sha) = task.journal()?;
+    ensure!(
+        journal.started && !journal.cancel_requested && journal.pending() == 0,
+        "invalid_input"
+    );
+    if journal.terminal.is_none() {
+        let selected = task.frozen.documents.len();
+        let budget = task
+            .frozen
+            .config
+            .request_budget
+            .context("binding_invalid")?;
+        ensure!(
+            journal.attempts.len() + journal.held.len() == selected
+                || journal.attempts.len() == budget
+                || journal.stop.is_some(),
+            "invalid_input"
+        );
+        // An existing result with a nonterminal journal is contradictory.
+        ensure!(
+            load_result(&task.workspace.root, None)?.is_none(),
+            "binding_invalid"
+        );
+        journal.terminal = Some(if journal.scored() == selected {
+            Terminal::Complete
+        } else {
+            Terminal::Partial
+        });
+        sha = task.save_journal(&journal)?;
+    }
+    ensure!(
+        matches!(
+            journal.terminal,
+            Some(Terminal::Complete | Terminal::Partial)
+        ),
+        "invalid_input"
+    );
+    finish_settled(&task, &journal, sha)
+}
+
 pub fn run(
     plan: &Path,
     config: Option<&Path>,
@@ -987,20 +1059,11 @@ pub fn run(
             open_lock(&task.workspace.root, EXECUTION_LOCK, false)?.context("workspace_busy")?;
         let (mut journal, sha) = task.journal()?;
         if let Some(terminal) = journal.terminal {
-            let expected = task.result(&journal, sha)?;
-            let published = load_result(&task.workspace.root, Some(expected.clone()))?.is_some();
             if terminal != Terminal::Cancelled || !resume {
-                if !published {
-                    workspace::atomic_write(
-                        &task.workspace.root.join("result.json"),
-                        &bytes(&expected)?,
-                    )?;
-                }
-                return Ok(task
-                    .summary("score", terminal.name(), &journal, false, true)
-                    .exit(terminal.exit()));
+                return finish_settled(&task, &journal, sha);
             }
-            if published {
+            let expected = task.result(&journal, sha)?;
+            if load_result(&task.workspace.root, Some(expected))?.is_some() {
                 fs::remove_file(task.workspace.root.join("result.json"))?;
                 File::open(&task.workspace.root)?.sync_all()?;
             }

@@ -115,8 +115,7 @@ def make_plan(book, run, documents, knowledge, comparison, semantic, *, workspac
         elif body.get("action") == "SKIP" and (
             status == "EQUIVALENT"
             or status == "CHANGED"
-            and type(body.get("score")) is int
-            and 1 <= body["score"] <= 5
+            and body.get("routing_reason") == "SCORE_AT_OR_BELOW_THRESHOLD"
         ):
             action = (
                 "metadata"

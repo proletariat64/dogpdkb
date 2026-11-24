@@ -1,0 +1,85 @@
+{
+  "type": "json_schema",
+  "name": "authored_semantic_assessment_v2",
+  "strict": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "evaluation_status",
+      "change_score",
+      "checked_operations",
+      "changes",
+      "reason",
+      "missing_evidence"
+    ],
+    "properties": {
+      "evaluation_status": {
+        "type": "string",
+        "enum": [
+          "evaluated",
+          "insufficient_input"
+        ]
+      },
+      "change_score": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "enum": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          null
+        ]
+      },
+      "checked_operations": {
+        "type": "array",
+        "items": {
+          "type": "integer"
+        }
+      },
+      "changes": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operation_id",
+            "before",
+            "after",
+            "ambiguity"
+          ],
+          "properties": {
+            "operation_id": {
+              "type": "integer"
+            },
+            "before": {
+              "type": "string"
+            },
+            "after": {
+              "type": "string"
+            },
+            "ambiguity": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      },
+      "reason": {
+        "type": "string"
+      },
+      "missing_evidence": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

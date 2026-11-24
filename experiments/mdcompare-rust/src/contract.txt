@@ -10,6 +10,7 @@ COMMANDS
   accept --plan FILE [--config FILE]
   run --plan FILE [--config FILE]
   score --plan FILE [--config FILE] [--resume]
+  score --plan FILE --recover
   route --plan FILE --scores FILE [--config FILE]
   status --plan FILE
   cancel --plan FILE
@@ -262,8 +263,13 @@ persisted concurrency by one. A 429 at concurrency one stops new admissions.
 Authentication failure and observed unknown network outcomes stop admissions.
 Cancel persists an intent before it succeeds. In-flight requests can settle.
 Only score --resume clears the intent for identities with no prior admission.
-A terminal partial result remains terminal. A settled journal can finish
-publication offline after interruption. Validate the terminal binding before
+A terminal partial result remains terminal. Use score --recover to verify
+an existing scored job and publish a missing result from its journal. Recovery
+uses the frozen plan without reading configuration or credentials. It accepts
+a sealed terminal result or a journal with no unresolved admission and no
+remaining admissible work. Recovery never creates a score workspace, clears a
+cancellation, or calls the provider. Active, cancelled, incomplete, or corrupt
+jobs fail without modifying their journal or result. Validate the terminal binding before
 releasing any caller reservation.
 
 OFFLINE ROUTING

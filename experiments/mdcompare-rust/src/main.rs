@@ -80,7 +80,14 @@ fn run(command: Command, progress: &Progress) -> Result<Outcome> {
             work,
             settings,
             resume,
-        } => semantic_score::run(&work.plan, settings.config.as_deref(), resume, progress),
+            recover,
+        } => {
+            if recover {
+                semantic_score::recover(&work.plan)
+            } else {
+                semantic_score::run(&work.plan, settings.config.as_deref(), resume, progress)
+            }
+        }
         Command::Route {
             work,
             scores,
