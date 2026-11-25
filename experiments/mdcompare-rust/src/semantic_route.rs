@@ -1,6 +1,6 @@
 use crate::config::{Config, Scope};
-use crate::input::{check_output, json_bytes, parse_utf8_json};
-use crate::semantic_generation::{Generation, Identity, identity, load};
+use crate::input::{Identity, check_output, json_bytes, parse_utf8_json};
+use crate::semantic_generation::{Generation, identity, load};
 use crate::summary::{Outcome, Summary};
 use crate::workspace::{self, Workspace, checksum};
 use anyhow::{Context, Result, ensure};
@@ -92,7 +92,10 @@ fn scores(generation: &Generation, input: ScoreInput) -> Result<BTreeMap<Identit
             );
             for row in external.scores {
                 insert(
-                    (row.knowledge_base, row.document_id),
+                    Identity {
+                        knowledge_base: row.knowledge_base,
+                        document_id: row.document_id,
+                    },
                     &row.evidence_sha256,
                     None,
                     row.score,
@@ -109,7 +112,10 @@ fn scores(generation: &Generation, input: ScoreInput) -> Result<BTreeMap<Identit
             for row in local.rows {
                 if row.state == "scored" {
                     insert(
-                        (row.knowledge_base, row.document_id),
+                        Identity {
+                            knowledge_base: row.knowledge_base,
+                            document_id: row.document_id,
+                        },
                         row.evidence_sha256.as_deref().context("binding_invalid")?,
                         Some(row.evidence.as_deref().context("binding_invalid")?),
                         row.score.context("binding_invalid")?,

@@ -2,7 +2,6 @@ use super::{Frozen, ScoreResult, ScoreRow, bytes, digest, frozen, is_digest, rea
 use crate::{
     provider::Outcome as ProviderOutcome,
     score_context::{self, ReplyValidation},
-    summary::{Outcome, Summary},
     workspace::{self, Workspace},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -60,26 +59,18 @@ struct Journal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Terminal {
+pub(super) enum Terminal {
     Complete,
     Partial,
     Cancelled,
 }
 
 impl Terminal {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Self::Complete => "complete",
             Self::Partial => "partial",
             Self::Cancelled => "cancelled",
-        }
-    }
-
-    fn exit(self) -> u8 {
-        match self {
-            Self::Complete => 0,
-            Self::Partial => 2,
-            Self::Cancelled => 3,
         }
     }
 }
@@ -407,6 +398,45 @@ impl<'a> LockedStore<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum State {
+    Accepted,
+    Running,
+    CancelRequested,
+    Terminal(Terminal),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ProgressCounts {
+    pub(super) admitted: usize,
+    pub(super) in_flight: usize,
+    held: usize,
+}
+
+impl ProgressCounts {
+    pub(super) fn completed(self) -> usize {
+        self.admitted - self.in_flight + self.held
+    }
+}
+
+pub(super) struct Snapshot {
+    pub(super) state: State,
+    pub(super) progress: ProgressCounts,
+    pub(super) scored: usize,
+    pub(super) running: bool,
+    pub(super) published: bool,
+    pub(super) interrupted: bool,
+    pub(super) stop_reason: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum ReceiptPublication {
+    /// A newly finalized run has already checked for an absent result at start.
+    Fresh,
+    /// Repeated completion or recovery must check any existing terminal result.
+    VerifyExisting,
+}
+
 pub(super) enum Next {
     Done,
     Wait,
@@ -444,39 +474,19 @@ impl LockedJournal<'_> {
             .result(self.frozen(), self.locked.store.plan_sha, self.sha.clone())
     }
 
-    fn summary(
-        &self,
-        command: &'static str,
-        state: &str,
-        running: bool,
-        artifact: bool,
-    ) -> Summary {
-        let mut summary = Summary::new(command, state)
-            .comparison(self.frozen().comparison_sha256.clone())
-            .artifact("plan", self.root().join("plan.json"))
-            .artifact("journal", self.root().join("journal.json"))
-            .count("selected", self.frozen().documents.len())
-            .count("admitted", self.journal.attempts.len())
-            .count("scored", self.journal.scored())
-            .count(
-                "in_flight",
-                if running { self.journal.pending() } else { 0 },
-            );
-        if let Some(reason) = match state {
-            "cancel_requested" | "cancelled" => Some("cancelled"),
-            "partial" => self.journal.stop.as_deref(),
-            _ => None,
-        } {
-            summary = summary.reason(reason);
-        }
-        if artifact {
-            summary.artifact("result", self.root().join("result.json"))
-        } else {
-            summary
+    fn snapshot(&self, state: State, running: bool, published: bool) -> Snapshot {
+        Snapshot {
+            state,
+            progress: self.counts(),
+            scored: self.journal.scored(),
+            running,
+            published,
+            interrupted: state == State::Accepted && !running && self.journal.started,
+            stop_reason: self.journal.stop.clone(),
         }
     }
 
-    pub(super) fn observe(&mut self, cancel: bool, running: bool) -> Result<Outcome> {
+    pub(super) fn observe(&mut self, cancel: bool, running: bool) -> Result<Snapshot> {
         let expected = self.journal.terminal.map(|_| self.result()).transpose()?;
         let published = load_result(self.root(), expected)?.is_some();
         if cancel && self.journal.terminal.is_none() && !self.journal.cancel_requested {
@@ -484,28 +494,25 @@ impl LockedJournal<'_> {
             self.save()?;
         }
         let state = if published {
-            self.journal.terminal.context("binding_invalid")?.name()
+            State::Terminal(self.journal.terminal.context("binding_invalid")?)
         } else if self.journal.terminal == Some(Terminal::Cancelled) {
-            "cancelled"
+            State::Terminal(Terminal::Cancelled)
         } else if self.journal.cancel_requested {
-            "cancel_requested"
+            State::CancelRequested
         } else if running {
-            "running"
+            State::Running
         } else {
-            "accepted"
+            State::Accepted
         };
-        let command = if cancel { "cancel" } else { "status" };
-        let mut summary = self.summary(command, state, running, published);
-        if state == "accepted" && !running && self.journal.started {
-            summary = summary.reason("interrupted");
-        }
-        Ok(summary.exit(0))
+        Ok(self.snapshot(state, running, published))
     }
 
-    pub(super) fn start(&mut self, resume: bool) -> Result<Option<Outcome>> {
+    pub(super) fn start(&mut self, resume: bool) -> Result<Option<Snapshot>> {
         if let Some(terminal) = self.journal.terminal {
             if terminal != Terminal::Cancelled || !resume {
-                return self.finish_settled().map(Some);
+                return self
+                    .publish_terminal(ReceiptPublication::VerifyExisting)
+                    .map(Some);
             }
             let expected = self.result()?;
             if load_result(self.root(), Some(expected))?.is_some() {
@@ -530,12 +537,12 @@ impl LockedJournal<'_> {
         Ok(None)
     }
 
-    pub(super) fn counts(&self) -> (usize, usize, usize) {
-        (
-            self.journal.attempts.len(),
-            self.journal.pending(),
-            self.journal.held.len(),
-        )
+    pub(super) fn counts(&self) -> ProgressCounts {
+        ProgressCounts {
+            admitted: self.journal.attempts.len(),
+            in_flight: self.journal.pending(),
+            held: self.journal.held.len(),
+        }
     }
 
     pub(super) fn drain_throttle(&mut self) -> Result<()> {
@@ -647,18 +654,22 @@ impl LockedJournal<'_> {
         Ok(())
     }
 
-    fn finish_settled(&self) -> Result<Outcome> {
+    fn publish_terminal(&self, publication: ReceiptPublication) -> Result<Snapshot> {
         let terminal = self.journal.terminal.context("binding_invalid")?;
-        let expected = self.result()?;
-        if load_result(self.root(), Some(expected.clone()))?.is_none() {
-            workspace::atomic_write(&self.root().join("result.json"), &bytes(&expected)?)?;
+        let result = self.result()?;
+        let needs_write = match publication {
+            ReceiptPublication::Fresh => true,
+            ReceiptPublication::VerifyExisting => {
+                load_result(self.root(), Some(result.clone()))?.is_none()
+            }
+        };
+        if needs_write {
+            workspace::atomic_write(&self.root().join("result.json"), &bytes(&result)?)?;
         }
-        Ok(self
-            .summary("score", terminal.name(), false, true)
-            .exit(terminal.exit()))
+        Ok(self.snapshot(State::Terminal(terminal), false, true))
     }
 
-    pub(super) fn recover(&mut self) -> Result<Outcome> {
+    pub(super) fn recover(&mut self) -> Result<Snapshot> {
         ensure!(
             self.journal.started && !self.journal.cancel_requested && self.journal.pending() == 0,
             "invalid_input"
@@ -692,10 +703,10 @@ impl LockedJournal<'_> {
             ),
             "invalid_input"
         );
-        self.finish_settled()
+        self.publish_terminal(ReceiptPublication::VerifyExisting)
     }
 
-    pub(super) fn finish(&mut self) -> Result<Outcome> {
+    pub(super) fn finish(&mut self) -> Result<Snapshot> {
         let selected = self.frozen().documents.len();
         let terminal = if self.journal.scored() == selected {
             self.journal.cancel_requested = false;
@@ -710,10 +721,6 @@ impl LockedJournal<'_> {
         };
         self.journal.terminal = Some(terminal);
         self.save()?;
-        let result = self.result()?;
-        workspace::atomic_write(&self.root().join("result.json"), &bytes(&result)?)?;
-        Ok(self
-            .summary("score", terminal.name(), false, true)
-            .exit(terminal.exit()))
+        self.publish_terminal(ReceiptPublication::Fresh)
     }
 }

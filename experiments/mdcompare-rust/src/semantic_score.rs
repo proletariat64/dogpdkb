@@ -1,9 +1,10 @@
 use crate::{
     config::{Config, Scope, ScoreConfig},
+    input::Identity,
     provider::{FORMAT, PROMPT, Provider},
     score_context::{self, Packet},
     semantic_generation,
-    summary::{Outcome, Progress},
+    summary::{Outcome, Progress, Summary},
     workspace::{self, Workspace, checksum as digest},
 };
 use anyhow::{Context, Result, ensure};
@@ -20,17 +21,10 @@ use std::{
 
 mod journal;
 
-use journal::Next;
+use journal::{Next, Snapshot, State, Terminal};
 
 const WORK: &str = "mdcompare-score-work-1";
 const PLAN: &str = "mdcompare-score-plan-1";
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Identity {
-    knowledge_base: String,
-    document_id: String,
-}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -125,21 +119,17 @@ fn comparison(comparison: &Path, sha: &str) -> Result<(PathBuf, BTreeMap<Identit
     let bindings = generation
         .score_candidates()?
         .into_iter()
-        .map(|((knowledge_base, document_id), raw)| {
-            let identity = Identity {
-                knowledge_base,
-                document_id,
-            };
-            Ok((
+        .map(|(identity, raw)| {
+            (
                 identity.clone(),
                 Binding {
                     identity,
                     evidence: raw.evidence.clone(),
                     evidence_sha256: raw.digest.clone(),
                 },
-            ))
+            )
         })
-        .collect::<Result<_>>()?;
+        .collect();
     Ok((generation.directory, bindings))
 }
 
@@ -324,6 +314,48 @@ impl Task {
         })
     }
 
+    fn outcome(&self, command: &'static str, snapshot: Snapshot) -> Outcome {
+        let state = match snapshot.state {
+            State::Accepted => "accepted",
+            State::Running => "running",
+            State::CancelRequested => "cancel_requested",
+            State::Terminal(terminal) => terminal.name(),
+        };
+        let mut summary = Summary::new(command, state)
+            .comparison(self.frozen.comparison_sha256.clone())
+            .artifact("plan", self.workspace.root.join("plan.json"))
+            .artifact("journal", self.workspace.root.join("journal.json"))
+            .count("selected", self.frozen.documents.len())
+            .count("admitted", snapshot.progress.admitted)
+            .count("scored", snapshot.scored)
+            .count(
+                "in_flight",
+                if snapshot.running {
+                    snapshot.progress.in_flight
+                } else {
+                    0
+                },
+            );
+        let reason = match snapshot.state {
+            State::CancelRequested | State::Terminal(Terminal::Cancelled) => Some("cancelled"),
+            State::Terminal(Terminal::Partial) => snapshot.stop_reason.as_deref(),
+            State::Accepted if snapshot.interrupted => Some("interrupted"),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            summary = summary.reason(reason);
+        }
+        if snapshot.published {
+            summary = summary.artifact("result", self.workspace.root.join("result.json"));
+        }
+        let exit = match (command, snapshot.state) {
+            ("score", State::Terminal(Terminal::Partial)) => 2,
+            ("score", State::Terminal(Terminal::Cancelled)) => 3,
+            _ => 0,
+        };
+        summary.exit(exit)
+    }
+
     fn journal(&self) -> journal::Store<'_> {
         journal::Store::new(&self.workspace.root, &self.frozen, &self.plan_sha256)
     }
@@ -375,7 +407,9 @@ fn observe(plan: &Path, cancel: bool) -> Result<Outcome> {
     let task = Task::open(Workspace::locate(plan)?)?;
     let locked = task.journal().lock()?;
     let running = locked.running()?;
-    locked.load()?.observe(cancel, running)
+    let mut journal = locked.load()?;
+    let snapshot = journal.observe(cancel, running)?;
+    Ok(task.outcome(if cancel { "cancel" } else { "status" }, snapshot))
 }
 
 pub fn cancel(plan: &Path) -> Result<Outcome> {
@@ -429,13 +463,12 @@ fn run_pending(task: &Task, directory: &Path, progress: &Progress) -> Result<()>
                 if progress_counts != Some(counts) {
                     progress_counts = Some(counts);
                     drop(journal);
-                    let (admitted, pending, held) = counts;
                     progress.update(
                         "scoring",
-                        admitted - pending + held,
+                        counts.completed(),
                         task.frozen.documents.len(),
-                        admitted,
-                        pending,
+                        counts.admitted,
+                        counts.in_flight,
                     );
                     continue;
                 }
@@ -505,7 +538,9 @@ pub fn recover(plan: &Path) -> Result<Outcome> {
     let _execution = locked.claim_execution()?;
     verify_seal(&task, &seal_file(&seal_path(&task.workspace))?)?;
     task.comparison()?;
-    locked.load()?.recover()
+    let mut journal = locked.load()?;
+    let snapshot = journal.recover()?;
+    Ok(task.outcome("score", snapshot))
 }
 
 pub fn run(
@@ -521,11 +556,14 @@ pub fn run(
         // Claim execution and clear the previous cancellation together.
         // Cancel cannot observe this run before the transition is durable.
         let execution = locked.claim_execution()?;
-        if let Some(outcome) = locked.load()?.start(resume)? {
-            return Ok(outcome);
+        let mut journal = locked.load()?;
+        if let Some(snapshot) = journal.start(resume)? {
+            return Ok(task.outcome("score", snapshot));
         }
         execution
     };
     run_pending(&task, &directory, progress)?;
-    task.journal().lock()?.load()?.finish()
+    let mut journal = task.journal().lock()?.load()?;
+    let snapshot = journal.finish()?;
+    Ok(task.outcome("score", snapshot))
 }

@@ -7,7 +7,10 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Debug, Clone, Hash, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Debug, Clone, Hash, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
+#[serde(deny_unknown_fields)]
 pub struct Identity {
     pub knowledge_base: String,
     pub document_id: String,

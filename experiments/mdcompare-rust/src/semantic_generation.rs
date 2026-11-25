@@ -1,13 +1,11 @@
 //! Verified semantic comparison generation shared by scoring and routing.
-use crate::input::parse_utf8_json;
+use crate::input::{Identity, parse_utf8_json};
 use crate::workspace::{self, Workspace, checksum};
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
-
-pub type Identity = (String, String);
 
 pub struct Binding {
     pub evidence: String,
@@ -43,10 +41,10 @@ pub(crate) fn identity(row: &Value) -> Result<Identity> {
             .filter(|value| !value.is_empty())
             .context("binding_invalid")
     };
-    Ok((
-        field("knowledge_base")?.to_owned(),
-        field("document_id")?.to_owned(),
-    ))
+    Ok(Identity {
+        knowledge_base: field("knowledge_base")?.to_owned(),
+        document_id: field("document_id")?.to_owned(),
+    })
 }
 
 fn eligible(row: &Value) -> bool {
