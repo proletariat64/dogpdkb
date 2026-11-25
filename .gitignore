@@ -25,6 +25,7 @@ __pycache__/
 /build/
 /dist/
 /experiments/mdcompare-rust/target/
+/experiments/mdocr-rust/target/
 
 # Virtualenv and worktree-local CI dependency cache
 .venv/

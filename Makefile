@@ -6,9 +6,13 @@ TARGET ?= antcode
 CARGO ?= cargo
 MDCOMPARE_RUST_DIR := experiments/mdcompare-rust
 MDCOMPARE_RUST_TARGET := x86_64-unknown-linux-musl
-CARGO_TARGET_DIR ?= $(MDCOMPARE_RUST_DIR)/target
+MDOCR_RUST_DIR := experiments/mdocr-rust
+MDOCR_RUST_TARGET := x86_64-unknown-linux-gnu
+MDCOMPARE_CARGO_TARGET_DIR ?= $(or $(CARGO_TARGET_DIR),$(MDCOMPARE_RUST_DIR)/target)
+MDOCR_CARGO_TARGET_DIR ?= $(or $(CARGO_TARGET_DIR),$(MDOCR_RUST_DIR)/target)
 
 .PHONY: bootstrap doc-guard test lint check build smoke checkr buildr smoker doctor release publish-release publish-site-release
+.PHONY: checkr-mdcomparer buildr-mdcomparer smoker-mdcomparer checkr-mdocrr buildr-mdocrr smoker-mdocrr
 
 bootstrap:
 	$(PYTHON) -B scripts/bootstrap.py
@@ -24,16 +28,33 @@ build:
 smoke: build
 	$(DEV_PYTHON) scripts/smoke_install.py --dist "$(DIST_DIR)"
 
-checkr:
+checkr: checkr-mdcomparer checkr-mdocrr
+
+buildr: buildr-mdcomparer buildr-mdocrr
+
+smoker: smoker-mdcomparer smoker-mdocrr
+
+checkr-mdcomparer:
 	$(CARGO) fmt --manifest-path "$(MDCOMPARE_RUST_DIR)/Cargo.toml" --check
-	$(CARGO) clippy --locked --manifest-path "$(MDCOMPARE_RUST_DIR)/Cargo.toml" --target-dir "$(CARGO_TARGET_DIR)" --all-targets -- -D warnings
-	$(CARGO) test --locked --manifest-path "$(MDCOMPARE_RUST_DIR)/Cargo.toml" --target-dir "$(CARGO_TARGET_DIR)" --all-targets
+	$(CARGO) clippy --locked --manifest-path "$(MDCOMPARE_RUST_DIR)/Cargo.toml" --target-dir "$(MDCOMPARE_CARGO_TARGET_DIR)" --all-targets -- -D warnings
+	$(CARGO) test --locked --manifest-path "$(MDCOMPARE_RUST_DIR)/Cargo.toml" --target-dir "$(MDCOMPARE_CARGO_TARGET_DIR)" --all-targets
 
-buildr:
-	$(CARGO) build --locked --release --manifest-path "$(MDCOMPARE_RUST_DIR)/Cargo.toml" --target "$(MDCOMPARE_RUST_TARGET)" --target-dir "$(CARGO_TARGET_DIR)"
+buildr-mdcomparer:
+	$(CARGO) build --locked --release --manifest-path "$(MDCOMPARE_RUST_DIR)/Cargo.toml" --target "$(MDCOMPARE_RUST_TARGET)" --target-dir "$(MDCOMPARE_CARGO_TARGET_DIR)"
 
-smoker: buildr
-	bash scripts/smoke_mdcompare_rust.sh "$(CARGO_TARGET_DIR)/$(MDCOMPARE_RUST_TARGET)/release/mdcomparer"
+smoker-mdcomparer: buildr-mdcomparer
+	bash scripts/smoke_mdcompare_rust.sh "$(MDCOMPARE_CARGO_TARGET_DIR)/$(MDCOMPARE_RUST_TARGET)/release/mdcomparer"
+
+checkr-mdocrr:
+	$(CARGO) fmt --manifest-path "$(MDOCR_RUST_DIR)/Cargo.toml" --check
+	$(CARGO) clippy --locked --manifest-path "$(MDOCR_RUST_DIR)/Cargo.toml" --target-dir "$(MDOCR_CARGO_TARGET_DIR)" --all-targets -- -D warnings
+	$(CARGO) test --locked --manifest-path "$(MDOCR_RUST_DIR)/Cargo.toml" --target-dir "$(MDOCR_CARGO_TARGET_DIR)" --all-targets
+
+buildr-mdocrr:
+	RUSTFLAGS="$(strip $(RUSTFLAGS) -C target-feature=+crt-static)" $(CARGO) build --locked --release --manifest-path "$(MDOCR_RUST_DIR)/Cargo.toml" --target "$(MDOCR_RUST_TARGET)" --target-dir "$(MDOCR_CARGO_TARGET_DIR)"
+
+smoker-mdocrr: buildr-mdocrr
+	bash scripts/smoke_mdocr_rust.sh "$(MDOCR_CARGO_TARGET_DIR)/$(MDOCR_RUST_TARGET)/release/mdocrr"
 
 doctor:
 	$(DEV_PYTHON) -m dogpdkb doctor $(DOCTOR_ARGS)

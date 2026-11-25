@@ -1,10 +1,8 @@
-"""Offline coverage for stable homepage publication and atomic remote updates."""
+"""Offline coverage for stable homepage publication and atomic local updates."""
 
 import io
 import json
 import os
-import runpy
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -112,7 +110,9 @@ class Response(io.BytesIO):
 
 def test_download_is_bounded(monkeypatch):
     monkeypatch.setattr(
-        tool, "urlopen", lambda *a, **kw: Response(b"x" * (1024 * 1024 + 1))
+        tool.request,
+        "urlopen",
+        lambda *a, **kw: Response(b"x" * (1024 * 1024 + 1)),
     )
     with pytest.raises(tool.SitePublishError, match="invalid"):
         tool.fetch("https://example.invalid")
@@ -122,7 +122,7 @@ def test_download_errors_do_not_expose_provider_message(monkeypatch):
     def fail(*args, **kwargs):
         raise OSError("secret token")
 
-    monkeypatch.setattr(tool, "urlopen", fail)
+    monkeypatch.setattr(tool.request, "urlopen", fail)
     with pytest.raises(
         tool.SitePublishError, match="^Anonymous installer download failed$"
     ):
@@ -141,29 +141,56 @@ def test_command_errors_are_sanitized(monkeypatch):
         tool.command(["antcode", "release", "show"])
 
 
-def test_publish_transports_only_metadata(release, installer, monkeypatch):
+def test_publish_transports_only_metadata(release, installer, monkeypatch, tmp_path):
+    monkeypatch.setattr(tool, "SITE", str(tmp_path))
     calls = []
     uploaded = []
 
     def command(arguments):
         calls.append(arguments)
+        return json.dumps(release)
+
+    def update_local(payload, destination, public_url):
+        uploaded.append(json.loads(payload))
+
+    monkeypatch.setattr(tool, "command", command)
+    monkeypatch.setattr(tool, "fetch", lambda _: installer)
+    monkeypatch.setattr(tool, "update_local", update_local)
+    tool.publish("v1.2.3")
+    assert uploaded == [tool.metadata("v1.2.3", release, installer)]
+    assert calls == [
+        [
+            "antcode",
+            "release",
+            "show",
+            "v1.2.3",
+            "--project",
+            tool.PROJECT,
+            "--json",
+        ]
+    ]
+
+
+def test_nonlocal_publish_uses_poolab(release, installer, monkeypatch, tmp_path):
+    monkeypatch.setattr(tool, "SITE", str(tmp_path / "missing-site"))
+    calls = []
+    remote_calls = []
+
+    def command(arguments):
+        calls.append(arguments)
         if arguments[0] == "antcode":
             return json.dumps(release)
-        if arguments[:2] == ["poolab", "sync"]:
-            uploaded.append(json.loads(Path(arguments[-2]).read_text()))
         return ""
 
     monkeypatch.setattr(tool, "command", command)
     monkeypatch.setattr(tool, "fetch", lambda _: installer)
-    tool.publish("v1.2.3")
-    assert uploaded == [tool.metadata("v1.2.3", release, installer)]
-    assert calls[0][:4] == ["antcode", "release", "show", "v1.2.3"]
-    assert any(
-        tool.REMOTE_UPDATE in shlex.split(args[-1])
-        for args in calls
-        if args[:3] == ["poolab", "terminal", "execute"]
+    monkeypatch.setattr(
+        tool, "remote_python", lambda *args: remote_calls.append(args) or ""
     )
-    assert sum(args[:2] == ["poolab", "sync"] for args in calls) == 1
+    tool.publish("v1.2.3")
+
+    assert any(args[:2] == ["poolab", "sync"] for args in calls)
+    assert any(args[0] == tool.REMOTE_UPDATE for args in remote_calls)
 
 
 def run_remote(tmp_path, monkeypatch, data, previous=None, replace_failure=False):
@@ -198,9 +225,12 @@ def run_remote(tmp_path, monkeypatch, data, previous=None, replace_failure=False
 
 
 def execute_remote(tmp_path):
-    program = tmp_path / "remote_update.py"
-    program.write_text(tool.REMOTE_UPDATE)
-    runpy.run_path(str(program))
+    source = Path(sys.argv[1])
+    try:
+        tool.update_local(source.read_bytes(), Path(sys.argv[2]), sys.argv[3])
+    finally:
+        source.unlink(missing_ok=True)
+        source.parent.rmdir()
 
 
 def test_remote_atomic_publish_and_readback(tmp_path, monkeypatch, release, installer):
@@ -293,27 +323,17 @@ def test_verification_failure_restores_previous_state(
     assert not stage.exists()
 
 
-def test_failed_transport_cleans_owned_stage(release, installer, monkeypatch):
-    calls = []
-
-    def command(arguments):
-        calls.append(arguments)
-        if arguments[0] == "antcode":
-            return json.dumps(release)
-        if arguments[:2] == ["poolab", "sync"]:
-            raise tool.SitePublishError("sync failed")
-        return ""
-
-    monkeypatch.setattr(tool, "command", command)
+def test_failed_local_update_surfaces(release, installer, monkeypatch, tmp_path):
+    monkeypatch.setattr(tool, "SITE", str(tmp_path))
+    monkeypatch.setattr(tool, "command", lambda _: json.dumps(release))
     monkeypatch.setattr(tool, "fetch", lambda _: installer)
-    with pytest.raises(tool.SitePublishError, match="sync failed"):
+
+    def fail_update(*args):
+        raise tool.SitePublishError("local update failed")
+
+    monkeypatch.setattr(tool, "update_local", fail_update)
+    with pytest.raises(tool.SitePublishError, match="local update failed"):
         tool.publish("v1.2.3")
-    assert "shutil.rmtree" in calls[-1][-1]
-    assert not any(
-        tool.REMOTE_UPDATE in shlex.split(args[-1])
-        for args in calls
-        if args[:3] == ["poolab", "terminal", "execute"]
-    )
 
 
 def test_unsafe_release_never_writes_remote(release, installer, monkeypatch):

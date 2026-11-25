@@ -27,23 +27,24 @@ mdcomparer help all
 ## Build for Linux x86-64
 
 Install the `x86_64-unknown-linux-musl` Rust target and a musl C compiler.
-Install `rustfmt` and Clippy for `checkr`, and `readelf` for `smoker`.
+Install `rustfmt` and Clippy for `checkr-mdcomparer`, and `readelf` for `smoker-mdcomparer`.
 CI verifies the locked build with Rust 1.96.0.
 
 ```sh
-make checkr
-make buildr
-make smoker
+make checkr-mdcomparer
+make buildr-mdcomparer
+make smoker-mdcomparer
 ```
 
-`checkr` verifies formatting, runs Clippy with warnings denied, and runs Rust
-tests. `buildr` builds the release binary using the locked dependency versions.
-`smoker` runs `buildr`, verifies static linkage, and runs an offline comparison
+`checkr-mdcomparer` verifies formatting, runs Clippy with warnings denied, and runs Rust
+tests. `buildr-mdcomparer` builds the release binary using the locked dependency versions.
+`smoker-mdcomparer` runs `buildr-mdcomparer`, verifies static linkage, and runs an offline comparison
 and status check with a relocated binary in a cleared environment.
 
 By default, the executable is at
 `experiments/mdcompare-rust/target/x86_64-unknown-linux-musl/release/mdcomparer`.
-Set `CARGO_TARGET_DIR` to use a different build directory. The binary embeds
+Set `MDCOMPARE_CARGO_TARGET_DIR` or `CARGO_TARGET_DIR` to use a different build directory.
+The unsuffixed Make targets run both Rust tools. The binary embeds
 help, the scoring prompt, and the scoring schema. For a local runtime check,
 run `mdcomparer doctor --pretty`.
 

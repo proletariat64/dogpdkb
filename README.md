@@ -275,7 +275,10 @@ skylark = ["node", "/opt/pi-skylark/dist/cli.mjs"]
 `sync` 和 `update-graph` 将每本书固定的 Corpus 目录直接交给 Graphify，输出写入
 该书固定的原生输出目录（默认 `corpus/graphify-out`）。计划选择控制哪些文档进入
 Corpus，不构成 Graphify 扫描范围；扫描、排除规则、缓存和合并由 Graphify 管理。
-没有镜像目录、输出交换、手工范围文件或校验和要求。正常新 run 支持 resume，
+调用固定包含 `--no-gitignore`，防止 Git 排除规则隐藏已发布 Corpus；新
+`.graphifyignore` 使用原子 no-overwrite 创建，已有不完整白名单保留原文并提示操作者
+补齐，不覆盖已有规则。没有镜像目录、输出交换、手工范围文件或校验和要求。正常新
+run 支持 resume，
 且可显式重试同一 run 的图谱工作；不会自动重试其他 run 已知失败或结果未知的同版本。
 失败或中断时 Graphify 原生文件可能已改变；Corpus 保留，但不确认新的图谱版本。
 详见[Graphify 合同](docs/orchestrator-graphify-contract.md)。Skylark 使用已恢复的独立
