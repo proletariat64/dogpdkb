@@ -1,30 +1,29 @@
 use crate::{
     config::{Config, Scope, ScoreConfig},
-    provider::{self, Connection, FORMAT, Outcome as ProviderOutcome, PROMPT},
-    score_context::{self, Packet, ReplyValidation},
+    provider::{self, Connection, FORMAT, PROMPT},
+    score_context::{self, Packet},
     semantic_route,
-    summary::{Outcome, Progress, Summary},
+    summary::{Outcome, Progress},
     workspace::{self, Workspace, checksum as digest},
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
+    fs::File,
     io::{self, Write},
-    os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
     time::Duration,
 };
 
+mod journal;
+
+use journal::Next;
+
 const WORK: &str = "mdcompare-score-work-1";
 const PLAN: &str = "mdcompare-score-plan-1";
-const JOURNAL: &str = "mdcompare-score-journal-1";
-const RESULT: &str = "mdcompare-score-result-1";
-const EXECUTION_LOCK: &str = "execution.lock";
-const JOURNAL_LOCK: &str = "admission.lock";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,70 +62,6 @@ struct Frozen {
     config_source: Option<PathBuf>,
     prompt_sha256: String,
     format_sha256: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum AttemptState {
-    Admitted,
-    Scored,
-    Unscored,
-    Unknown,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Attempt {
-    document: usize,
-    packet_sha256: String,
-    state: AttemptState,
-    reason_code: Option<String>,
-    score: Option<u8>,
-    ambiguous: Option<bool>,
-    usage_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    validation: Option<ReplyValidation>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Journal {
-    schema_version: String,
-    score_plan_sha256: String,
-    attempts: Vec<Attempt>,
-    held: BTreeMap<usize, String>,
-    concurrency: u8,
-    throttled: bool,
-    stop: Option<String>,
-    cancel_requested: bool,
-    started: bool,
-    terminal: Option<Terminal>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Terminal {
-    Complete,
-    Partial,
-    Cancelled,
-}
-
-impl Terminal {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Complete => "complete",
-            Self::Partial => "partial",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
-    fn exit(self) -> u8 {
-        match self {
-            Self::Complete => 0,
-            Self::Partial => 2,
-            Self::Cancelled => 3,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,11 +244,7 @@ fn ensure_seal(task: &Task, path: &Path) -> Result<()> {
     } else {
         // Adoption is only safe for an accepted workspace that never began
         // execution. A spent journal without its ownership seal is damaged.
-        let (journal, _) = task.journal()?;
-        ensure!(
-            !journal.started && journal.attempts.is_empty(),
-            "binding_invalid"
-        );
+        ensure!(task.journal().unstarted()?, "binding_invalid");
         let mut temp = tempfile::NamedTempFile::new_in(parent).context("publish_failed")?;
         writeln!(temp, "{}", task.plan_sha256).context("publish_failed")?;
         temp.as_file().sync_all().context("publish_failed")?;
@@ -357,13 +288,7 @@ fn prepare_task(workspace: Workspace, explicit: Option<&Path>) -> Result<Task> {
             format_sha256: digest(FORMAT.as_bytes()),
         };
         let plan = bytes(&frozen)?;
-        let journal = Journal::new(digest(&plan), frozen.config.concurrency);
-        workspace.initialize(&[
-            ("plan.json", plan),
-            ("journal.json", bytes(&journal)?),
-            (EXECUTION_LOCK, Vec::new()),
-            (JOURNAL_LOCK, Vec::new()),
-        ])?;
+        journal::initialize(&workspace, plan, frozen.config.concurrency)?;
     }
     let task = Task::open(workspace)?;
     ensure_seal(&task, &seal)?;
@@ -401,13 +326,6 @@ fn frozen(root: &Path) -> Result<(Frozen, String)> {
     Ok((frozen, sha))
 }
 
-fn load_journal(root: &Path, frozen: &Frozen, plan_sha: &str) -> Result<(Journal, String)> {
-    let file = workspace::artifact_path(root, "journal.json").context("binding_invalid")?;
-    let (journal, sha): (Journal, _) = read(&file).context("binding_invalid")?;
-    journal.verify(frozen, plan_sha)?;
-    Ok((journal, sha))
-}
-
 impl Task {
     fn open(workspace: Workspace) -> Result<Self> {
         ensure!(workspace.root.try_exists()?, "workspace_missing");
@@ -423,15 +341,8 @@ impl Task {
         })
     }
 
-    fn journal(&self) -> Result<(Journal, String)> {
-        load_journal(&self.workspace.root, &self.frozen, &self.plan_sha256)
-    }
-
-    fn save_journal(&self, journal: &Journal) -> Result<String> {
-        let data = bytes(journal)?;
-        workspace::atomic_write(&self.workspace.root.join("journal.json"), &data)
-            .context("publish_failed")?;
-        Ok(digest(&data))
+    fn journal(&self) -> journal::Store<'_> {
+        journal::Store::new(&self.workspace.root, &self.frozen, &self.plan_sha256)
     }
 
     fn comparison(&self) -> Result<PathBuf> {
@@ -475,309 +386,15 @@ impl Task {
         )
         .context("binding_invalid")
     }
-
-    fn result(&self, journal: &Journal, journal_sha256: String) -> Result<ScoreResult> {
-        journal.result(&self.frozen, &self.plan_sha256, journal_sha256)
-    }
-
-    fn summary(
-        &self,
-        command: &'static str,
-        state: &str,
-        journal: &Journal,
-        running: bool,
-        artifact: bool,
-    ) -> Summary {
-        let mut summary = Summary::new(command, state)
-            .comparison(self.frozen.comparison_sha256.clone())
-            .artifact("plan", self.workspace.root.join("plan.json"))
-            .artifact("journal", self.workspace.root.join("journal.json"))
-            .count("selected", self.frozen.documents.len())
-            .count("admitted", journal.attempts.len())
-            .count("scored", journal.scored())
-            .count("in_flight", if running { journal.pending() } else { 0 });
-        if let Some(reason) = match state {
-            "cancel_requested" | "cancelled" => Some("cancelled"),
-            "partial" => journal.stop.as_deref(),
-            _ => None,
-        } {
-            summary = summary.reason(reason);
-        }
-        if artifact {
-            summary.artifact("result", self.workspace.root.join("result.json"))
-        } else {
-            summary
-        }
-    }
 }
 
-impl Journal {
-    fn new(score_plan_sha256: String, concurrency: u8) -> Self {
-        Self {
-            schema_version: JOURNAL.to_owned(),
-            score_plan_sha256,
-            attempts: Vec::new(),
-            held: BTreeMap::new(),
-            concurrency,
-            throttled: false,
-            stop: None,
-            cancel_requested: false,
-            started: false,
-            terminal: None,
-        }
-    }
-
-    fn verify(&self, frozen: &Frozen, sha: &str) -> Result<()> {
-        ensure!(
-            self.schema_version == JOURNAL
-                && self.score_plan_sha256 == sha
-                && self.attempts.len()
-                    <= frozen.config.request_budget.context("binding_invalid")?
-                && (1..=frozen.config.concurrency).contains(&self.concurrency),
-            "binding_invalid"
-        );
-        let mut used = BTreeSet::new();
-        for attempt in &self.attempts {
-            ensure!(
-                attempt.document < frozen.documents.len()
-                    && used.insert(attempt.document)
-                    && is_digest(&attempt.packet_sha256)
-                    && attempt.validation.is_none_or(|validation| {
-                        attempt.state == AttemptState::Unscored
-                            && attempt.reason_code.as_deref() == Some(validation.reason_code())
-                            && validation != ReplyValidation::InsufficientInput
-                    })
-                    && match attempt.state {
-                        AttemptState::Admitted =>
-                            self.terminal.is_none()
-                                && attempt.score.is_none()
-                                && attempt.ambiguous.is_none()
-                                && attempt.reason_code.is_none(),
-                        AttemptState::Scored =>
-                            attempt.score.is_some_and(|score| (1..=5).contains(&score))
-                                && attempt.ambiguous.is_some()
-                                && attempt.reason_code.is_none(),
-                        AttemptState::Unscored | AttemptState::Unknown =>
-                            attempt.score.is_none()
-                                && attempt.ambiguous.is_none()
-                                && attempt
-                                    .reason_code
-                                    .as_ref()
-                                    .is_some_and(|reason| !reason.is_empty()),
-                    },
-                "binding_invalid"
-            );
-        }
-        for (&document, reason) in &self.held {
-            ensure!(
-                document < frozen.documents.len() && used.insert(document) && !reason.is_empty(),
-                "binding_invalid"
-            );
-        }
-        match self.terminal {
-            Some(Terminal::Complete) => {
-                ensure!(self.scored() == frozen.documents.len(), "binding_invalid")
-            }
-            Some(Terminal::Partial) => ensure!(
-                self.scored() < frozen.documents.len()
-                    && !self.cancel_requested
-                    && (used.len() == frozen.documents.len()
-                        || self.stop.is_some()
-                        || self.attempts.len() == frozen.config.request_budget.unwrap_or_default()),
-                "binding_invalid"
-            ),
-            Some(Terminal::Cancelled) => ensure!(
-                self.cancel_requested && used.len() < frozen.documents.len(),
-                "binding_invalid"
-            ),
-            None => {}
-        }
-        Ok(())
-    }
-
-    fn scored(&self) -> usize {
-        self.attempts
-            .iter()
-            .filter(|item| item.state == AttemptState::Scored)
-            .count()
-    }
-
-    fn pending(&self) -> usize {
-        self.attempts
-            .iter()
-            .filter(|item| item.state == AttemptState::Admitted)
-            .count()
-    }
-
-    fn result(
-        &self,
-        frozen: &Frozen,
-        plan_sha: &str,
-        journal_sha256: String,
-    ) -> Result<ScoreResult> {
-        let terminal = self.terminal.context("binding_invalid")?;
-        let attempts: BTreeMap<_, _> = self
-            .attempts
-            .iter()
-            .enumerate()
-            .map(|(n, row)| (row.document, (n + 1, row)))
-            .collect();
-        let rows = frozen
-            .documents
-            .iter()
-            .enumerate()
-            .map(|(index, binding)| {
-                let mut row = ScoreRow {
-                    knowledge_base: binding.identity.knowledge_base.clone(),
-                    document_id: binding.identity.document_id.clone(),
-                    state: "not_sent".to_owned(),
-                    reason_code: None,
-                    admission: None,
-                    evidence: None,
-                    evidence_sha256: None,
-                    score: None,
-                    ambiguous: None,
-                };
-                if let Some(&(sequence, attempt)) = attempts.get(&index) {
-                    row.admission = Some(sequence);
-                    row.reason_code = attempt.reason_code.clone();
-                    row.state = match attempt.state {
-                        AttemptState::Scored => {
-                            row.score = attempt.score;
-                            row.ambiguous = attempt.ambiguous;
-                            row.evidence = Some(binding.evidence.clone());
-                            row.evidence_sha256 = Some(binding.evidence_sha256.clone());
-                            "scored"
-                        }
-                        AttemptState::Unscored => "unscored",
-                        AttemptState::Unknown => "unknown",
-                        AttemptState::Admitted => bail!("binding_invalid"),
-                    }
-                    .to_owned();
-                } else {
-                    row.reason_code = Some(
-                        self.held
-                            .get(&index)
-                            .cloned()
-                            .or_else(|| {
-                                (terminal == Terminal::Cancelled).then(|| "cancelled".to_owned())
-                            })
-                            .or_else(|| self.stop.clone())
-                            .unwrap_or_else(|| "request_budget_exhausted".to_owned()),
-                    );
-                }
-                Ok(row)
-            })
-            .collect::<Result<_>>()?;
-        Ok(ScoreResult {
-            schema_version: RESULT.to_owned(),
-            state: terminal.name().to_owned(),
-            comparison_sha256: frozen.comparison_sha256.clone(),
-            score_plan_sha256: plan_sha.to_owned(),
-            journal_sha256,
-            rows,
-        })
-    }
-}
-
-fn open_lock(root: &Path, name: &str, blocking: bool) -> Result<Option<File>> {
-    let file = File::open(workspace::artifact_path(root, name)?).context("binding_invalid")?;
-    let mode = libc::LOCK_EX | if blocking { 0 } else { libc::LOCK_NB };
-    loop {
-        if unsafe { libc::flock(file.as_raw_fd(), mode) } == 0 {
-            return Ok(Some(file));
-        }
-        let error = io::Error::last_os_error();
-        match error.kind() {
-            io::ErrorKind::WouldBlock if !blocking => return Ok(None),
-            io::ErrorKind::Interrupted => {}
-            _ => return Err(error.into()),
-        }
-    }
-}
-
-fn journal_lock(root: &Path) -> Result<File> {
-    open_lock(root, JOURNAL_LOCK, true)?.context("workspace_busy")
-}
-
-fn load_result(
-    root: &Path,
-    expected: Option<ScoreResult>,
-) -> Result<Option<(ScoreResult, String)>> {
-    let path = root.join("result.json");
-    if path
-        .symlink_metadata()
-        .is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
-    {
-        return Ok(None);
-    }
-    let path = workspace::artifact_path(root, "result.json")?;
-    let (raw, _) = crate::input::read(&path, u64::MAX)
-        .map_err(anyhow::Error::msg)
-        .context("binding_invalid")?;
-    let parsed = workspace::parse_json(&raw).context("binding_invalid")?;
-    let expected = expected.context("binding_invalid")?;
-    ensure!(
-        parsed == serde_json::to_value(&expected)?,
-        "binding_invalid"
-    );
-    Ok(Some((expected, digest(&raw))))
-}
-
-pub fn verified_result(path: &Path) -> Result<(ScoreResult, String)> {
-    ensure!(
-        path.file_name().and_then(|part| part.to_str()) == Some("result.json"),
-        "binding_invalid"
-    );
-    let root = path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let _lock = journal_lock(root)?;
-    let (frozen, plan_sha) = frozen(root)?;
-    let (journal, journal_sha) = load_journal(root, &frozen, &plan_sha)?;
-    ensure!(
-        matches!(
-            journal.terminal,
-            Some(Terminal::Complete | Terminal::Partial)
-        ),
-        "binding_invalid"
-    );
-    let expected = journal.result(&frozen, &plan_sha, journal_sha)?;
-    load_result(root, Some(expected))?.context("binding_invalid")
-}
+pub use journal::verified_result;
 
 fn observe(plan: &Path, cancel: bool) -> Result<Outcome> {
     let task = Task::open(Workspace::locate(plan)?)?;
-    let _state = journal_lock(&task.workspace.root)?;
-    let running = open_lock(&task.workspace.root, EXECUTION_LOCK, false)?.is_none();
-    let (mut journal, sha) = task.journal()?;
-    let expected = journal
-        .terminal
-        .map(|_| task.result(&journal, sha))
-        .transpose()?;
-    let published = load_result(&task.workspace.root, expected)?.is_some();
-    if cancel && journal.terminal.is_none() && !journal.cancel_requested {
-        journal.cancel_requested = true;
-        task.save_journal(&journal)?;
-    }
-    let state = if published {
-        journal.terminal.context("binding_invalid")?.name()
-    } else if journal.terminal == Some(Terminal::Cancelled) {
-        "cancelled"
-    } else if journal.cancel_requested {
-        "cancel_requested"
-    } else if running {
-        "running"
-    } else {
-        "accepted"
-    };
-    let command = if cancel { "cancel" } else { "status" };
-    let mut summary = task.summary(command, state, &journal, running, published);
-    if state == "accepted" && !running && journal.started {
-        summary = summary.reason("interrupted");
-    }
-    Ok(summary.exit(0))
+    let locked = task.journal().lock()?;
+    let running = locked.running()?;
+    locked.load()?.observe(cancel, running)
 }
 
 pub fn cancel(plan: &Path) -> Result<Outcome> {
@@ -801,74 +418,17 @@ fn prepare_packet(
     Ok(score_context::prepare(&data, limit)?.map_err(str::to_ascii_lowercase))
 }
 
-fn settle(task: &Task, index: usize, operations: usize, outcome: ProviderOutcome) -> Result<()> {
-    let _lock = journal_lock(&task.workspace.root)?;
-    let (mut journal, _) = task.journal()?;
-    let attempt = journal.attempts.get_mut(index).context("binding_invalid")?;
-    ensure!(attempt.state == AttemptState::Admitted, "binding_invalid");
-    attempt.usage_tokens = outcome.usage;
-    let result = if let Some(reply) = outcome.reply {
-        score_context::validate_reply(&reply, operations).map_err(|validation| {
-            let reason = validation.reason_code();
-            if reason == "invalid_response" {
-                attempt.validation = Some(validation);
-            }
-            reason
-        })
-    } else {
-        Err(outcome.reason.unwrap_or("invalid_response"))
-    };
-    match result {
-        Ok((score, ambiguous)) => {
-            attempt.state = AttemptState::Scored;
-            attempt.score = Some(score);
-            attempt.ambiguous = Some(ambiguous);
-        }
-        Err(reason) => {
-            attempt.state = if reason == "unknown_outcome" {
-                AttemptState::Unknown
-            } else {
-                AttemptState::Unscored
-            };
-            attempt.reason_code = Some(reason.to_ascii_lowercase());
-            if outcome.http_status == Some(429) {
-                journal.throttled = true;
-            } else if matches!(
-                reason,
-                "unknown_outcome"
-                    | "auth_error"
-                    | "oauth_required"
-                    | "unsupported_transport"
-                    | "proxy_unavailable"
-                    | "ca_unavailable"
-            ) {
-                journal.stop.get_or_insert(reason.to_owned());
-            }
-        }
-    }
-    task.save_journal(&journal)?;
-    Ok(())
-}
-
 fn run_pending(task: &Task, directory: &Path, progress: &Progress) -> Result<()> {
     let config = &task.frozen.config;
-    let budget = config.request_budget.context("invalid_config")?;
     let connection = settings(config);
     let (sent, finished) = mpsc::channel();
-    let (initial, _) = task.journal()?;
-    let attempted: BTreeSet<_> = initial
-        .attempts
-        .iter()
-        .map(|attempt| attempt.document)
-        .collect();
+    let known = task.journal().known_documents()?;
     let mut remaining = task
         .frozen
         .documents
         .iter()
         .enumerate()
-        .filter(|(document, _)| {
-            !attempted.contains(document) && !initial.held.contains_key(document)
-        })
+        .filter(|(document, _)| !known.contains(document))
         .peekable();
     let mut packet: Option<(usize, Packet)> = None;
     let mut checked = false;
@@ -876,25 +436,18 @@ fn run_pending(task: &Task, directory: &Path, progress: &Progress) -> Result<()>
     thread::scope(|scope| -> Result<()> {
         loop {
             while let Ok((sequence, operations, outcome)) = finished.try_recv() {
-                settle(task, sequence, operations, outcome)?;
+                task.journal()
+                    .lock()?
+                    .load()?
+                    .settle(sequence, operations, outcome)?;
             }
             {
-                let _lock = journal_lock(&task.workspace.root)?;
-                let (mut journal, _) = task.journal()?;
-                let pending = journal.pending();
-                if journal.throttled && pending == 0 {
-                    journal.throttled = false;
-                    if journal.concurrency == 1 {
-                        journal.stop.get_or_insert("rate_limited".to_owned());
-                    } else {
-                        journal.concurrency -= 1;
-                    }
-                    task.save_journal(&journal)?;
-                }
-                let counts = (journal.attempts.len(), pending, journal.held.len());
+                let mut journal = task.journal().lock()?.load()?;
+                journal.drain_throttle()?;
+                let counts = journal.counts();
                 if progress_counts != Some(counts) {
                     progress_counts = Some(counts);
-                    drop(_lock);
+                    drop(journal);
                     let (admitted, pending, held) = counts;
                     progress.update(
                         "scoring",
@@ -905,32 +458,22 @@ fn run_pending(task: &Task, directory: &Path, progress: &Progress) -> Result<()>
                     );
                     continue;
                 }
-                if journal.stop.is_some()
-                    || journal.cancel_requested
-                    || journal.attempts.len() >= budget
-                    || (remaining.peek().is_none() && packet.is_none())
-                {
-                    if pending == 0 {
-                        break;
-                    }
-                } else if !journal.throttled && pending < usize::from(journal.concurrency) {
-                    if let Some((document, prepared)) = packet.take() {
-                        let Packet {
-                            evidence,
-                            operations,
-                        } = prepared;
-                        let sequence = journal.attempts.len();
-                        journal.attempts.push(Attempt {
-                            document,
-                            packet_sha256: digest(evidence.as_bytes()),
-                            state: AttemptState::Admitted,
-                            reason_code: None,
-                            score: None,
-                            ambiguous: None,
-                            usage_tokens: None,
-                            validation: None,
-                        });
-                        task.save_journal(&journal)?;
+                match journal.next(
+                    remaining.peek().is_some() || packet.is_some(),
+                    packet
+                        .as_ref()
+                        .map(|(document, packet)| (*document, packet.evidence.as_str())),
+                )? {
+                    Next::Done => break,
+                    Next::Wait => {}
+                    Next::Admitted(sequence) => {
+                        let (
+                            _,
+                            Packet {
+                                evidence,
+                                operations,
+                            },
+                        ) = packet.take().context("binding_invalid")?;
                         let sent = sent.clone();
                         let connection = &connection;
                         scope.spawn(move || {
@@ -944,103 +487,54 @@ fn run_pending(task: &Task, directory: &Path, progress: &Progress) -> Result<()>
                         });
                         continue;
                     }
-                    drop(_lock);
-                    let (document, binding) = remaining.next().context("binding_invalid")?;
-                    match prepare_packet(directory, binding, config.max_evidence_bytes)? {
-                        Ok(prepared) => {
-                            // Only load scoring prerequisites for a sendable packet.
-                            if !checked {
-                                task.protect_oauth_file()?;
-                                provider::check_oauth_settings(
-                                    &config.model,
-                                    &config.effort,
-                                    &connection,
-                                )
-                                .map_err(|reason| anyhow::anyhow!("invalid_config: {reason}"))?;
-                                checked = true;
+                    Next::Prepare => {
+                        drop(journal);
+                        let (document, binding) = remaining.next().context("binding_invalid")?;
+                        match prepare_packet(directory, binding, config.max_evidence_bytes)? {
+                            Ok(prepared) => {
+                                // Only load scoring prerequisites for a sendable packet.
+                                if !checked {
+                                    task.protect_oauth_file()?;
+                                    provider::check_oauth_settings(
+                                        &config.model,
+                                        &config.effort,
+                                        &connection,
+                                    )
+                                    .map_err(|reason| {
+                                        anyhow::anyhow!("invalid_config: {reason}")
+                                    })?;
+                                    checked = true;
+                                }
+                                packet = Some((document, prepared));
                             }
-                            packet = Some((document, prepared));
+                            Err(reason) => task.journal().lock()?.load()?.hold(document, reason)?,
                         }
-                        Err(reason) => {
-                            let _lock = journal_lock(&task.workspace.root)?;
-                            let (mut journal, _) = task.journal()?;
-                            if !journal.cancel_requested {
-                                journal.held.insert(document, reason);
-                                task.save_journal(&journal)?;
-                            }
-                        }
+                        continue;
                     }
-                    continue;
                 }
             }
             if let Ok((sequence, operations, outcome)) =
                 finished.recv_timeout(Duration::from_millis(200))
             {
-                settle(task, sequence, operations, outcome)?;
+                task.journal()
+                    .lock()?
+                    .load()?
+                    .settle(sequence, operations, outcome)?;
             }
         }
         Ok(())
     })
 }
 
-fn finish_settled(task: &Task, journal: &Journal, sha: String) -> Result<Outcome> {
-    let terminal = journal.terminal.context("binding_invalid")?;
-    let expected = task.result(journal, sha)?;
-    if load_result(&task.workspace.root, Some(expected.clone()))?.is_none() {
-        workspace::atomic_write(&task.workspace.root.join("result.json"), &bytes(&expected)?)?;
-    }
-    Ok(task
-        .summary("score", terminal.name(), journal, false, true)
-        .exit(terminal.exit()))
-}
-
 /// Reconstruct only an already settled receipt. This entry point cannot
 /// initialize a score plan, recover unknown admissions or dispatch requests.
 pub fn recover(plan: &Path) -> Result<Outcome> {
     let task = Task::open(Workspace::locate(plan)?)?;
-    let _lock = journal_lock(&task.workspace.root)?;
-    let _execution =
-        open_lock(&task.workspace.root, EXECUTION_LOCK, false)?.context("workspace_busy")?;
+    let locked = task.journal().lock()?;
+    let _execution = locked.claim_execution()?;
     verify_seal(&task, &seal_file(&seal_path(&task.workspace))?)?;
     task.comparison()?;
-    let (mut journal, mut sha) = task.journal()?;
-    ensure!(
-        journal.started && !journal.cancel_requested && journal.pending() == 0,
-        "invalid_input"
-    );
-    if journal.terminal.is_none() {
-        let selected = task.frozen.documents.len();
-        let budget = task
-            .frozen
-            .config
-            .request_budget
-            .context("binding_invalid")?;
-        ensure!(
-            journal.attempts.len() + journal.held.len() == selected
-                || journal.attempts.len() == budget
-                || journal.stop.is_some(),
-            "invalid_input"
-        );
-        // An existing result with a nonterminal journal is contradictory.
-        ensure!(
-            load_result(&task.workspace.root, None)?.is_none(),
-            "binding_invalid"
-        );
-        journal.terminal = Some(if journal.scored() == selected {
-            Terminal::Complete
-        } else {
-            Terminal::Partial
-        });
-        sha = task.save_journal(&journal)?;
-    }
-    ensure!(
-        matches!(
-            journal.terminal,
-            Some(Terminal::Complete | Terminal::Partial)
-        ),
-        "invalid_input"
-    );
-    finish_settled(&task, &journal, sha)
+    locked.load()?.recover()
 }
 
 pub fn run(
@@ -1052,59 +546,15 @@ pub fn run(
     let task = prepare_task(Workspace::locate(plan)?, config)?;
     let directory = task.comparison()?;
     let _execution = {
-        let _lock = journal_lock(&task.workspace.root)?;
+        let locked = task.journal().lock()?;
         // Claim execution and clear the previous cancellation together.
         // Cancel cannot observe this run before the transition is durable.
-        let execution =
-            open_lock(&task.workspace.root, EXECUTION_LOCK, false)?.context("workspace_busy")?;
-        let (mut journal, sha) = task.journal()?;
-        if let Some(terminal) = journal.terminal {
-            if terminal != Terminal::Cancelled || !resume {
-                return finish_settled(&task, &journal, sha);
-            }
-            let expected = task.result(&journal, sha)?;
-            if load_result(&task.workspace.root, Some(expected))?.is_some() {
-                fs::remove_file(task.workspace.root.join("result.json"))?;
-                File::open(&task.workspace.root)?.sync_all()?;
-            }
-            journal.terminal = None;
-        } else {
-            ensure!(
-                load_result(&task.workspace.root, None)?.is_none(),
-                "binding_invalid"
-            );
+        let execution = locked.claim_execution()?;
+        if let Some(outcome) = locked.load()?.start(resume)? {
+            return Ok(outcome);
         }
-        if resume {
-            journal.cancel_requested = false;
-        }
-        journal.started = true;
-        for previous in &mut journal.attempts {
-            if previous.state == AttemptState::Admitted {
-                previous.state = AttemptState::Unknown;
-                previous.reason_code = Some("interrupted".to_owned());
-            }
-        }
-        task.save_journal(&journal)?;
         execution
     };
     run_pending(&task, &directory, progress)?;
-    let _lock = journal_lock(&task.workspace.root)?;
-    let (mut journal, _) = task.journal()?;
-    let selected = task.frozen.documents.len();
-    let terminal = if journal.scored() == selected {
-        journal.cancel_requested = false;
-        Terminal::Complete
-    } else if journal.cancel_requested && journal.attempts.len() + journal.held.len() < selected {
-        Terminal::Cancelled
-    } else {
-        journal.cancel_requested = false;
-        Terminal::Partial
-    };
-    journal.terminal = Some(terminal);
-    let sha = task.save_journal(&journal)?;
-    let result = task.result(&journal, sha)?;
-    workspace::atomic_write(&task.workspace.root.join("result.json"), &bytes(&result)?)?;
-    Ok(task
-        .summary("score", terminal.name(), &journal, false, true)
-        .exit(terminal.exit()))
+    task.journal().lock()?.load()?.finish()
 }
