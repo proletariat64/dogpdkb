@@ -11,20 +11,20 @@ statically linked executable with its Markdown parser, image processing,
 embedded fonts, TLS roots, Mermaid checker, and help.
 
 ```sh
-make checkr
-make buildr
-make smoker
+make checkr-mdocrr
+make buildr-mdocrr
+make smoker-mdocrr
 ```
 
-`checkr` uses `rustfmt` and Clippy with warnings denied, then runs Rust tests.
-`smoker` runs `buildr`, checks static linkage with `readelf`, and exercises a
+`checkr-mdocrr` uses `rustfmt` and Clippy with warnings denied, then runs Rust tests.
+`smoker-mdocrr` runs `buildr-mdocrr`, checks static linkage with `readelf`, and exercises a
 relocated binary with a cleared environment. It uses a credential fixture and
-submits zero OCR requests. GitHub Actions runs `checkr` and `smoker` in the Rust
-job.
+submits zero OCR requests. GitHub Actions runs the tool-specific checks in the Rust job.
 
 By default, the executable is at
 `experiments/mdocr-rust/target/x86_64-unknown-linux-gnu/release/mdocrr`.
-Set `CARGO_TARGET_DIR` to use a different build directory.
+Set `MDOCR_CARGO_TARGET_DIR` or `CARGO_TARGET_DIR` to use a different build directory.
+The unsuffixed Make targets run both Rust tools.
 
 ## Run one document
 

@@ -123,6 +123,7 @@ class Settings:
     ocr_budget_seconds: float
     tools: dict[str, tuple[str, ...]] = field(default_factory=dict)
     web_options: dict[str, Any] = field(default_factory=dict)
+    mdcompare_config: Path | None = None
     body_recovery: Path | None = None
     semantic_score_request_budget: int | None = None
     semantic_score_model: str | None = None
@@ -330,6 +331,7 @@ def load_config(path: Path | str | None = None) -> Settings:
         ocr_concurrency=ocr_concurrency,
         ocr_fix=ocr_fix,
         body_recovery=configured_path("body_recovery"),
+        mdcompare_config=configured_path("mdcompare_config"),
         semantic_score_request_budget=score_requests,
         semantic_score_model=model,
         tools=tools,

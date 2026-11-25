@@ -1,0 +1,32 @@
+[package]
+name = "mdcomparer"
+version = "1.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "mdcomparer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+html-escape = "0.2"
+libc = "0.2"
+percent-encoding = "2"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+toml = "0.8"
+unicode-casefold = "0.2"
+unicode-normalization = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

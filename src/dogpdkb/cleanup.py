@@ -97,6 +97,7 @@ def clean_run(store, run, *, preserve=()):
         "partial",
     }:
         return
+    retrying = run.data.get("cleanup", {}).get("status") in {"started", "failed"}
     run.data["cleanup"] = {"status": "started"}
     try:
         root = run.directory
@@ -121,12 +122,19 @@ def clean_run(store, run, *, preserve=()):
         manifest_path = Path(
             run.data["artifacts"].get("manifest", root / "manifest.json")
         )
+        plan = run.data["artifacts"].get("plan")
+        plan_path = Path(plan) if plan else None
+        # An older cleanup can fail after pruning the plan. Keep any surviving
+        # files when the evidence needed to compute the keep set is gone.
+        plan_missing = retrying and plan_path is not None and not plan_path.exists()
         keep = {
             run.path,
             root / "manifest.json",
             manifest_path,
             *preserve,
-        } | failure_files(store, run)
+        }
+        if not plan_missing:
+            keep.update(failure_files(store, run))
         # Explicit replan can be interrupted before any cleanup marker exists.
         # Its active selection and frozen comparison inputs remain recovery data
         # even when the next retry does not repeat --replan.
@@ -139,7 +147,7 @@ def clean_run(store, run, *, preserve=()):
                 for path in comparison.rglob("*")
                 if path.is_file() and not path.is_symlink()
             )
-        run.save()
+        run.save(durable=True)
 
         def prune(directory):
             for path in directory.iterdir():
@@ -147,7 +155,7 @@ def clean_run(store, run, *, preserve=()):
                     prune(path)
                     if not any(path.iterdir()):
                         path.rmdir()
-                elif path not in keep:
+                elif path not in keep and path != plan_path:
                     path.unlink()
 
         # A sealed compile manifest authorizes graph scope, not the mutable
@@ -156,11 +164,23 @@ def clean_run(store, run, *, preserve=()):
             manifest = read_json(manifest_path)
             manifest["failures"] = run.data["failures"]
             atomic_json(manifest_path, manifest)
-        prune(run.directory)
+        if not plan_missing:
+            prune(run.directory)
+            # Keep the plan until the end so a failed prune can reconstruct
+            # the retention set on resume. Follow no symlinked parents.
+            if (
+                plan_path is not None
+                and plan_path not in keep
+                and plan_path.is_relative_to(root)
+                and plan_path.parent.resolve() == plan_path.parent
+            ):
+                plan_path.unlink(missing_ok=True)
+        # Structured comparison and score bindings refer to evidence under
+        # durable semantic state. Clear stale direct paths from the run record.
         removed = {
             key: value
             for key, value in run.data["artifacts"].items()
-            if not Path(value).exists()
+            if isinstance(value, str) and not Path(value).exists()
         }
         run.data["artifacts"] = {
             key: value

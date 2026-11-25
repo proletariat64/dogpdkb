@@ -39,6 +39,46 @@ jobs:
           UV_OFFLINE: "0"
         run: make smoke
 
+  rust-mdcomparer:
+    name: Rust (mdcomparer)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: "1.96.0"
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy --component rustfmt --target x86_64-unknown-linux-musl
+      - name: Install musl build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools binutils
+      - name: Run Rust quality gate
+        run: make checkr-mdcomparer
+      - name: Build and verify static mdcomparer
+        run: make smoker-mdcomparer
+      - name: Set up uv for integration tests
+        # astral-sh/setup-uv v10.3.3
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          version: "0.11.7"
+          enable-cache: true
+      - name: Verify dogpdkb integration with the static binary
+        env:
+          MDCOMPARE_RUST_BINARY: ${{ github.workspace }}/experiments/mdcompare-rust/target/x86_64-unknown-linux-musl/release/mdcomparer
+        run: |
+          uv python install
+          make bootstrap PYTHON="$(uv python find --managed-python)"
+          .venv/bin/python -m pytest -q \
+            tests/test_orchestrator_mdcompare_rust_cli.py \
+            tests/test_native_wash_cleanup_cli.py \
+            tests/test_orchestrator_mdcompare_rust_route.py
+
   rust:
     name: Rust
     runs-on: ubuntu-24.04
@@ -53,6 +93,6 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy --component rustfmt
       - name: Run Rust quality gate
-        run: make checkr
+        run: make checkr-mdocrr
       - name: Build and verify standalone Rust executable
-        run: make smoker
+        run: make smoker-mdocrr

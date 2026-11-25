@@ -176,3 +176,42 @@ compares full resources and declared OCR evidence. Both accept optional `--repor
 for human Markdown. Exit 0 is a resolved report, 2 is an unresolved report, and 1
 is an invalid invocation/input. Reports, not exit 2 alone, carry per-document
 classification and reason codes. See the tool's schema for complete reports.
+
+## mdcomparer work-plan CLI
+
+See the [mdcomparer build and usage guide](mdcompare-rust-cli.md).
+
+Point dogpdkb at the installed executable.
+
+```toml
+[tools]
+mdcompare_rust = "/path/to/mdcomparer"
+```
+
+The directory inventory, comparison, score and route calls use the commands
+documented by `mdcomparer help all`. To select Rust configuration, set
+`[paths].mdcompare_config` to the TOML file for the tool. Its
+`[score].request_budget` enables scoring when positive. Credential, proxy and
+certificate settings belong to the tool configuration. The orchestrator
+never loads its credential file.
+
+The caller pairs captured Markdown by scoped identity in a
+`mdcompare-work-1` plan. It captures the final stdout JSON separately and sends
+live stderr progress to the run log. A comparison is usable only when its
+commit marker binds the frozen plan and report. Semantic results also require
+the matching index and complete verified sidecars. Catalog reports carry the
+resource inventory for directory snapshots and strict diagnostics.
+
+The caller durably reserves eligible document versions before launching score.
+A `mdcompare-score-work-1` plan binds only those identities and the exact
+comparison generation. The caller releases a reservation only when the score
+result, frozen score plan and complete journal establish zero admissions for
+that document. The run durably records the comparison generation and score
+work plan. After an interruption, resume queries the same scoring workspace for
+its terminal result. If publication was interrupted, `score --recover` can
+republish a fully settled journal without admitting provider requests.
+Unverifiable outcomes keep their reservations. The offline route must bind
+the same comparison and score bytes and preserve all unscored deterministic
+decisions. The caller validates the route's published policy and artifact
+fields and treats the route directory identifier as opaque. It records the
+resulting artifact hashes in its plan for resume validation.

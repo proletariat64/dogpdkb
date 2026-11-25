@@ -1,0 +1,328 @@
+mdcomparer offline contract
+
+QUICK START
+  mdcomparer draft before.md after.md --plan work.json
+  mdcomparer run --plan work.json > summary.json 2>> progress.log
+  mdcomparer status --plan work.json
+
+COMMANDS
+  draft OLD.md NEW.md --plan FILE
+  accept --plan FILE [--config FILE]
+  run --plan FILE [--config FILE]
+  score --plan FILE [--config FILE] [--resume]
+  score --plan FILE --recover
+  route --plan FILE --scores FILE [--config FILE]
+  status --plan FILE
+  cancel --plan FILE
+  doctor [--config FILE] [--pretty]
+  help all
+
+Use mdcomparer COMMAND --help for the default behavior and exit codes of one
+command. Help and version are embedded and work without network, configuration
+or a work directory.
+
+COMPARISON WORK PLAN
+{
+  "schema_version": "mdcompare-work-1",
+  "operation": "semantic",
+  "documents": [
+    {
+      "knowledge_base": "payments",
+      "document_id": "42",
+      "baseline": {
+        "path": "snapshots/v17/42.md",
+        "content_kind": "raw",
+        "metadata": {
+          "name": "Limits",
+          "logical_path": "Rules",
+          "source_ref": "payments:42"
+        },
+        "provenance": {"version": "17"}
+      },
+      "incoming": {
+        "path": "snapshots/v18/42.md",
+        "content_kind": "raw",
+        "metadata": {
+          "name": "Limits",
+          "logical_path": "Rules",
+          "source_ref": "payments:42"
+        },
+        "provenance": {"version": "18"}
+      }
+    }
+  ]
+}
+
+Use UTF-8 JSON up to 16 MiB. Duplicate object keys, unknown fields and
+duplicate identities are errors. The ordered documents array can be empty.
+Each identity is the pair (knowledge_base, document_id). Each row has at least
+one snapshot. Use null for an absent side. Baseline-only rows are advisory.
+Catalog accepts incoming-only rows. Relative paths resolve from the containing
+work plan. Provenance versions trace captured bytes and cannot establish equality.
+Snapshot content_kind is raw or enriched. Metadata name, logical_path and
+source_ref are strings. An optional sync_timestamp change alone does not
+authorize a strict update. Strict reports enriched content as observed text
+with unverified raw equivalence. Semantic and knowledge use the observed body.
+
+SNAPSHOT DECLARATIONS
+A snapshot may declare generated content explicitly:
+  "body_scope": {
+    "version": "generated-regions-v1",
+    "regions": [{"kind":"mdocr_ocr","start_line":4,"end_line":6}]
+  }
+The bounds are inclusive one-based source lines. Each start and end line must
+contain its matching marker exactly once. Regions must not overlap. Complete
+marked OCR blocks outside literal code are excluded automatically. Marker-like
+content in literal code is preserved unless a valid declaration identifies
+it. Invalid or unclosed boundaries leave the body unavailable.
+
+Strict requires an explicit resources array. Each declaration has a distinct
+resource_id, kind (image, attachment or media), and url matching the reference.
+An optional path supplies local bytes captured for that exact target.
+  {"resource_id":"chart","kind":"image","url":"charts/detail.png",
+   "path":"capture/detail.png"}
+Stable IDs pair resources across URL changes. Every detected reference must
+map unambiguously, including repeated occurrences. Catalog inventories references
+from Markdown. Unsupported or ambiguous resource syntax remains visible as an
+unverified reason. No remote URL is fetched.
+
+An optional immutable object can prove equality without local bytes using
+contract = s3-version-id-v1, captured = true, bucket, key and version_id.
+The HTTPS virtual-hosted S3 URL must exactly identify that bucket and decoded
+object key with a single non-null versionId parameter. Both sides must identify
+the same immutable version. A failed local evidence read remains unverified.
+
+For OCR reuse, supply an ocr object on both snapshots with contract equal to
+mdocr-ocr-2, a nonempty configuration object (including mode paddle or llm),
+and an images array of records identified by resource_id. Baseline records need
+status = success. A usable record binds source_path and source_sha256 to the
+original resource bytes, and artifact and artifact_sha256 to a complete v2
+OCR block. The block header must name the mode and source digest, followed by a
+nonempty body and closing marker. The configuration must match, and llm also
+requires matching valid context_sha256 values on both OCR objects. Relative resource
+and OCR paths resolve from the work plan; absolute local paths are also accepted.
+Unverified correspondence remains
+UNKNOWN. Confirmed missing or unsuccessful baseline OCR requires processing.
+
+Only semantic may set body_recovery. That path points to a JSON object with
+schema_version = mdcompare-body-recovery-1 and a documents array. Each row has
+knowledge_base, document_id, side (baseline or incoming), source_copy relative
+to the recovery file, and ordered insertions with byte_offset and text.
+The witness bytes must match the source. Insertions only restore generated
+region boundaries or line breaks. Evidence uses original source coordinates.
+The source stays read-only.
+
+OPERATIONS
+  semantic   Compare authored bodies. An available, paired, contextually equal
+             normalized sequence is EQUIVALENT/SKIP. NEW, CHANGED and UNCERTAIN
+             rows COMPILE. Unavailable rows DEFER. Image syntax, corresponding
+             alt text and explicitly generated OCR do not enter the comparison.
+  knowledge  Explain retained, added, revised or unresolved body units. Images
+             and OCR remain outside the operation. Candidates are diagnostic.
+  strict     Verify text, resource, metadata and OCR dimensions. Missing
+             prerequisites produce UNKNOWN. With verified inputs, precedence
+             is new document, changed resources, OCR work, text changes,
+             metadata changes, then verified skip.
+  catalog    Inventory references in the incoming local Markdown. Unresolved
+             resources carry reasons. No remote download is performed.
+
+TOML CONFIGURATION
+The explicit file wins. Otherwise a new plan uses default.toml adjacent to
+the plan, then built-ins. Unset fields use built-ins. Paths inside TOML resolve
+from that TOML file. Accepted plans retain the effective settings they consume.
+Explicit settings supplied again must agree with the frozen settings. Route
+selects the current policy on each invocation. Bare doctor checks built-ins.
+Doctor reports its configuration source, runtime and named checks. After local
+validation it sends one fixed PING through the configured provider, model and
+effort when a usable credential or test endpoint is configured. A completed,
+nonempty text reply passes. The probe has a 20-second deadline, never retries
+or refreshes credentials, and does not use a scoring work plan or journal.
+An explicit zero scoring budget skips the probe. A missing scoring budget
+allows the diagnostic request, while scoring itself still requires a budget.
+The JSON reports provider response, HTTP status, remote OAuth acceptance and
+model status. Doctor --pretty indents the same JSON object.
+
+  [compare]
+  max_file_bytes = 16777216
+  max_diff_work = 2000000
+  normalize_line_endings = false
+
+  [report]
+  markdown = false
+  include_body_excerpts = false
+  # max_excerpt_chars = 8000
+
+  [score]
+  request_budget = 20
+  model = "openai/gpt-6.1-terra"
+  effort = "medium"
+  concurrency = 3
+  oauth_file = "credentials/pi-auth.json"
+  # proxy = "http://127.0.0.1:8080"
+  # ca_file = "certificates/extra-ca.pem"
+  # max_evidence_bytes = 65536
+
+  [route]
+  compile_above = 3
+  compile_ambiguous = false
+
+Compare limits constrain comparison work. Line ending normalization applies only
+to strict and translates CRLF and lone CR to LF. Setting excerpt length requires
+both Markdown and excerpts. Machine evidence remains complete independently of
+excerpts. Semantic evidence stores full body text and should be kept private.
+Scoring requires explicit request_budget. Zero or an empty selection runs locally
+without credentials. The budget counts every durable admission across resumes.
+Use an explicit OAuth file, proxy and additional CA as applicable.
+An optional endpoint may target an HTTP server at a literal loopback address
+for integration tests. It receives no OAuth credentials.
+
+WORKSPACE AND COMMIT
+A work plan uses a .json name. Its canonical path work.json binds to
+work.mdcompare in the same directory. Keep the work plan and workspace together.
+Acceptance records the work plan bytes, dependency availability and hashes, and
+effective settings in plan.json. A path, contents or availability change to a
+frozen dependency requires a new work plan before publishing a comparison.
+Only dependencies that an operation consumes participate in its freeze. Semantic
+and knowledge never read image or OCR evidence files.
+
+The comparison commit marker is commit.json with schema mdcompare-commit-1,
+plan_sha256 and artifacts mapping workspace-relative paths to SHA-256 digests.
+Its own byte digest is comparison_sha256. A comparison is consumable only after
+the marker is published and the binding is verified. The run command can
+recompute from stable frozen inputs after an unfinished commit. An existing
+verified result is reused even when its original snapshots are offline.
+
+Every result.json includes schema_version, state, results, baseline_only and
+counts. Per-operation result versions are mdcompare-semantic-result-1,
+mdcompare-knowledge-result-1, mdcompare-strict-result-1 and
+mdcompare-catalog-result-1. Results list incoming identities in plan order.
+Semantic publishes diff-index.json (mdcompare-diff-index-1) and per-document
+evidence (mdcompare-diff-evidence-1) with report and evidence SHA-256 bindings.
+The semantic results contain semantic_status, action, reason_codes,
+comparison_complete and extraction.available. Available rows also include
+unit counts and incoming_body_status in extraction. The index binds result.json
+as report_sha256. Each documents row names the scoped identity, its relative
+evidence path, and the sidecar sha256. The sidecar holds source_inputs,
+old_units, new_units, changes, recovery and reason_codes. The zero-based
+old_ref and new_ref in each change address the corresponding unit array and
+are null on the absent side. Human excerpt settings never clip these sidecars.
+Semantic and knowledge extraction stop with BODY_CONTEXT_BUDGET_EXCEEDED if
+expanding inherited context across body units exceeds 16 MiB per snapshot.
+Reference expansion stops with BODY_REFERENCE_BUDGET_EXCEEDED if the projected
+body would exceed the larger of 16 MiB and the original snapshot size.
+
+Knowledge rows report status (REUSE, DELTA, REVIEW, NO_BODY or UNKNOWN),
+comparison_complete, reason_codes, counts, units and graphify_plan.
+Unit entries give kind, basis and source references, with null for absent
+references. graphify_plan is diagnostic and cannot authorize automatic
+extraction. REVIEW and UNKNOWN produce a partial knowledge result.
+
+Strict rows contain text, resources, metadata, ocr, action and reason_codes.
+The actions are UNKNOWN, PROCESS_REQUIRED, PROCESS_CHANGED_RESOURCES,
+UPDATE_TEXT_REUSE_OCR, UPDATE_METADATA_ONLY and SKIP_VERIFIED. Resource items
+report resource_id, kind, status, basis, reason_codes and occurrence indexes.
+The dimensions retain confirmed changes even when the document is UNKNOWN.
+UNKNOWN produces a partial strict result.
+
+Catalog rows report status (COMPLETE or UNKNOWN), resources and
+resource_warnings. UNKNOWN produces a partial catalog result.
+Knowledge and strict can publish human-readable review.md. Optional body
+excerpts appear there. Machine JSON omits those excerpts and clipping metadata.
+
+SCORE WORK PLAN
+{
+  "schema_version": "mdcompare-score-work-1",
+  "comparison_plan": "work.json",
+  "comparison_sha256": "9b71c6a41b0d5eac96458f3bc3c92a50ade0cf891738947fe12a6f05c89d4471",
+  "documents": [{"knowledge_base": "payments", "document_id": "42"}]
+}
+
+Use the comparison_sha256 from the committed comparison summary. The digest
+above is only an example. The selected identities must be unique and refer
+to CHANGED/COMPILE rows with available bodies and complete comparisons. The
+caller owns persistent reservations across business versions and work plans.
+A per-document request may contain affected units, bounded surrounding context
+and related retained text. Oversized evidence is held whole. A valid score
+covers all expected operations and excludes unverified claims.
+
+The score workspace keeps plan.json, journal.json (mdcompare-score-journal-1)
+and result.json (mdcompare-score-result-1). The result binds the comparison,
+frozen score plan and journal by byte digest and orders rows by selection.
+Each row identifies the scoped document and includes an admission number or
+null together with its status and reason.
+  scored     An admitted request produced a validated score from 1 through 5.
+             Evidence path, evidence digest and ambiguity accompany the score.
+  unscored   An admitted request settled without a valid score.
+  unknown    The outcome of a durable admission cannot be proved.
+  not_sent   The valid terminal journal shows that the document had no admission.
+
+A network request requires durable admission first. An interrupted admission
+without a durable settlement becomes unknown and is never repeated. Missing or
+corrupt journal state fails closed. The score.mdcompare.score-seal sibling binds
+the initialized frozen plan before scoring and prevents recreating a missing
+score workspace as an empty ledger. Keep the seal with the workspace.
+A 429 drains in-flight work and lowers the
+persisted concurrency by one. A 429 at concurrency one stops new admissions.
+Authentication failure and observed unknown network outcomes stop admissions.
+Cancel persists an intent before it succeeds. In-flight requests can settle.
+Only score --resume clears the intent for identities with no prior admission.
+A terminal partial result remains terminal. Use score --recover to verify
+an existing scored job and publish a missing result from its journal. Recovery
+uses the frozen plan without reading configuration or credentials. It accepts
+a sealed terminal result or a journal with no unresolved admission and no
+remaining admissible work. Recovery never creates a score workspace, clears a
+cancellation, or calls the provider. Active, cancelled, incomplete, or corrupt
+jobs fail without modifying their journal or result. Validate the terminal binding before
+releasing any caller reservation.
+
+OFFLINE ROUTING
+Use a terminal result from score or provide external scores such as
+{
+  "schema_version": "mdcompare-external-scores-1",
+  "comparison_sha256": "9b71c6a41b0d5eac96458f3bc3c92a50ade0cf891738947fe12a6f05c89d4471",
+  "scores": [
+    {
+      "knowledge_base": "payments",
+      "document_id": "42",
+      "evidence_sha256": "fbc02a47fc6405205cbba55b7eb906a870d2e7e7eb09272f1671c52fadfb768b",
+      "score": 3,
+      "ambiguous": true
+    }
+  ]
+}
+
+Each external score references an eligible evidence row through the scoped
+identity and SHA-256 of its evidence bytes. Scores and threshold are integers
+from 1 through 5. Duplicate identities, bad digests, invalid fields or mismatched
+comparison generations block publication. An eligible score above compile_above
+compiles. A score at or below it skips unless ambiguity interception applies.
+A missing score leaves the original action in force. Results bind the exact
+comparison, score bytes and policy, and publish under routes/BINDING/result.json
+as mdcompare-route-result-1.
+
+PROCESS OUTPUT
+A business command writes a single final UTF-8 JSON object to stdout. It uses
+mdcompare-summary-1 and contains command, state, artifacts (absolute paths), counts
+and reason_code (null on normal success). Completed comparisons also report
+comparison_sha256. A scoring summary reports selected, admitted, scored and
+in_flight. Usage errors leave stdout empty. Help and version use plain text.
+An interrupted process may omit its final summary.
+
+Stderr emits flushed English progress with a timestamp, phase, document
+counts, request counts, in-flight counts and final stop reason. Long operations
+emit regular heartbeats. Neither stream includes raw model replies,
+credentials, full data URLs or snapshot text.
+
+  0  Requested action succeeded, including status queries and cancel intents.
+  1  Invalid input, configuration, binding, workspace or artifact publication.
+  2  A partial result was published or doctor found a local capability issue.
+  3  Scoring is explicitly cancelled and requires score --resume.
+ 64  Invalid usage.
+
+Status reads and verifies existing artifacts without creating workspace state.
+It returns the task state as accepted, running, cancel_requested, cancelled,
+complete or partial. An interrupted uncommitted execution reports accepted
+with reason_code interrupted. Stable failure reasons include invalid_input,
+invalid_config, input_drift, binding_invalid, workspace_busy, publish_failed
+and workspace_missing. SHA-256 digests are lowercase hexadecimal over exact
+file bytes.
