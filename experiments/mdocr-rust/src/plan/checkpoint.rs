@@ -1,5 +1,7 @@
-use super::{DOWNLOAD_SCHEMA, Disposition, PlannedDocument, read_image};
-use crate::artifacts::{atomic, json_bytes, owned_path, read_bound, sha, validate_settings};
+use super::staging::read_image;
+use super::{DOWNLOAD_SCHEMA, Disposition, PlannedDocument};
+use crate::artifacts::{atomic, json_bytes, owned_path, read_bound, sha};
+use crate::config::validate_settings;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,9 +15,9 @@ pub(super) struct DownloadCheckpoint {
     schema_version: String,
     work_path: PathBuf,
     work_sha256: String,
-    pub(super) settings: Value,
-    pub(super) config_source: Option<PathBuf>,
-    pub(super) documents: Vec<DownloadDocument>,
+    settings: Value,
+    config_source: Option<PathBuf>,
+    documents: Vec<DownloadDocument>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -23,15 +25,15 @@ pub(super) struct DownloadCheckpoint {
 pub(super) struct DownloadDocument {
     path: PathBuf,
     sha256: String,
-    pub(super) images: Vec<DownloadImage>,
+    images: Vec<DownloadImage>,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct DownloadImage {
+struct DownloadImage {
     id: String,
     source_id: String,
-    pub(super) outcome: Option<Outcome>,
+    outcome: Option<Outcome>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -70,6 +72,29 @@ impl DownloadDocument {
 }
 
 impl DownloadCheckpoint {
+    pub(super) fn settings(&self) -> &Value {
+        &self.settings
+    }
+
+    pub(super) fn config_source(&self) -> Option<&PathBuf> {
+        self.config_source.as_ref()
+    }
+
+    pub(super) fn outcome(&self, document: usize, image: usize) -> Option<&Outcome> {
+        self.documents[document].images[image].outcome.as_ref()
+    }
+
+    pub(super) fn record(
+        &mut self,
+        path: &Path,
+        document: usize,
+        image: usize,
+        outcome: Outcome,
+    ) -> Result<()> {
+        self.documents[document].images[image].outcome = Some(outcome);
+        atomic(path, &json_bytes(self)?, false)
+    }
+
     pub(super) fn read(path: &Path, work: &Path, digest: &str) -> Result<Option<Self>> {
         owned_path(path)?;
         let checkpoint: Self = match fs::read(path) {
