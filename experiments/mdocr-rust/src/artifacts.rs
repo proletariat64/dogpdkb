@@ -162,60 +162,6 @@ fn absolute(value: &str, kind: &str) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-fn integer(object: &Value, key: &str) -> Result<u64> {
-    field(object, key)?
-        .as_u64()
-        .with_context(|| format!("invalid plan {key}"))
-}
-
-pub(crate) fn validate_settings(settings: &Value) -> Result<Option<PathBuf>> {
-    let mode = string(settings, "mode")?;
-    let llm = mode == "llm";
-    ensure!(llm || mode == "paddle", "invalid plan mode");
-    let concurrency = integer(settings, "concurrency")?;
-    ensure!((1..=100).contains(&concurrency), "invalid plan concurrency");
-    integer(settings, "retry_rounds")?;
-    if settings
-        .get("mermaid_repair_rounds")
-        .is_some_and(|n| !n.is_null())
-    {
-        ensure!(
-            integer(settings, "mermaid_repair_rounds")? == 0 || llm,
-            "invalid Mermaid repair mode"
-        );
-    }
-    if !field(settings, "request_budget")?.is_null() {
-        integer(settings, "request_budget")?;
-    }
-    let deadline = field(settings, "admission_seconds")?
-        .as_f64()
-        .context("invalid plan deadline")?;
-    ensure!(
-        deadline.is_finite() && deadline >= 0.0,
-        "invalid plan deadline"
-    );
-    let endpoint = optional_string(settings, "endpoint")?;
-    if llm {
-        string(settings, "prompt")?;
-        ensure!(
-            string(settings, "llm_schema")? == "mdocr-image-content-1",
-            "unsupported LLM plan schema"
-        );
-        ensure!(!string(settings, "model")?.is_empty(), "invalid LLM model");
-        ensure!(
-            matches!(
-                string(settings, "effort")?,
-                "low" | "medium" | "high" | "xhigh"
-            ),
-            "invalid LLM effort"
-        );
-        ensure!(endpoint.is_none(), "invalid endpoint for LLM plan");
-    }
-    optional_string(settings, "cache_dir")?
-        .map(|path| absolute(path, "cache directory"))
-        .transpose()
-}
-
 fn image_value(
     value: &Value,
     occurrence: &Occurrence,
@@ -357,7 +303,7 @@ fn load_plan_inner(
         "unsupported or invalid mdocrr plan"
     );
     let settings = field(&plan, "settings")?;
-    let cache = validate_settings(settings)?;
+    let cache = crate::config::validate_settings(settings)?;
     if let Some(cache) = &cache {
         checked_path(cache, true)?;
     }

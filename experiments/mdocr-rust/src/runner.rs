@@ -1,11 +1,11 @@
 use crate::artifacts::{self, Image, Plan, atomic, json_bytes, read_bound, sha, validate_patch};
+use crate::config::{evidence as configuration, rounds};
 use crate::progress;
 use crate::provider::{self, Failure};
 use crate::publication::{self, PublicationReceipt};
 use crate::workspace::{Workspace, lock_control, try_lock};
 use anyhow::{Context, Result, ensure};
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, TryLockError};
@@ -14,99 +14,19 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod journal;
+use journal::{Attempt, Budget, Concurrency, Journal, Status};
+
 const JOURNAL_SCHEMA: &str = "mdocr-journal-1";
 const RESULT_SCHEMA: &str = "mdocr-batch-result-1";
 const ASSEMBLY_SCHEMA: &str = "mdocr-assembly-1";
-const CANCEL_SCHEMA: &str = "mdocr-cancel-1";
 const CANCELED: &str = "BATCH_CANCELED";
 const HEARTBEAT: Duration = Duration::from_secs(5);
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Status {
-    Admitted,
-    Unknown,
-    Failed,
-    Success,
-    Reused,
-}
-
-#[derive(Deserialize, Serialize)]
-struct Attempt {
-    key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_sha256: Option<String>,
-    status: Status,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    usage_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    retry_round: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    repair_round: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    patches: Option<[Value; 1]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    warnings: Option<[String; 1]>,
-}
-
-impl Attempt {
-    fn new(key: String, status: Status) -> Self {
-        Self {
-            key,
-            status,
-            source_sha256: None,
-            usage_tokens: None,
-            reason: None,
-            retry_round: None,
-            repair_round: None,
-            patches: None,
-            warnings: None,
-        }
-    }
-
-    fn patch(&self) -> Option<&Value> {
-        self.patches.as_ref().map(|patches| &patches[0])
-    }
-}
-
-#[derive(Default, Deserialize, Serialize)]
-struct Budget {
-    requests: u64,
-    tokens: u64,
-    request_limit: Option<u64>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct Concurrency {
-    initial: usize,
-    #[serde(rename = "final")]
-    current: usize,
-    transitions: Vec<Value>,
-}
 
 pub(crate) struct PublicationState {
     pub(crate) status: String,
     pub(crate) receipts: Vec<PublicationReceipt>,
     pub(crate) unresolved: bool,
-}
-
-#[derive(Deserialize, Serialize)]
-struct Journal {
-    schema_version: String,
-    plan_sha256: String,
-    runtime_version: String,
-    status: String,
-    causes: Vec<String>,
-    concurrency: Concurrency,
-    budget: Budget,
-    requests: Vec<Attempt>,
-    #[serde(default)]
-    reused: BTreeMap<String, Attempt>,
-    documents: Vec<Value>,
-    #[serde(default)]
-    publication_receipts: BTreeMap<String, PublicationReceipt>,
 }
 
 struct Layout<'a> {
@@ -259,25 +179,6 @@ enum Pass {
     Initial,
     Fix,
     Repair,
-}
-
-fn rounds(settings: &Value, key: &str) -> u64 {
-    settings[key].as_u64().unwrap_or(0)
-}
-
-fn configuration(settings: &Value, version: &str) -> Value {
-    if settings["mode"] == "llm" {
-        json!({
-            "mode":"llm", "version":version, "model":settings["model"],
-            "effort":settings["effort"], "schema":settings["llm_schema"],
-            "prompt_sha256":sha(settings["prompt"].as_str().unwrap_or_default().as_bytes())
-        })
-    } else {
-        json!({
-            "mode":"paddle", "version":version, "model":crate::paddle::MODEL,
-            "jpeg_quality":crate::paddle::JPEG_QUALITY, "endpoint":settings["endpoint"]
-        })
-    }
 }
 
 fn read_journal(path: &Path) -> Result<Journal> {
@@ -475,124 +376,14 @@ impl<'a> Execution<'a> {
             deadline,
             retry_failed,
         };
-        execution.restore()?;
+        let (latest, repairs) = execution.state.recover(plan, &execution.layout.jobs)?;
+        execution.latest = latest;
+        execution.repairs = repairs;
         Ok(execution)
     }
 
-    fn restore(&mut self) -> Result<()> {
-        let settings = &self.plan.settings;
-        let state = &mut self.state;
-        ensure!(
-            state.schema_version == JOURNAL_SCHEMA
-                && state.plan_sha256 == self.plan.digest
-                && matches!(
-                    state.status.as_str(),
-                    "running" | "partial" | "completed" | "canceled"
-                ),
-            "execution journal schema or plan binding is invalid"
-        );
-        ensure!(
-            state.concurrency.initial as u64 == rounds(settings, "concurrency")
-                && (1..=state.concurrency.initial).contains(&state.concurrency.current)
-                && state.budget.requests == state.requests.len() as u64
-                && state.budget.request_limit == settings["request_budget"].as_u64()
-                && settings["request_budget"]
-                    .as_u64()
-                    .is_none_or(|n| state.budget.requests <= n),
-            "invalid saved execution counters"
-        );
-        self.validate_history()?;
-        let state = &mut self.state;
-        for (i, attempt) in state.requests.iter_mut().enumerate() {
-            if attempt.status == Status::Admitted {
-                attempt.status = Status::Unknown;
-                attempt.reason = Some("OCR_OUTCOME_UNKNOWN".into());
-            }
-            if attempt.repair_round.is_some() {
-                self.repairs.insert(attempt.key.clone(), i);
-                if attempt.status != Status::Success || attempt.warnings.is_some() {
-                    continue;
-                }
-            }
-            self.latest.insert(attempt.key.clone(), i);
-        }
-        for (key, attempt) in &state.reused {
-            ensure!(
-                key == &attempt.key
-                    && self.layout.jobs.contains_key(key)
-                    && attempt.status == Status::Reused,
-                "invalid journal cache reuse"
-            );
-            validate_patch(attempt.patch().context("missing cached patch")?)
-                .map_err(anyhow::Error::msg)?;
-        }
-        Ok(())
-    }
-
-    fn validate_history(&self) -> Result<()> {
-        let mut latest: HashMap<&str, &Attempt> = HashMap::new();
-        let mut fixes = HashMap::new();
-        let mut accounted_tokens = 0u64;
-        for attempt in &self.state.requests {
-            let key = attempt.key.as_str();
-            let image = self.layout.jobs.get(key).context(
-                "saved OCR request identities do not match this runtime; no requests sent",
-            )?;
-            ensure!(
-                attempt.source_sha256 == image.sha256
-                    && attempt.status != Status::Reused
-                    && (attempt.status == Status::Success) == attempt.patches.is_some(),
-                "invalid journal attempt"
-            );
-            if let Some(patch) = attempt.patch() {
-                validate_patch(patch).map_err(anyhow::Error::msg)?;
-                if let Some(warnings) = &attempt.warnings {
-                    ensure!(
-                        patch["warnings"] == json!(warnings),
-                        "journal warning does not match patch"
-                    );
-                }
-            } else {
-                ensure!(attempt.warnings.is_none(), "journal warning has no patch");
-            }
-            accounted_tokens = accounted_tokens
-                .checked_add(attempt.usage_tokens.unwrap_or(0))
-                .context("token usage overflow")?;
-            let last = latest.get(key).copied();
-            let bounded = match (attempt.retry_round, attempt.repair_round) {
-                (None, None) => last.is_none_or(|last| {
-                    last.status == Status::Failed && last.repair_round.is_none()
-                }),
-                (Some(round), None) => {
-                    let previous = fixes.insert(key, round).unwrap_or(0u64);
-                    round <= rounds(&self.plan.settings, "retry_rounds")
-                        && previous.checked_add(1) == Some(round)
-                        && last.is_some_and(|last| {
-                            last.repair_round.is_none() && Self::is_fixable(last)
-                        })
-                }
-                (None, Some(round)) => {
-                    round <= rounds(&self.plan.settings, "mermaid_repair_rounds")
-                        && last.is_some_and(|last| {
-                            last.status == Status::Success
-                                && last.warnings.is_some()
-                                && last.repair_round.unwrap_or(0).checked_add(1) == Some(round)
-                        })
-                }
-                (Some(_), Some(_)) => false,
-            };
-            ensure!(bounded, "invalid or unsafe journal retry history");
-            latest.insert(key, attempt);
-        }
-        ensure!(
-            accounted_tokens == self.state.budget.tokens,
-            "invalid journal token tally"
-        );
-        Ok(())
-    }
-
     fn save_journal(&self) -> Result<()> {
-        atomic(&self.workspace.journal, &json_bytes(&self.state)?, false)
+        self.state.persist(&self.workspace.journal)
     }
 
     fn report(&self, schema: &str, status: &str, rows: Vec<Value>) -> Value {
@@ -637,7 +428,7 @@ impl<'a> Execution<'a> {
     }
 
     fn observe_cancel(&mut self) -> Result<()> {
-        if cancel_requested(self.workspace, &self.plan.digest)? {
+        if crate::lifecycle::cancel_requested(self.workspace, &self.plan.digest)? {
             self.set_stop(CANCELED);
         }
         Ok(())
@@ -812,9 +603,8 @@ impl<'a> Execution<'a> {
                 self.latest.insert(key.into(), index);
             }
         }
-        self.state.requests.push(attempt);
-        self.state.budget.requests += 1;
-        self.save_journal()?;
+        self.state
+            .record_admission(attempt, &self.workspace.journal)?;
         Ok(Some(index))
     }
 
@@ -833,70 +623,14 @@ impl<'a> Execution<'a> {
         tier: usize,
         result: Result<Conversion, Failure>,
     ) -> Result<()> {
-        let attempt = &mut self.state.requests[index];
-        let mut cache = None;
-        let (status, usage) = match result {
-            Ok(conversion) => {
-                let warned = !conversion.mermaid_errors.is_empty();
-                attempt.status = Status::Success;
-                if warned && rounds(&self.plan.settings, "mermaid_repair_rounds") > 0 {
-                    attempt.warnings = Some(["response_mermaid_syntax_invalid".into()]);
-                }
-                if attempt.repair_round.is_none() || !warned {
-                    self.latest.insert(attempt.key.clone(), index);
-                }
-                if !warned && conversion.patch["kind"] != "hold" {
-                    cache = self.plan.settings["cache_dir"].as_str();
-                }
-                attempt.patches = Some([conversion.patch]);
-                (None, conversion.usage_tokens)
-            }
-            Err(failure) => {
-                attempt.status = if failure.unknown {
-                    Status::Unknown
-                } else {
-                    Status::Failed
-                };
-                attempt.reason = Some(failure.reason.into());
-                (failure.status, failure.usage_tokens)
-            }
-        };
-        if let Some(tokens) = usage {
-            self.state.budget.tokens = self
-                .state
-                .budget
-                .tokens
-                .checked_add(tokens)
-                .context("token usage overflow")?;
-            attempt.usage_tokens = Some(tokens);
-        }
-        let limit = &mut self.state.concurrency.current;
-        if self.stop.is_none() {
-            match status {
-                Some(401) => self.stop = Some("OCR_AUTH_UNAVAILABLE"),
-                Some(403) => self.stop = Some("OCR_QUOTA_EXHAUSTED"),
-                Some(429) if tier == *limit && *limit == 1 => self.stop = Some("OCR_RATE_LIMITED"),
-                Some(429) if tier == *limit => {
-                    *limit -= 1;
-                    self.state
-                        .concurrency
-                        .transitions
-                        .push(json!({"from": tier, "to": *limit}));
-                }
-                _ => {}
-            }
-        }
-        let cache_record = if let (Some(dir), Some(patches)) = (cache, &attempt.patches) {
-            let key = &attempt.key;
-            Some((
-                Path::new(dir).join(format!("{key}.json")),
-                json_bytes(
-                    &json!({"key": key, "patches": patches, "sha256": sha(&json_bytes(patches)?)}),
-                )?,
-            ))
-        } else {
-            None
-        };
+        let cache_record = self.state.settle(
+            index,
+            tier,
+            result,
+            &self.plan.settings,
+            &mut self.latest,
+            &mut self.stop,
+        )?;
         if let Some(reason) = self.stop {
             self.set_stop(reason);
         }
@@ -1187,29 +921,13 @@ impl<'a> Execution<'a> {
 
     fn publish_output(&mut self, index: usize, bytes: &[u8], digest: &str) -> Result<()> {
         let document = &self.plan.documents[index];
-        let output = &document.output;
-        let id = &document.document_id;
-        let parent = publication::parent(output)?;
-        artifacts::owned_path(output)?;
-        fs::create_dir_all(parent)?;
-        let directory =
-            publication::lock_directory(parent)?.context("publication directory disappeared")?;
-        if let Some(receipt) = self.state.publication_receipts.get(id) {
-            ensure!(
-                &receipt.path == output && receipt.sha256 == digest,
-                "publication receipt differs from the rendered document"
-            );
-        } else {
-            ensure!(
-                !output.try_exists()?,
-                "preexisting unowned document output: {}",
-                output.display()
-            );
-            let receipt = PublicationReceipt::new(output.clone(), digest.into())?;
-            self.state.publication_receipts.insert(id.clone(), receipt);
-            self.save_journal()?;
-        }
-        self.state.publication_receipts[id].write_output(bytes, &directory)
+        let output = document.output.clone();
+        let id = document.document_id.clone();
+        let existing = self.state.publication_receipts.get(&id).cloned();
+        publication::publish(&output, bytes, digest, existing, |receipt| {
+            self.state.publication_receipts.insert(id, receipt);
+            self.save_journal()
+        })
     }
 
     fn publish_documents(&mut self) -> Result<Vec<Value>> {
@@ -1293,47 +1011,17 @@ fn load_workspace(workspace: &Workspace) -> Result<Plan> {
     Ok(plan)
 }
 
-fn cancel_requested(workspace: &Workspace, digest: &str) -> Result<bool> {
-    artifacts::owned_path(&workspace.cancel)?;
-    let data = match fs::read(&workspace.cancel) {
-        Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    let marker: Value = serde_json::from_slice(&data)?;
-    ensure!(
-        marker["schema_version"] == CANCEL_SCHEMA && marker["plan_sha256"] == digest,
-        "cancel marker is bound to a different frozen plan"
-    );
-    marker["requested"]
-        .as_bool()
-        .context("invalid cancel marker state")
-}
-
-fn write_cancel(workspace: &Workspace, digest: &str, requested: bool) -> Result<()> {
-    let marker = json!({
-        "schema_version": CANCEL_SCHEMA,
-        "plan_sha256": digest,
-        "requested": requested,
-    });
-    atomic(&workspace.cancel, &json_bytes(&marker)?, false)
-}
-
-pub(crate) fn frozen_batch_canceled(workspace: &Workspace, digest: &str) -> Result<bool> {
-    let _control = lock_control(&workspace.control)?;
-    if cancel_requested(workspace, digest)? {
-        return Ok(true);
-    }
+pub(crate) fn journal_status(workspace: &Workspace, digest: &str) -> Result<Option<String>> {
     artifacts::owned_path(&workspace.journal)?;
     if !workspace.journal.try_exists()? {
-        return Ok(false);
+        return Ok(None);
     }
-    let state = read_journal(&workspace.journal)?;
+    let journal = read_journal(&workspace.journal)?;
     ensure!(
-        state.schema_version == JOURNAL_SCHEMA && state.plan_sha256 == digest,
+        journal.schema_version == JOURNAL_SCHEMA && journal.plan_sha256 == digest,
         "execution journal schema or plan binding is invalid"
     );
-    Ok(state.status == "canceled")
+    Ok(Some(journal.status))
 }
 
 pub(crate) fn run(workspace: &Workspace, resume: bool, retry_failed: bool) -> Result<(u8, Value)> {
@@ -1346,13 +1034,13 @@ pub(crate) fn run(workspace: &Workspace, resume: bool, retry_failed: bool) -> Re
             publication::preflight(plan.documents.iter().map(|doc| doc.output.as_path()))?;
             return execution.finish(true);
         }
-        let requested = cancel_requested(workspace, &plan.digest)?;
+        let requested = crate::lifecycle::cancel_requested(workspace, &plan.digest)?;
         if requested || execution.state.status == "canceled" {
             if !resume {
                 execution.set_stop(CANCELED);
                 return execution.finish(false);
             }
-            write_cancel(workspace, &plan.digest, false)?;
+            crate::lifecycle::write_cancel(workspace, &plan.digest, false)?;
             execution.state.status = "running".into();
             execution.save_journal()?;
         }
@@ -1413,8 +1101,8 @@ pub(crate) fn cancel(workspace: &Workspace) -> Result<(u8, Value)> {
             ));
         }
     }
-    if !cancel_requested(workspace, &digest)? {
-        write_cancel(workspace, &digest, true)?;
+    if !crate::lifecycle::cancel_requested(workspace, &digest)? {
+        crate::lifecycle::write_cancel(workspace, &digest, true)?;
     }
     if execution_lock.is_some() {
         let plan = load_workspace(workspace)?;

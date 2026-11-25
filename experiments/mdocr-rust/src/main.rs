@@ -1,5 +1,6 @@
 mod artifacts;
 mod config;
+mod lifecycle;
 mod llm;
 mod markdown;
 mod paddle;
@@ -10,14 +11,14 @@ mod publication;
 mod runner;
 mod workspace;
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pulldown_cmark::{CodeBlockKind, Event, Parser as Markdown, Tag, TagEnd};
 use serde_json::{Value, json};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
-use workspace::{CleanupPending, Purged, Workspace};
+use workspace::{CleanupPending, Purged};
 
 const FULL_HELP: &str = include_str!("../../../.scratch/mdocr-rust-cli/spec.md");
 
@@ -169,21 +170,6 @@ impl Command {
     }
 }
 
-fn accept(workspace: &Workspace, explicit: Option<&Path>, repair_canceled: bool) -> Result<Value> {
-    artifacts::owned_path(&workspace.plan)?;
-    let fresh = !workspace.plan.try_exists()?;
-    let summary = plan::accept(workspace, explicit, repair_canceled)?;
-    let counts = &summary["counts"];
-    progress::emit(
-        "accepted",
-        format_args!(
-            "phase=accept new={fresh} documents={} selected={} staged={} failed={}",
-            counts["documents"], counts["selected"], counts["staged"], counts["failed"]
-        ),
-    );
-    Ok(summary)
-}
-
 fn execute(command: Command) -> Outcome {
     match command {
         Command::Draft(args) => {
@@ -191,45 +177,22 @@ fn execute(command: Command) -> Outcome {
             Ok((0, json!({"status":"drafted", "work_plan_path":path})))
         }
         Command::Accept(input) => {
-            let ws = Workspace::new(&input.batch.plan)?;
-            let _lock = ws.create_and_lock()?;
-            let mut output = accept(&ws, input.config.as_deref(), true)?;
-            output["status"] = json!("accepted");
-            Ok((0, output))
+            lifecycle::accept_batch(&input.batch.plan, input.config.as_deref())
         }
         Command::Run {
             input,
             resume,
             retry_failed,
-        } => {
-            let ws = Workspace::new(&input.batch.plan)?;
-            let _lock = ws.create_and_lock()?;
-            let frozen = ws.plan.try_exists()?;
-            if retry_failed {
-                ensure!(frozen, "no accepted batch exists to retry");
-            }
-            if resume {
-                ensure!(
-                    frozen || ws.download.try_exists()?,
-                    "no accepted batch or download checkpoint exists to resume"
-                );
-            }
-            accept(&ws, input.config.as_deref(), resume)?;
-            runner::run(&ws, resume, retry_failed)
-        }
-        Command::Cancel(batch) => {
-            let ws = Workspace::new(&batch.plan)?;
-            ws.ensure_live()?;
-            ws.ensure_owner()?;
-            runner::cancel(&ws)
-        }
-        Command::Assemble { batch, output_dir } => {
-            let ws = Workspace::new(&batch.plan)?;
-            let _lock = ws.lock_existing()?;
-            runner::assemble(&ws, output_dir)
-        }
-        Command::Reset(batch) => workspace::reset(&Workspace::new(&batch.plan)?),
-        Command::Purge { batch, yes } => workspace::purge(&Workspace::new(&batch.plan)?, yes),
+        } => lifecycle::run(
+            &input.batch.plan,
+            input.config.as_deref(),
+            resume,
+            retry_failed,
+        ),
+        Command::Cancel(batch) => lifecycle::cancel(&batch.plan),
+        Command::Assemble { batch, output_dir } => lifecycle::assemble(&batch.plan, output_dir),
+        Command::Reset(batch) => lifecycle::reset(&batch.plan),
+        Command::Purge { batch, yes } => lifecycle::purge(&batch.plan, yes),
         Command::Doctor { config, .. } => config::doctor(config.as_deref()),
         Command::CheckMermaid { input } => check_mermaid(input),
         Command::Help { .. } | Command::Licenses => unreachable!("text commands handled in main"),

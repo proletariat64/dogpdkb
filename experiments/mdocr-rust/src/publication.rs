@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use rustix::fs::{CWD, RenameFlags, XattrFlags, fgetxattr, fsetxattr, renameat_with};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -16,6 +16,87 @@ pub(crate) struct PublicationReceipt {
     pub(crate) path: PathBuf,
     pub(crate) sha256: String,
     id: String,
+}
+
+fn valid_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+pub(crate) fn verify_cleanup<'a>(
+    receipts: &[PublicationReceipt],
+    outputs: impl Iterator<Item = &'a Path>,
+    work: &Path,
+    root: &Path,
+) -> Result<()> {
+    let paths: HashMap<_, _> = receipts
+        .iter()
+        .map(|receipt| (receipt.path.as_path(), receipt))
+        .collect();
+    ensure!(paths.len() == receipts.len(), "duplicate cleanup receipts");
+    let mut matched = 0;
+    for output in outputs {
+        owned_path(output)?;
+        if let Some(receipt) = paths.get(output) {
+            ensure!(
+                output != work && !output.starts_with(root) && !root.starts_with(output),
+                "cleanup receipt overlaps the work plan or workspace"
+            );
+            ensure!(
+                valid_digest(&receipt.sha256),
+                "invalid cleanup receipt digest"
+            );
+            receipt.verify_output_if_present()?;
+            matched += 1;
+        } else {
+            ensure!(
+                !output.try_exists()?,
+                "unowned output: {}",
+                output.display()
+            );
+        }
+    }
+    ensure!(
+        matched == paths.len(),
+        "cleanup receipt is outside its work plan outputs"
+    );
+    Ok(())
+}
+
+/// Hold destination ownership through durable receipt recording and output publication.
+pub(crate) fn publish(
+    output: &Path,
+    bytes: &[u8],
+    digest: &str,
+    existing: Option<PublicationReceipt>,
+    record: impl FnOnce(PublicationReceipt) -> Result<()>,
+) -> Result<()> {
+    let parent = parent(output)?;
+    owned_path(output)?;
+    fs::create_dir_all(parent)?;
+    let directory = lock_directory(parent)?.context("publication directory disappeared")?;
+    let receipt = match existing {
+        Some(receipt) => {
+            ensure!(
+                receipt.path == output && receipt.sha256 == digest,
+                "publication receipt differs from the rendered document"
+            );
+            receipt
+        }
+        None => {
+            ensure!(
+                !output.try_exists()?,
+                "preexisting unowned document output: {}",
+                output.display()
+            );
+            let receipt = PublicationReceipt::new(output.to_path_buf(), digest.into())?;
+            record(receipt.clone())?;
+            receipt
+        }
+    };
+    receipt.write_output(bytes, &directory)
 }
 
 impl PublicationReceipt {

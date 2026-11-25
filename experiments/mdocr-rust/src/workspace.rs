@@ -5,7 +5,6 @@ use crate::runner::publication_state;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -386,44 +385,12 @@ impl Cleanup {
     }
 
     fn verify_outputs(&self, work: &Work, workspace: &Workspace) -> Result<()> {
-        let paths: HashMap<_, _> = self
-            .outputs
-            .iter()
-            .map(|receipt| (receipt.path.as_path(), receipt))
-            .collect();
-        ensure!(
-            paths.len() == self.outputs.len(),
-            "duplicate cleanup receipts"
-        );
-        let mut matched = 0;
-        for output in work.outputs() {
-            owned_path(output)?;
-            if let Some(receipt) = paths.get(output) {
-                ensure!(
-                    output != workspace.work
-                        && !output.starts_with(&workspace.root)
-                        && !workspace.root.starts_with(output),
-                    "cleanup receipt overlaps the work plan or workspace"
-                );
-                ensure!(
-                    valid_digest(&receipt.sha256),
-                    "invalid cleanup receipt digest"
-                );
-                receipt.verify_output_if_present()?;
-                matched += 1;
-            } else {
-                ensure!(
-                    !output.try_exists()?,
-                    "unowned output: {}",
-                    output.display()
-                );
-            }
-        }
-        ensure!(
-            matched == paths.len(),
-            "cleanup receipt is outside its work plan outputs"
-        );
-        Ok(())
+        crate::publication::verify_cleanup(
+            &self.outputs,
+            work.outputs(),
+            &workspace.work,
+            &workspace.root,
+        )
     }
 }
 

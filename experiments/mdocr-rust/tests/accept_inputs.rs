@@ -217,6 +217,42 @@ fn resume_before_freeze_reuses_only_committed_downloads_and_saved_policy() {
 }
 
 #[test]
+fn resume_before_freeze_reuses_a_committed_url_for_later_occurrences() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let (listener, png) = remote_batch(root, &["first.png", "second.png", "first.png"]);
+    let mut interrupted = start_command(root, &["run", "--plan", "work.json"]);
+    let (stream, request) = await_get(&listener);
+    assert!(request.starts_with("GET /first.png "));
+    respond_png(stream, &png);
+    let (stream, request) = await_get(&listener);
+    assert!(request.starts_with("GET /second.png "));
+    interrupted.kill().unwrap();
+    interrupted.wait().unwrap();
+    drop(stream);
+
+    let resumed = start_command(root, &["run", "--plan", "work.json", "--resume"]);
+    let (stream, request) = await_get(&listener);
+    assert!(request.starts_with("GET /second.png "));
+    respond_png(stream, &png);
+    let output = resumed.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let checkpoint = json_file(&root.join("work.mdocr/download.json"));
+    let images = checkpoint["documents"][0]["images"].as_array().unwrap();
+    assert_eq!(images.len(), 3);
+    assert!(
+        images
+            .iter()
+            .all(|image| image["outcome"]["status"] == "success")
+    );
+    assert_eq!(images[0]["outcome"], images[2]["outcome"]);
+}
+
+#[test]
 fn resume_before_freeze_refetches_only_unusable_or_unrecorded_images() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

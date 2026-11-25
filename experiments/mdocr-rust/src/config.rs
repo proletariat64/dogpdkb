@@ -482,3 +482,108 @@ pub(crate) fn doctor(explicit: Option<&Path>) -> Result<(u8, Value)> {
     }
     Ok((if passed { 0 } else { 2 }, report))
 }
+
+pub(crate) fn validate_settings(settings: &Value) -> Result<Option<PathBuf>> {
+    let mode = string(settings, "mode")?;
+    let llm = mode == "llm";
+    ensure!(llm || mode == "paddle", "invalid plan mode");
+    let concurrency = integer(settings, "concurrency")?;
+    ensure!((1..=100).contains(&concurrency), "invalid plan concurrency");
+    integer(settings, "retry_rounds")?;
+    if settings
+        .get("mermaid_repair_rounds")
+        .is_some_and(|n| !n.is_null())
+    {
+        ensure!(
+            integer(settings, "mermaid_repair_rounds")? == 0 || llm,
+            "invalid Mermaid repair mode"
+        );
+    }
+    if !field(settings, "request_budget")?.is_null() {
+        integer(settings, "request_budget")?;
+    }
+    let deadline = field(settings, "admission_seconds")?
+        .as_f64()
+        .context("invalid plan deadline")?;
+    ensure!(
+        deadline.is_finite() && deadline >= 0.0,
+        "invalid plan deadline"
+    );
+    let endpoint = optional_string(settings, "endpoint")?;
+    if llm {
+        string(settings, "prompt")?;
+        ensure!(
+            string(settings, "llm_schema")? == "mdocr-image-content-1",
+            "unsupported LLM plan schema"
+        );
+        ensure!(!string(settings, "model")?.is_empty(), "invalid LLM model");
+        ensure!(
+            matches!(
+                string(settings, "effort")?,
+                "low" | "medium" | "high" | "xhigh"
+            ),
+            "invalid LLM effort"
+        );
+        ensure!(endpoint.is_none(), "invalid endpoint for LLM plan");
+    }
+    optional_string(settings, "cache_dir")?
+        .map(|path| absolute(path, "cache directory"))
+        .transpose()
+}
+
+fn field<'a>(object: &'a Value, key: &str) -> Result<&'a Value> {
+    object
+        .get(key)
+        .with_context(|| format!("plan is missing {key}"))
+}
+
+fn string<'a>(object: &'a Value, key: &str) -> Result<&'a str> {
+    field(object, key)?
+        .as_str()
+        .with_context(|| format!("invalid plan {key}"))
+}
+
+fn optional_string<'a>(object: &'a Value, key: &str) -> Result<Option<&'a str>> {
+    let value = field(object, key)?;
+    if value.is_null() {
+        Ok(None)
+    } else {
+        Ok(Some(
+            value
+                .as_str()
+                .with_context(|| format!("invalid plan {key}"))?,
+        ))
+    }
+}
+
+fn absolute(value: &str, kind: &str) -> Result<PathBuf> {
+    let path = Path::new(value);
+    ensure!(path.is_absolute(), "plan {kind} must be an absolute path");
+    artifacts::owned_path(path)?;
+    Ok(path.to_path_buf())
+}
+
+fn integer(object: &Value, key: &str) -> Result<u64> {
+    field(object, key)?
+        .as_u64()
+        .with_context(|| format!("invalid plan {key}"))
+}
+
+pub(crate) fn rounds(settings: &Value, key: &str) -> u64 {
+    settings[key].as_u64().unwrap_or(0)
+}
+
+pub(crate) fn evidence(settings: &Value, version: &str) -> Value {
+    if settings["mode"] == "llm" {
+        json!({
+            "mode":"llm", "version":version, "model":settings["model"],
+            "effort":settings["effort"], "schema":settings["llm_schema"],
+            "prompt_sha256":artifacts::sha(settings["prompt"].as_str().unwrap_or_default().as_bytes())
+        })
+    } else {
+        json!({
+            "mode":"paddle", "version":version, "model":crate::paddle::MODEL,
+            "jpeg_quality":crate::paddle::JPEG_QUALITY, "endpoint":settings["endpoint"]
+        })
+    }
+}
