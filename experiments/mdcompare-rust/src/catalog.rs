@@ -34,14 +34,10 @@ fn declarations(doc: &Document) -> Result<(Vec<Value>, BTreeMap<&str, usize>)> {
     Ok((declared, by_id))
 }
 
-fn candidate(doc: &Document, url: &str) -> Result<Option<PathBuf>> {
-    let cleaned = url.replace(['\r', '\n', '\t'], "");
-    let target = split_url(&cleaned).context("RESOURCE_SYNTAX_UNVERIFIED")?;
-    if !target.scheme.is_empty() || !target.host.is_empty() {
-        return Ok(None);
-    }
-    let parent = doc.path.parent().context("INPUT_PATH_INVALID")?;
-    Ok(Some(parent.join(decoded(target.path))))
+enum Candidate {
+    Local(PathBuf),
+    Remote,
+    SyntaxUnverified,
 }
 
 fn by_reference(declared: &[Value]) -> BTreeMap<(&str, &str), &Value> {
@@ -54,12 +50,19 @@ fn by_reference(declared: &[Value]) -> BTreeMap<(&str, &str), &Value> {
     references
 }
 
-fn candidate_path(doc: &Document, entry: Option<&Value>, url: &str) -> Result<Option<PathBuf>> {
+fn candidate_path(doc: &Document, entry: Option<&Value>, url: &str) -> Result<Candidate> {
+    let cleaned = url.replace(['\r', '\n', '\t'], "");
+    let Some(target) = split_url(&cleaned) else {
+        return Ok(Candidate::SyntaxUnverified);
+    };
     if let Some(path) = entry.and_then(|entry| entry["path"].as_str()) {
-        Ok(Some(doc.resolve(path)))
-    } else {
-        candidate(doc, url)
+        return Ok(Candidate::Local(doc.resolve(path)));
     }
+    if !target.scheme.is_empty() || !target.host.is_empty() {
+        return Ok(Candidate::Remote);
+    }
+    let parent = doc.path.parent().context("INPUT_PATH_INVALID")?;
+    Ok(Candidate::Local(parent.join(decoded(target.path))))
 }
 
 pub(crate) fn local_candidates(doc: &Document, bytes: &[u8]) -> Result<Vec<PathBuf>> {
@@ -69,7 +72,9 @@ pub(crate) fn local_candidates(doc: &Document, bytes: &[u8]) -> Result<Vec<PathB
     let mut paths = Vec::new();
     for usage in references {
         let entry = by_reference.get(&(usage.url.as_str(), usage.kind)).copied();
-        paths.extend(candidate_path(doc, entry, &usage.url)?);
+        if let Candidate::Local(path) = candidate_path(doc, entry, &usage.url)? {
+            paths.push(path);
+        }
     }
     Ok(paths)
 }
@@ -100,7 +105,7 @@ fn catalog_document(doc: &Document, data: &[u8], reader: &mut Reader) -> Result<
     let (declared, by_id) = declarations(doc)?;
     let by_reference = by_reference(&declared);
     let declared_urls = by_reference.keys().map(|(url, _)| *url).collect();
-    let (used, warnings) = uses(data, &declared_urls);
+    let (used, mut warnings) = uses(data, &declared_urls);
     let mut last_kind = BTreeMap::new();
     let mixed_urls: BTreeSet<_> = used
         .iter()
@@ -114,6 +119,7 @@ fn catalog_document(doc: &Document, data: &[u8], reader: &mut Reader) -> Result<
     let historical = doc.content_kind() == "enriched";
     let mut resources = Vec::new();
     let mut unverified = Vec::new();
+    let mut recorded_reasons = BTreeSet::new();
     let mut retained = BTreeMap::new();
     if historical {
         for value in &declared {
@@ -153,22 +159,35 @@ fn catalog_document(doc: &Document, data: &[u8], reader: &mut Reader) -> Result<
         entry["kind"] = json!(usage.kind);
         let local = candidate_path(doc, declaration, &usage.url)?;
         let reason = match local {
-            Some(path) => {
+            Candidate::Local(path) => {
                 let (path, exists) = reader.local_file(&path)?;
                 if exists || entry["path"].is_string() {
                     entry["path"] = json_path(&path)?;
                 }
                 (!exists).then_some("LOCAL_RESOURCE_UNAVAILABLE")
             }
-            None if entry["url"]
-                .as_str()
-                .is_some_and(|url| url.starts_with("data:")) =>
+            Candidate::Remote
+                if entry["url"]
+                    .as_str()
+                    .is_some_and(|url| url.starts_with("data:")) =>
             {
                 Some("EMBEDDED_BYTES_UNVERIFIED")
             }
-            None => Some("REMOTE_RESOURCE_UNVERIFIED"),
+            Candidate::SyntaxUnverified => {
+                if !warnings.contains(&"RESOURCE_SYNTAX_UNVERIFIED") {
+                    warnings.push("RESOURCE_SYNTAX_UNVERIFIED");
+                }
+                entry
+                    .as_object_mut()
+                    .expect("resource object")
+                    .remove("path");
+                Some("RESOURCE_SYNTAX_UNVERIFIED")
+            }
+            Candidate::Remote => Some("REMOTE_RESOURCE_UNVERIFIED"),
         };
-        if let Some(reason) = reason {
+        if let Some(reason) = reason
+            && recorded_reasons.insert((id.clone(), reason))
+        {
             unverified.push(json!({"resource_id":id,"reason_code":reason}));
         }
         if let std::collections::btree_map::Entry::Vacant(occurrence) = retained.entry(id) {

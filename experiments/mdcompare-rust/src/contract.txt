@@ -99,8 +99,9 @@ status = success. A usable record binds source_path and source_sha256 to the
 original resource bytes, and artifact and artifact_sha256 to a complete v2
 OCR block. The block header must name the mode and source digest, followed by a
 nonempty body and closing marker. The configuration must match, and llm also
-requires matching valid context_sha256 values on both OCR objects. Resource and
-OCR paths are relative to the work plan. Unverified correspondence remains
+requires matching valid context_sha256 values on both OCR objects. Relative resource
+and OCR paths resolve from the work plan; absolute local paths are also accepted.
+Unverified correspondence remains
 UNKNOWN. Confirmed missing or unsuccessful baseline OCR requires processing.
 
 Only semantic may set body_recovery. That path points to a JSON object with
@@ -207,6 +208,8 @@ old_ref and new_ref in each change address the corresponding unit array and
 are null on the absent side. Human excerpt settings never clip these sidecars.
 Semantic and knowledge extraction stop with BODY_CONTEXT_BUDGET_EXCEEDED if
 expanding inherited context across body units exceeds 16 MiB per snapshot.
+Reference expansion stops with BODY_REFERENCE_BUDGET_EXCEEDED if the projected
+body would exceed the larger of 16 MiB and the original snapshot size.
 
 Knowledge rows report status (REUSE, DELTA, REVIEW, NO_BODY or UNKNOWN),
 comparison_complete, reason_codes, counts, units and graphify_plan.

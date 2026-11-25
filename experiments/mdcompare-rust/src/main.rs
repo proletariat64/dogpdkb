@@ -111,11 +111,19 @@ fn main() -> ExitCode {
     let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
         Err(error)
-            if match (error.kind(), &args[1..]) {
-                (ErrorKind::DisplayHelp, [flag] | [_, flag]) => flag == "--help" || flag == "-h",
-                (ErrorKind::DisplayVersion, [flag]) => flag == "--version" || flag == "-V",
-                _ => false,
-            } =>
+            if (error.kind() == ErrorKind::DisplayHelp
+                && args.iter().enumerate().skip(1).any(|(index, flag)| {
+                    (flag == "--help" || flag == "-h")
+                        && (index + 1 == args.len()
+                            || Cli::try_parse_from(
+                                args.iter().take(index).chain(args.iter().skip(index + 1)),
+                            )
+                            .is_ok())
+                }))
+                || (error.kind() == ErrorKind::DisplayVersion
+                    && args
+                        .last()
+                        .is_some_and(|flag| flag == "--version" || flag == "-V")) =>
         {
             return ExitCode::from(u8::from(error.print().is_err()));
         }

@@ -12,11 +12,15 @@ fn run(args: &[&str]) -> Output {
 fn help_grows_from_workflow_to_command_to_full_contract() {
     let root = run(&["--help"]);
     let run_help = run(&["run", "--help"]);
+    let configured_help = run(&["run", "--plan", "not-created.json", "--help"]);
+    let leading_help = run(&["run", "--help", "--plan", "not-created.json"]);
     let full = run(&["help", "all"]);
-    for output in [&root, &run_help, &full] {
+    for output in [&root, &run_help, &configured_help, &leading_help, &full] {
         assert!(output.status.success(), "{:?}", output);
         assert!(output.stderr.is_empty());
     }
+    assert_eq!(run_help.stdout, configured_help.stdout);
+    assert_eq!(run_help.stdout, leading_help.stdout);
     let root = String::from_utf8(root.stdout).unwrap();
     let run_help = String::from_utf8(run_help.stdout).unwrap();
     let full = String::from_utf8(full.stdout).unwrap();

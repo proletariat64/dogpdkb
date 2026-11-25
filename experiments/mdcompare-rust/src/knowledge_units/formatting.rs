@@ -3,7 +3,7 @@ use std::ops::Range;
 use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
 
-use super::body_view::{closing, inline_code};
+use super::body_view::inline_code;
 use super::table_separator;
 
 pub(super) fn html_tags() -> &'static Regex {
@@ -80,28 +80,143 @@ pub(super) fn cosmetic_attrs(attrs: &[(String, Option<&str>)]) -> bool {
     })
 }
 
-fn cosmetic_markup(text: &str) -> String {
-    html_tags()
-        .replace_all(text, |match_: &regex::Captures<'_>| {
-            let tag = match_["tag"].to_ascii_lowercase();
-            if is_cosmetic(&tag) {
-                let closing = match_.name("closing").is_some();
-                if tag == "br" && !closing {
-                    return " ".to_owned();
-                }
-                if tag != "br"
-                    && (closing
-                        || attributes(&match_["attrs"]).is_some_and(|attrs| cosmetic_attrs(&attrs)))
-                {
-                    return String::new();
-                }
-            }
-            match_[0].to_owned()
-        })
-        .into_owned()
+fn self_closing_attrs(raw: &str) -> (&str, bool) {
+    let ending = raw.strip_suffix('/').filter(|before| {
+        raw.trim() == "/" || !raw.contains('=') || before.ends_with([' ', '\t', '"', '\''])
+    });
+    ending.map_or((raw, false), |before| (before, true))
 }
 
-fn protected_ranges(text: &str, include_cosmetic: bool) -> Vec<Range<usize>> {
+fn overlaps(span: &Range<usize>, sorted: &[Range<usize>]) -> bool {
+    sorted
+        .get(sorted.partition_point(|range| range.end <= span.start))
+        .is_some_and(|range| range.start < span.end)
+}
+
+fn merged_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    ranges.retain(|span| !span.is_empty());
+    ranges.sort_unstable_by_key(|span| (span.start, span.end));
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for span in ranges {
+        if let Some(last) = merged.last_mut()
+            && span.start <= last.end
+        {
+            last.end = last.end.max(span.end);
+        } else {
+            merged.push(span);
+        }
+    }
+    merged
+}
+
+fn cosmetic_markup(text: &str) -> String {
+    let protected = protected_ranges(text, false);
+    let mut pairs = Vec::new();
+    let mut removable = Vec::new();
+    for m in html_tags().captures_iter(text) {
+        let range = m.get(0).expect("tag match").range();
+        if overlaps(&range, &protected) {
+            continue;
+        }
+        let tag = m["tag"].to_ascii_lowercase();
+        if !is_cosmetic(&tag) {
+            continue;
+        }
+        let raw = &m["attrs"];
+        if m.name("closing").is_some() {
+            if pairs.last().is_some_and(|(name, _, _)| name == &tag) {
+                let (_, open, safe) = pairs.pop().expect("matching opener");
+                if safe && raw.trim().is_empty() {
+                    let boundary = matches!(tag.as_str(), "p" | "div" | "center");
+                    removable.extend([(open, boundary), (range, boundary)]);
+                }
+            } else {
+                pairs.clear();
+            }
+        } else {
+            let (raw, self_closing) = self_closing_attrs(raw);
+            let safe = attributes(raw).is_some_and(|attrs| cosmetic_attrs(&attrs));
+            if tag == "br" {
+                if safe {
+                    removable.push((range, true));
+                }
+            } else if !self_closing {
+                pairs.push((tag, range, safe));
+            }
+        }
+    }
+    removable.sort_unstable_by_key(|(range, _)| range.start);
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (range, boundary) in removable {
+        result.push_str(&text[cursor..range.start]);
+        if boundary {
+            result.push(' ');
+        }
+        cursor = range.end;
+    }
+    result.push_str(&text[cursor..]);
+    result
+}
+
+fn link_ranges(text: &str, ranges: &mut Vec<Range<usize>>) {
+    let bytes = text.as_bytes();
+    let mut stack = Vec::new();
+    let mut pos = 0;
+    while let Some(byte) = bytes.get(pos) {
+        match byte {
+            b'\\' => {
+                pos += 2;
+                continue;
+            }
+            b'(' => stack.push(pos),
+            b')' => {
+                if let Some(start) = stack.pop()
+                    && bytes.get(start.wrapping_sub(1)) == Some(&b']')
+                {
+                    ranges.push(start + 1..pos);
+                }
+            }
+            _ => {}
+        }
+        pos += 1;
+    }
+}
+
+fn literal_ranges(text: &str, protected: &[Range<usize>], ranges: &mut Vec<Range<usize>>) {
+    let mut stack = Vec::new();
+    let mut start = None;
+    for m in html_tags().captures_iter(text) {
+        let range = m.get(0).expect("tag match").range();
+        let tag = m["tag"].to_ascii_lowercase();
+        if !matches!(tag.as_str(), "code" | "pre") {
+            continue;
+        }
+        if start.is_none() && overlaps(&(range.start..range.start + 1), protected) {
+            continue;
+        }
+        if m.name("closing").is_some() {
+            if stack.last() == Some(&tag) && m["attrs"].trim().is_empty() {
+                stack.pop();
+                if stack.is_empty()
+                    && let Some(start) = start.take()
+                {
+                    ranges.push(start..range.end);
+                }
+            }
+        } else {
+            // Non-void HTML elements do not gain a trusted closing boundary
+            // from a slash. An uncertain opening is protected to the end.
+            start.get_or_insert(range.start);
+            stack.push(tag);
+        }
+    }
+    if let Some(start) = start {
+        ranges.push(start..text.len());
+    }
+}
+
+fn protected_ranges(text: &str, include_tags: bool) -> Vec<Range<usize>> {
     let mut ranges = inline_code(text, false);
     let urls = rx!(r"(?:[A-Za-z][A-Za-z0-9+.-]*://|www\.)[^\s<>]+");
     ranges.extend(urls.find_iter(text).map(|entry| entry.range()));
@@ -133,17 +248,15 @@ fn protected_ranges(text: &str, include_cosmetic: bool) -> Vec<Range<usize>> {
             ranges.push(pos..pos + prefix + end);
         }
     }
-    ranges.extend(html_tags().captures_iter(text).filter_map(|m| {
-        (include_cosmetic || !is_cosmetic(&m["tag"].to_ascii_lowercase()))
-            .then(|| m.get(0).expect("tag match").range())
-    }));
-    for (start, _) in text.match_indices("](") {
-        if let Some(end) = closing(text, start + 1, b'(', b')') {
-            ranges.push(start + 2..end);
-        }
+    link_ranges(text, &mut ranges);
+    let mut ranges = merged_ranges(ranges);
+    let mut literal = Vec::new();
+    literal_ranges(text, &ranges, &mut literal);
+    ranges.extend(literal);
+    if include_tags {
+        ranges.extend(html_tags().find_iter(text).map(|m| m.range()));
     }
-    ranges.sort_unstable_by_key(|span| (span.start, span.end));
-    ranges
+    merged_ranges(ranges)
 }
 
 fn transform_unprotected(
@@ -194,6 +307,72 @@ fn quantity(m: &regex::Captures<'_>) -> String {
     }
 }
 
+fn escaped(text: &str, pos: usize) -> bool {
+    text.as_bytes()[..pos]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count()
+        % 2
+        != 0
+}
+
+fn flanking(text: &str, start: usize, end: usize) -> (bool, bool) {
+    let previous = text[..start].chars().next_back();
+    let next = text[end..].chars().next();
+    let whitespace = |ch: Option<char>| {
+        ch.is_none_or(|ch| {
+            matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{000c}')
+                || (!ch.is_ascii() && rx!(r"^\p{Zs}$").is_match(ch.encode_utf8(&mut [0; 4])))
+        })
+    };
+    let punctuation = |ch: Option<char>| ch.is_some_and(is_punctuation);
+    let left =
+        !whitespace(next) && (!punctuation(next) || whitespace(previous) || punctuation(previous));
+    let right =
+        !whitespace(previous) && (!punctuation(previous) || whitespace(next) || punctuation(next));
+    (left, right)
+}
+
+fn is_punctuation(ch: char) -> bool {
+    ch.is_ascii_punctuation()
+        || (!ch.is_ascii() && rx!(r"^\p{P}$").is_match(ch.encode_utf8(&mut [0; 4])))
+}
+
+fn strip_strong_emphasis(text: &str, protected: &[Range<usize>]) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for m in rx!(r"\*\*([^*]+)\*\*|__([^_]+)__").captures_iter(text) {
+        let full = m.get(0).expect("emphasis match").range();
+        let inner = m.get(1).or_else(|| m.get(2)).expect("emphasis content");
+        let marker = text.as_bytes()[full.start];
+        let opening_end = inner.start();
+        let closing_start = inner.end();
+        let (opens_left, opens_right) = flanking(text, full.start, opening_end);
+        let (closes_left, closes_right) = flanking(text, closing_start, full.end);
+        let previous = text[..full.start].chars().next_back();
+        let following = text[full.end..].chars().next();
+        if overlaps(&full, protected)
+            || escaped(text, full.start)
+            || escaped(text, closing_start)
+            || previous.is_some_and(|ch| ch == marker as char)
+            || following.is_some_and(|ch| ch == marker as char)
+            || !opens_left
+            || !closes_right
+            || (marker == b'_'
+                && (opens_right && !previous.is_some_and(is_punctuation)
+                    || closes_left && !following.is_some_and(is_punctuation)))
+        {
+            continue;
+        }
+        result.push_str(&text[cursor..full.start]);
+        result.push_str(inner.as_str());
+        cursor = full.end;
+    }
+    result.push_str(&text[cursor..]);
+    result
+}
+
 fn normalize(text: &str) -> String {
     let unit = rx!(
         r"(?P<number>(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?)\s*(?P<magnitude>万亿|亿|万)?\s*(?P<unit>人民币元|美元|港元|欧元|日元|万元|元|笔|个|次|人|天|日|年|秒|分钟|小时|[%％‰])"
@@ -202,14 +381,6 @@ fn normalize(text: &str) -> String {
         .replace('\u{a0}', " ")
         .nfc()
         .collect::<String>();
-    let value =
-        rx!(r"\*\*([^*]+)\*\*|__([^_]+)__").replace_all(&value, |m: &regex::Captures<'_>| {
-            m.get(1)
-                .or_else(|| m.get(2))
-                .expect("emphasis content")
-                .as_str()
-                .to_owned()
-        });
     let value = rx!(r"[ \t\n]+").replace_all(&value, " ");
     unit.replace_all(&value, |m: &regex::Captures<'_>| {
         let full = m.get(0).expect("quantity match");
@@ -230,8 +401,15 @@ fn normalize(text: &str) -> String {
 }
 
 pub fn prose_key(text: &str) -> String {
-    let text = transform_unprotected(text, protected_ranges(text, false), cosmetic_markup);
-    transform_unprotected(&text, protected_ranges(&text, true), normalize)
+    // Recognize delimiters in the original Markdown, before markup removal
+    // or entity decoding can manufacture new emphasis syntax.
+    let text = strip_strong_emphasis(text, &protected_ranges(text, true));
+    let text = cosmetic_markup(&text);
+    normalized_prose(&text)
+}
+
+fn normalized_prose(text: &str) -> String {
+    transform_unprotected(text, protected_ranges(text, true), normalize)
         .trim()
         .to_owned()
 }
@@ -242,6 +420,7 @@ struct HtmlTable {
     row: Option<Vec<String>>,
     cell: Option<String>,
     links: Vec<String>,
+    inline: Vec<String>,
     depth: i64,
     tables: usize,
     literal_code: bool,
@@ -305,22 +484,36 @@ impl HtmlTable {
             }
             _ => {
                 let cell = self.cell.as_mut()?;
+                if self.literal_code {
+                    return None;
+                }
                 match tag {
-                    "font" | "span" | "u" if cosmetic_attrs(&attrs) => {}
-                    "br" | "p" | "div" if cosmetic_attrs(&attrs) => cell.push(' '),
-                    "b" | "strong" => cell.push_str("**"),
-                    "em" | "i" => cell.push('*'),
-                    "code" if !self.literal_code => {
+                    "font" | "span" | "u" | "b" | "strong" | "em" | "i"
+                        if cosmetic_attrs(&attrs) => {}
+                    "br" | "p" | "div" | "center" if cosmetic_attrs(&attrs) => cell.push(' '),
+                    "code" if cosmetic_attrs(&attrs) => {
                         self.literal_code = true;
                         cell.push('`');
                     }
                     "a" => {
-                        let href = attrs.iter().rev().find(|(name, _)| name == "href")?.1?;
+                        let mut hrefs = attrs.iter().filter(|(name, _)| name == "href");
+                        let href = hrefs.next()?.1?;
+                        let cosmetic: Vec<_> = attrs
+                            .iter()
+                            .filter(|(name, _)| name != "href")
+                            .cloned()
+                            .collect();
+                        if hrefs.next().is_some() || !cosmetic_attrs(&cosmetic) {
+                            return None;
+                        }
                         self.links
                             .push(html_escape::decode_html_entities(href).into_owned());
                         cell.push('[');
                     }
                     _ => return None,
+                }
+                if tag != "br" {
+                    self.inline.push(tag.into());
                 }
             }
         }
@@ -330,11 +523,11 @@ impl HtmlTable {
     fn end(&mut self, tag: &str) -> Option<()> {
         match tag {
             "td" | "th" => {
-                if self.literal_code {
+                if self.literal_code || !self.inline.is_empty() {
                     return None;
                 }
                 let value = self.cell.take()?;
-                self.row.as_mut()?.push(prose_key(&value));
+                self.row.as_mut()?.push(normalized_prose(&value));
             }
             "tr" => {
                 if self.cell.is_some() {
@@ -346,11 +539,12 @@ impl HtmlTable {
             "thead" | "tbody" | "tfoot" => {}
             _ => {
                 let cell = self.cell.as_mut()?;
+                if self.inline.pop().as_deref() != Some(tag) {
+                    return None;
+                }
                 match tag {
-                    "font" | "span" | "u" => {}
-                    "p" | "div" => cell.push(' '),
-                    "b" | "strong" => cell.push_str("**"),
-                    "em" | "i" => cell.push('*'),
+                    "font" | "span" | "u" | "b" | "strong" | "em" | "i" => {}
+                    "p" | "div" | "center" => cell.push(' '),
                     "code" if self.literal_code => {
                         self.literal_code = false;
                         cell.push('`');
@@ -371,7 +565,7 @@ impl HtmlTable {
         if let Some(cell) = self.cell.as_mut() {
             if self.literal_code {
                 let decoded = html_escape::decode_html_entities(text);
-                if decoded.contains('`') {
+                if decoded.contains(['`', '\r', '\n']) {
                     return None;
                 }
                 cell.push_str(&decoded);
@@ -403,19 +597,10 @@ impl HtmlTable {
             if m.name("closing").is_some() {
                 parser.end(&tag)?;
             } else {
-                let raw = &m["attrs"];
-                let self_close = raw.ends_with('/')
-                    && (raw.trim() == "/"
-                        || !raw.contains('=')
-                        || raw[..raw.len() - 1].ends_with([' ', '\t', '"', '\'']));
+                let (attr_text, self_close) = self_closing_attrs(&m["attrs"]);
                 if self_close && tag != "br" {
                     return None;
                 }
-                let attr_text = if self_close {
-                    &raw[..raw.len() - 1]
-                } else {
-                    raw
-                };
                 parser.start(&tag, attributes(attr_text)?)?;
             }
         }
@@ -455,15 +640,16 @@ fn markdown_cells(line: &str) -> Vec<String> {
 }
 
 pub fn table_key(text: &str) -> String {
-    let mut rows = if rx!(r"(?i)<table\b").is_match(text) {
+    let mut rows = if rx!(r"(?i)^\s*<table\b").is_match(text) {
         let Some(rows) = HtmlTable::parse(text) else {
             return format!("unsupported-html-table:{text}");
         };
         rows
     } else {
         text.split_terminator('\n')
-            .filter(|line| !table_separator().is_match(line))
-            .map(markdown_cells)
+            .enumerate()
+            .filter(|(index, line)| *index != 1 || !table_separator().is_match(line))
+            .map(|(_, line)| markdown_cells(line))
             .collect()
     };
     let mut position = 0;
@@ -479,7 +665,109 @@ pub fn table_key(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::table_key;
+    use super::{link_ranges, prose_key, table_key};
+
+    #[test]
+    fn block_markup_keeps_boundaries_between_adjacent_values() {
+        assert_eq!(prose_key("<p>10</p><p>20</p>"), "10 20");
+        assert_eq!(prose_key("<div>10</div><center>20</center>"), "10 20");
+    }
+
+    #[test]
+    fn non_cosmetic_tags_and_break_attributes_remain_in_the_key() {
+        assert_ne!(
+            prose_key("<span hidden>10</span>20"),
+            prose_key("<span hidden>1020</span>")
+        );
+        assert_ne!(
+            prose_key("10<br title=\"Required\">20"),
+            prose_key("10<br>20")
+        );
+        assert_eq!(prose_key("10<br class=\"layout\"/>20"), "10 20");
+        assert_eq!(prose_key("<span>10 <b>20</b></span>"), "10 20");
+    }
+
+    #[test]
+    fn strong_emphasis_requires_real_unescaped_markdown_delimiters() {
+        assert_ne!(
+            prose_key("account__id__suffix"),
+            prose_key("accountidsuffix")
+        );
+        assert_ne!(prose_key("&#42;&#42;Limit&#42;&#42;"), prose_key("Limit"));
+        assert_ne!(prose_key(r"\**Limit**"), prose_key("Limit"));
+        assert_ne!(prose_key("A**，Limit**"), prose_key("A，Limit"));
+        assert_eq!(prose_key("**Limit** __Amount__"), "Limit Amount");
+    }
+
+    #[test]
+    fn literal_html_code_and_preformatted_regions_preserve_payload() {
+        assert_ne!(
+            prose_key("Use <code>foo  bar</code>"),
+            prose_key("Use <code>foo bar</code>")
+        );
+        assert_ne!(
+            prose_key("Use <pre><span>10万元</span></pre>"),
+            prose_key("Use <pre>100000元</pre>")
+        );
+        assert_eq!(prose_key("Use <code>foo  bar"), "Use <code>foo  bar");
+        assert_eq!(
+            prose_key("<span>Use <code>foo  bar</code></span>"),
+            "Use <code>foo  bar</code>"
+        );
+    }
+
+    #[test]
+    fn link_target_ranges_match_nested_and_escaped_parentheses() {
+        let text = r"[one](path(nested)) and [two](file\).txt) [unfinished](folder";
+        let mut ranges = Vec::new();
+        link_ranges(text, &mut ranges);
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| &text[range.clone()])
+                .collect::<Vec<_>>(),
+            ["path(nested)", r"file\).txt"]
+        );
+    }
+
+    #[test]
+    fn markdown_table_with_code_example_is_classified_as_markdown() {
+        assert_eq!(
+            table_key("|A|B|\n|---|---|\n|`<table>`|Limit|"),
+            table_key("| A | B |\n|---|---|\n| `<table>` | Limit |")
+        );
+    }
+
+    #[test]
+    fn markdown_table_retains_separator_looking_data_rows() {
+        let header = "|A|B|\n|---|---|\n";
+        assert_eq!(
+            table_key(&format!("{header}|---|---|")),
+            r#"table:[["A","B"],["---","---"]]"#
+        );
+        assert_ne!(table_key(header), table_key(&format!("{header}|---|---|")));
+    }
+
+    #[test]
+    fn html_cells_keep_literal_text_and_unsafe_attributes() {
+        let table = |value| table_key(&format!("<table><tr><td>{value}</td></tr></table>"));
+        let plain = table("Required");
+        assert_eq!(table("<strong>Required</strong>"), plain);
+        assert_ne!(table("**Required**"), plain);
+        assert_ne!(table("<strong hidden>Required</strong>"), plain);
+        assert_ne!(
+            table("<code hidden>Required</code>"),
+            table("<code>Required</code>")
+        );
+        assert_ne!(
+            table("<a href=\"doc\" title=\"Required\">Report</a>"),
+            table("<a href=\"doc\">Report</a>")
+        );
+        assert_eq!(
+            table("<a href=\"doc\">Report</a>"),
+            r#"table:[["[Report](doc)"]]"#
+        );
+    }
 
     #[test]
     fn markdown_table_empty_edge_cells_keep_column_bindings() {

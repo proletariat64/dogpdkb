@@ -78,8 +78,13 @@ fn has_residue(text: &str) -> bool {
     text.contains('\u{fffd}')
         || RESIDUE.find_iter(text).any(|hit| {
             !hit.as_str().starts_with("![")
-                || hit.start() == 0
-                || text.as_bytes()[hit.start() - 1] != b'\\'
+                || text.as_bytes()[..hit.start()]
+                    .iter()
+                    .rev()
+                    .take_while(|&&byte| byte == b'\\')
+                    .count()
+                    % 2
+                    == 0
         })
 }
 
@@ -459,6 +464,12 @@ pub fn validate_reply(raw: &str, count: usize) -> Result<(u8, bool), ReplyValida
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_residue_respects_escape_parity() {
+        assert!(has_residue(r"\\![image](chart.png)"));
+        assert!(!has_residue(r"\![image](chart.png)"));
+    }
 
     fn unit(text: &str) -> Value {
         json!({"kind": "paragraph", "context": [], "key": text, "text": text})

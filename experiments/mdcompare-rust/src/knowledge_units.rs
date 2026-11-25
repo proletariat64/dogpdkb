@@ -48,7 +48,19 @@ fn fence_end(line: &str, delimiter: &str) -> bool {
 }
 
 fn heading() -> &'static regex::Regex {
-    rx!(r"^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
+    rx!(r"^ {0,3}(#{1,6})[ \t]+(.*)$")
+}
+
+fn heading_text(text: &str) -> &str {
+    let text = text.trim_end_matches([' ', '\t']);
+    // A pure hash run following the opening delimiter is an empty heading.
+    if text.bytes().all(|byte| byte == b'#') {
+        return "";
+    }
+    let closing = rx!(r"[ \t]+#+$");
+    closing
+        .find(text)
+        .map_or(text, |matched| &text[..matched.start()])
 }
 
 fn ordered() -> &'static regex::Regex {
@@ -74,7 +86,7 @@ fn condition() -> &'static regex::Regex {
 }
 
 fn is_indented(line: &str) -> bool {
-    line.starts_with("    ") || line.starts_with('\t')
+    source_indent(line) >= 4
 }
 
 fn is_html_table(line: &str) -> bool {
@@ -130,12 +142,36 @@ fn tab_indent(prefix: &str) -> usize {
     })
 }
 
+fn source_indent(line: &str) -> usize {
+    let prefix = line.trim_start_matches([' ', '\t']);
+    tab_indent(&line[..line.len() - prefix.len()])
+}
+
+fn ordered_key(lines: &[&str], original: &[&str]) -> String {
+    let base = source_indent(original[0]) as isize;
+    let mut items = Vec::<(isize, String)>::new();
+    for (&line, &raw) in lines.iter().zip(original) {
+        if ordered().is_match(line) || bullet().is_match(line) {
+            let level = source_indent(raw) as isize - base;
+            items.push((level, line.trim().to_owned()));
+        } else if let Some((_, item)) = items.last_mut() {
+            item.push(' ');
+            item.push_str(line.trim());
+        }
+    }
+    for (_, item) in &mut items {
+        *item = prose_key(item);
+    }
+    serde_json::to_string(&items).expect("ordered items are serializable")
+}
+
 struct Extractor {
     units: Vec<Unit>,
     headings: Vec<(usize, String)>,
     bullet_parents: Vec<(usize, String)>,
     leadin: String,
     list_scope: String,
+    list_indent: Option<usize>,
     remaining_context_bytes: usize,
 }
 
@@ -146,12 +182,8 @@ impl Extractor {
         start: usize,
         end: usize,
         text: String,
+        key: String,
     ) -> Result<(), &'static str> {
-        let key = match kind {
-            "code" => text.trim_end_matches('\n').to_owned(),
-            "table" => table_key(&text),
-            _ => prose_key(&text),
-        };
         if key.is_empty() {
             return Ok(());
         }
@@ -197,8 +229,23 @@ impl Extractor {
         start: usize,
         end: usize,
         lines: &[&str],
+        original: &[&str],
     ) -> Result<(), &'static str> {
-        self.append(kind, start, end, lines[start..end].join("\n"))?;
+        let text = lines[start..end].join("\n");
+        let key = match kind {
+            "code" => text.trim_end_matches('\n').to_owned(),
+            "table" => table_key(&text),
+            "ordered" => ordered_key(&lines[start..end], &original[start..end]),
+            _ => unreachable!("block kind"),
+        };
+        self.append(kind, start, end, text, key)?;
+        self.list_indent = (kind == "ordered").then(|| {
+            let first = original[start];
+            ordered().find(first).map_or_else(
+                || source_indent(first) + 2,
+                |matched| tab_indent(matched.as_str()),
+            )
+        });
         self.list_scope = self
             .units
             .last()
@@ -221,6 +268,7 @@ pub fn extract_units(
         bullet_parents: Vec::new(),
         leadin: String::new(),
         list_scope: String::new(),
+        list_indent: None,
         remaining_context_bytes: crate::input::MANIFEST_LIMIT as usize,
     };
     let mut index = 0;
@@ -237,8 +285,11 @@ pub fn extract_units(
             }
             output.leadin.clear();
             output.list_scope.clear();
-            output.append("heading", start, index, m[2].to_owned())?;
-            output.headings.push((level, prose_key(&m[2])));
+            output.list_indent = None;
+            let text = heading_text(&m[2]);
+            let key = prose_key(text);
+            output.append("heading", start, index, text.to_owned(), key.clone())?;
+            output.headings.push((level, key));
             output.bullet_parents.clear();
             continue;
         }
@@ -249,8 +300,27 @@ pub fn extract_units(
                     break;
                 }
             }
-            output.block("code", start, index, &lines)?;
+            output.block("code", start, index, &lines, &original)?;
             continue;
+        }
+        if is_indented(original[start]) {
+            let indent = source_indent(original[start]);
+            let in_container =
+                |content_indent| indent >= content_indent && indent < content_indent + 4;
+            let nested_item = (ordered().is_match(line) || bullet().is_match(line))
+                && (output.list_indent.is_some_and(in_container)
+                    || output
+                        .bullet_parents
+                        .iter()
+                        .any(|(parent, _)| in_container(parent + 2)));
+            if !nested_item {
+                while original.get(index).is_some_and(|next| is_indented(next)) {
+                    index += 1;
+                }
+                output.block("code", start, index, &lines, &original)?;
+                output.bullet_parents.clear();
+                continue;
+            }
         }
         if table_start(&lines, start) {
             index += 1;
@@ -260,19 +330,19 @@ pub fn extract_units(
             {
                 index += 1;
             }
-            output.block("table", start, index, &lines)?;
+            output.block("table", start, index, &lines, &original)?;
             continue;
         }
         if is_html_table(line) {
             while index < lines.len() && !rx!(r"(?i)</table\s*>").is_match(lines[index - 1]) {
                 index += 1;
             }
-            output.block("table", start, index, &lines)?;
+            output.block("table", start, index, &lines, &original)?;
             continue;
         }
         if ordered().is_match(line) {
-            index = list_end(&lines, index, ordered());
-            output.block("ordered", start, index, &lines)?;
+            index = list_end(&lines, &original, index, ordered());
+            output.block("ordered", start, index, &lines, &original)?;
             continue;
         }
         if let Some(m) = bullet().captures(line) {
@@ -281,12 +351,13 @@ pub fn extract_units(
                 .iter()
                 .any(|(_, key)| workflow().is_match(key))
                 || workflow().is_match(&output.list_scope)
+                || workflow().is_match(&output.leadin)
             {
-                index = list_end(&lines, index, bullet());
-                output.block("ordered", start, index, &lines)?;
+                index = list_end(&lines, &original, index, bullet());
+                output.block("ordered", start, index, &lines, &original)?;
                 continue;
             }
-            let indent = tab_indent(&m[1]);
+            let indent = source_indent(original[start]);
             while output
                 .bullet_parents
                 .last()
@@ -295,10 +366,9 @@ pub fn extract_units(
                 output.bullet_parents.pop();
             }
             let mut value = m[2].to_owned();
-            let required_indent = " ".repeat(indent + 2);
             while let Some(next) = lines.get(index).filter(|next| {
                 !blank(next)
-                    && next.starts_with(&required_indent)
+                    && source_indent(original[index]) >= indent + 2
                     && !bullet().is_match(next)
                     && !ordered().is_match(next)
             }) {
@@ -307,15 +377,9 @@ pub fn extract_units(
                 value.push_str(next.trim());
             }
             let key = prose_key(&value);
-            output.append("bullet", start, index, value)?;
+            output.append("bullet", start, index, value, key.clone())?;
+            output.list_indent = None;
             output.bullet_parents.push((indent, key));
-            continue;
-        }
-        if is_indented(original[start]) {
-            while original.get(index).is_some_and(|next| is_indented(next)) {
-                index += 1;
-            }
-            output.block("code", start, index, &lines)?;
             continue;
         }
         while let Some(&next) = lines.get(index) {
@@ -331,13 +395,11 @@ pub fn extract_units(
         let is_scope = value.trim_end().ends_with([':', '：'])
             || condition().is_match(&value)
             || workflow().is_match(&value);
-        let scope = if is_scope {
-            prose_key(&value)
-        } else {
-            String::new()
-        };
-        output.append("paragraph", start, index, value)?;
+        let key = prose_key(&value);
+        let scope = if is_scope { key.clone() } else { String::new() };
+        output.append("paragraph", start, index, value, key)?;
         output.list_scope = scope;
+        output.list_indent = None;
         if is_scope {
             output.leadin.clone_from(&output.list_scope);
         }
@@ -362,9 +424,9 @@ fn block_start(line: &str, original: &str) -> bool {
         || is_html_table(line)
 }
 
-fn list_end(lines: &[&str], mut index: usize, marker: &regex::Regex) -> usize {
+fn list_end(lines: &[&str], original: &[&str], mut index: usize, marker: &regex::Regex) -> usize {
     while lines.get(index).is_some_and(|next| {
-        !blank(next) && (marker.is_match(next) || next.starts_with([' ', '\t']))
+        !blank(next) && (marker.is_match(next) || source_indent(original[index]) > 0)
     }) {
         index += 1;
     }
@@ -396,6 +458,29 @@ fn grams(text: &str) -> HashSet<Vec<char>> {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct Candidates {
+    best: Option<(f64, usize)>,
+    runner_up: Option<f64>,
+}
+
+impl Candidates {
+    fn consider(&mut self, score: f64, index: usize) {
+        if self.best.is_none_or(|(best, _)| score > best) {
+            self.runner_up = self.best.map(|(best, _)| best);
+            self.best = Some((score, index));
+        } else if self.runner_up.is_none_or(|second| score > second) {
+            self.runner_up = Some(score);
+        }
+    }
+
+    fn ambiguous(&self) -> bool {
+        self.best
+            .zip(self.runner_up)
+            .is_some_and(|((best, _), second)| best - second < 0.03)
+    }
+}
+
 pub fn align_units(old: &[&Unit], new: &[&Unit], max_work: usize) -> Alignment {
     let mut exact = HashMap::<_, Vec<usize>>::new();
     for (index, unit) in old.iter().enumerate() {
@@ -422,6 +507,7 @@ pub fn align_units(old: &[&Unit], new: &[&Unit], max_work: usize) -> Alignment {
         })
         .collect();
     let mut groups = HashMap::<_, Vec<usize>>::new();
+    let old_lengths: Vec<_> = old.iter().map(|unit| unit.key.chars().count()).collect();
     for (index, unit) in old.iter().enumerate().filter(|(i, _)| !used.contains(i)) {
         groups
             .entry((unit.kind, unit.context.as_slice()))
@@ -430,60 +516,91 @@ pub fn align_units(old: &[&Unit], new: &[&Unit], max_work: usize) -> Alignment {
     }
     let mut cache = HashMap::new();
     let mut remaining = max_work;
-    let mut complete = true;
-    for (index, item) in items
-        .iter_mut()
-        .enumerate()
-        .filter(|(_, item)| item.is_none())
-    {
+    let mut exhausted = false;
+    let mut incomplete_groups = HashSet::new();
+    let mut by_old = vec![Candidates::default(); old.len()];
+    let mut by_new = vec![Candidates::default(); new.len()];
+    for (index, item) in items.iter().enumerate() {
+        if item.is_some() {
+            continue;
+        }
         let unit = new[index];
-        let mut scored = Vec::<(f64, usize)>::new();
-        let after = grams(&unit.key);
+        let group_key = (unit.kind, unit.context.as_slice());
+        let Some(group) = groups.get(&group_key) else {
+            continue;
+        };
+        if exhausted {
+            incomplete_groups.insert(group_key);
+            continue;
+        }
         let after_size = unit.key.chars().count();
-        let mut exhausted = false;
-        for &previous in groups
-            .get(&(unit.kind, unit.context.as_slice()))
-            .into_iter()
-            .flatten()
-        {
-            if used.contains(&previous) {
-                continue;
-            }
-            let cost = old[previous].key.chars().count().saturating_add(after_size);
+        let mut after = None;
+        for &previous in group {
+            // Reserve the scan and the expensive grams construction before
+            // allocating either candidate. Every traversal consumes work.
+            let cost = old_lengths[previous]
+                .saturating_add(after_size)
+                .saturating_add(1);
             let Some(work) = remaining.checked_sub(cost) else {
                 exhausted = true;
+                incomplete_groups.insert(group_key);
                 break;
             };
             remaining = work;
             let before = cache
                 .entry(previous)
                 .or_insert_with(|| grams(&old[previous].key));
-            let similarity = (2 * before.intersection(&after).count()) as f64
+            let after = after.get_or_insert_with(|| grams(&unit.key));
+            let similarity = (2 * before.intersection(after).count()) as f64
                 / (before.len() + after.len()) as f64;
             if similarity >= 0.6 {
-                scored.push((similarity, previous));
+                by_old[previous].consider(similarity, index);
+                by_new[index].consider(similarity, previous);
             }
         }
-        scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-        let (kind, previous, basis, similarity) = if exhausted {
-            complete = false;
+    }
+    // A revision is uniquely strongest only if both sides chose each
+    // other. Do not consume an old occurrence until competitors are known.
+    let mut revisions = HashMap::new();
+    for (index, candidates) in by_new.iter().enumerate() {
+        if incomplete_groups.contains(&(new[index].kind, new[index].context.as_slice())) {
+            continue;
+        }
+        if let Some((score, previous)) = candidates.best
+            && !candidates.ambiguous()
+            && !by_old[previous].ambiguous()
+            && by_old[previous]
+                .best
+                .is_some_and(|(_, preferred)| preferred == index)
+        {
+            used.insert(previous);
+            revisions.insert(index, (previous, score));
+        }
+    }
+
+    for (index, item) in items.iter_mut().enumerate() {
+        if item.is_some() {
+            continue;
+        }
+        let candidates = &by_new[index];
+        let group_key = (new[index].kind, new[index].context.as_slice());
+        let (kind, previous, basis, similarity) = if incomplete_groups.contains(&group_key) {
             ("unresolved", None, "BODY_MATCH_BUDGET_EXCEEDED", None)
-        } else {
-            match scored.as_slice() {
-                [(best, _), (second, _), ..] if best - second < 0.03 => {
-                    ("unresolved", None, "AMBIGUOUS_BODY_ALIGNMENT", Some(*best))
-                }
-                [(similarity, previous), ..] => {
-                    used.insert(*previous);
-                    (
-                        "revise",
-                        Some(*previous),
-                        "SIMILAR_BODY_REVISION_CANDIDATE",
-                        Some(*similarity),
-                    )
-                }
-                [] => ("add", None, "NO_MATCHED_BASELINE_BODY_UNIT", None),
+        } else if let Some(&(previous, score)) = revisions.get(&index) {
+            (
+                "revise",
+                Some(previous),
+                "SIMILAR_BODY_REVISION_CANDIDATE",
+                Some(score),
+            )
+        } else if let Some((score, previous)) = candidates.best {
+            if candidates.ambiguous() || by_old[previous].ambiguous() || !used.contains(&previous) {
+                ("unresolved", None, "AMBIGUOUS_BODY_ALIGNMENT", Some(score))
+            } else {
+                ("add", None, "NO_MATCHED_BASELINE_BODY_UNIT", None)
             }
+        } else {
+            ("add", None, "NO_MATCHED_BASELINE_BODY_UNIT", None)
         };
         *item = Some(Match {
             kind,
@@ -493,6 +610,7 @@ pub fn align_units(old: &[&Unit], new: &[&Unit], max_work: usize) -> Alignment {
             similarity,
         });
     }
+    let complete = !exhausted;
     let mut items: Vec<_> = items
         .into_iter()
         .map(|item| item.expect("all new units aligned"))
@@ -513,7 +631,7 @@ pub fn align_units(old: &[&Unit], new: &[&Unit], max_work: usize) -> Alignment {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_units;
+    use super::{align_units, extract_units};
     use serde_json::Value;
 
     #[test]
@@ -545,6 +663,105 @@ mod tests {
             assert_eq!(units[0].kind, "paragraph");
             assert_eq!(units[0].key, "Keep this policy.");
         }
+    }
+
+    fn authored(text: &str) -> Vec<super::Unit> {
+        extract_units(text, &Value::Null, false).unwrap()
+    }
+
+    #[test]
+    fn closing_hashes_do_not_erase_a_heading_hash() {
+        let language = authored("# C#\n\nUse this language.");
+        let letter = authored("# C\n\nUse this language.");
+        let closed = authored("# C# ###\n\nUse this language.");
+        assert_ne!(language[0].exact_key(), letter[0].exact_key());
+        assert_ne!(language[1].exact_key(), letter[1].exact_key());
+        assert_eq!(language[0].exact_key(), closed[0].exact_key());
+    }
+
+    #[test]
+    fn indented_root_structure_is_code_but_a_nested_bullet_is_a_list_item() {
+        for text in ["    - allow", "    1. allow", "    <table>allow</table>"] {
+            assert_eq!(authored(text)[0].kind, "code");
+        }
+        let nested = authored("- parent\n    - child");
+        assert_eq!(nested.len(), 2);
+        assert_eq!(nested[1].kind, "bullet");
+        assert_eq!(nested[1].context, ["parent"]);
+    }
+
+    #[test]
+    fn removed_image_padding_does_not_join_a_list_item_to_a_paragraph() {
+        for marker in ["-", "1."] {
+            let plain = authored(&format!("{marker} limit\nKeep this policy."));
+            let illustrated = authored(&format!(
+                "{marker} limit\n![diagram](old.png) Keep this policy."
+            ));
+            assert_eq!(plain.len(), 2);
+            assert_eq!(illustrated.len(), 2);
+            for (plain_unit, illustrated_unit) in plain.iter().zip(&illustrated) {
+                assert_eq!(plain_unit.exact_key(), illustrated_unit.exact_key());
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_keys_preserve_item_boundaries_and_nesting() {
+        let two = authored("1. Require approval\n2. Release funds");
+        let one = authored("1. Require approval 2. Release funds");
+        let nested = authored("1. Require approval\n    2. Release funds");
+        let wrapped = authored("1. Require\n   approval\n2. Release funds");
+        assert_ne!(two[0].exact_key(), one[0].exact_key());
+        assert_ne!(two[0].exact_key(), nested[0].exact_key());
+        assert_eq!(two[0].exact_key(), wrapped[0].exact_key());
+    }
+
+    #[test]
+    fn loose_workflow_lists_remain_order_sensitive() {
+        let prior = authored("Procedure:\n\n- Approve\n\n- Validate\n\n- Release");
+        let incoming = authored("Procedure:\n\n- Approve\n\n- Release\n\n- Validate");
+        assert!(prior[1..].iter().all(|unit| unit.kind == "ordered"));
+        let alignment = align_units(
+            &prior.iter().collect::<Vec<_>>(),
+            &incoming.iter().collect::<Vec<_>>(),
+            10_000,
+        );
+        assert!(alignment.items.iter().any(|item| item.kind != "reuse"));
+    }
+
+    #[test]
+    fn revision_competition_is_resolved_on_both_sides() {
+        let old = authored("abcdefghijk");
+        for incoming in ["abcdefghijx\n\nabcdefghijy", "abcdefghijy\n\nabcdefghijx"] {
+            let new = authored(incoming);
+            let alignment = align_units(&[&old[0]], &new.iter().collect::<Vec<_>>(), 10_000);
+            assert_eq!(
+                alignment.items[..2]
+                    .iter()
+                    .map(|item| item.kind)
+                    .collect::<Vec<_>>(),
+                ["unresolved", "unresolved"]
+            );
+        }
+        let new = authored("abcdefghixx\n\nabcdefghijx");
+        let alignment = align_units(&[&old[0]], &[&new[0], &new[1]], 10_000);
+        assert_eq!(alignment.items[0].kind, "add");
+        assert_eq!(alignment.items[1].kind, "revise");
+    }
+
+    #[test]
+    fn alignment_budget_cannot_publish_a_partial_group_as_unique() {
+        let old = authored("abcdefghijk");
+        let new = authored("abcdefghijx\n\nabcdefghijy");
+        let alignment = align_units(&[&old[0]], &[&new[0], &new[1]], 24);
+        assert!(!alignment.complete);
+        assert_eq!(
+            alignment.items[..2]
+                .iter()
+                .map(|item| item.basis)
+                .collect::<Vec<_>>(),
+            ["BODY_MATCH_BUDGET_EXCEEDED", "BODY_MATCH_BUDGET_EXCEEDED"]
+        );
     }
 
     #[test]

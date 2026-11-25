@@ -70,6 +70,21 @@ fn catalog_and_accept_match_url_and_kind_to_distinct_declared_paths() {
     );
 
     let actual = resources(&work);
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        fs::metadata(work.with_extension("mdcompare"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(work.with_extension("mdcompare.accept.lock"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o600
+    );
 
     assert_eq!(actual.len(), 2);
     assert_eq!(actual[0]["resource_id"], "chart-image");
@@ -100,6 +115,52 @@ fn implicit_catalog_ids_distinguish_uses_of_the_same_url() {
         actual
             .iter()
             .all(|entry| entry["path"] == json!(root.join("chart.png")))
+    );
+}
+
+#[test]
+fn repeated_remote_reference_is_reported_once() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("doc.md"),
+        "![chart](https://example.invalid/chart.png)\n![chart](https://example.invalid/chart.png)\n",
+    )
+    .unwrap();
+    let work = plan(dir.path(), "work.json", None, None);
+    let output = invoke(&work, "run");
+    assert!(output.status.success(), "{output:?}");
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let report: Value = serde_json::from_slice(
+        &fs::read(summary["artifacts"]["result"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let result = &report["results"][0];
+    assert_eq!(result["resources"].as_array().unwrap().len(), 1);
+    assert_eq!(result["unverified_resources"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn malformed_resource_target_retains_partial_inventory() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("doc.md"),
+        "![chart](https://[invalid]/chart.png)\n",
+    )
+    .unwrap();
+    let work = plan(dir.path(), "work.json", None, None);
+    let output = invoke(&work, "run");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let report: Value = serde_json::from_slice(
+        &fs::read(summary["artifacts"]["result"].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let row = &report["results"][0];
+    assert_eq!(row["status"], "UNKNOWN");
+    assert_eq!(row["resources"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        row["unverified_resources"][0]["reason_code"],
+        "RESOURCE_SYNTAX_UNVERIFIED"
     );
 }
 

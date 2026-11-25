@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,7 +217,12 @@ impl Workspace {
         let root = source.with_extension("mdcompare");
         // A committed or prepared workspace must be an actual private directory.
         match fs::symlink_metadata(&root) {
-            Ok(meta) => ensure!(meta.is_dir(), "binding_invalid"),
+            Ok(meta) => ensure!(
+                meta.is_dir()
+                    && meta.uid() == unsafe { libc::geteuid() }
+                    && meta.mode() & 0o077 == 0,
+                "binding_invalid"
+            ),
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(e).context("binding_invalid"),
         }
@@ -246,7 +251,10 @@ impl Workspace {
 
     pub fn initialize(&self, files: &[(&str, Vec<u8>)]) -> Result<()> {
         let parent = self.root.parent().context("publish_failed")?;
-        let staging = tempfile::tempdir_in(parent).context("publish_failed")?;
+        let staging = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(parent)
+            .context("publish_failed")?;
         for (name, bytes) in files {
             let destination = artifact_path(staging.path(), name)?;
             atomic_new(&destination, bytes)?;
@@ -293,8 +301,12 @@ fn open_lock(path: &Path, wait: bool) -> Result<Lock> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .context("binding_invalid")?;
+    let meta = file.metadata()?;
     ensure!(
-        file.metadata()?.is_file() && file.metadata()?.nlink() == 1,
+        meta.is_file()
+            && meta.nlink() == 1
+            && meta.uid() == unsafe { libc::geteuid() }
+            && meta.mode() & 0o077 == 0,
         "binding_invalid"
     );
     ensure!(try_lock(&file, wait)?, "workspace_busy");
@@ -709,7 +721,8 @@ fn create_plan(workspace: &Workspace, explicit: Option<&Path>) -> Result<FrozenP
         }
     }
     if let Some((original, path)) = recovery_paths {
-        frozen.path_targets.insert(original, path.clone());
+        ensure!(frozen.bind_path(&original)? == path, "input_drift");
+        frozen.bind_path(&path)?;
         add_recovery(&mut frozen, &path)?;
     }
     protected.extend(frozen.inputs.keys().cloned());

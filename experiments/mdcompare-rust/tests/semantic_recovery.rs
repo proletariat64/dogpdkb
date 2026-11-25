@@ -40,7 +40,8 @@ fn compare(
             .to_string(),
         )
         .unwrap();
-        plan["body_recovery"] = json!("recovery.json");
+        std::os::unix::fs::symlink("recovery.json", root.join("recovery-link.json")).unwrap();
+        plan["body_recovery"] = json!("recovery-link.json");
     }
     fs::write(root.join("work.json"), plan.to_string()).unwrap();
     let result = Command::new(env!("CARGO_BIN_EXE_mdcomparer"))

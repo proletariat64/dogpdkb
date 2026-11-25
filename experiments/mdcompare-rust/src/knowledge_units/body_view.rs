@@ -41,7 +41,30 @@ pub(super) fn closing(text: &str, start: usize, open: u8, close: u8) -> Option<u
 }
 
 pub(super) fn outside(position: usize, spans: &[Span]) -> bool {
-    !spans.iter().any(|span| span.contains(&position))
+    !spans
+        .get(spans.partition_point(|span| span.end <= position))
+        .is_some_and(|span| span.contains(&position))
+}
+
+fn overlaps(area: &Span, spans: &[Span]) -> bool {
+    spans
+        .get(spans.partition_point(|span| span.end <= area.start))
+        .is_some_and(|span| span.start < area.end)
+}
+
+fn merge_spans(mut spans: Vec<Span>) -> Vec<Span> {
+    spans.sort_unstable_by_key(|span| span.start);
+    let mut merged: Vec<Span> = Vec::new();
+    for span in spans {
+        if let Some(last) = merged.last_mut()
+            && span.start < last.end
+        {
+            last.end = last.end.max(span.end);
+        } else {
+            merged.push(span);
+        }
+    }
+    merged
 }
 
 pub(super) fn inline_code(text: &str, multiline: bool) -> Vec<Span> {
@@ -69,14 +92,29 @@ fn code_ranges(text: &str) -> Vec<Span> {
     let mut spans = Vec::new();
     let mut offset = 0;
     let mut open = None;
+    let mut prose = None;
     for line in source_lines(text, true) {
-        let line_value = line.trim_end_matches('\n');
+        let line_value = line.trim_end_matches(is_source_line_end);
+        let delimiter = fence().captures(line_value).and_then(|m| m.get(1));
+        let is_code = open.is_some() || delimiter.is_some() || is_indented(line_value);
+        let boundary = is_code || line_value.trim().is_empty();
+        if boundary {
+            if let Some(start) = prose.take() {
+                spans.extend(
+                    inline_code(&text[start..offset], true)
+                        .into_iter()
+                        .map(|span| start + span.start..start + span.end),
+                );
+            }
+        } else if prose.is_none() {
+            prose = Some(offset);
+        }
         if let Some((start, delimiter)) = open {
             if fence_end(line_value, delimiter) {
                 spans.push(start..offset + line.len());
                 open = None;
             }
-        } else if let Some(delimiter) = fence().captures(line_value).and_then(|m| m.get(1)) {
+        } else if let Some(delimiter) = delimiter {
             open = Some((offset, delimiter.as_str()));
         } else if is_indented(line) {
             spans.push(offset..offset + line.len());
@@ -86,8 +124,14 @@ fn code_ranges(text: &str) -> Vec<Span> {
     if let Some((start, _)) = open {
         spans.push(start..text.len());
     }
-    spans.extend(inline_code(text, true));
-    spans
+    if let Some(start) = prose {
+        spans.extend(
+            inline_code(&text[start..], true)
+                .into_iter()
+                .map(|span| start + span.start..start + span.end),
+        );
+    }
+    merge_spans(spans)
 }
 
 fn line_number(line_starts: &[usize], pos: usize) -> usize {
@@ -131,8 +175,18 @@ fn declared_regions(
     if declaration["version"] != "generated-regions-v1" {
         return Err(INVALID);
     }
-    let begins: Vec<_> = ocr_begin().find_iter(text).collect();
-    let ends: Vec<_> = ocr_end().find_iter(text).collect();
+    let markers_by_line = |pattern: &'static Regex| {
+        let mut markers = HashMap::new();
+        for entry in pattern.find_iter(text) {
+            markers
+                .entry(line_number(line_starts, entry.start()))
+                .and_modify(|previous| *previous = None)
+                .or_insert(Some(entry));
+        }
+        markers
+    };
+    let begins = markers_by_line(ocr_begin());
+    let ends = markers_by_line(ocr_end());
     let mut regions = Vec::new();
     for region in declaration["regions"].as_array().ok_or(INVALID)? {
         if region["kind"] != "mdocr_ocr" {
@@ -143,16 +197,8 @@ fn declared_regions(
         if start < 1 || end < start || end > line_starts.len() {
             return Err(LOCATION);
         }
-        let start_matches: Vec<_> = begins
-            .iter()
-            .filter(|m| line_number(line_starts, m.start()) == start)
-            .collect();
-        let end_matches: Vec<_> = ends
-            .iter()
-            .filter(|m| line_number(line_starts, m.start()) == end)
-            .collect();
-        match (start_matches.as_slice(), end_matches.as_slice()) {
-            ([a], [b]) if a.end() <= b.start() => regions.push(Region {
+        match (begins.get(&start), ends.get(&end)) {
+            (Some(Some(a)), Some(Some(b))) if a.end() <= b.start() => regions.push(Region {
                 opening: a.start(),
                 closing_start: b.start(),
                 end: b.end(),
@@ -187,22 +233,29 @@ fn generated_ranges(text: &str, code: &[Span], spans: &mut Vec<Span>) -> Result<
         .find_iter(text)
         .map(|m| (m, true))
         .chain(ocr_end().find_iter(text).map(|m| (m, false)))
-        .filter(|(m, _)| outside(m.start(), code))
+        .filter(|(m, _)| outside(m.start(), code) && outside(m.start(), spans))
         .collect();
     markers.sort_unstable_by_key(|(m, _)| m.start());
     let mut open = None;
+    let mut generated = Vec::new();
     for (m, begin) in markers {
         if begin {
             if open.replace(m.start()).is_some() {
                 return Err(BOUNDARY);
             }
         } else {
-            spans.push(open.take().ok_or(BOUNDARY)?..m.end());
+            let area = open.take().ok_or(BOUNDARY)?..m.end();
+            if overlaps(&area, spans) {
+                return Err(BOUNDARY);
+            }
+            generated.push(area);
         }
     }
     if open.is_some() {
         return Err(UNCLOSED);
     }
+    spans.extend(generated);
+    *spans = merge_spans(std::mem::take(spans));
     Ok(())
 }
 
@@ -238,6 +291,7 @@ fn legacy_generated_ranges(
         }
     }
     spans.extend(legacy);
+    *spans = merge_spans(std::mem::take(spans));
     Ok(())
 }
 
@@ -251,43 +305,36 @@ fn image_ranges(
         .filter(|m| outside(m.start(), code))
         .map(|m| m.range())
         .collect();
-    let tags = html_tags();
-    let captures: Vec<_> = tags.captures_iter(text).collect();
     let mut html_spans = Vec::new();
-    for m in &captures {
+    let mut elements = Vec::<(String, usize)>::new();
+    for m in html_tags().captures_iter(text) {
         let full = m.get(0).expect("tag match");
         html_spans.push(full.range());
-        if m.name("closing").is_some() || !outside(full.start(), code) {
+        if !outside(full.start(), code) {
             continue;
         }
-        match m["tag"].to_ascii_lowercase().as_str() {
-            "picture" | "svg" if full.as_str().ends_with("/>") => spans.push(full.range()),
-            "picture" | "svg" => {
-                let end = captures
-                    .iter()
-                    .filter(|other| {
-                        other.name("closing").is_some()
-                            && other["tag"].eq_ignore_ascii_case(&m["tag"])
-                    })
-                    .filter_map(|other| other.get(0))
-                    .find(|other| other.start() >= full.end())
-                    .map_or(text.len(), |other| other.end());
-                spans.push(full.start()..end);
+        let tag = m["tag"].to_ascii_lowercase();
+        if matches!(tag.as_str(), "picture" | "svg") {
+            if m.name("closing").is_some() {
+                if elements.last().is_some_and(|(name, _)| *name == tag) {
+                    let (_, start) = elements.pop().expect("matching opening");
+                    spans.push(start..full.end());
+                } else {
+                    // A mismatched or absent closer does not prove image scope.
+                    elements.clear();
+                }
+            } else if full.as_str().ends_with("/>") {
+                spans.push(full.range());
+            } else {
+                elements.push((tag, full.start()));
             }
-            "img" | "source" => spans.push(full.range()),
-            _ => {}
+        } else if m.name("closing").is_none() && matches!(tag.as_str(), "img" | "source") {
+            spans.push(full.range());
         }
     }
     let mut labels = HashSet::new();
     for (start, _) in text.match_indices("![") {
-        let escaped = text.as_bytes()[..start]
-            .iter()
-            .rev()
-            .take_while(|&&b| b == b'\\')
-            .count()
-            % 2
-            != 0;
-        if escaped || !outside(start, code) || !outside(start, &html_spans) {
+        if escaped(text, start) || !outside(start, code) || !outside(start, &html_spans) {
             continue;
         }
         let Some(close) = closing(text, start + 1, b'[', b']') else {
@@ -325,7 +372,17 @@ fn image_ranges(
         };
         spans.push(start..end);
     }
-    (spans, labels)
+    (merge_spans(spans), labels)
+}
+
+fn escaped(text: &str, start: usize) -> bool {
+    text.as_bytes()[..start]
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte == b'\\')
+        .count()
+        % 2
+        != 0
 }
 
 fn mask(text: &str, spans: &[Span]) -> String {
@@ -342,20 +399,24 @@ fn mask(text: &str, spans: &[Span]) -> String {
 }
 
 fn caused_by_image(area: Span, content: Span, images: &[Span], code: &[Span]) -> bool {
-    !code
-        .iter()
-        .any(|span| span.start < area.end && area.start < span.end)
+    !overlaps(&area, code)
         && images
-            .iter()
-            .any(|span| content.start <= span.start && span.end <= content.end)
+            .get(images.partition_point(|span| span.start < content.start))
+            .is_some_and(|span| span.end <= content.end)
 }
 
 fn blank_image_links(text: String, images: &[Span], code: &[Span]) -> String {
-    let spans: Vec<_> = rx!(r"\[(\s*)\]\([^\n)]*\)")
+    let spans: Vec<_> = rx!(r"\[(\s*)\]\(")
         .captures_iter(&text)
         .filter_map(|m| {
-            let area = m.get(0)?.range();
+            let prefix = m.get(0)?;
             let content = m.get(1)?.range();
+            let opening = prefix.end() - 1;
+            let end = closing(&text, opening, b'(', b')')?;
+            if !valid_link_target(&text[opening + 1..end], true) || escaped(&text, prefix.start()) {
+                return None;
+            }
+            let area = prefix.start()..end + 1;
             caused_by_image(area.clone(), content, images, code).then_some(area)
         })
         .collect();
@@ -502,36 +563,70 @@ struct Definition<'a> {
 }
 
 fn reference_definitions<'a>(text: &'a str, code: &[Span]) -> Vec<Definition<'a>> {
-    rx!(r"(?m)^ {0,3}\[([^\]\n]+)\]:([^\n]*(?:\n[ \t]+[^\n]*)*)")
+    rx!(r"(?m)^ {0,3}\[([^\]\r\n\x0B\x0C\x1C-\x1E\u{85}\u{2028}\u{2029}]+)\]:[ \t]*")
         .captures_iter(text)
         .filter_map(|entry| {
-            let span = entry.get(0)?.range();
-            let target = entry.get(2)?.as_str();
+            let marker = entry.get(0)?;
             let label = fold_label(&entry[1]);
-            (valid_link_target(target, false)
-                && !label.is_empty()
-                && !code
-                    .iter()
-                    .any(|code| code.start < span.end && span.start < code.end))
-            .then_some(Definition {
+            if label.is_empty() || !outside(marker.start(), code) {
+                return None;
+            }
+            let target_start = marker.end();
+            let target_end = target_start + definition_target_end(&text[target_start..])?;
+            Some(Definition {
                 label,
-                target,
-                span,
+                target: &text[target_start..target_end],
+                span: marker.start()..target_end,
             })
         })
         .collect()
+}
+
+fn definition_target_end(text: &str) -> Option<usize> {
+    let mut lines = source_lines(text, true);
+    let first = lines.next()?;
+    let mut line = first;
+    let mut preceding = 0;
+    if first.trim().is_empty() {
+        line = lines.next()?;
+        if !line.starts_with([' ', '\t']) {
+            return None;
+        }
+        preceding = first.len();
+    }
+    let value = line.trim_end_matches(is_source_line_end);
+    if !valid_link_target(value, false) {
+        return None;
+    }
+    let end = preceding + value.len();
+    // A title can follow on its own continuation line. Additional indented
+    // body lines are not part of the definition.
+    if target_end(value.trim()) == Some(value.trim().len())
+        && let Some(title) = lines.next()
+        && title.starts_with([' ', '\t'])
+        && valid_title(title.trim())
+    {
+        return Some(preceding + line.len() + title.trim_end_matches(is_source_line_end).len());
+    }
+    Some(end)
 }
 
 fn references<'a>(
     text: &'a str,
     code: &'a [Span],
 ) -> impl Iterator<Item = (regex::Captures<'a>, Span, String)> {
-    rx!(r"\[([^\]\n]+)\](?:\[([^\]\n]*)\])?")
+    // Reference binding changes the label spelling; it must not change the
+    // number of source lines represented in the projected document.
+    rx!(r"\[([^\]\r\n\x0B\x0C\x1C-\x1E\u{85}\u{2028}\u{2029}]+)\](?:\[([^\]\r\n\x0B\x0C\x1C-\x1E\u{85}\u{2028}\u{2029}]*)\])?")
         .captures_iter(text)
         .filter_map(move |m| {
             let full = m.get(0)?;
+            let image = full.start().checked_sub(1).is_some_and(|before| {
+                text.as_bytes()[before] == b'!' && !escaped(text, before)
+            });
             if !outside(full.start(), code)
-                || text.as_bytes().get(full.start().wrapping_sub(1)) == Some(&b'!')
+                || escaped(text, full.start())
+                || image
                 || matches!(text.as_bytes().get(full.end()), Some(b'[' | b':' | b'('))
             {
                 return None;
@@ -561,10 +656,15 @@ fn blank_image_definitions(
     (mask(&text, &removed), removed)
 }
 
-fn bind_references(mut text: String) -> String {
-    let code = code_ranges(&text);
+fn bind_references(
+    masked: &str,
+    original: &str,
+    code: &[Span],
+    limit: usize,
+) -> Result<String, &'static str> {
+    const BUDGET: &str = "BODY_REFERENCE_BUDGET_EXCEEDED";
     let mut definitions = HashMap::new();
-    for entry in reference_definitions(&text, &code) {
+    for entry in reference_definitions(masked, code) {
         definitions.entry(entry.label).or_insert_with(|| {
             entry
                 .target
@@ -573,17 +673,45 @@ fn bind_references(mut text: String) -> String {
                 .join(" ")
         });
     }
-    let replacements: Vec<_> = references(&text, &code)
-        .filter_map(|(m, span, label)| {
-            definitions
-                .get(&label)
-                .map(|target| (span, format!("[{}]({target})", &m[1])))
-        })
-        .collect();
-    for (span, value) in replacements.into_iter().rev() {
-        text.replace_range(span, &value);
+    let mut output = String::with_capacity(original.len().min(limit));
+    let append = |output: &mut String, range: Span| {
+        for (pos, ch) in original[range.clone()].char_indices() {
+            let value = if masked.as_bytes()[range.start + pos] == b' ' && ch != ' ' {
+                ' '
+            } else {
+                ch
+            };
+            if value.len_utf8() > limit - output.len() {
+                return Err(BUDGET);
+            }
+            output.push(value);
+        }
+        Ok(())
+    };
+    let mut cursor = 0;
+    for (capture, span, label) in references(masked, code) {
+        let Some(target) = definitions.get(&label) else {
+            continue;
+        };
+        append(&mut output, cursor..span.start)?;
+        let label_span = capture.get(1).expect("matched reference label").range();
+        if label_span
+            .len()
+            .saturating_add(target.len())
+            .saturating_add(4)
+            > limit - output.len()
+        {
+            return Err(BUDGET);
+        }
+        output.push('[');
+        append(&mut output, label_span)?;
+        output.push_str("](");
+        output.push_str(target);
+        output.push(')');
+        cursor = span.end;
     }
-    text
+    append(&mut output, cursor..original.len())?;
+    Ok(output)
 }
 
 pub(super) fn body_view(
@@ -595,10 +723,12 @@ pub(super) fn body_view(
     let lines: Vec<_> = source_lines(&original, true).collect();
     let positions = line_starts(&original);
     let code = code_ranges(&original);
-    let mut spans: Vec<_> = declared_regions(&original, body_scope, &positions)?
-        .into_iter()
-        .map(|region| region.opening..region.end)
-        .collect();
+    let mut spans = merge_spans(
+        declared_regions(&original, body_scope, &positions)?
+            .into_iter()
+            .map(|region| region.opening..region.end)
+            .collect(),
+    );
     generated_ranges(&original, &code, &mut spans)?;
     if explicit_legacy_repair {
         legacy_generated_ranges(&original, &code, &mut spans)?;
@@ -616,17 +746,14 @@ pub(super) fn body_view(
     let masked = blank_image_wrappers(masked, &images, &code);
     let (masked, removed) = blank_image_definitions(masked, &image_labels, definitions, &code);
     spans.extend(removed);
-    // During syntax analysis preserve byte offsets. Restore the character count
-    // for the exposed source text once span offsets are no longer needed.
-    let mut projected = String::with_capacity(masked.len());
-    for (pos, ch) in original.char_indices() {
-        if masked.as_bytes()[pos] == b' ' && ch != ' ' {
-            projected.push(' ');
-        } else {
-            projected.push(ch);
-        }
-    }
-    let projected = bind_references(projected);
+    // Bind in original byte coordinates, then restore the character counts of
+    // masked text while constructing the bounded projected output in one pass.
+    let projected = bind_references(
+        &masked,
+        &original,
+        &code,
+        original.len().max(crate::input::MANIFEST_LIMIT as usize),
+    )?;
     let mut excluded_lines = HashSet::new();
     for span in spans {
         let start = line_number(&positions, span.start) - 1;
@@ -646,7 +773,7 @@ pub(super) fn body_view(
 
 #[cfg(test)]
 mod tests {
-    use super::body_view;
+    use super::{bind_references, body_view, code_ranges};
     use serde_json::{Value, json};
 
     #[test]
@@ -690,5 +817,104 @@ mod tests {
             assert_eq!(view.matches('\u{85}').count(), 1);
             assert!(!view.contains("hidden"));
         }
+    }
+
+    #[test]
+    fn masked_image_does_not_turn_ordinary_reference_into_literal_code() {
+        let body = "![图](chart.png) Read [policy][p].\n\n[p]: /guide";
+        let (view, _) = body_view(body, &Value::Null, false).unwrap();
+        assert!(view.contains("Read [policy](/guide)."));
+    }
+
+    #[test]
+    fn image_only_link_masks_balanced_destination_completely() {
+        let body = "[![chart](chart.png)](reports/2026(final).pdf)\n\nPolicy.";
+        let (view, _) = body_view(body, &Value::Null, false).unwrap();
+        assert!(!view.contains("reports"));
+        assert!(!view.contains(".pdf)"));
+        assert!(view.contains("Policy."));
+    }
+
+    #[test]
+    fn escaped_reference_bracket_remains_literal() {
+        let body = "![chart][fig]\n\n\\[fig]\n\n[fig]: chart.png";
+        let (view, _) = body_view(body, &Value::Null, false).unwrap();
+        assert!(view.contains("\\[fig]"));
+        assert!(!view.contains("chart.png"));
+
+        let ordinary = "\\![fig]\n\n[fig]: chart.png";
+        let (view, _) = body_view(ordinary, &Value::Null, false).unwrap();
+        assert!(view.contains("\\![fig](chart.png)"));
+    }
+
+    #[test]
+    fn reference_definitions_use_only_valid_continuations() {
+        for definition in [
+            "[fig]: chart.png",
+            "[fig]:\n    chart.png\n    \"Annual chart\"",
+        ] {
+            let body = format!("![chart][fig]\n\n{definition}\n    Example code.");
+            let (view, _) = body_view(&body, &Value::Null, false).unwrap();
+            assert!(!view.contains("chart.png"));
+            assert!(view.contains("    Example code."));
+        }
+    }
+
+    #[test]
+    fn reference_binding_preserves_unicode_source_line_boundaries() {
+        let body = "[Read][policy\u{2028}plan]\n\n[policy plan]: /guide\n\nTail.";
+        let (view, _) = body_view(body, &Value::Null, false).unwrap();
+        assert_eq!(view, body);
+    }
+
+    #[test]
+    fn unclosed_or_nested_image_elements_are_scoped_by_confirmed_closers() {
+        let body = "<svg><text>Outer diagram</text><svg><text>Nested diagram</text></svg><text>Outer caption</text></svg>\n\nPolicy.";
+        let (view, _) = body_view(body, &Value::Null, false).unwrap();
+        assert!(!view.contains("Outer caption"));
+        assert!(view.contains("Policy."));
+
+        let body = "<picture>\n\nPolicy.\n\n~~~html\n</picture>\n~~~\n";
+        let (view, _) = body_view(body, &Value::Null, false).unwrap();
+        assert!(view.contains("Policy."));
+        assert!(view.contains("</picture>"));
+    }
+
+    #[test]
+    fn block_code_delimiters_do_not_pair_with_prose_backticks() {
+        let body = "~~~text\n`\n~~~\n\n<!-- mdocr:ocr-begin -->\nGenerated text.\n<!-- mdocr:ocr-end -->\n\nPolicy ` noted.";
+        let (view, _) = body_view(body, &Value::Null, false).unwrap();
+        assert!(!view.contains("Generated text."));
+        assert!(view.contains("Policy ` noted."));
+        let prose = "Example `![literal](diagram.png)\ncontinued` text.";
+        let (view, _) = body_view(prose, &Value::Null, false).unwrap();
+        assert_eq!(view, prose);
+    }
+
+    #[test]
+    fn reference_output_limit_is_checked_before_expansion() {
+        let text = "[Help][guide]\n\n[guide]: /team/long/path\n";
+        let code = code_ranges(text);
+        assert_eq!(
+            bind_references(text, text, &code, text.len()).unwrap_err(),
+            "BODY_REFERENCE_BUDGET_EXCEEDED"
+        );
+        assert!(
+            bind_references(text, text, &code, 100)
+                .unwrap()
+                .contains("[Help](/team/long/path)")
+        );
+    }
+
+    #[test]
+    fn declared_region_owns_both_of_its_markers() {
+        let body = "    <!-- mdocr:ocr-begin -->\n    generated\n<!-- mdocr:ocr-end -->\n\nPolicy.";
+        let declaration = json!({
+            "version":"generated-regions-v1",
+            "regions":[{"kind":"mdocr_ocr","start_line":1,"end_line":3}],
+        });
+        let (view, _) = body_view(body, &declaration, false).unwrap();
+        assert!(!view.contains("generated"));
+        assert!(view.contains("Policy."));
     }
 }

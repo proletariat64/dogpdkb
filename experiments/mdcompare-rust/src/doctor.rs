@@ -196,20 +196,14 @@ pub(crate) fn run(config: Option<&Path>, progress: &Progress) -> Outcome {
         .iter()
         .filter(|check| check["status"] == "failed")
         .count();
-    let warnings = checks
-        .iter()
-        .filter(|check| check["status"] == "warning")
-        .count();
     let skipped = checks
         .iter()
         .filter(|check| check["status"] == "skipped")
         .count();
-    let reason = ["failed", "warning"].into_iter().find_map(|status| {
-        checks
-            .iter()
-            .find(|check| check["status"] == status)
-            .and_then(|check| check["reason_code"].as_str())
-    });
+    let reason = checks
+        .iter()
+        .find(|check| check["status"] == "failed")
+        .and_then(|check| check["reason_code"].as_str());
     let status = if inference == "passed" {
         "online"
     } else if inference == "failed" {
@@ -222,15 +216,13 @@ pub(crate) fn run(config: Option<&Path>, progress: &Progress) -> Outcome {
         } else {
             "not_configured"
         }
-    } else if warnings > 0 {
-        "refresh_required"
     } else {
         "local_prerequisites_passed"
     };
     let mut summary = Summary::new("doctor", if failed == 0 { "complete" } else { "partial" })
         .count("checks", checks.len() - skipped)
         .count("failed", failed)
-        .count("warnings", warnings)
+        .count("warnings", 0)
         .count("skipped", skipped)
         .count("probe_attempts", usize::from(probe.is_some()));
     if let Some(reason) = reason {
