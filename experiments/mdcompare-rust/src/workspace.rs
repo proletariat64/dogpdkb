@@ -102,11 +102,17 @@ pub struct FrozenPlan {
     source_sha256: String,
     pub work: WorkPlan,
     pub settings: CompareSettings,
-    pub inputs: BTreeMap<PathBuf, InputWitness>,
-    pub presence: BTreeMap<PathBuf, bool>,
+    inputs: BTreeMap<PathBuf, InputWitness>,
+    presence: BTreeMap<PathBuf, bool>,
     // A work plan and body-recovery declaration share the work-plan limit.
     manifest_inputs: BTreeSet<PathBuf>,
-    pub(crate) path_targets: BTreeMap<PathBuf, PathBuf>,
+    path_targets: BTreeMap<PathBuf, PathBuf>,
+}
+
+pub(crate) struct Snapshots {
+    pub baseline: BTreeMap<Identity, Document>,
+    pub incoming: BTreeMap<Identity, Document>,
+    pub order: Vec<Identity>,
 }
 
 impl FrozenPlan {
@@ -143,6 +149,57 @@ impl FrozenPlan {
                 )
             })
             .collect()
+    }
+
+    pub fn snapshots(&self) -> Result<Snapshots> {
+        let (mut old, mut new) = (BTreeMap::<Identity, Document>::new(), BTreeMap::new());
+        let mut order = Vec::new();
+        for (baseline, incoming) in self.documents() {
+            let identity = incoming
+                .as_ref()
+                .or(baseline.as_ref())
+                .context("binding_invalid")?
+                .identity
+                .clone();
+            order.push(identity.clone());
+            if let Some(doc) = baseline {
+                old.insert(identity.clone(), doc);
+            }
+            if let Some(doc) = incoming {
+                new.insert(identity, doc);
+            }
+        }
+
+        Ok(Snapshots {
+            baseline: old,
+            incoming: new,
+            order,
+        })
+    }
+
+    /// Frozen input paths used by output isolation checks.
+    pub fn input_paths(&self) -> impl Iterator<Item = &Path> {
+        self.inputs.keys().map(PathBuf::as_path)
+    }
+
+    /// Build a reader bound to this exact frozen set of witnesses.
+    pub fn reader(&self) -> input::Reader {
+        input::Reader::new_frozen(
+            self.settings.compare.max_file_bytes,
+            &self.inputs,
+            &self.presence,
+            &self.path_targets,
+        )
+    }
+
+    /// Check both reads observed during comparison and all frozen inputs,
+    /// including ones not opened by the chosen comparison operation.
+    pub fn verify_reads(&self, reader: &input::Reader) -> Result<()> {
+        ensure!(
+            !reader.drifted() && reader.changed_paths().is_empty(),
+            "input_drift"
+        );
+        self.verify_inputs()
     }
 
     pub fn verify_inputs(&self) -> Result<()> {
@@ -963,6 +1020,34 @@ pub fn verify_commit(workspace: &Workspace) -> Result<Option<Commit>> {
         comparison_sha256: checksum(&bytes),
         artifacts: record.artifacts,
     }))
+}
+
+/// Install the staged comparison generation, then publish its durable marker.
+pub fn publish_generation(
+    workspace: &Workspace,
+    frozen: &FrozenPlan,
+    stage: &Path,
+    artifacts: &[&str],
+) -> Result<Commit> {
+    for name in artifacts
+        .iter()
+        .copied()
+        .chain(matches!(frozen.work.operation, Operation::Semantic).then_some("evidence"))
+    {
+        let destination = workspace.root.join(name);
+        if let Ok(prior) = fs::symlink_metadata(&destination) {
+            // A previous interrupted run may have placed files before it wrote its commit.
+            if name == "evidence" {
+                ensure!(prior.is_dir(), "publish_failed");
+                fs::rename(&destination, stage.join("abandoned-evidence"))
+                    .context("publish_failed")?;
+            } else {
+                ensure!(prior.is_file() && prior.nlink() == 1, "publish_failed");
+            }
+        }
+        fs::rename(stage.join(name), destination).context("publish_failed")?;
+    }
+    publish_commit(workspace, frozen.digest(), artifacts)
 }
 
 pub fn publish_commit(

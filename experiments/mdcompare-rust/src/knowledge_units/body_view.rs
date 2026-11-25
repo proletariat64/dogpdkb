@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
+use crate::markdown_syntax::{attributes, escaped, fold_label, html_tags, inline_code, overlaps};
 use regex::Regex;
 use serde_json::Value;
-use unicode_casefold::UnicodeCaseFold;
 
-use super::formatting::{attributes, cosmetic_attrs, html_tags};
+use super::formatting::cosmetic_attrs;
 use super::{fence, fence_end, is_indented, is_source_line_end, source_lines};
 
 type Span = Range<usize>;
@@ -46,12 +46,6 @@ pub(super) fn outside(position: usize, spans: &[Span]) -> bool {
         .is_some_and(|span| span.contains(&position))
 }
 
-fn overlaps(area: &Span, spans: &[Span]) -> bool {
-    spans
-        .get(spans.partition_point(|span| span.end <= area.start))
-        .is_some_and(|span| span.start < area.end)
-}
-
 fn merge_spans(mut spans: Vec<Span>) -> Vec<Span> {
     spans.sort_unstable_by_key(|span| span.start);
     let mut merged: Vec<Span> = Vec::new();
@@ -65,27 +59,6 @@ fn merge_spans(mut spans: Vec<Span>) -> Vec<Span> {
         }
     }
     merged
-}
-
-pub(super) fn inline_code(text: &str, multiline: bool) -> Vec<Span> {
-    let mut runs: Vec<_> = rx!(r"`+").find_iter(text).map(|m| (m, None)).collect();
-    let mut following = HashMap::new();
-    for (index, (run, next)) in runs.iter_mut().enumerate().rev() {
-        *next = following.insert(run.len(), index);
-    }
-    let mut pairs = Vec::new();
-    let mut index = 0;
-    while let Some((start, next)) = runs.get(index) {
-        index += 1;
-        if let Some(next) = *next {
-            let (end, _) = runs[next];
-            if multiline || !text[start.end()..end.start()].contains('\n') {
-                pairs.push(start.start()..end.end());
-                index = next + 1;
-            }
-        }
-    }
-    pairs
 }
 
 fn code_ranges(text: &str) -> Vec<Span> {
@@ -375,16 +348,6 @@ fn image_ranges(
     (merge_spans(spans), labels)
 }
 
-fn escaped(text: &str, start: usize) -> bool {
-    text.as_bytes()[..start]
-        .iter()
-        .rev()
-        .take_while(|&&byte| byte == b'\\')
-        .count()
-        % 2
-        != 0
-}
-
 fn mask(text: &str, spans: &[Span]) -> String {
     let mut bytes = text.as_bytes().to_vec();
     for span in spans {
@@ -545,15 +508,6 @@ fn valid_link_target(text: &str, allow_empty: bool) -> bool {
     };
     let suffix = &text[end..];
     suffix.is_empty() || (suffix.starts_with(char::is_whitespace) && valid_title(suffix.trim()))
-}
-
-fn fold_label(label: &str) -> String {
-    label
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .case_fold()
-        .collect()
 }
 
 struct Definition<'a> {

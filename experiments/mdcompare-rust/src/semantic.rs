@@ -1,249 +1,20 @@
-use crate::{offline::Snapshots, summary::Progress};
-use std::borrow::Cow;
+use crate::{summary::Progress, workspace::Snapshots};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::{Path, PathBuf, absolute};
+use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
-use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::input::{Document, Identity, MANIFEST_LIMIT, Reader, json_bytes, parse_utf8_json};
-use crate::knowledge::extract_document_body;
-use crate::knowledge_units::{
-    Alignment, Unit, align_units, declared_marker_positions, is_source_line_end, source_lines,
+use crate::authored_body::{
+    BodyProjection, Recovery, RecoveryRecord, Side, load_recovery, source_evidence,
 };
+use crate::input::{Document, Identity, Reader, json_bytes};
+use crate::knowledge_units::{Alignment, Unit, align_units};
 use crate::text::Options;
-
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-enum Side {
-    Baseline,
-    Incoming,
-}
-
-impl Side {
-    fn parse(value: &Value) -> Option<Self> {
-        match value.as_str()? {
-            "baseline" => Some(Self::Baseline),
-            "incoming" => Some(Self::Incoming),
-            _ => None,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Baseline => "baseline",
-            Self::Incoming => "incoming",
-        }
-    }
-
-    fn unit_field(self) -> &'static str {
-        match self {
-            Self::Baseline => "old_units",
-            Self::Incoming => "new_units",
-        }
-    }
-}
-
-struct Record {
-    source_copy: PathBuf,
-    insertions: Vec<Value>,
-}
-
-type Recovery = HashMap<(Identity, Side), Record>;
-
-fn load_recovery(path: Option<&Path>, reader: &mut Reader) -> Result<Recovery> {
-    const INVALID: &str = "RECOVERY_MANIFEST_INVALID";
-    let Some(path) = path else {
-        return Ok(Recovery::new());
-    };
-    let bytes = reader
-        .read_with_limit(path, MANIFEST_LIMIT)
-        .map_err(|_| anyhow::anyhow!(INVALID))?;
-    let value = parse_utf8_json(&bytes).map_err(|_| anyhow::anyhow!(INVALID))?;
-    ensure!(
-        value["schema_version"] == "mdcompare-body-recovery-1",
-        INVALID
-    );
-    let root = path.parent().context(INVALID)?;
-    let mut recovery = Recovery::new();
-    for row in value["documents"].as_array().context(INVALID)? {
-        let field = |key| {
-            row[key]
-                .as_str()
-                .filter(|value| !value.is_empty())
-                .context(INVALID)
-        };
-        let side = Side::parse(&row["side"]).context(INVALID)?;
-        let identity = Identity {
-            knowledge_base: field("knowledge_base")?.to_owned(),
-            document_id: field("document_id")?.to_owned(),
-        };
-        let record = Record {
-            source_copy: root.join(field("source_copy")?),
-            insertions: row["insertions"].as_array().context(INVALID)?.clone(),
-        };
-        ensure!(recovery.insert((identity, side), record).is_none(), INVALID);
-    }
-    Ok(recovery)
-}
-
-#[derive(Serialize)]
-struct Repair<'a> {
-    byte_offset: usize,
-    text: &'a str,
-    source_line: usize,
-}
-
-fn line_offsets(text: &str) -> Vec<usize> {
-    std::iter::once(0)
-        .chain(source_lines(text, true).scan(0, |offset, line| {
-            *offset += line.len();
-            Some(*offset)
-        }))
-        .collect()
-}
-
-fn legacy_closer(line: &str) -> bool {
-    matches!(line, "> 转写说明：" | "> **转写说明：**" | "-->")
-}
-
-fn repair<'a>(
-    original: &str,
-    record: Option<&'a Record>,
-    reader: &mut Reader,
-) -> std::result::Result<(String, Vec<Repair<'a>>), &'static str> {
-    const INVALID: &str = "RECOVERY_INSERTION_INVALID";
-    let Some(record) = record else {
-        return Ok((original.to_owned(), Vec::new()));
-    };
-    if reader.read(&record.source_copy)? != original.as_bytes() {
-        return Err("RECOVERY_SOURCE_DRIFT");
-    }
-    let mut offsets = line_offsets(original);
-    if !original.is_empty() && !original.ends_with(is_source_line_end) {
-        offsets.pop();
-    }
-    let mut repairs = Vec::new();
-    let mut previous = 0;
-    for entry in &record.insertions {
-        let byte_offset = entry["byte_offset"]
-            .as_u64()
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or(INVALID)?;
-        let text = entry["text"]
-            .as_str()
-            .filter(|text| text.ends_with('\n'))
-            .ok_or(INVALID)?;
-        if byte_offset < previous
-            || !original.is_char_boundary(byte_offset)
-            || !source_lines(text, false).all(|line| {
-                matches!(
-                    line,
-                    "" | "<!-- mdocr:ocr-begin -->" | "<!-- mdocr:ocr-end -->"
-                ) || legacy_closer(line)
-            })
-        {
-            return Err(INVALID);
-        }
-        previous = byte_offset;
-        let source_line = offsets.partition_point(|&offset| offset <= byte_offset);
-        repairs.push(Repair {
-            byte_offset,
-            text,
-            source_line,
-        });
-    }
-    let mut projected = String::new();
-    let mut position = 0;
-    for repair in &repairs {
-        projected.push_str(&original[position..repair.byte_offset]);
-        projected.push_str(repair.text);
-        position = repair.byte_offset;
-    }
-    projected.push_str(&original[position..]);
-    Ok((projected, repairs))
-}
-
-fn project_declared_scope<'a>(
-    original: &str,
-    projected: &str,
-    repairs: &[Repair<'_>],
-    scope: &'a Value,
-) -> std::result::Result<Cow<'a, Value>, &'static str> {
-    if repairs.is_empty() || scope.is_null() {
-        return Ok(Cow::Borrowed(scope));
-    }
-    let markers = declared_marker_positions(original, scope)?;
-    if markers.is_empty() {
-        return Ok(Cow::Borrowed(scope));
-    }
-    let mut inserted = 0;
-    let shifts: Vec<_> = repairs
-        .iter()
-        .map(|repair| {
-            inserted += repair.text.len();
-            (repair.byte_offset, inserted)
-        })
-        .collect();
-    let offsets = line_offsets(projected);
-    let locate = |marker| {
-        let count = shifts.partition_point(|&(offset, _)| offset <= marker);
-        let shift = count.checked_sub(1).map_or(0, |index| shifts[index].1);
-        offsets.partition_point(|&offset| offset <= marker + shift)
-    };
-    let mut projection = scope.clone();
-    let regions = projection["regions"]
-        .as_array_mut()
-        .expect("validated scope");
-    for (region, (opening, closing)) in regions.iter_mut().zip(markers) {
-        region["start_line"] = json!(locate(opening));
-        region["end_line"] = json!(locate(closing));
-    }
-    Ok(Cow::Owned(projection))
-}
-
-fn coordinate_map(original: &str, projected: &str, repairs: &[Repair<'_>]) -> Vec<usize> {
-    let original_offsets = line_offsets(original);
-    let mut inserted = 0;
-    let mut inserts = repairs.iter().peekable();
-    line_offsets(projected)
-        .into_iter()
-        .map(|position| {
-            let mut source = position - inserted;
-            while let Some(next) = inserts.peek() {
-                let start = next.byte_offset + inserted;
-                if position < start {
-                    break;
-                }
-                if position < start + next.text.len() {
-                    source = next.byte_offset;
-                    break;
-                }
-                inserted += next.text.len();
-                inserts.next();
-                source = position - inserted;
-            }
-            original_offsets
-                .partition_point(|&offset| offset <= source)
-                .min(original_offsets.len().saturating_sub(1).max(1))
-        })
-        .collect()
-}
-
-fn unit_evidence(unit: &Unit, coordinates: Option<&[usize]>) -> Value {
-    let mut evidence = json!(unit);
-    if let Some(coordinates) = coordinates {
-        evidence["projected_start_line"] = json!(unit.start_line);
-        evidence["projected_end_line"] = json!(unit.end_line);
-        evidence["start_line"] = json!(coordinates[unit.start_line - 1]);
-        evidence["end_line"] = json!(coordinates[unit.end_line - 1]);
-    }
-    evidence
-}
 
 fn sequence(units: &[Unit]) -> (Vec<&Unit>, Vec<usize>) {
     units
@@ -348,43 +119,25 @@ fn changes(
     operations
 }
 
-fn source(document: Option<&Document>) -> Result<Value> {
-    document.map_or(Ok(Value::Null), |doc| {
-        Ok(json!({
-            "path": absolute(&doc.path)?,
-            "content_kind": doc.content_kind(),
-            "metadata": doc.metadata,
-            "version": doc.raw["provenance"]["version"],
-        }))
-    })
-}
-
 fn load_side(
     doc: &Document,
     side: Side,
-    record: Option<&Record>,
+    record: Option<&RecoveryRecord>,
     reader: &mut Reader,
     evidence: &mut Value,
-) -> std::result::Result<Vec<Unit>, &'static str> {
-    let original = reader.read(&doc.path)?;
-    let original = std::str::from_utf8(&original).map_err(|_| "TEXT_ENCODING_UNSUPPORTED")?;
-    let (projected, repairs) = repair(original, record, reader)?;
-    evidence["recovery"].as_array_mut().expect("recovery evidence").extend(repairs.iter().map(|item| json!({
-        "side": side.label(), "byte_offset": item.byte_offset, "text": item.text, "source_line": item.source_line,
-    })));
-    let scope = project_declared_scope(original, &projected, &repairs, &doc.raw["body_scope"])?;
-    let explicit_legacy_repair = repairs
-        .iter()
-        .any(|repair| source_lines(repair.text, false).any(legacy_closer));
-    let units = extract_document_body(doc, &projected, &scope, explicit_legacy_repair)?;
-    let coordinates = (!repairs.is_empty()).then(|| coordinate_map(original, &projected, &repairs));
-    evidence[side.unit_field()] = json!(
-        units
-            .iter()
-            .map(|unit| unit_evidence(unit, coordinates.as_deref()))
-            .collect::<Vec<_>>()
-    );
-    Ok(units)
+) -> Result<Vec<Unit>, &'static str> {
+    let projection = BodyProjection::read(doc, record, reader)?;
+    evidence["recovery"]
+        .as_array_mut()
+        .expect("recovery evidence")
+        .extend(projection.recovery_evidence(side));
+    let units = projection.extract()?;
+    let field = match side {
+        Side::Baseline => "old_units",
+        Side::Incoming => "new_units",
+    };
+    evidence[field] = json!(units.evidence());
+    Ok(units.into_units())
 }
 
 fn document(
@@ -400,7 +153,7 @@ fn document(
     let mut evidence = json!({
         "schema_version":"mdcompare-diff-evidence-1",
         "knowledge_base": identity.knowledge_base, "document_id": identity.document_id,
-        "source_inputs": {"baseline":source(old)?, "incoming":source(Some(new))?},
+        "source_inputs": {"baseline":source_evidence(old)?, "incoming":source_evidence(Some(new))?},
         "old_units": [], "new_units": [], "changes": [], "recovery": [],
     });
     reader.begin_document();

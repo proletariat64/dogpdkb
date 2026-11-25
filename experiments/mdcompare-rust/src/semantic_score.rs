@@ -1,8 +1,8 @@
 use crate::{
     config::{Config, Scope, ScoreConfig},
-    provider::{self, Connection, FORMAT, PROMPT},
+    provider::{FORMAT, PROMPT, Provider},
     score_context::{self, Packet},
-    semantic_route,
+    semantic_generation,
     summary::{Outcome, Progress},
     workspace::{self, Workspace, checksum as digest},
 };
@@ -120,18 +120,12 @@ fn read<T: DeserializeOwned>(path: &Path) -> Result<(T, String)> {
 
 fn comparison(comparison: &Path, sha: &str) -> Result<(PathBuf, BTreeMap<Identity, Binding>)> {
     let workspace = Workspace::locate(comparison).context("binding_invalid")?;
-    let generation = semantic_route::load(&workspace)?;
+    let generation = semantic_generation::load(&workspace)?;
     ensure!(generation.comparison_sha256 == sha, "binding_invalid");
     let bindings = generation
-        .results
-        .iter()
-        .filter(|row| semantic_route::eligible(row))
-        .map(|row| {
-            let (knowledge_base, document_id) = semantic_route::identity(row)?;
-            let raw = generation
-                .bindings
-                .get(&(knowledge_base.clone(), document_id.clone()))
-                .context("binding_invalid")?;
+        .score_candidates()?
+        .into_iter()
+        .map(|((knowledge_base, document_id), raw)| {
             let identity = Identity {
                 knowledge_base,
                 document_id,
@@ -165,15 +159,6 @@ fn work(workspace: &Workspace) -> Result<ScoreWork> {
     Ok(work)
 }
 
-fn settings(config: &ScoreConfig) -> Connection {
-    Connection {
-        oauth_file: config.oauth_file.clone(),
-        proxy: config.proxy.clone(),
-        ca_file: config.ca_file.clone(),
-        endpoint: config.endpoint.clone(),
-    }
-}
-
 fn score_config(workspace: &Workspace, explicit: Option<&Path>) -> Result<Config> {
     let config =
         Config::load(Some(&workspace.source), explicit, Scope::Score).context("invalid_config")?;
@@ -200,9 +185,7 @@ fn protect_score_destinations(
 ) -> Result<()> {
     let plan = workspace::load_frozen(comparison)?;
     let protected = || {
-        plan.inputs
-            .keys()
-            .map(PathBuf::as_path)
+        plan.input_paths()
             .chain([
                 workspace.source.as_path(),
                 comparison.root.as_path(),
@@ -371,9 +354,7 @@ impl Task {
         crate::input::check_output(
             oauth,
             pair_plan
-                .inputs
-                .keys()
-                .map(PathBuf::as_path)
+                .input_paths()
                 .chain([
                     pair.root.as_path(),
                     pair.source.as_path(),
@@ -420,7 +401,7 @@ fn prepare_packet(
 
 fn run_pending(task: &Task, directory: &Path, progress: &Progress) -> Result<()> {
     let config = &task.frozen.config;
-    let connection = settings(config);
+    let provider = Provider::new(config);
     let (sent, finished) = mpsc::channel();
     let known = task.journal().known_documents()?;
     let mut remaining = task
@@ -475,14 +456,9 @@ fn run_pending(task: &Task, directory: &Path, progress: &Progress) -> Result<()>
                             },
                         ) = packet.take().context("binding_invalid")?;
                         let sent = sent.clone();
-                        let connection = &connection;
+                        let provider = &provider;
                         scope.spawn(move || {
-                            let outcome = provider::assess_with_connection(
-                                &config.model,
-                                &config.effort,
-                                &evidence,
-                                connection,
-                            );
+                            let outcome = provider.assess(&evidence);
                             let _ = sent.send((sequence, operations, outcome));
                         });
                         continue;
@@ -495,12 +471,7 @@ fn run_pending(task: &Task, directory: &Path, progress: &Progress) -> Result<()>
                                 // Only load scoring prerequisites for a sendable packet.
                                 if !checked {
                                     task.protect_oauth_file()?;
-                                    provider::check_oauth_settings(
-                                        &config.model,
-                                        &config.effort,
-                                        &connection,
-                                    )
-                                    .map_err(|reason| {
+                                    provider.score_preflight().map_err(|reason| {
                                         anyhow::anyhow!("invalid_config: {reason}")
                                     })?;
                                     checked = true;

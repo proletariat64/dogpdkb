@@ -3,7 +3,6 @@ use serde_json::{Value, json};
 use crate::knowledge_units::source_lines;
 
 pub struct Options {
-    pub file_bytes: u64,
     pub normalize: bool,
     pub evidence: bool,
     pub work: usize,

@@ -1,72 +1,22 @@
-use crate::{offline::Snapshots, summary::Progress};
+use crate::{summary::Progress, workspace::Snapshots};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
 use serde_json::{Value, json};
 
+use crate::authored_body::{BodyProjection, unit_reference};
 use crate::input::{Document, Identity, Reader};
-use crate::knowledge_units::{
-    KINDS, Unit, align_units, extract_units, prose_key, source_lines, table_key,
-};
+use crate::knowledge_units::{KINDS, Unit, align_units, prose_key, table_key};
 use crate::text::Options;
 
 const STATUSES: [&str; 5] = ["REUSE", "DELTA", "REVIEW", "NO_BODY", "UNKNOWN"];
 const GRAPHIFY_ACTIONS: [&str; 3] = ["KEEP_EXISTING", "HOLD_EXISTING", "BODY_DELTA_CANDIDATE"];
 
-pub fn extract_document_units(document: &Document, text: &str) -> Result<Vec<Unit>, &'static str> {
-    extract_document_body(document, text, &document.raw["body_scope"], false)
-}
-
-pub(crate) fn extract_document_body(
-    document: &Document,
-    text: &str,
-    body_scope: &Value,
-    explicit_legacy_repair: bool,
-) -> Result<Vec<Unit>, &'static str> {
-    let name = document.metadata["name"].as_str().unwrap_or_default();
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let mut lines = source_lines(&normalized, true);
-    let mut header = None;
-    if let (Some(title), Some(origin)) = (lines.next(), lines.next()) {
-        let origin_text = origin.trim_end_matches('\n');
-        let origin_prefix = format!("doc_id: {} · book: ", document.identity.document_id);
-        static EXPORTER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-            regex::Regex::new(r"^.+ \(book_id [0-9]+\) · word_count: [0-9]+$").unwrap()
-        });
-        if !name.is_empty()
-            && title.trim_end_matches('\n').strip_prefix("# ") == Some(name)
-            && origin_text
-                .strip_prefix(&origin_prefix)
-                .is_some_and(|rest| EXPORTER.is_match(rest))
-        {
-            header = Some((title.len(), title.len() + origin_text.len()));
-        }
-    }
-    drop(lines);
-    let mut normalized = normalized;
-    if let Some((start, end)) = header {
-        normalized.replace_range(start..end, "");
-    }
-    let mut units = extract_units(&normalized, body_scope, explicit_legacy_repair)?;
-    if let Some((title, rest)) = units
-        .split_first_mut()
-        .filter(|(title, _)| title.kind == "heading" && title.start_line == 1 && title.text == name)
-    {
-        title.exporter_title = header.is_some();
-        for unit in rest {
-            if unit.context.first() == Some(&title.key) {
-                unit.context.remove(0);
-            }
-        }
-    }
-    Ok(units)
-}
-
 fn read_units(document: &Document, reader: &mut Reader) -> Result<Vec<Unit>, &'static str> {
     reader.begin_document();
-    let data = reader.read(&document.path)?;
-    let text = std::str::from_utf8(&data).map_err(|_| "TEXT_ENCODING_UNSUPPORTED")?;
-    extract_document_units(document, text)
+    Ok(BodyProjection::read(document, None, reader)?
+        .extract()?
+        .into_units())
 }
 
 fn rich_layout_key(unit: &Unit) -> Option<String> {
@@ -113,13 +63,6 @@ fn identity_json(identity: &Identity) -> Value {
 fn error(document: &Document, side: &str, reason: &str) -> Value {
     json!({"knowledge_base": document.identity.knowledge_base, "document_id": document.identity.document_id,
         "side":side,"reason_code":reason})
-}
-
-fn reference(document: &Document, unit: &Unit) -> Value {
-    json!({
-        "knowledge_base": document.identity.knowledge_base, "document_id": document.identity.document_id,
-        "start_line": unit.start_line, "end_line": unit.end_line,
-    })
 }
 
 type IndexKey = (String, String, String, &'static str, Vec<String>, String);
@@ -323,13 +266,13 @@ fn document_row<'a>(
             "body_context_changed": body_context_changed,
             "new_body_chars": after.map_or(0, |unit| unit.text.chars().count()),
             "body_seen_before": seen.is_some(),
-            "existing_body": old.zip(seen).map(|(doc, unit)| reference(doc, unit)),
+            "existing_body": old.zip(seen).map(|(doc, unit)| unit_reference(doc, unit)),
             "presentation_seen_before": layout_match.is_some(),
-            "existing_presentation_body": old.zip(layout_match).map(|(doc, unit)| reference(doc, unit)),
+            "existing_presentation_body": old.zip(layout_match).map(|(doc, unit)| unit_reference(doc, unit)),
             "basis": basis, "similarity": similarity,
-            "old": source.zip(before).map(|(doc, unit)| reference(doc, unit)),
+            "old": source.zip(before).map(|(doc, unit)| unit_reference(doc, unit)),
             "old_side": before.map(|_| source_side),
-            "new": after.map(|unit| reference(document, unit)),
+            "new": after.map(|unit| unit_reference(document, unit)),
         });
         if options.evidence {
             let mut evidence = json!({});

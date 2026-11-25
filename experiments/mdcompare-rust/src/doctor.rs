@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use crate::{
     config::{Config, Scope},
-    provider,
+    provider::{OAuthReadiness, Provider},
     summary::{Outcome, Progress, Summary},
 };
 
@@ -41,14 +41,10 @@ pub(crate) fn run(config: Option<&Path>, progress: &Progress) -> Outcome {
     };
 
     let score = settings.score;
-    let connection = provider::Connection {
-        oauth_file: score.oauth_file,
-        proxy: score.proxy,
-        ca_file: score.ca_file,
-        endpoint: score.endpoint,
-    };
-    let backend = provider::check_model(&score.model, &score.effort);
-    let transport = provider::check_transport_settings(&connection);
+    let provider = Provider::new(&score);
+    let readiness = provider.diagnostics();
+    let backend = readiness.backend;
+    let transport = readiness.transport;
     let mut checks = vec![check("config", "passed", None, None)];
     checks.push(match backend {
         Ok(_) => check("llm_model", "passed", None, None),
@@ -68,60 +64,40 @@ pub(crate) fn run(config: Option<&Path>, progress: &Progress) -> Outcome {
         })),
     });
 
-    let scoring_enabled = score.request_budget.is_some_and(|budget| budget > 0);
-    let oauth = if connection.endpoint.is_some() {
-        check("llm_oauth", "skipped", Some("local_test_endpoint"), None)
-    } else if connection.oauth_file.is_none() && !scoring_enabled {
-        check(
+    let scoring_enabled = readiness.scoring_enabled;
+    checks.push(match readiness.oauth {
+        OAuthReadiness::Passed => check("llm_oauth", "passed", None, None),
+        OAuthReadiness::Skipped(code) => check(
             "llm_oauth",
             "skipped",
-            Some("oauth_not_configured"),
-            Some("Set [score].oauth_file to a local OAuth credentials file to check it."),
-        )
-    } else if backend.is_err() {
-        check("llm_oauth", "skipped", Some("unsupported_model"), None)
-    } else {
-        match provider::check_saved_oauth(&score.model, &score.effort, &connection) {
-            Ok(false) => check("llm_oauth", "passed", None, None),
-            Ok(true) => check(
-                "llm_oauth",
-                "failed",
-                Some("oauth_expired"),
-                Some("Refresh the saved OAuth credential before checking the model."),
-            ),
-            Err(code) => check(
-                "llm_oauth",
-                "failed",
-                Some(code),
-                Some(match code {
-                    "oauth_file_unreadable" => {
-                        "Check the path and permissions of [score].oauth_file."
-                    }
-                    "oauth_file_invalid" => "Use a valid OAuth credentials JSON file.",
-                    "oauth_provider_missing" => {
-                        "Log in to the configured provider and set [score].oauth_file to its credential file."
-                    }
-                    "oauth_credential_invalid" => {
-                        "Log in again to replace the invalid credential for this provider."
-                    }
-                    _ => "Set [score].oauth_file to a readable OAuth credentials file.",
-                }),
-            ),
-        }
-    };
-    checks.push(oauth);
-    let skip = if score.request_budget == Some(0) {
-        Some("request_budget_zero")
-    } else if checks.iter().any(|check| check["status"] == "failed") {
-        Some("prerequisites_failed")
-    } else if connection.endpoint.is_none() && connection.oauth_file.is_none() {
-        Some("oauth_not_configured")
-    } else {
-        None
-    };
+            Some(code),
+            (code == "oauth_not_configured")
+                .then_some("Set [score].oauth_file to a local OAuth credentials file to check it."),
+        ),
+        OAuthReadiness::Failed(code) => check(
+            "llm_oauth",
+            "failed",
+            Some(code),
+            Some(match code {
+                "oauth_expired" => "Refresh the saved OAuth credential before checking the model.",
+                "oauth_file_unreadable" => {
+                    "Check the path and permissions of [score].oauth_file."
+                }
+                "oauth_file_invalid" => "Use a valid OAuth credentials JSON file.",
+                "oauth_provider_missing" => {
+                    "Log in to the configured provider and set [score].oauth_file to its credential file."
+                }
+                "oauth_credential_invalid" => {
+                    "Log in again to replace the invalid credential for this provider."
+                }
+                _ => "Set [score].oauth_file to a readable OAuth credentials file.",
+            }),
+        ),
+    });
+    let skip = readiness.probe_skip;
     let probe = skip.is_none().then(|| {
         progress.update("probe", 0, 0, 1, 1);
-        let outcome = provider::probe(&score.model, &score.effort, &connection);
+        let outcome = provider.probe();
         progress.update("probe", 0, 0, 1, 0);
         outcome
     });
@@ -144,7 +120,7 @@ pub(crate) fn run(config: Option<&Path>, progress: &Progress) -> Outcome {
             "failed",
             Some(reason),
             Some(match reason {
-                "oauth_rejected" if connection.endpoint.is_some() => {
+                "oauth_rejected" if score.endpoint.is_some() => {
                     "Check the local test endpoint. The probe sends no credentials to it."
                 }
                 "oauth_rejected" => "Log in again to the configured provider.",
@@ -177,7 +153,7 @@ pub(crate) fn run(config: Option<&Path>, progress: &Progress) -> Outcome {
         (_, Some("provider_unreachable")) => "unreachable",
         _ => "not_checked",
     };
-    let oauth_remote_status = if connection.endpoint.is_some() {
+    let oauth_remote_status = if score.endpoint.is_some() {
         "not_applicable"
     } else {
         match http_status {
@@ -240,10 +216,10 @@ pub(crate) fn run(config: Option<&Path>, progress: &Progress) -> Outcome {
             "request_budget": score.request_budget,
             "concurrency": score.concurrency,
             "max_evidence_bytes": score.max_evidence_bytes,
-            "transport": if connection.endpoint.is_some() { "explicit_endpoint" } else { "provider_default" },
-            "oauth_file_configured": connection.oauth_file.is_some(),
-            "proxy_configured": connection.proxy.is_some(),
-            "ca_file_configured": connection.ca_file.is_some(),
+            "transport": if score.endpoint.is_some() { "explicit_endpoint" } else { "provider_default" },
+            "oauth_file_configured": score.oauth_file.is_some(),
+            "proxy_configured": score.proxy.is_some(),
+            "ca_file_configured": score.ca_file.is_some(),
             "inference": inference,
             "provider_status": provider_status,
             "http_status": http_status,

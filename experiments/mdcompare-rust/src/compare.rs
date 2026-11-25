@@ -1,6 +1,6 @@
 use crate::input::{Document, Identity, Reader};
 use crate::{ocr, resources, text};
-use crate::{offline::Snapshots, summary::Progress};
+use crate::{summary::Progress, workspace::Snapshots};
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};

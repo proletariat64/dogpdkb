@@ -1,41 +1,15 @@
 use std::ops::Range;
 
-use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
 
-use super::body_view::inline_code;
 use super::table_separator;
-
-pub(super) fn html_tags() -> &'static Regex {
-    rx!(
-        r#"<(?P<closing>/)?(?P<tag>[A-Za-z][A-Za-z0-9:-]*)\b(?P<attrs>(?:[^>"']|"[^"]*"|'[^']*')*)>"#
-    )
-}
+use crate::markdown_syntax::{attributes, escaped, html_tags, inline_code, overlaps};
 
 fn is_cosmetic(tag: &str) -> bool {
     matches!(
         tag,
         "font" | "span" | "u" | "div" | "p" | "center" | "b" | "strong" | "em" | "i" | "br"
     )
-}
-
-pub(super) fn attributes(text: &str) -> Option<Vec<(String, Option<&str>)>> {
-    let pattern =
-        rx!(r#"\s+([A-Za-z_:][A-Za-z0-9_:.-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?"#);
-    let mut cursor = 0;
-    let mut attrs = Vec::new();
-    for entry in pattern.captures_iter(text) {
-        let full = entry.get(0)?;
-        if !text[cursor..full.start()].trim().is_empty() {
-            return None;
-        }
-        attrs.push((
-            entry[1].to_ascii_lowercase(),
-            (2..=4).find_map(|i| entry.get(i).map(|value| value.as_str())),
-        ));
-        cursor = full.end();
-    }
-    text[cursor..].trim().is_empty().then_some(attrs)
 }
 
 pub(super) fn cosmetic_attrs(attrs: &[(String, Option<&str>)]) -> bool {
@@ -85,12 +59,6 @@ fn self_closing_attrs(raw: &str) -> (&str, bool) {
         raw.trim() == "/" || !raw.contains('=') || before.ends_with([' ', '\t', '"', '\''])
     });
     ending.map_or((raw, false), |before| (before, true))
-}
-
-fn overlaps(span: &Range<usize>, sorted: &[Range<usize>]) -> bool {
-    sorted
-        .get(sorted.partition_point(|range| range.end <= span.start))
-        .is_some_and(|range| range.start < span.end)
 }
 
 fn merged_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
@@ -305,16 +273,6 @@ fn quantity(m: &regex::Captures<'_>) -> String {
     } else {
         format!("{integer}.{decimals}{unit}")
     }
-}
-
-fn escaped(text: &str, pos: usize) -> bool {
-    text.as_bytes()[..pos]
-        .iter()
-        .rev()
-        .take_while(|byte| **byte == b'\\')
-        .count()
-        % 2
-        != 0
 }
 
 fn flanking(text: &str, start: usize, end: usize) -> (bool, bool) {

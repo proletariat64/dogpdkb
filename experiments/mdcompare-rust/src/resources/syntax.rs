@@ -1,9 +1,9 @@
 use super::{BUDGET, MAX_REFERENCES, SYNTAX, download};
+use crate::markdown_syntax::{backtick_spans, escaped, fold_label};
 use regex::Regex;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
-use unicode_casefold::UnicodeCaseFold;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Use {
@@ -26,57 +26,26 @@ impl Use {
     }
 }
 
-fn label(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .case_fold()
-        .collect()
-}
-
-fn escaped(text: &str, offset: usize) -> bool {
-    text.as_bytes()[..offset]
-        .iter()
-        .rev()
-        .take_while(|&&b| b == b'\\')
-        .count()
-        % 2
-        != 0
-}
-
 fn mask_spans(line: &str, output: &mut String) {
-    static TICKS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x60+").unwrap());
     static ANGLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>\r\n]*(?:>|$)").unwrap());
-    let runs: Vec<_> = TICKS.find_iter(line).collect();
-    let mut following = BTreeMap::new();
-    let mut closers = vec![None; runs.len()];
-    for (index, run) in runs.iter().enumerate().rev() {
-        closers[index] = following.insert(run.len(), index);
-    }
     let mut angles = ANGLE.find_iter(line).peekable();
-    let mut index = 0;
-    let mut previous = 0;
-    while index < runs.len() {
-        let start = runs[index].start();
-        while angles.peek().is_some_and(|angle| angle.end() <= start) {
+    let spans = backtick_spans(line, |start, _| {
+        while angles
+            .peek()
+            .is_some_and(|angle| angle.end() <= start.start)
+        {
             angles.next();
         }
-        if let Some(end) = closers[index]
-            && !escaped(line, start)
-            && angles.peek().is_none_or(|angle| angle.start() > start)
-        {
-            let end_offset = runs[end].end();
-            output.push_str(&line[previous..start]);
-            output.extend(std::iter::repeat_n(
-                ' ',
-                line[start..end_offset].chars().count(),
-            ));
-            previous = end_offset;
-            index = end + 1;
-        } else {
-            index += 1;
-        }
+        !escaped(line, start.start)
+            && angles
+                .peek()
+                .is_none_or(|angle| angle.start() > start.start)
+    });
+    let mut previous = 0;
+    for span in spans {
+        output.push_str(&line[previous..span.start]);
+        previous = span.end;
+        output.extend(std::iter::repeat_n(' ', line[span].chars().count()));
     }
     output.push_str(&line[previous..]);
 }
@@ -501,7 +470,7 @@ pub(crate) fn uses(data: &[u8], declared: &BTreeSet<&str>) -> (Vec<Use>, Vec<&'s
             .or_else(|| cap.get(6))
             .map(|m| m.as_str());
         if definitions
-            .insert(label(&cap[1]), (target, title))
+            .insert(fold_label(&cap[1]), (target, title))
             .is_some()
         {
             reasons.push(SYNTAX);
@@ -566,7 +535,7 @@ pub(crate) fn uses(data: &[u8], declared: &BTreeSet<&str>) -> (Vec<Use>, Vec<&'s
             .get(3)
             .filter(|m| !m.is_empty())
             .map_or(&cap[2], |m| m.as_str());
-        if let Some((target, title)) = definitions.get(&label(reference)) {
+        if let Some((target, title)) = definitions.get(&fold_label(reference)) {
             if marked_image || download(target) || declared.contains(target) {
                 let kind = if is_image { "image" } else { "attachment" };
                 usages.push(Use::new(start, kind, target, &cap[2], *title));

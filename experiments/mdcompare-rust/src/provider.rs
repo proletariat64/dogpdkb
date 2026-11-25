@@ -1,3 +1,4 @@
+use crate::config::ScoreConfig;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::{Certificate, Proxy, Url, blocking::Client, redirect};
 use serde_json::{Value, json};
@@ -108,11 +109,22 @@ fn model<'a>(name: &'a str, effort: &'a str) -> Result<Model<'a>, &'static str> 
 }
 
 #[derive(Default)]
-pub struct Connection {
-    pub oauth_file: Option<PathBuf>,
-    pub proxy: Option<String>,
-    pub ca_file: Option<PathBuf>,
-    pub endpoint: Option<String>,
+struct Connection {
+    oauth_file: Option<PathBuf>,
+    proxy: Option<String>,
+    ca_file: Option<PathBuf>,
+    endpoint: Option<String>,
+}
+
+impl From<&ScoreConfig> for Connection {
+    fn from(config: &ScoreConfig) -> Self {
+        Self {
+            oauth_file: config.oauth_file.clone(),
+            proxy: config.proxy.clone(),
+            ca_file: config.ca_file.clone(),
+            endpoint: config.endpoint.clone(),
+        }
+    }
 }
 
 impl Connection {
@@ -146,22 +158,36 @@ impl Connection {
     }
 }
 
+// Shared local OAuth document and credential interpretation. Scoring maps
+// local failures to its existing coarse authentication error; diagnostics retain
+// the precise reason without returning credential contents.
 fn auth_json(path: &Path) -> Result<Value, &'static str> {
-    let (bytes, _) = crate::input::read(path, 1024 * 1024).map_err(|_| "oauth_required")?;
+    let (bytes, _) = crate::input::read(path, 1024 * 1024).map_err(|_| "oauth_file_unreadable")?;
     serde_json::from_slice(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes))
-        .map_err(|_| "oauth_required")
+        .map_err(|_| "oauth_file_invalid")
 }
 
 fn credential(auth: &Value, backend: Backend) -> Result<&Value, &'static str> {
-    let cred = &auth[backend.name()];
+    if !auth.is_object() {
+        return Err("oauth_file_invalid");
+    }
+    let cred = auth.get(backend.name()).ok_or("oauth_provider_missing")?;
     if cred["type"] != "oauth"
         || nonempty(&cred["access"]).is_none()
         || nonempty(&cred["refresh"]).is_none()
         || cred["expires"].as_f64().is_none()
     {
-        return Err("oauth_required");
+        return Err("oauth_credential_invalid");
     }
     Ok(cred)
+}
+
+fn score_auth_json(path: &Path) -> Result<Value, &'static str> {
+    auth_json(path).map_err(|_| "oauth_required")
+}
+
+fn score_credential(auth: &Value, backend: Backend) -> Result<&Value, &'static str> {
+    credential(auth, backend).map_err(|_| "oauth_required")
 }
 
 fn nonempty(value: &Value) -> Option<&str> {
@@ -182,8 +208,8 @@ fn expired(cred: &Value) -> bool {
         .is_some_and(|stamp| stamp <= now_millis())
 }
 
-fn connection(settings: &Connection) -> Result<Client, &'static str> {
-    settings.endpoint()?;
+fn connection(settings: &Connection) -> Result<(Client, Option<Url>), &'static str> {
+    let endpoint = settings.endpoint()?;
     let mut builder = Client::builder()
         .redirect(redirect::Policy::none())
         .retry(reqwest::retry::never())
@@ -202,66 +228,121 @@ fn connection(settings: &Connection) -> Result<Client, &'static str> {
             builder = builder.add_root_certificate(certificate);
         }
     }
-    builder.build().map_err(|_| "proxy_unavailable")
+    let client = builder.build().map_err(|_| "proxy_unavailable")?;
+    Ok((client, endpoint))
 }
 
-pub fn check_transport_settings(settings: &Connection) -> Result<(), &'static str> {
-    connection(settings).map(drop)
+pub(crate) enum OAuthReadiness {
+    Passed,
+    Failed(&'static str),
+    Skipped(&'static str),
 }
 
-pub fn check_oauth_settings(
-    name: &str,
-    effort: &str,
-    settings: &Connection,
-) -> Result<bool, &'static str> {
-    let model = model(name, effort)?;
-    let _client = connection(settings)?;
-    if settings.endpoint()?.is_some() {
-        return Ok(false);
+/// Local prerequisites for doctor, kept independent so one failed check does
+/// not suppress diagnostics for the others.
+pub(crate) struct Readiness {
+    pub(crate) backend: Result<&'static str, &'static str>,
+    pub(crate) transport: Result<(), &'static str>,
+    pub(crate) oauth: OAuthReadiness,
+    pub(crate) scoring_enabled: bool,
+    pub(crate) probe_skip: Option<&'static str>,
+}
+
+/// Interpret a frozen scoring configuration once. Readiness is checked only
+/// at the entry point that needs it. Each actual request still obtains fresh
+/// transport and credentials.
+pub(crate) struct Provider<'a> {
+    model: Result<Model<'a>, &'static str>,
+    connection: Connection,
+    request_budget: Option<usize>,
+}
+
+impl<'a> Provider<'a> {
+    pub(crate) fn new(config: &'a ScoreConfig) -> Self {
+        Self {
+            model: model(&config.model, &config.effort),
+            connection: config.into(),
+            request_budget: config.request_budget,
+        }
     }
-    oauth_expired(settings, model.backend)
-}
 
-pub(crate) fn check_model(name: &str, effort: &str) -> Result<&'static str, &'static str> {
-    model(name, effort).map(|model| model.backend.name())
-}
-
-pub(crate) fn check_saved_oauth(
-    name: &str,
-    effort: &str,
-    settings: &Connection,
-) -> Result<bool, &'static str> {
-    let backend = model(name, effort)?.backend;
-    let saved = saved_credential(settings, backend)?;
-    let expired = expired(&saved);
-    if !expired
-        && matches!(backend, Backend::Codex)
-        && nonempty(&saved["access"]).and_then(jwt_account).is_none()
-    {
-        return Err("oauth_credential_invalid");
+    pub(crate) fn diagnostics(&self) -> Readiness {
+        let backend = self.model.map(|model| model.backend.name());
+        let transport = connection(&self.connection).map(drop);
+        let scoring_enabled = self.request_budget.is_some_and(|budget| budget > 0);
+        let oauth = if self.connection.endpoint.is_some() {
+            OAuthReadiness::Skipped("local_test_endpoint")
+        } else if self.connection.oauth_file.is_none() && !scoring_enabled {
+            OAuthReadiness::Skipped("oauth_not_configured")
+        } else if let Ok(model) = self.model {
+            match saved_credential(&self.connection, model.backend) {
+                Ok(saved) if expired(&saved) => OAuthReadiness::Failed("oauth_expired"),
+                Ok(saved)
+                    if matches!(model.backend, Backend::Codex)
+                        && nonempty(&saved["access"]).and_then(jwt_account).is_none() =>
+                {
+                    OAuthReadiness::Failed("oauth_credential_invalid")
+                }
+                Ok(_) => OAuthReadiness::Passed,
+                Err(code) => OAuthReadiness::Failed(code),
+            }
+        } else {
+            OAuthReadiness::Skipped("unsupported_model")
+        };
+        let probe_skip = if self.request_budget == Some(0) {
+            Some("request_budget_zero")
+        } else if backend.is_err()
+            || transport.is_err()
+            || matches!(oauth, OAuthReadiness::Failed(_))
+        {
+            Some("prerequisites_failed")
+        } else if self.connection.endpoint.is_none() && self.connection.oauth_file.is_none() {
+            Some("oauth_not_configured")
+        } else {
+            None
+        };
+        Readiness {
+            backend,
+            transport,
+            oauth,
+            scoring_enabled,
+            probe_skip,
+        }
     }
-    Ok(expired)
+
+    pub(crate) fn score_preflight(&self) -> Result<bool, &'static str> {
+        let model = self.model?;
+        let (_client, endpoint) = connection(&self.connection)?;
+        if endpoint.is_some() {
+            return Ok(false);
+        }
+        let auth = score_auth_json(&self.connection.auth_path()?)?;
+        Ok(expired(score_credential(&auth, model.backend)?))
+    }
+
+    pub(crate) fn assess(&self, packet: &str) -> Outcome {
+        self.model
+            .and_then(|model| request(model, Purpose::Score(packet), &self.connection))
+            .unwrap_or_else(|reason| Outcome::error(reason, None))
+    }
+
+    pub(crate) fn probe(&self) -> Outcome {
+        self.model
+            .and_then(|model| {
+                request(
+                    model,
+                    Purpose::Probe(Duration::from_secs(20)),
+                    &self.connection,
+                )
+            })
+            .unwrap_or_else(|reason| Outcome::error(reason, None))
+    }
 }
 
 fn saved_credential(settings: &Connection, backend: Backend) -> Result<Value, &'static str> {
     let path = settings.oauth_file.as_deref().ok_or("oauth_required")?;
-    let (bytes, _) = crate::input::read(path, 1024 * 1024).map_err(|_| "oauth_file_unreadable")?;
-    let auth: Value = serde_json::from_slice(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes))
-        .map_err(|_| "oauth_file_invalid")?;
-    if !auth.is_object() {
-        return Err("oauth_file_invalid");
-    }
-    if auth.get(backend.name()).is_none() {
-        return Err("oauth_provider_missing");
-    }
-    credential(&auth, backend)
-        .cloned()
-        .map_err(|_| "oauth_credential_invalid")
-}
-
-fn oauth_expired(settings: &Connection, backend: Backend) -> Result<bool, &'static str> {
-    let auth = auth_json(&settings.auth_path()?)?;
-    Ok(expired(credential(&auth, backend)?))
+    let auth = auth_json(path)?;
+    credential(&auth, backend).cloned()
 }
 
 // Pi's proper-lockfile expires an unchanged lock directory after ten
@@ -422,8 +503,8 @@ fn refresh(client: &Client, backend: Backend, cred: &Value) -> Result<Value, &'s
 }
 
 fn access(client: &Client, backend: Backend, path: &Path) -> Result<String, &'static str> {
-    let auth = auth_json(path)?;
-    let cred = credential(&auth, backend)?;
+    let auth = score_auth_json(path)?;
+    let cred = score_credential(&auth, backend)?;
     if !expired(cred) {
         return nonempty(&cred["access"])
             .map(str::to_owned)
@@ -431,8 +512,8 @@ fn access(client: &Client, backend: Backend, path: &Path) -> Result<String, &'st
     }
 
     let lock = AuthLock::acquire(path)?;
-    let mut auth = auth_json(path)?;
-    let cred = credential(&auth, backend)?;
+    let mut auth = score_auth_json(path)?;
+    let cred = score_credential(&auth, backend)?;
     if expired(cred) {
         let metadata = fs::metadata(path).map_err(|_| "auth_error")?;
         let next = refresh(client, backend, cred)?;
@@ -455,7 +536,7 @@ fn access(client: &Client, backend: Backend, path: &Path) -> Result<String, &'st
             .and_then(|dir| dir.sync_all())
             .map_err(|_| "auth_error")?;
     }
-    nonempty(&credential(&auth, backend)?["access"])
+    nonempty(&score_credential(&auth, backend)?["access"])
         .map(str::to_owned)
         .ok_or("oauth_required")
 }
@@ -600,8 +681,7 @@ fn request(
     purpose: Purpose<'_>,
     settings: &Connection,
 ) -> Result<Outcome, &'static str> {
-    let client = connection(settings)?;
-    let endpoint = settings.endpoint()?;
+    let (client, endpoint) = connection(settings)?;
     let token = if endpoint.is_some() {
         None
     } else {
@@ -719,17 +799,6 @@ fn request(
     )
 }
 
-pub fn assess_with_connection(
-    name: &str,
-    effort: &str,
-    packet: &str,
-    settings: &Connection,
-) -> Outcome {
-    model(name, effort)
-        .and_then(|model| request(model, Purpose::Score(packet), settings))
-        .unwrap_or_else(|reason| Outcome::error(reason, None))
-}
-
 fn probe_http_error(
     status: u16,
     response: reqwest::blocking::Response,
@@ -766,12 +835,6 @@ fn is_model_rejection(code: &Value) -> bool {
     )
 }
 
-pub(crate) fn probe(name: &str, effort: &str, settings: &Connection) -> Outcome {
-    model(name, effort)
-        .and_then(|model| request(model, Purpose::Probe(Duration::from_secs(20)), settings))
-        .unwrap_or_else(|reason| Outcome::error(reason, None))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,12 +864,44 @@ mod tests {
     }
 
     #[test]
-    fn provider_rejects_remote_override_without_connecting() {
-        let cfg = Connection {
-            endpoint: Some("https://example.invalid/v1/responses".to_owned()),
-            ..Connection::default()
+    fn preflight_shares_credentials_but_keeps_probe_and_refresh_policies_distinct() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let expired =
+            br#"{"openai":{"type":"oauth","access":"dummy","refresh":"dummy","expires":1}}"#;
+        fs::write(&path, expired).unwrap();
+        let config = ScoreConfig {
+            request_budget: Some(1),
+            oauth_file: Some(path.clone()),
+            ..ScoreConfig::default()
         };
-        let outcome = assess_with_connection("openai/gpt-6.1-terra", "medium", "packet", &cfg);
+        let provider = Provider::new(&config);
+        let readiness = provider.diagnostics();
+        assert!(matches!(
+            readiness.oauth,
+            OAuthReadiness::Failed("oauth_expired")
+        ));
+        assert_eq!(readiness.probe_skip, Some("prerequisites_failed"));
+        assert_eq!(provider.score_preflight(), Ok(true));
+        assert_eq!(fs::read(&path).unwrap(), expired);
+
+        fs::write(&path, b"{").unwrap();
+        let readiness = provider.diagnostics();
+        assert!(matches!(
+            readiness.oauth,
+            OAuthReadiness::Failed("oauth_file_invalid")
+        ));
+        assert_eq!(provider.score_preflight(), Err("oauth_required"));
+        assert_eq!(fs::read(&path).unwrap(), b"{");
+    }
+
+    #[test]
+    fn provider_rejects_remote_override_without_connecting() {
+        let cfg = ScoreConfig {
+            endpoint: Some("https://example.invalid/v1/responses".to_owned()),
+            ..ScoreConfig::default()
+        };
+        let outcome = Provider::new(&cfg).assess("packet");
         assert_eq!(outcome.reason, Some("unsupported_transport"));
     }
 

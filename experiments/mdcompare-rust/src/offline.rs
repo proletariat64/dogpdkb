@@ -1,18 +1,10 @@
-use crate::input::{Document, Identity, Reader, json_bytes, parse_utf8_json};
+use crate::input::{json_bytes, parse_utf8_json};
 use crate::summary::{Outcome, Progress, Summary};
 use crate::text::Options;
 use crate::workspace::{self, Commit, FrozenPlan, Operation, Workspace};
 use anyhow::{Context, Result, ensure};
-use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-
-pub(crate) struct Snapshots {
-    pub baseline: BTreeMap<Identity, Document>,
-    pub incoming: BTreeMap<Identity, Document>,
-    pub order: Vec<Identity>,
-}
 
 pub(crate) fn run(plan: &Path, config: Option<&Path>, progress: &Progress) -> Result<Outcome> {
     let (workspace, frozen) = workspace::accept(plan, config)?;
@@ -27,46 +19,18 @@ pub(crate) fn run(plan: &Path, config: Option<&Path>, progress: &Progress) -> Re
 
     frozen.verify_inputs()?;
     let stage = tempfile::tempdir_in(&workspace.root).context("publish_failed")?;
-    let (mut old, mut new) = (BTreeMap::<Identity, Document>::new(), BTreeMap::new());
-    let mut order = Vec::new();
-    for (baseline, incoming) in frozen.documents() {
-        let identity = incoming
-            .as_ref()
-            .or(baseline.as_ref())
-            .context("binding_invalid")?
-            .identity
-            .clone();
-        order.push(identity.clone());
-        if let Some(doc) = baseline {
-            old.insert(identity.clone(), doc);
-        }
-        if let Some(doc) = incoming {
-            new.insert(identity, doc);
-        }
-    }
-
-    let snapshots = Snapshots {
-        baseline: old,
-        incoming: new,
-        order,
-    };
+    let snapshots = frozen.snapshots()?;
     let total = snapshots.incoming.len();
     let compare = &frozen.settings.compare;
     let report = &frozen.settings.report;
     let options = Options {
-        file_bytes: compare.max_file_bytes,
         normalize: compare.normalize_line_endings,
         work: compare.max_diff_work,
         evidence: report.include_body_excerpts,
         chars: report.max_excerpt_chars.unwrap_or(8000),
         char_region: 4096,
     };
-    let mut reader = Reader::new_frozen(
-        options.file_bytes,
-        &frozen.inputs,
-        &frozen.presence,
-        &frozen.path_targets,
-    );
+    let mut reader = frozen.reader();
     progress.update("compare", 0, total, 0, 0);
     let mut artifacts = vec!["result.json"];
     let operation = frozen.work.operation;
@@ -102,11 +66,7 @@ pub(crate) fn run(plan: &Path, config: Option<&Path>, progress: &Progress) -> Re
         )?),
     };
 
-    ensure!(
-        !reader.drifted() && reader.changed_paths().is_empty(),
-        "input_drift"
-    );
-    frozen.verify_inputs()?;
+    frozen.verify_reads(&reader)?;
     if let Some(mut result) = result {
         if report.markdown {
             let markdown = match operation {
@@ -148,25 +108,7 @@ pub(crate) fn run(plan: &Path, config: Option<&Path>, progress: &Progress) -> Re
         workspace::atomic_write(&stage.path().join("result.json"), &json_bytes(&result)?)?;
     }
     progress.update("publish", total, total, 0, 0);
-    for name in artifacts
-        .iter()
-        .copied()
-        .chain(matches!(operation, Operation::Semantic).then_some("evidence"))
-    {
-        let destination = workspace.root.join(name);
-        if let Ok(prior) = fs::symlink_metadata(&destination) {
-            // A previous interrupted run may have placed files before it wrote its commit.
-            if name == "evidence" {
-                ensure!(prior.is_dir(), "publish_failed");
-                fs::rename(&destination, stage.path().join("abandoned-evidence"))
-                    .context("publish_failed")?;
-            } else {
-                ensure!(prior.is_file() && prior.nlink() == 1, "publish_failed");
-            }
-        }
-        fs::rename(stage.path().join(name), destination).context("publish_failed")?;
-    }
-    let commit = workspace::publish_commit(&workspace, frozen.digest(), &artifacts)?;
+    let commit = workspace::publish_generation(&workspace, &frozen, stage.path(), &artifacts)?;
     published("run", &workspace, commit)
 }
 
