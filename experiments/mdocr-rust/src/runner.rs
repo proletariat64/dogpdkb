@@ -7,7 +7,7 @@ use crate::workspace::{Workspace, lock_control, try_lock};
 use anyhow::{Context, Result, ensure};
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod journal;
-use journal::{Attempt, Budget, Concurrency, Journal, Status};
+use journal::{Attempt, Journal, Status};
 
 const JOURNAL_SCHEMA: &str = "mdocr-journal-1";
 const RESULT_SCHEMA: &str = "mdocr-batch-result-1";
@@ -168,8 +168,6 @@ struct Execution<'a> {
     state: Journal,
     workspace: &'a Workspace,
     stop: Option<&'static str>,
-    latest: HashMap<String, usize>,
-    repairs: HashMap<String, usize>,
     deadline: Instant,
     retry_failed: bool,
 }
@@ -310,29 +308,7 @@ fn journal_for(plan: &Plan, result: &Path, ledger: &Path) -> Result<Journal> {
             "preexisting unowned document output"
         );
     }
-    let limit = plan.settings["concurrency"]
-        .as_u64()
-        .context("missing concurrency")? as usize;
-    Ok(Journal {
-        schema_version: JOURNAL_SCHEMA.into(),
-        plan_sha256: plan.digest.clone(),
-        runtime_version: env!("CARGO_PKG_VERSION").into(),
-        status: "running".into(),
-        causes: Vec::new(),
-        concurrency: Concurrency {
-            initial: limit,
-            current: limit,
-            transitions: Vec::new(),
-        },
-        budget: Budget {
-            request_limit: plan.settings["request_budget"].as_u64(),
-            ..Budget::default()
-        },
-        requests: Vec::new(),
-        reused: BTreeMap::new(),
-        documents: Vec::new(),
-        publication_receipts: BTreeMap::new(),
-    })
+    Journal::new(plan)
 }
 
 fn validate_mirror(plan: &Plan, result: &Path) -> Result<()> {
@@ -371,14 +347,10 @@ impl<'a> Execution<'a> {
             state,
             workspace,
             stop: None,
-            latest: HashMap::new(),
-            repairs: HashMap::new(),
             deadline,
             retry_failed,
         };
-        let (latest, repairs) = execution.state.recover(plan, &execution.layout.jobs)?;
-        execution.latest = latest;
-        execution.repairs = repairs;
+        execution.state.recover(plan, &execution.layout.jobs)?;
         Ok(execution)
     }
 
@@ -495,30 +467,7 @@ impl<'a> Execution<'a> {
     }
 
     fn last(&self, key: &str) -> Option<&Attempt> {
-        self.state
-            .reused
-            .get(key)
-            .or_else(|| self.latest.get(key).map(|&i| &self.state.requests[i]))
-    }
-
-    fn is_fixable(attempt: &Attempt) -> bool {
-        matches!(
-            (attempt.status, attempt.reason.as_deref()),
-            (
-                Status::Failed,
-                Some(
-                    "OCR_RATE_LIMITED"
-                        | "rate_limited"
-                        | "response_incomplete"
-                        | "response_json_invalid"
-                        | "response_mermaid_fence_invalid"
-                        | "response_output_limit"
-                        | "response_schema_invalid"
-                        | "response_table_invalid"
-                        | "response_unexpected_stop"
-                )
-            ) | (Status::Unknown, Some("connection_outcome_unknown"))
-        )
+        self.state.last(key)
     }
 
     fn read_cache(&self, key: &str) -> Result<Option<[Value; 1]>> {
@@ -579,42 +528,14 @@ impl<'a> Execution<'a> {
             self.set_stop("BATCH_DEADLINE_EXCEEDED");
             return Ok(None);
         }
-        let mut attempt = Attempt::new(key.into(), Status::Admitted);
-        attempt
-            .source_sha256
-            .clone_from(&self.layout.jobs[key].sha256);
-        let index = self.state.requests.len();
-        match pass {
-            Pass::Repair => {
-                attempt.repair_round = Some(
-                    self.repairs
-                        .get(key)
-                        .and_then(|&i| self.state.requests[i].repair_round)
-                        .unwrap_or(0)
-                        + 1,
-                );
-                self.repairs.insert(key.into(), index);
-            }
-            Pass::Fix | Pass::Initial => {
-                // Explicit retries still inherit earlier fix rounds for this image.
-                if pass == Pass::Fix {
-                    attempt.retry_round = Some(self.retry_round(key) + 1);
-                }
-                self.latest.insert(key.into(), index);
-            }
-        }
-        self.state
-            .record_admission(attempt, &self.workspace.journal)?;
+        let index = self.state.record_admission(
+            key,
+            &self.layout.jobs[key].sha256,
+            pass,
+            &self.plan.settings,
+            &self.workspace.journal,
+        )?;
         Ok(Some(index))
-    }
-
-    fn retry_round(&self, key: &str) -> u64 {
-        self.state
-            .requests
-            .iter()
-            .rev()
-            .find_map(|r| (r.key == key).then_some(r.retry_round).flatten())
-            .unwrap_or(0)
     }
 
     fn settle(
@@ -623,19 +544,18 @@ impl<'a> Execution<'a> {
         tier: usize,
         result: Result<Conversion, Failure>,
     ) -> Result<()> {
-        let cache_record = self.state.settle(
+        let settlement = self.state.settle(
             index,
             tier,
             result,
             &self.plan.settings,
-            &mut self.latest,
-            &mut self.stop,
+            self.stop.is_none(),
         )?;
-        if let Some(reason) = self.stop {
+        if let Some(reason) = settlement.stop_reason {
             self.set_stop(reason);
         }
         self.save_journal()?;
-        if let Some((path, data)) = cache_record {
+        if let Some((path, data)) = settlement.cache_record {
             atomic(&path, &data, false)?;
         }
         Ok(())
@@ -673,8 +593,8 @@ impl<'a> Execution<'a> {
                 .keys()
                 .filter(|key| {
                     !self.layout.published.contains(*key)
-                        && self.last(key).is_some_and(Self::is_fixable)
-                        && self.retry_round(key) < limit
+                        && self.last(key).is_some_and(Journal::is_fixable)
+                        && self.state.retry_round(key) < limit
                 })
                 .map(|key| (key.clone(), None))
                 .collect::<HashMap<_, _>>();
@@ -700,10 +620,7 @@ impl<'a> Execution<'a> {
             let Some(original) = self.last(key) else {
                 continue;
             };
-            let newest = self
-                .repairs
-                .get(key)
-                .map_or(original, |&i| &self.state.requests[i]);
+            let newest = self.state.repair(key).unwrap_or(original);
             if self.layout.published.contains(key)
                 || newest.repair_round.unwrap_or(0) >= limit
                 || newest.status != Status::Success

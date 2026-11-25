@@ -1,3 +1,4 @@
+use crate::artifacts::decode::{absolute, field, optional_string, string};
 use crate::{artifacts, llm, provider};
 use anyhow::{Context, Result, ensure};
 use pulldown_cmark::{Event, Parser, Tag};
@@ -529,38 +530,6 @@ pub(crate) fn validate_settings(settings: &Value) -> Result<Option<PathBuf>> {
     optional_string(settings, "cache_dir")?
         .map(|path| absolute(path, "cache directory"))
         .transpose()
-}
-
-fn field<'a>(object: &'a Value, key: &str) -> Result<&'a Value> {
-    object
-        .get(key)
-        .with_context(|| format!("plan is missing {key}"))
-}
-
-fn string<'a>(object: &'a Value, key: &str) -> Result<&'a str> {
-    field(object, key)?
-        .as_str()
-        .with_context(|| format!("invalid plan {key}"))
-}
-
-fn optional_string<'a>(object: &'a Value, key: &str) -> Result<Option<&'a str>> {
-    let value = field(object, key)?;
-    if value.is_null() {
-        Ok(None)
-    } else {
-        Ok(Some(
-            value
-                .as_str()
-                .with_context(|| format!("invalid plan {key}"))?,
-        ))
-    }
-}
-
-fn absolute(value: &str, kind: &str) -> Result<PathBuf> {
-    let path = Path::new(value);
-    ensure!(path.is_absolute(), "plan {kind} must be an absolute path");
-    artifacts::owned_path(path)?;
-    Ok(path.to_path_buf())
 }
 
 fn integer(object: &Value, key: &str) -> Result<u64> {
